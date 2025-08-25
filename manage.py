@@ -8,6 +8,7 @@ import os
 import sys
 
 if __name__ == "__main__":
+    os.environ.setdefault("ENV_FOR_WEBLATE", "development")
     default = "weblate.settings"
     if len(sys.argv) >= 2 and sys.argv[1] == "test":
         default = "weblate.settings_test"

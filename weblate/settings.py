@@ -26,6 +26,9 @@ class Env(Enum):
 
 
 APP_NAME = "weblate"
+# Build paths inside the project like this: BASE_DIR / 'subdir'.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 dynset = Dynaconf(
     root_path=Path(__file__).parent,
     core_loaders=("TOML",),
@@ -52,6 +55,7 @@ ENABLE_HTTPS = IN_PROD
 # Site URL
 SITE_URL = "{}://{}".format("https" if ENABLE_HTTPS else "http", SITE_DOMAIN)
 
+PROCER_TMP_DIR = dynset.WORKER_TMP_DIR
 
 #
 # Django settings for Weblate project.
@@ -92,11 +96,8 @@ DATABASES = {
     }
 }
 
-# Data directory, you can use following for the development purposes:
-DEVELOPMENT_DATA_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
-)
-DATA_DIR = dynset.get("DATA_DIR", DEVELOPMENT_DATA_DIR)
+PUBLIC_ROOT = BASE_DIR.parent / dynset.PUBLIC_REL_DIR
+DATA_DIR = PUBLIC_ROOT
 CACHE_DIR = f"{DATA_DIR}/cache"
 
 # Local time zone for this installation. Choices can be found here:
@@ -177,7 +178,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 URL_PREFIX = ""
 
 # Absolute filesystem path to the directory that will hold user-uploaded files.
-MEDIA_ROOT = os.path.join(DATA_DIR, "media")
+MEDIA_ROOT = DATA_DIR / "media"
 
 # URL that handles the media served from MEDIA_ROOT. Make sure to use a
 # trailing slash.
@@ -186,17 +187,12 @@ MEDIA_URL = f"{URL_PREFIX}/media/"
 # Absolute path to the directory static files should be collected to.
 # Don't put anything in this directory yourself; store your static files
 # in apps' "static/" subdirectories and in STATICFILES_DIRS.
-STATIC_ROOT = os.path.join(CACHE_DIR, "static")
+STATIC_ROOT = PUBLIC_ROOT / "static"
 
 # URL prefix for static files.
 STATIC_URL = f"{URL_PREFIX}/static/"
 
-# Additional locations of static files
-STATICFILES_DIRS = (
-    # Put strings here, like "/home/html/static" or "C:/www/django/static".
-    # Always use forward slashes, even on Windows.
-    # Don't forget to use absolute paths, not relative paths.
-)
+STATICFILES_DIRS = (BASE_DIR / "static",)
 
 # List of finder classes that know how to find static files in
 # various locations.

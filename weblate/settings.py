@@ -81,6 +81,9 @@ DATABASES = {
         "NAME": DB_NAME,
         # Database user.
         "USER": POSTGRES_USER,
+        # Name of role to alter to set parameters in PostgreSQL,
+        # use in case role name is different than user used for authentication.
+        "ALTER_ROLE": POSTGRES_USER,
         # Database password.
         "PASSWORD": POSTGRES_PASSWORD,
         # Set to empty string for localhost.

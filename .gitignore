@@ -6,7 +6,6 @@
 /docs/locales/*/*/*.mo
 weblate-*.tar.*
 /*.db
-/weblate/settings.py
 /reports/
 /tags
 /prof
@@ -41,3 +40,14 @@ weblate-*.tar.*
 /weblate-openapi.yaml
 /memray*
 /mypy.log
+
+# Ignore dynaconf secret files
+.secrets.*
+settings.toml
+
+### OSX ###
+.DS_Store
+.AppleDouble
+.LSOverride
+*.whl
+*.rdb

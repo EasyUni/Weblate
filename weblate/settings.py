@@ -55,7 +55,7 @@ ENABLE_HTTPS = IN_PROD
 # Site URL
 SITE_URL = "{}://{}".format("https" if ENABLE_HTTPS else "http", SITE_DOMAIN)
 
-PROCER_TMP_DIR = dynset.WORKER_TMP_DIR
+WORKER_TMP_DIR = dynset.WORKER_TMP_DIR
 
 #
 # Django settings for Weblate project.

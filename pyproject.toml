@@ -168,6 +168,7 @@ dependencies = [
   "weblate-language-data>=2025.7",
   "weblate-schemas==2025.5",
   "dynaconf>=3.2.11",
+  "gunicorn>=23.0.0",
 ]
 description = "A web-based continuous localization system with tight version control integration"
 keywords = [

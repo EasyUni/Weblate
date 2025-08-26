@@ -175,7 +175,7 @@ USE_TZ = True
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
 # URL prefix to use, please see documentation for more details
-URL_PREFIX = ""
+URL_PREFIX = "/weblate"
 
 # Absolute filesystem path to the directory that will hold user-uploaded files.
 MEDIA_ROOT = DATA_DIR / "media"
@@ -192,7 +192,8 @@ STATIC_ROOT = PUBLIC_ROOT / "static"
 # URL prefix for static files.
 STATIC_URL = f"{URL_PREFIX}/static/"
 
-STATICFILES_DIRS = (BASE_DIR / "static",)
+# Additional locations of static files
+STATICFILES_DIRS = () if IN_PROD else (BASE_DIR / "static",)
 
 # List of finder classes that know how to find static files in
 # various locations.

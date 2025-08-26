@@ -4,8 +4,6 @@ import logging
 from logging import LogRecord
 from typing import cast
 
-from django.conf import settings
-
 
 def is_bot(user_agent: str):
     bot_ids = (
@@ -37,7 +35,7 @@ class BotIgnoreFilter(logging.Filter):
 
 
 proc_name = "weblate-web"
-worker_tmp_dir = settings.WORKER_TMP_DIR
+worker_tmp_dir = "/dev/shm/"
 # Production server should configure worker number in systemd service file,
 # because this file is shared.
 

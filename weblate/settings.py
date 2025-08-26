@@ -173,7 +173,7 @@ USE_TZ = True
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
 # URL prefix to use, please see documentation for more details
-URL_PREFIX = "/weblate"
+URL_PREFIX = ""
 
 # Absolute filesystem path to the directory that will hold user-uploaded files.
 MEDIA_ROOT = DATA_DIR / "media"

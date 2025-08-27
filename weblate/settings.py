@@ -476,6 +476,7 @@ INSTALLED_APPS = [
     "drf_spectacular",
     "drf_spectacular_sidecar",
     "drf_standardized_errors",
+    "anymail",
 ]
 
 # django_zxcvbn_password_validator integration
@@ -839,6 +840,13 @@ CRISPY_TEMPLATE_PACK = "bootstrap3"
 #     "weblate.addons.webhooks.WebhookAddon",
 #     "weblate.addons.webhooks.SlackWebhookAddon",
 # )
+
+# email
+EMAIL_BACKEND = dynset.EMAIL_BACKEND
+ANYMAIL = {
+    "MAILGUN_API_KEY": dynset.MAILGUN_API_KEY,
+    "MAILGUN_SENDER_DOMAIN": dynset.MAILGUN_SENDER_DOMAIN,
+}
 
 # E-mail address that error messages come from.
 SERVER_EMAIL = dynset.VERIFIED_EMAIL

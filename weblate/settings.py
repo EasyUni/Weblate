@@ -95,8 +95,10 @@ DATABASES = {
 }
 
 PUBLIC_ROOT = BASE_DIR.parent / dynset.PUBLIC_REL_DIR
-DATA_DIR = PUBLIC_ROOT
-CACHE_DIR = f"{DATA_DIR}/cache"
+CACHE_DIR = PUBLIC_ROOT / "cache"
+# DATA_DIR is used in various other places
+# Celery requires it to be a string
+DATA_DIR = str(PUBLIC_ROOT)
 
 # Local time zone for this installation. Choices can be found here:
 # http://en.wikipedia.org/wiki/List_of_tz_zones_by_name
@@ -176,7 +178,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 URL_PREFIX = ""
 
 # Absolute filesystem path to the directory that will hold user-uploaded files.
-MEDIA_ROOT = DATA_DIR / "media"
+MEDIA_ROOT = PUBLIC_ROOT / "media"
 
 # URL that handles the media served from MEDIA_ROOT. Make sure to use a
 # trailing slash.
@@ -896,8 +898,6 @@ SPECTACULAR_SETTINGS = get_spectacular_settings(INSTALLED_APPS, SITE_URL, SITE_T
 FONTS_CDN_URL = None
 
 # Django compressor offline mode
-# TODO: remove this
-COMPRESS_ENABLED = True
 COMPRESS_OFFLINE = True
 COMPRESS_OFFLINE_CONTEXT = "weblate.utils.compress.offline_context"
 COMPRESS_CSS_HASHING_METHOD = "content"
@@ -932,11 +932,10 @@ SILENCED_SYSTEM_CHECKS = [
     # Silence drf_spectacular until these are addressed
     "drf_spectacular.W001",
     "drf_spectacular.W002",
-    # TODO: remove this after development
-    "otp_webauthn.E031",
+    "otp_webauthn.E031" if not IN_PROD else "",
 ]
 
-# Celery worker configuration for testing
+# Celery worker configuration for development
 # CELERY_TASK_ALWAYS_EAGER = True
 # CELERY_BROKER_URL = "memory://"
 # CELERY_TASK_EAGER_PROPAGATES = True

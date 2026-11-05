@@ -345,6 +345,7 @@ ignore = [
   "docs/*/*/*",
   "docs/*/*/*/*",
   "LICENSES/*",
+  "gunicorn_conf.py",
   "rundev.sh",
   "scripts/*",
   "scripts/*/*",

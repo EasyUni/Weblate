@@ -2,58 +2,72 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-$(document).ready(() => {
+document.addEventListener("DOMContentLoaded", () => {
   // The paste trigger button
-  const $pasteScreenshotBtn = $("#paste-screenshot-btn");
+  const pasteScreenshotBtn = document.getElementById("paste-screenshot-btn");
+  if (pasteScreenshotBtn === null) {
+    return;
+  }
+  const screenshotForm = document.getElementById("screenshot-form-container");
   // The file input to store the screenshot file
-  const $screenshotFileInput = $("#screenshot-form-container input#id_image");
-
-  // Check if the browser supports the Clipboard API
-  if (!navigator.clipboard?.read) {
-    $pasteScreenshotBtn.remove();
+  const screenshotFileInput = screenshotForm?.querySelector("input#id_image");
+  if (screenshotForm === null || screenshotFileInput === null) {
+    pasteScreenshotBtn.remove();
+    return;
   }
 
-  $pasteScreenshotBtn.on("click", async (e) => {
+  const setScreenshotImage = (blob, type) => {
+    const fileName = `screenshot_${Date.now()}.${type.split("/")[1]}`;
+    const imageFile = new File([blob], fileName, { type: type });
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(imageFile);
+    screenshotFileInput.files = dataTransfer.files;
+    screenshotFileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    showInfo("success", gettext("Image Pasted!"));
+  };
+
+  const showPasteInstructions = () => {
+    showInfo("info", gettext("Press Ctrl+V or Command+V to paste an image."));
+  };
+
+  screenshotForm.addEventListener("paste", (event) => {
+    const clipboardItems = event.clipboardData?.items;
+    if (clipboardItems === undefined) {
+      return;
+    }
+    const imageItem = Array.from(clipboardItems).find(
+      (item) => item.kind === "file" && item.type.startsWith("image/"),
+    );
+    const imageFile = imageItem?.getAsFile();
+    if (imageFile === null || imageFile === undefined) {
+      return;
+    }
+    event.preventDefault();
+    setScreenshotImage(imageFile, imageItem.type);
+  });
+
+  pasteScreenshotBtn.addEventListener("click", async (e) => {
     e.preventDefault();
+    if (!navigator.clipboard?.read) {
+      showPasteInstructions();
+      return;
+    }
     try {
       // Read clipboard content
       const clipboardItems = await navigator.clipboard.read();
-      let imageFound = false;
       for (const clipboardItem of clipboardItems) {
         // Find the image in the clipboard
-        for (const type of clipboardItem.types) {
-          if (type.startsWith("image/")) {
-            // Convert the image data to a file data
-            const blob = await clipboardItem.getType(type);
-            const reader = new FileReader();
-            reader.onload = (_event) => {
-              if ($screenshotFileInput.length > 0) {
-                // Load the file data into the form input
-                const fileName = `screenshot_${Date.now()}.${type.split("/")[1]}`;
-                const imageFile = new File([blob], fileName, { type: type });
-                const dataTransfer = new DataTransfer();
-                dataTransfer.items.add(imageFile);
-                $screenshotFileInput[0].files = dataTransfer.files;
-                // Inform paste success
-                showInfo("success", gettext("Image Pasted!"));
-              } else {
-                showInfo("danger", gettext("Something went wrong!"));
-              }
-            };
-            reader.readAsDataURL(blob);
-            imageFound = true;
-            break;
-          }
-        }
-        if (imageFound) {
-          break;
+        const type = clipboardItem.types.find((itemType) =>
+          itemType.startsWith("image/"),
+        );
+        if (type !== undefined) {
+          setScreenshotImage(await clipboardItem.getType(type), type);
+          return;
         }
       }
-      if (!imageFound) {
-        showInfo("warning", gettext("No image found in clipboard"));
-      }
+      showInfo("warning", gettext("No image found in clipboard"));
     } catch (_err) {
-      showInfo("danger", gettext("Something went wrong!"));
+      showPasteInstructions();
     }
   });
 });
@@ -65,10 +79,16 @@ $(document).ready(() => {
  * @param {string} message - The content of the message.
  */
 function showInfo(type, message) {
-  const $pasteScreenshotInfo = $("#paste-screenshot-info-label");
-  const span = `<span class="text-${type}">${message}</span>`;
-  $pasteScreenshotInfo.html(span);
-  $pasteScreenshotInfo
-    .css("transform", "scale(1)")
-    .removeClass("animate__animated animate__fadeIn");
+  const pasteScreenshotInfo = document.getElementById(
+    "paste-screenshot-info-label",
+  );
+  if (pasteScreenshotInfo === null) {
+    return;
+  }
+  const span = document.createElement("span");
+  span.classList.add(`text-${type}`);
+  span.textContent = message;
+  pasteScreenshotInfo.replaceChildren(span);
+  pasteScreenshotInfo.style.transform = "scale(1)";
+  pasteScreenshotInfo.classList.remove("animate__animated", "animate__fadeIn");
 }

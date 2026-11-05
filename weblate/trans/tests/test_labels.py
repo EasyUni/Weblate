@@ -4,12 +4,26 @@
 
 """Test for variants."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
+
+from asgiref.sync import async_to_sync
+from django.core.cache import cache
+from django.test.utils import override_settings
 from django.urls import reverse
 
-from weblate.trans.tests.test_views import ViewTestCase
+from weblate.trans.actions import ActionEvents
+from weblate.trans.models import Category, Component, Project
+from weblate.trans.tests.test_views import FixtureTestCase, ViewTestCase
+from weblate.utils.stats import CategoryLanguage, ProjectLanguage
+
+if TYPE_CHECKING:
+    from weblate.trans.models import Translation
 
 
-class LabelTest(ViewTestCase):
+class LabelTest(FixtureTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.make_manager()
@@ -46,6 +60,17 @@ class LabelTest(ViewTestCase):
             response, "Label with this Project and Label name already exists."
         )
         self.assertEqual(self.project.label_set.filter(name="Test label").count(), 1)
+
+    def test_list_order(self) -> None:
+        for name in ("Zulu label", "Alpha label", "Middle label"):
+            self.project.label_set.create(name=name, color="orange")
+
+        response = self.client.get(self.labels_url)
+
+        self.assertEqual(
+            [label.name for label in response.context["labels"]],
+            ["Alpha label", "Middle label", "Zulu label"],
+        )
 
     def test_edit_name(self) -> None:
         self.test_create()
@@ -92,47 +117,218 @@ class LabelTest(ViewTestCase):
     def test_delete(self) -> None:
         self.test_create()
         label = self.project.label_set.get()
-        response = self.client.post(
+        self.async_client.force_login(self.user)
+        response = async_to_sync(self.async_client.post)(
             reverse(
                 "label_delete", kwargs={"project": self.project.slug, "pk": label.pk}
             ),
-            follow=True,
         )
-        self.assertRedirects(response, self.labels_url)
-        self.assertNotContains(response, "Test label")
+        self.assertRedirects(response, self.labels_url, fetch_redirect_response=False)
         self.assertFalse(self.project.label_set.filter(name="Test label").exists())
 
     def test_assign(self) -> None:
         self.test_create()
         label = self.project.label_set.get()
         unit = self.get_unit().source_unit
-        self.client.post(
-            reverse("edit_context", kwargs={"pk": unit.pk}),
-            {"explanation": "", "extra_flags": "", "labels": label.pk},
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(
+                reverse("edit_context", kwargs={"pk": unit.pk}),
+                {"explanation": "", "extra_flags": "", "labels": label.pk},
+            )
         translation = self.get_translation()
         self.assertEqual(getattr(translation.stats, "label:Test label"), 1)
+        changes = unit.change_set.filter(action=ActionEvents.LABEL_ADD)
+        self.assertEqual(changes.count(), 1)
+        self.assertEqual(changes.first().user, self.user)
 
-        self.client.post(
-            reverse("edit_context", kwargs={"pk": unit.pk}),
-            {"explanation": "", "extra_flags": ""},
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(
+                reverse("edit_context", kwargs={"pk": unit.pk}),
+                {"explanation": "", "extra_flags": ""},
+            )
         translation = self.get_translation()
         self.assertEqual(getattr(translation.stats, "label:Test label"), 0)
+        changes = unit.change_set.filter(action=ActionEvents.LABEL_REMOVE)
+        self.assertEqual(changes.count(), 1)
+        self.assertEqual(changes.first().user, self.user)
 
     def test_delete_assigned(self) -> None:
         self.test_create()
         label = self.project.label_set.get()
         unit = self.get_unit().source_unit
-        self.client.post(
-            reverse("edit_context", kwargs={"pk": unit.pk}),
-            {"explanation": "", "extra_flags": "", "labels": label.pk},
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(
+                reverse("edit_context", kwargs={"pk": unit.pk}),
+                {"explanation": "", "extra_flags": "", "labels": label.pk},
+            )
         translation = self.get_translation()
         self.assertEqual(getattr(translation.stats, "label:Test label"), 1)
 
-        label.delete()
+        with self.captureOnCommitCallbacks(execute=True):
+            label.delete()
 
         translation = self.get_translation()
         with self.assertRaises(AttributeError):
             getattr(translation.stats, "label:Test label")
+
+    def test_delete_assigned_refreshes_totals(self) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Labels", slug="labels"
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.category = category
+            self.component.save(update_fields=["category"])
+        translation = self.get_translation()
+        unit = self.get_unit().source_unit
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy), override_settings(STATS_LAZY=lazy):
+                label = self.project.label_set.create(name="Deleted", color="red")
+                with self.captureOnCommitCallbacks(execute=True):
+                    unit.labels.add(label)
+                scopes: tuple[
+                    Translation
+                    | Component
+                    | Project
+                    | ProjectLanguage
+                    | CategoryLanguage,
+                    ...,
+                ] = (
+                    self.get_translation(),
+                    Component.objects.get(pk=self.component.pk),
+                    Project.objects.get(pk=self.project.pk),
+                    ProjectLanguage(self.project, translation.language),
+                    CategoryLanguage(category, translation.language),
+                )
+                before = [
+                    tuple(
+                        getattr(scope.stats, key)
+                        for key in ("unlabeled", "unlabeled_words", "unlabeled_chars")
+                    )
+                    for scope in scopes
+                ]
+                for detail_scope in (scopes[0], *scopes[3:]):
+                    for suffix in ("", "_words", "_chars"):
+                        self.assertGreater(
+                            getattr(detail_scope.stats, f"label:Deleted{suffix}"), 0
+                        )
+
+                with self.captureOnCommitCallbacks(execute=True):
+                    label.delete()
+
+                for scope, previous in zip(scopes, before, strict=True):
+                    scope.stats.force_load()
+                    multiplier = (
+                        self.component.translation_set.count()
+                        if isinstance(scope, (Component, Project))
+                        else 1
+                    )
+                    for key, old, delta in zip(
+                        ("unlabeled", "unlabeled_words", "unlabeled_chars"),
+                        previous,
+                        (1, unit.num_words, len(unit.source)),
+                        strict=True,
+                    ):
+                        self.assertEqual(
+                            getattr(scope.stats, key), old + delta * multiplier
+                        )
+                for detail_scope in (scopes[0], *scopes[3:]):
+                    for suffix in ("", "_words", "_chars"):
+                        with self.assertRaises(AttributeError):
+                            getattr(detail_scope.stats, f"label:Deleted{suffix}")
+
+    def test_label_multiple_changes(self) -> None:
+        """Test that adding multiple labels creates multiple change events."""
+        self.test_create()
+        self.client.post(
+            self.labels_url,
+            {
+                "name": "Second label",
+                "description": "Second test label",
+                "color": "blue",
+                "project": self.project.pk,
+            },
+        )
+
+        label1 = self.project.label_set.get(name="Test label")
+        label2 = self.project.label_set.get(name="Second label")
+        unit = self.get_unit().source_unit
+
+        self.client.post(
+            reverse("edit_context", kwargs={"pk": unit.pk}),
+            {"explanation": "", "extra_flags": "", "labels": [label1.pk, label2.pk]},
+        )
+
+        changes = unit.change_set.filter(action=ActionEvents.LABEL_ADD)
+        self.assertEqual(changes.count(), 2)
+
+
+class MonolingualLabelTest(ViewTestCase):
+    def create_component(self) -> Component:
+        return self.create_ts_mono()
+
+    def test_source_change_recalculates_cached_label_stats(self) -> None:
+        label = self.project.label_set.create(
+            name="Test label",
+            description="Test description for Test Label",
+            color="orange",
+        )
+        target_translation = self.get_translation()
+        target_unit = self.get_unit(language="cs")
+        target_unit.source_unit.labels.add(label)
+
+        label_words = f"label:{label.name}_words"
+        self.assertEqual(
+            getattr(target_translation.stats, label_words),
+            target_unit.source_unit.num_words,
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.edit_unit(
+                "Hello, world!\n", "Hello, beautiful world!\n", language="en"
+            )
+
+        updated_unit = self.get_unit("Hello, beautiful world!\n", language="cs")
+        target_translation = self.get_translation()
+        self.assertEqual(
+            getattr(target_translation.stats, label_words),
+            updated_unit.source_unit.num_words,
+        )
+
+    def test_apply_source_delta_uses_latest_cached_stats(self) -> None:
+        stats = self.get_translation().stats
+        _ = stats.all_words
+        base_timestamp = cast("float", stats.stats_timestamp)
+        latest = stats.get_data_copy()
+        latest["all_words"] = cast("int", latest["all_words"]) + 3
+        cache.set(stats.cache_key, latest, 30 * 86400)
+
+        self.assertTrue(stats.apply_source_delta(base_timestamp, {"all_words": 2}))
+        self.assertEqual(
+            cache.get(stats.cache_key)["all_words"],
+            cast("int", latest["all_words"]) + 2,
+        )
+
+    def test_apply_source_delta_skips_newer_generation(self) -> None:
+        stats = self.get_translation().stats
+        _ = stats.all_words
+        base_timestamp = cast("float", stats.stats_timestamp)
+        latest = stats.get_data_copy()
+        latest["stats_timestamp"] = base_timestamp + 1
+        latest["all_words"] = cast("int", latest["all_words"]) + 7
+        cache.set(stats.cache_key, latest, 30 * 86400)
+
+        self.assertFalse(stats.apply_source_delta(base_timestamp, {"all_words": 2}))
+        self.assertEqual(cache.get(stats.cache_key), latest)
+
+    @override_settings(STATS_LAZY=False)
+    def test_save_holds_lock(self) -> None:
+        stats = self.get_translation().stats
+        original = cache.set
+
+        def wrapped(*args, **kwargs) -> None:
+            if args[0] == stats.cache_key:
+                self.assertTrue(stats.lock.is_locked)
+            original(*args, **kwargs)
+
+        with patch("weblate.utils.stats.cache.set", side_effect=wrapped):
+            stats.update_stats(update_parents=False)

@@ -10,72 +10,86 @@ from typing import TYPE_CHECKING
 
 from django import template
 from django.conf import settings
+from django.contrib.staticfiles import finders
 from django.contrib.staticfiles.storage import staticfiles_storage
+from django.core.exceptions import ObjectDoesNotExist
 from django.utils.html import format_html
-from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy
+from social_core.backends.utils import get_backend
+from social_core.exceptions import AuthConfigurationError
+from social_django.utils import load_strategy
 
-from weblate.accounts.utils import DeviceType, get_key_name
+from weblate.accounts.utils import (
+    get_key_name,
+    get_totp_device_label,
+    has_recent_sensitive_verification,
+)
 
 if TYPE_CHECKING:
+    from django.template import Context
     from django_otp.models import Device
+    from django_otp.plugins.otp_totp.models import TOTPDevice
     from django_stubs_ext import StrOrPromise
+
+    from weblate.accounts.types import DeviceType
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 register = template.Library()
 
-SOCIALS: dict[str, dict[str, StrOrPromise]] = {
-    "auth0": {"name": "Auth0", "image": "auth0.svg"},
-    "saml": {"name": "SAML", "image": "saml.svg"},
-    "google": {"name": "Google", "image": "google.svg"},
-    "google-oauth2": {"name": "Google", "image": "google.svg"},
-    "google-plus": {"name": "Google+", "image": "google.svg"},
+
+@register.simple_tag
+def can_show_personal_api_key(request: AuthenticatedHttpRequest) -> bool:
+    return request.user.is_authenticated and has_recent_sensitive_verification(request)
+
+
+@register.simple_tag
+def personal_api_key(request: AuthenticatedHttpRequest) -> str:
+    if can_show_personal_api_key(request):
+        try:
+            return request.user.auth_token.key
+        except ObjectDoesNotExist:
+            pass
+    return "TOKEN"
+
+
+# Local authentication methods.
+LOCAL_METHODS: dict[str, dict[str, StrOrPromise]] = {
     "password": {"name": gettext_lazy("Password"), "image": "password.svg"},
     "email": {"name": gettext_lazy("E-mail"), "image": "email.svg"},
-    "ubuntu": {"name": "Ubuntu", "image": "ubuntu.svg"},
-    "opensuse": {"name": "openSUSE", "image": "opensuse.svg"},
-    "fedora": {"name": "Fedora OpenID", "image": "fedora.svg"},
-    "fedora-oidc": {"name": "Fedora", "image": "fedora.svg"},
-    "facebook": {"name": "Facebook", "image": "facebook.svg"},
-    "github": {"name": "GitHub", "image": "github.svg"},
-    "github-enterprise": {"name": "GitHub Enterprise", "image": "github.svg"},
-    "github-org": {"name": "GitHub Organization", "image": "github.svg"},
-    "bitbucket": {"name": "Bitbucket", "image": "bitbucket.svg"},
-    "bitbucket-oauth2": {"name": "Bitbucket", "image": "bitbucket.svg"},
-    "azuread-oauth2": {"name": "Azure", "image": "azure.svg"},
-    "azuread-tenant-oauth2": {"name": "Azure", "image": "azure.svg"},
-    "gitlab": {"name": "GitLab", "image": "gitlab.svg"},
-    "amazon": {"name": "Amazon", "image": "amazon.svg"},
-    "twitter": {"name": "Twitter", "image": "twitter.svg"},
-    "stackoverflow": {"name": "Stack Overflow", "image": "stackoverflow.svg"},
-    "musicbrainz": {"name": "MusicBrainz", "image": "musicbrainz.svg"},
-    "openinfra": {"name": "OpenInfraID"},
 }
 
 SECOND_FACTORS: dict[DeviceType, StrOrPromise] = {
-    "webauthn": gettext_lazy("Use security key (WebAuthn)"),
+    "webauthn": gettext_lazy("Use a passkey or security key (WebAuthn)"),
     "totp": gettext_lazy("Use authentication app (TOTP)"),
     "recovery": gettext_lazy("Use recovery codes"),
 }
 
-IMAGE_SOCIAL_TEMPLATE = """
-<img class="auth-image" src="{image}" />
-"""
+IMAGE_SOCIAL_TEMPLATE = (
+    """<img class="auth-image" src="{image}" alt="" aria-hidden="true" />"""
+)
 
-SOCIAL_TEMPLATE = """
-{icon}
-{separator}
-{name}
-"""
+SOCIAL_TEMPLATE = """{icon}<span class="auth-name">{name}</span>"""
 
 
 def get_auth_params(auth: str) -> dict[str, StrOrPromise]:
     """Generate authentication parameters."""
     # Fallback values
-    params: dict[str, StrOrPromise] = {"name": auth.title(), "image": "password.svg"}
-
-    # Hardcoded names
-    if auth in SOCIALS:
-        params.update(SOCIALS[auth])
+    params: dict[str, StrOrPromise] = {
+        "name": auth.title(),
+        "image": "password.svg",
+    }
+    if auth in LOCAL_METHODS:
+        params.update(LOCAL_METHODS[auth])
+    else:
+        try:
+            backend = get_backend(settings.AUTHENTICATION_BACKENDS, auth)
+        except AuthConfigurationError as error:
+            if error.code != "backend_missing":
+                raise
+        else:
+            params["name"] = backend.get_title(load_strategy()) or auth.title()
+            if backend.icon:
+                params["image"] = f"social_auth/icons/{backend.icon}"
 
     # Settings override
     settings_params = {
@@ -90,32 +104,44 @@ def get_auth_params(auth: str) -> dict[str, StrOrPromise]:
     return params
 
 
-auth_name_default_separator = mark_safe("<br />")
-
-
 @register.simple_tag
-def auth_name(auth: str, separator: str = auth_name_default_separator, only: str = ""):
+def auth_name(auth: str, only: str = "") -> StrOrPromise:
     """Create HTML markup for social authentication method."""
     params = get_auth_params(auth)
 
-    if not params["image"].startswith("http"):
-        params["image"] = staticfiles_storage.url("auth/" + params["image"])
-    params["icon"] = format_html(IMAGE_SOCIAL_TEMPLATE, separator=separator, **params)
+    if not params["image"].startswith(("http", "data:")):
+        image = str(params["image"])
+        if not image.startswith("social_auth/icons/"):
+            legacy_path = f"auth/{image}"
+            shared_path = f"social_auth/icons/{image}"
+            # Existing custom files take precedence over bundled provider artwork.
+            image = legacy_path
+            if not finders.find(legacy_path) and finders.find(shared_path):
+                image = shared_path
+        params["image"] = staticfiles_storage.url(image)
+    params["icon"] = format_html(IMAGE_SOCIAL_TEMPLATE, **params)
 
     if only:
         return params[only]
 
-    return format_html(SOCIAL_TEMPLATE, separator=separator, **params)
+    return format_html(SOCIAL_TEMPLATE, **params)
 
 
-def get_auth_name(auth: str):
+def get_auth_name(auth: str) -> StrOrPromise:
     """Get nice name for authentication backend."""
     return get_auth_params(auth)["name"]
 
 
 @register.simple_tag
 def key_name(device: Device) -> str:
-    return format_html('<span class="auth-name">{}</span>', get_key_name(device))
+    return format_html('<span class="key-name">{}</span>', get_key_name(device))
+
+
+@register.simple_tag
+def totp_key_name(device: TOTPDevice) -> str:
+    return format_html(
+        '<span class="key-name">{}</span>', get_totp_device_label(device)
+    )
 
 
 @register.simple_tag
@@ -124,7 +150,7 @@ def second_factor_name(name: DeviceType) -> StrOrPromise:
 
 
 @register.simple_tag(takes_context=True)
-def format_site_title(context) -> str:
+def format_site_title(context: Context) -> str:
     style = ""
     site_title = context["site_title"]
     if context["support_status"]["is_hosted_weblate"]:

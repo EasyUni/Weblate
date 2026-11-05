@@ -3,10 +3,10 @@
 {% load i18n %}
 
 {% block breadcrumbs %}
-  <li>
+  <li class="breadcrumb-item">
     <a href="{% url 'profile' %}">{% translate "Your profile" %}</a>
   </li>
-  <li>
+  <li class="breadcrumb-item">
     <a href="{% url 'billing' %}">{% translate "Billing" %}</a>
   </li>
 {% endblock breadcrumbs %}
@@ -27,7 +27,8 @@
   {% endif %}
 
   {% if payment_enabled and not active_billing_count %}
-    <a href="{% url 'create-billing' %}?upgrade=1" class="btn btn-primary">{% translate "Purchase new hosting plan" %}</a>
+    <a href="{% url 'create-billing' %}?upgrade=1"
+       class="btn btn-primary">{% translate "Purchase new hosting plan" %}</a>
   {% endif %}
 
 {% endblock content %}

@@ -8,59 +8,256 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 import warnings
 from collections import defaultdict
 from datetime import datetime
 from functools import partial
-from itertools import chain
+from io import BytesIO
+from itertools import batched
 from operator import itemgetter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from shutil import copyfileobj
-from typing import TYPE_CHECKING, Any, BinaryIO, TypedDict
-from zipfile import ZipFile
+from time import monotonic
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    BinaryIO,
+    Literal,
+    TypedDict,
+    TypeVar,
+    cast,
+    overload,
+)
+from zipfile import ZipFile, ZipInfo
 
 from django.conf import settings
+from django.contrib.staticfiles.storage import HashedFilesMixin, staticfiles_storage
+from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.files import File
-from django.db import connection, transaction
+from django.core.validators import MaxLengthValidator
+from django.db import transaction
+from django.db.models import Exists, F, Field, Model, OuterRef, Prefetch
 from django.db.models.fields.files import FieldFile
 from django.db.models.signals import pre_save
 from django.utils import timezone
 from django.utils.timezone import make_aware
+from django.utils.translation import gettext
+from packaging.version import InvalidVersion, Version
 from weblate_schemas import load_schema, validate_schema
 
-from weblate.auth.models import AutoGroup, Group, Role, User, get_anonymous
+from weblate.auth.bots import InternalBot
+from weblate.auth.models import (
+    AutoGroup,
+    Group,
+    Role,
+    TeamMembership,
+    User,
+    get_anonymous,
+)
+from weblate.auth.utils import TeamNameAllocator, get_team_rename_warnings
 from weblate.checks.models import Check
 from weblate.lang.models import Language, Plural
-from weblate.memory.models import Memory
+from weblate.memory.models import Memory, MemoryDict, MemoryScope
+from weblate.memory.utils import CATEGORY_FILE, CATEGORY_PRIVATE_OFFSET
 from weblate.screenshots.models import Screenshot
+from weblate.screenshots.ocr import schedule_ocr
+from weblate.screenshots.utils import normalize_screenshot_filename
+from weblate.trans import defaults
+from weblate.trans.actions import ActionEvents
+from weblate.trans.defines import CATEGORY_DEPTH
+from weblate.trans.file_format_params import FILE_FORMATS_PARAMS
+from weblate.trans.inherited_settings import (
+    INHERITABLE_COMPONENT_FLAGS,
+    INHERITABLE_COMPONENT_SETTINGS,
+)
 from weblate.trans.models import (
     Category,
+    Change,
     Comment,
     Component,
     Label,
     PendingUnitChange,
     Project,
+    SavedSearch,
     Suggestion,
     Translation,
     Unit,
     Vote,
 )
 from weblate.utils.data import data_path
+from weblate.utils.files import remove_tree
+from weblate.utils.forms import QueryField
 from weblate.utils.hash import checksum_to_hash, hash_to_checksum
 from weblate.utils.validators import validate_filename
 from weblate.utils.version import VERSION
+from weblate.utils.zip import (
+    ZipSafetyLimits,
+    extract_zip_member,
+    iter_safe_zip_members,
+    validate_zip_member_path,
+)
+from weblate.utils.zip import (
+    validate_zip_members as validate_safe_zip_members,
+)
+from weblate.vcs.base import (
+    RepositoryCommandError,
+    RepositoryError,
+    is_valid_revision_hash,
+)
 from weblate.vcs.models import VCS_REGISTRY
+from weblate.vcs.params import VCS_PARAMS
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
-    from django.db.models import Model
+    from django.core.files.storage import Storage
 
     from weblate.billing.models import Billing
+    from weblate.vcs.base import Repository
+    from weblate.workspaces.models import Workspace
 
 warnings.filterwarnings("error", module="zipfile")
 
+ModelT = TypeVar("ModelT", bound="Model")
 PROJECTBACKUP_PREFIX = "projectbackups"
+REPOSITORY_LOCK_REFRESH_INTERVAL = 300
+BACKUP_COPY_CHUNK_SIZE = 1024 * 1024
+TRANSLATION_REVISION_RE = re.compile(
+    r"(?:[0-9a-f]{40}(?::[0-9]+)?(?:,[0-9a-f]{40}){0,2})?"
+)
+BackupValue = str | int | bool | dict[str, Any] | list[Any] | None
+PROJECT_BACKUP_FIELDS = (
+    "public_sharing",
+    "use_workspace_tm",
+    "contribute_workspace_tm",
+    "autoclean_tm",
+    "enforced_2fa",
+    "commit_policy",
+    "check_flags",
+    *INHERITABLE_COMPONENT_SETTINGS,
+    *INHERITABLE_COMPONENT_FLAGS,
+)
+COMPONENT_BACKUP_FIELDS = (
+    "hide_glossary_matches",
+    "contribute_project_tm",
+    "file_format_params",
+    "vcs_params",
+    "screenshot_filemask",
+    "key_filter",
+    "secondary_language",
+    "repoweb_translations",
+    "push_on_update",
+    *INHERITABLE_COMPONENT_FLAGS,
+)
+CATEGORY_BACKUP_FIELDS = (
+    "check_flags",
+    *INHERITABLE_COMPONENT_SETTINGS,
+    *INHERITABLE_COMPONENT_FLAGS,
+)
+LEGACY_BACKUPS_FORMAT_MIGRATION_MAPPING: dict[
+    str, tuple[str, dict[str, str | int | bool | None]]
+] = {
+    # "old-format": ("new-format", {"new-format-params": "value"}),
+    "csv": (
+        "csv",
+        {"csv_encoding": "auto"},
+    ),
+    "csv-multi-utf-8": (
+        "csv-multi",
+        {"csv_encoding": "utf-8"},
+    ),
+    "csv-simple": (
+        "csv-simple",
+        {"csv_simple_encoding": "auto"},
+    ),
+    "csv-simple-iso": (
+        "csv-simple",
+        {"csv_simple_encoding": "iso-8859-1"},
+    ),
+    "csv-simple-utf-8": (
+        "csv-simple",
+        {"csv_simple_encoding": "utf-8"},
+    ),
+    "csv-utf-8": (
+        "csv",
+        {"csv_encoding": "utf-8"},
+    ),
+    "gwt": (
+        "gwt",
+        {"gwt_encoding": "utf-8"},
+    ),
+    "gwt-iso": (
+        "gwt",
+        {"gwt_encoding": "iso-8859-1"},
+    ),
+    "apple-xliff": ("apple-xliff", {"xml_whitespace_handling": "standard"}),
+    "plainxliff": (
+        "xliff",
+        {"xliff_placeables": "plain", "xml_whitespace_handling": "standard"},
+    ),
+    "poxliff": ("poxliff", {"xml_whitespace_handling": "standard"}),
+    "properties": (
+        "properties",
+        {"properties_encoding": "iso-8859-1"},
+    ),
+    "properties-utf8": (
+        "properties",
+        {"properties_encoding": "utf-8"},
+    ),
+    "properties-utf16": (
+        "properties",
+        {"properties_encoding": "utf-16"},
+    ),
+    "strings": (
+        "strings",
+        {"strings_encoding": "utf-16"},
+    ),
+    "strings-utf8": (
+        "strings",
+        {"strings_encoding": "utf-8"},
+    ),
+    "xliff": (
+        "xliff",
+        {"xliff_placeables": "placeables", "xml_whitespace_handling": "standard"},
+    ),
+    "xliff2": (
+        "xliff2",
+        {"xliff_placeables": "plain", "xml_whitespace_handling": "standard"},
+    ),
+    "xwiki-page-properties": (
+        "xwiki-page-properties",
+        {"properties_encoding": "utf-8"},
+    ),
+    "xliff2-placeables": (
+        "xliff2",
+        {"xliff_placeables": "placeables", "xml_whitespace_handling": "standard"},
+    ),
+}
+LEGACY_XLIFF_IDENTITY_FORMATS = frozenset(
+    {"apple-xliff", "poxliff", "xliff", "xliff2"},
+)
+
+
+def get_project_backup_download_storage() -> Storage:
+    return staticfiles_storage
+
+
+def get_project_backup_download_url(name: str) -> str:
+    storage = get_project_backup_download_storage()
+    if isinstance(storage, HashedFilesMixin):
+        return super(HashedFilesMixin, storage).url(name)
+    return storage.url(name)
+
+
+def backup_uses_xliff_format_params(backup_version: str | None) -> bool:
+    if backup_version is None:
+        return False
+    try:
+        return Version(backup_version).release[:2] >= (2026, 10)
+    except InvalidVersion:
+        return False
 
 
 class BackupListDict(TypedDict):
@@ -81,9 +278,7 @@ def list_backups(project_id: Project | int | str) -> list[BackupListDict]:
             "name": entry.name,
             "path": entry.as_posix(),
             "timestamp": make_aware(
-                datetime.fromtimestamp(  # noqa: DTZ006
-                    int(entry.name.split(".")[0])
-                )
+                datetime.fromtimestamp(int(entry.name.split(".")[0]))  # ruff: ignore[call-datetime-fromtimestamp]
             ),
             "size": entry.stat().st_size,
         }
@@ -92,16 +287,45 @@ def list_backups(project_id: Project | int | str) -> list[BackupListDict]:
     return sorted(result, key=itemgetter("timestamp"), reverse=True)
 
 
+def format_backup_error(error: Exception) -> list[str]:
+    """Present validation messages with archive paths instead of Python reprs."""
+    if not isinstance(error, ValidationError):
+        return [str(error)]
+    if not hasattr(error, "error_dict"):
+        return error.messages
+    return [
+        message if path == NON_FIELD_ERRORS else f"{path}: {message}"
+        for path, errors in error.error_dict.items()
+        for item in errors
+        for message in item.messages
+    ]
+
+
 class ProjectBackup:
     COMPONENTS_PREFIX = "components/"
     VCS_PREFIX = "vcs/"
     VCS_PREFIX_LEN = len(VCS_PREFIX)
+    IMPORT_BATCH_SIZE = 2000
+    MAX_ARCHIVE_MEMBERS = defaults.DEFAULT_PROJECT_BACKUP_IMPORT_MAX_MEMBERS
+    # Per-entry limits reject suspiciously high compression ratios, while the
+    # total uncompressed limit constrains low-compression archives as a whole.
+    MAX_COMPRESSED_ENTRY_SIZE = (
+        defaults.DEFAULT_PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE
+    )
+    MIN_COMPRESSED_RATIO_SIZE = defaults.DEFAULT_PROJECT_BACKUP_IMPORT_MIN_RATIO_SIZE
+    MAX_COMPRESSED_ENTRY_RATIO = (
+        defaults.DEFAULT_PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_RATIO
+    )
+    MAX_TOTAL_UNCOMPRESSED_SIZE = (
+        defaults.DEFAULT_PROJECT_BACKUP_IMPORT_MAX_TOTAL_UNCOMPRESSED_SIZE
+    )
 
     def __init__(self, filename: str = "", *, fileio: BinaryIO | None = None) -> None:
         self.data: dict[str, Any] = {}
         self.filename = filename
         self.fileio = fileio
         self.timestamp = timezone.now()
+        self.validated = False
         self.project: Project | None = None
         self.project_schema = load_schema("weblate-backup.schema.json")
         self.component_schema = load_schema("weblate-component.schema.json")
@@ -111,6 +335,25 @@ class ProjectBackup:
         self.components_cache: dict[str, Component] = {}
         self.categories_cache: dict[str, Category] = {}
         self.roles_cache: dict[str, Role] = {}
+        self.skipped_components: list[str] = []
+        self.renamed_teams: list[tuple[str, str]] = []
+        self.skipped_parameters: list[tuple[str, str, str, bool]] = []
+        self.component_data: dict[str, dict[str, Any]] = {}
+        self.memory_data: list[dict[str, Any]] = []
+        self.memory_loaded = False
+        self.category_paths: set[str] = set()
+        self.component_full_slugs: set[str] = set()
+        self.component_slugs_by_length: list[str] = []
+        self.component_repo_links: set[str] = set()
+        self.component_vcs: dict[str, type[Repository] | None] = {}
+        self.restored_repositories: set[str] = set()
+        self.label_names: set[str] = set()
+        self.name_siblings: set[tuple[str, str]] = set()
+        self.path_siblings: set[tuple[str, str]] = set()
+        self.validation_project: Project | None = None
+        self.created_media: list[tuple[Storage, str]] = []
+        # Project.set_language_team field was migrated to file format parameters after 5.17
+        self.set_language_team_project: bool = False
 
     @staticmethod
     def full_slug_without_project(obj: Component | Category) -> str:
@@ -118,19 +361,286 @@ class ProjectBackup:
         parts = obj.get_url_path()
         return "/".join(parts[1:])
 
-    @property
-    def supports_restore(self) -> bool:
-        return connection.features.can_return_rows_from_bulk_insert
-
     def validate_data(self) -> None:
         validate_schema(self.data, "weblate-backup.schema.json")
 
-    def backup_property(
-        self, obj: Model, field: str, extras: dict[str, Callable] | None = None
-    ) -> str | int | dict | None:
-        if extras and field in extras:
-            return extras[field](obj)
-        value = getattr(obj, field)
+    @staticmethod
+    def contextualize_validation_error(
+        error: ValidationError, path: str
+    ) -> ValidationError:
+        if not hasattr(error, "message_dict"):
+            return ValidationError({path: error.messages})
+        return ValidationError(
+            {
+                (
+                    path
+                    if name == NON_FIELD_ERRORS
+                    else f"{path}.{name}"
+                    if path
+                    else name
+                ): messages
+                for name, messages in error.message_dict.items()
+            }
+        )
+
+    @classmethod
+    def validate_model_data(
+        cls,
+        model: type[ModelT],
+        data: Mapping[str, Any],
+        path: str,
+        *,
+        exclude: frozenset[str] = frozenset(),
+        allow_blank: frozenset[str] = frozenset(),
+        overrides: Mapping[str, Any] | None = None,
+        model_clean: bool = False,
+    ) -> ModelT:
+        """Validate serialized values on an unsaved destination model."""
+        kwargs = {name: value for name, value in data.items() if name not in exclude}
+        kwargs.update(overrides or {})
+        try:
+            instance = model(**kwargs)
+        except (TypeError, ValueError) as error:
+            raise ValidationError({path: [str(error)]}) from error
+
+        # Relations are resolved separately from the archive graph. Fields absent
+        # from older backup formats retain their model defaults without making an
+        # otherwise compatible backup fail current validation. Empty values listed
+        # in allow_blank are valid stored data or synthesized later by the restore.
+        # ruff: ignore[private-member-access]
+        field_exclude = {
+            field.name
+            for field in model._meta.fields
+            if field.is_relation or field.name not in kwargs
+        }
+        field_exclude.update(exclude)
+        field_exclude.update(
+            name for name in allow_blank if data.get(name) in Field.empty_values
+        )
+        try:
+            if model_clean:
+                instance.full_clean(
+                    exclude=field_exclude,
+                    validate_unique=False,
+                    validate_constraints=False,
+                )
+            else:
+                instance.clean_fields(exclude=field_exclude)
+        except ValidationError as error:
+            raise cls.contextualize_validation_error(error, path) from error
+        return instance
+
+    @staticmethod
+    def validate_checksum(value: object, path: str) -> int:
+        """Validate the serialized 64-bit checksum and return its integer value."""
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{16}", value) is None:
+            raise ValidationError(
+                {
+                    path: [
+                        gettext(
+                            "The checksum has to be exactly 16 hexadecimal characters."
+                        )
+                    ]
+                }
+            )
+        try:
+            return checksum_to_hash(value)
+        except (OverflowError, ValueError) as error:
+            raise ValidationError(
+                {path: [gettext("The checksum is invalid.")]}
+            ) from error
+
+    @staticmethod
+    def validate_language(code: str, path: str, *, file_code: bool = False) -> Language:
+        """Resolve a language as restore would, without creating database rows."""
+        # ruff: ignore[private-member-access]
+        code_field = Language._meta.get_field("code")
+        try:
+            # Keep the raw length bound even when allowing file aliases.
+            MaxLengthValidator(cast("int", code_field.max_length))(code)
+            if not file_code:
+                code_field.clean(code, None)
+            language = Language.objects.auto_get_or_create(code, create=False)
+            # File codes can use aliases such as Android's b+zh+Hant+HK.
+            # Validate the resolved code before restore can create it.
+            code_field.clean(language.code, None)
+        except (TypeError, ValueError, ValidationError) as error:
+            if isinstance(error, ValidationError):
+                messages = error.messages
+            else:
+                messages = [str(error)]
+            raise ValidationError({path: messages}) from error
+        return language
+
+    def validate_categories(
+        self,
+        categories: list[dict[str, Any]],
+        *,
+        parent: str = "",
+        depth: int = 1,
+        path_prefix: str = "categories",
+        paths: set[str] | None = None,
+        names: set[tuple[str, str]] | None = None,
+        siblings: set[tuple[str, str]] | None = None,
+    ) -> tuple[set[str], set[tuple[str, str]]]:
+        if paths is None:
+            paths = set()
+        if siblings is None:
+            siblings = set()
+        if names is None:
+            names = set()
+        if categories and depth > CATEGORY_DEPTH:
+            raise ValidationError(
+                {path_prefix: [gettext("Too deep nesting of categories!")]}
+            )
+        for index, category in enumerate(categories):
+            path = f"{path_prefix}[{index}]"
+            self.validate_model_data(
+                Category,
+                category,
+                path,
+                exclude=frozenset({"categories", "secondary_language"}),
+            )
+            if secondary := category.get("secondary_language"):
+                self.validate_language(secondary, f"{path}.secondary_language")
+            sibling = (parent, category["slug"])
+            if sibling in siblings:
+                raise ValidationError(
+                    {f"{path}.slug": [gettext("Duplicate category or component slug.")]}
+                )
+            siblings.add(sibling)
+            name_sibling = (parent, category["name"])
+            if name_sibling in names:
+                raise ValidationError(
+                    {f"{path}.name": [gettext("Duplicate category or component name.")]}
+                )
+            names.add(name_sibling)
+            full_slug = f"{parent}/{category['slug']}" if parent else category["slug"]
+            if full_slug in paths:
+                raise ValidationError(
+                    {f"{path}.slug": [gettext("Duplicate category slug.")]}
+                )
+            paths.add(full_slug)
+            self.validate_categories(
+                category["categories"],
+                parent=full_slug,
+                depth=depth + 1,
+                path_prefix=f"{path}.categories",
+                paths=paths,
+                names=names,
+                siblings=siblings,
+            )
+        return paths, siblings
+
+    def validate_project_objects(
+        self,
+        *,
+        target_project_name: str | None = None,
+        target_project_slug: str | None = None,
+    ) -> None:
+        project = self.data["project"]
+        self.validation_project = self.validate_model_data(
+            Project,
+            project,
+            "project",
+            exclude=frozenset({"secondary_language", "set_language_team"}),
+            overrides={
+                "name": (
+                    project["name"]
+                    if target_project_name is None
+                    else target_project_name
+                ),
+                "slug": (
+                    project["slug"]
+                    if target_project_slug is None
+                    else target_project_slug
+                ),
+            },
+            model_clean=True,
+        )
+        # Component.clean_model_settings() skips validation without a project
+        # primary key. This sentinel keeps validation database-free while
+        # allowing it to reuse project-dependent model invariants.
+        self.validation_project.pk = -1
+        if secondary := project.get("secondary_language"):
+            self.validate_language(secondary, "project.secondary_language")
+
+        labels: set[str] = set()
+        for index, label in enumerate(self.data["labels"]):
+            self.validate_model_data(Label, label, f"labels[{index}]")
+            if label["name"] in labels:
+                raise ValidationError(
+                    {f"labels[{index}].name": [gettext("Duplicate label name.")]}
+                )
+            labels.add(label["name"])
+
+        self.category_paths, self.path_siblings = self.validate_categories(
+            self.data.get("categories", []), names=self.name_siblings
+        )
+        self.label_names = labels
+
+        saved_searches: set[str] = set()
+        query_field = QueryField(required=True)
+        for index, search in enumerate(self.data.get("saved_searches", [])):
+            path = f"saved_searches[{index}]"
+            self.validate_model_data(SavedSearch, search, path)
+            try:
+                query_field.clean(search["query"])
+            except ValidationError as error:
+                raise ValidationError({f"{path}.query": error.messages}) from error
+            if search["name"] in saved_searches:
+                raise ValidationError(
+                    {f"{path}.name": [gettext("Duplicate saved search name.")]}
+                )
+            saved_searches.add(search["name"])
+
+        for index, team in enumerate(self.data.get("teams", [])):
+            path = f"teams[{index}]"
+            self.validate_model_data(
+                Group,
+                team,
+                path,
+                exclude=frozenset(
+                    {
+                        "admins",
+                        "autogroups",
+                        "components",
+                        "languages",
+                        "members",
+                        "roles",
+                    }
+                ),
+            )
+            for autogroup_index, match in enumerate(team["autogroups"]):
+                self.validate_model_data(
+                    AutoGroup,
+                    {"match": match},
+                    f"{path}.autogroups[{autogroup_index}]",
+                )
+            for language_index, code in enumerate(team["languages"]):
+                self.validate_language(code, f"{path}.languages[{language_index}]")
+            for member_index, member in enumerate(team["members"]):
+                if isinstance(member, str):
+                    continue
+                for language_index, code in enumerate(member["limit_languages"]):
+                    self.validate_language(
+                        code,
+                        f"{path}.members[{member_index}].limit_languages[{language_index}]",
+                    )
+
+    def validate_memory_objects(self, data: list[dict[str, Any]]) -> None:
+        for index, item in enumerate(data):
+            path = f"memory[{index}]"
+            self.validate_model_data(
+                Memory,
+                item,
+                path,
+                exclude=frozenset({"category", "source_language", "target_language"}),
+            )
+            self.validate_language(item["source_language"], f"{path}.source_language")
+            self.validate_language(item["target_language"], f"{path}.target_language")
+
+    def backup_value(self, value: object) -> BackupValue:
         if isinstance(value, Language):
             return value.code
         if isinstance(value, Plural):
@@ -148,15 +658,118 @@ class ProjectBackup:
             return value.isoformat()
         if isinstance(value, FieldFile):
             return os.path.basename(value.name)  # type: ignore[type-var]
-        return value
+        if value is None or isinstance(value, str | int | bool):
+            return value
+        if isinstance(value, dict):
+            return cast("dict[str, Any]", value)
+        if isinstance(value, list):
+            return cast("list[Any]", value)
+        return cast("BackupValue", value)
+
+    def backup_property(
+        self,
+        obj: ModelT,
+        field: str,
+        extras: Mapping[str, Callable[[ModelT], object]] | None = None,
+    ) -> BackupValue:
+        if extras and field in extras:
+            return self.backup_value(extras[field](obj))
+        return self.backup_value(getattr(obj, field))
 
     def backup_object(
         self,
-        obj: Model,
+        obj: ModelT,
         properties: list[str],
-        extras: dict[str, Callable] | None = None,
-    ) -> dict[str, str | int | dict | None]:
+        extras: Mapping[str, Callable[[ModelT], object]] | None = None,
+    ) -> dict[str, BackupValue]:
         return {field: self.backup_property(obj, field, extras) for field in properties}
+
+    @staticmethod
+    def extend_fields(fields: list[str], *extra_fields: str) -> list[str]:
+        return list(dict.fromkeys((*fields, *extra_fields)))
+
+    def import_inherited_settings(self, kwargs: dict[str, Any]) -> None:
+        for field in INHERITABLE_COMPONENT_FLAGS:
+            kwargs.setdefault(field, False)
+        if "secondary_language" in kwargs and kwargs["secondary_language"] is not None:
+            kwargs["secondary_language"] = self.import_language(
+                kwargs["secondary_language"]
+            )
+
+    @staticmethod
+    def migrate_component_vcs_settings(component: dict[str, Any]) -> None:
+        """Convert version control settings used by older component backups."""
+        if component["vcs"] == "git-force-push":
+            component["vcs"] = "git"
+            component.setdefault("vcs_params", {})["git_force_push"] = True
+
+    def prepare_component_parameters(
+        self, component: dict[str, Any], filename: str
+    ) -> None:
+        """Migrate and validate parameters after structural schema validation."""
+        self.migrate_component_vcs_settings(component)
+        self.migrate_component_file_format_params(
+            component, backup_version=self.data["metadata"].get("version")
+        )
+        for name, registry, scope in (
+            ("vcs_params", VCS_PARAMS, component["vcs"]),
+            ("file_format_params", FILE_FORMATS_PARAMS, component["file_format"]),
+        ):
+            params = component.get(name, {})
+            known = {param.name: param for param in registry}
+            for key, value in list(params.items()):
+                param = known.get(key)
+                if param is None or not param.supports_scope(scope):
+                    del params[key]
+                    self.skipped_parameters.append((filename, name, key, param is None))
+                    continue
+                try:
+                    param().validate_stored_value(value)
+                except ValidationError as error:
+                    raise ValidationError(
+                        {f"{filename}.component.{name}.{key}": error.messages}
+                    ) from error
+
+    @staticmethod
+    def migrate_component_file_format_params(
+        component: dict[str, Any], *, backup_version: str | None = None
+    ) -> None:
+        """
+        Convert file format settings used by older component backups.
+
+        This replicates the logic in migrations files but for the backups format.
+        """
+        # json_sort_keys was a boolean in backups before 2026.9
+        if (
+            "file_format_params" in component
+            and "json_sort_keys" in component["file_format_params"]
+        ):
+            json_sort_keys = component["file_format_params"]["json_sort_keys"]
+            if isinstance(json_sort_keys, bool):
+                json_sort_keys = "case_sensitive" if json_sort_keys is True else "none"
+                component["file_format_params"]["json_sort_keys"] = json_sort_keys
+
+        # Migrate file format params for legacy formats
+        file_format = component["file_format"]
+        if file_format not in LEGACY_BACKUPS_FORMAT_MIGRATION_MAPPING:
+            return
+
+        # Skip backup already using XLIFF file format parameters
+        if (
+            file_format in LEGACY_XLIFF_IDENTITY_FORMATS
+            and backup_uses_xliff_format_params(backup_version)
+        ):
+            return
+
+        new_file_format, migrate_params = LEGACY_BACKUPS_FORMAT_MIGRATION_MAPPING[
+            file_format
+        ]
+
+        component["file_format"] = new_file_format
+        file_format_params = migrate_params | component.setdefault(
+            "file_format_params", {}
+        )
+        component["file_format_params"] = file_format_params
 
     def backup_m2m_flat(self, obj: Model, relation: str, field: str) -> list:
         """Backup a many to many relation using a unique identifying field of the related object."""
@@ -168,7 +781,6 @@ class ProjectBackup:
             ("roles", "roles", "name"),
             ("languages", "languages", "code"),
             ("admins", "admins", "username"),
-            ("members", "user_set", "username"),
             ("autogroups", "autogroup_set", "match"),
         ]:
             extras[schema_name] = partial(
@@ -179,25 +791,87 @@ class ProjectBackup:
         extras["components"] = lambda obj: [
             self.full_slug_without_project(c) for c in obj.components.all()
         ]
+        extras["members"] = self.backup_team_members
 
         return [
             self.backup_object(
                 group,
-                self.project_schema["properties"]["teams"]["items"]["required"],
+                self.extend_fields(
+                    self.project_schema["properties"]["teams"]["items"]["required"],
+                    "internal",
+                ),
                 extras,
             )
             for group in project.defined_groups.all()
         ]
 
-    def backup_categories(self, obj: Project | Category) -> list[dict]:
+    @staticmethod
+    def backup_team_members(group: Group) -> list[str | dict[str, Any]]:
+        result: list[str | dict[str, Any]] = []
+        memberships = (
+            group.memberships.select_related("user")
+            .prefetch_related(
+                Prefetch("limit_languages", queryset=Language.objects.only("code"))
+            )
+            .order_by("user__username")
+        )
+        for membership in memberships:
+            limit_languages = sorted(
+                language.code for language in membership.limit_languages.all()
+            )
+            if limit_languages:
+                result.append(
+                    {
+                        "username": membership.user.username,
+                        "limit_languages": limit_languages,
+                    }
+                )
+            else:
+                result.append(membership.user.username)
+        return result
+
+    def backup_memory(self, project: Project) -> list[MemoryDict]:
+        project_scope = MemoryScope.objects.using("default").filter(
+            memory_id=OuterRef("pk"),
+            project_id=project.pk,
+            scope__in=(MemoryScope.SCOPE_PROJECT, MemoryScope.SCOPE_PROJECT_FILE),
+        )
+        memory = (
+            Memory.objects.using("default")
+            .alias(has_project_scope=Exists(project_scope))
+            .filter(has_project_scope=True)
+            .prefetch_scopes()
+            .order_by("id")
+        )
+        automatic_category = CATEGORY_PRIVATE_OFFSET + project.pk
+        result: list[MemoryDict] = []
+        for item in memory.iterator(self.IMPORT_BATCH_SIZE):
+            project_scope_types = {
+                scope.scope
+                for scope in item.get_scope_list()
+                if scope.project_id == project.pk
+            }
+            if MemoryScope.SCOPE_PROJECT in project_scope_types:
+                result.append(item.as_dict(category=automatic_category))
+            if MemoryScope.SCOPE_PROJECT_FILE in project_scope_types:
+                result.append(item.as_dict(category=CATEGORY_FILE))
+        return result
+
+    def backup_categories(
+        self, obj: Project | Category
+    ) -> list[dict[str, BackupValue]]:
         if isinstance(obj, Project):
             categories = obj.category_set.filter(category=None)
         else:
             categories = obj.category_set.all()
+        category_fields = self.extend_fields(
+            self.project_schema["$defs"]["category"]["required"],
+            *CATEGORY_BACKUP_FIELDS,
+        )
         return [
             self.backup_object(
                 category,
-                self.project_schema["definitions"]["category"]["required"],
+                category_fields,
                 {"categories": self.backup_categories},
             )
             for category in categories
@@ -205,6 +879,15 @@ class ProjectBackup:
 
     def backup_data(self, project: Project) -> None:
         self.project = project
+        project_fields = self.extend_fields(
+            self.project_schema["properties"]["project"]["required"],
+            *PROJECT_BACKUP_FIELDS,
+        )
+        project_extras: dict[str, Callable[[Project], object]] = {
+            field: partial(Project.get_effective_setting, field=field)
+            for field in INHERITABLE_COMPONENT_SETTINGS
+        }
+        project_extras["check_flags"] = lambda obj: obj.effective_check_flags.format()
         self.data = {
             "metadata": {
                 "version": VERSION,
@@ -212,31 +895,71 @@ class ProjectBackup:
                 "domain": settings.SITE_DOMAIN.rsplit(":", 1)[0],
                 "timestamp": self.timestamp.isoformat(),
             },
-            "project": self.backup_object(
-                project, self.project_schema["properties"]["project"]["required"]
-            ),
+            "project": self.backup_object(project, project_fields, project_extras),
             "labels": [
                 {"name": label.name, "color": label.color}
                 for label in project.label_set.all()
             ],
             "categories": self.backup_categories(project),
             "teams": self.backup_teams(project),
+            "saved_searches": [
+                {
+                    "name": search.name,
+                    "query": search.query,
+                    "description": search.description,
+                }
+                for search in project.savedsearch_set.order()
+            ],
         }
 
         # Make sure generated backup data is correct
         self.validate_data()
 
-    def backup_dir(self, backupzip: ZipFile, directory: str, target: str) -> None:
+    def backup_dir(
+        self,
+        backupzip: ZipFile,
+        directory: str,
+        target: str,
+        refresh_lock: Callable[[], None],
+    ) -> None:
         """Backup single directory to specified target in zip."""
-        for folder, _subfolders, filenames in os.walk(directory):
+
+        def onerror(error: OSError) -> None:
+            if not isinstance(error, FileNotFoundError):
+                raise error
+
+        refresh_at = monotonic() + REPOSITORY_LOCK_REFRESH_INTERVAL
+
+        def refresh_repository_lock() -> None:
+            nonlocal refresh_at
+            now = monotonic()
+            if now >= refresh_at:
+                refresh_lock()
+                refresh_at = now + REPOSITORY_LOCK_REFRESH_INTERVAL
+
+        for folder, _subfolders, filenames in os.walk(directory, onerror=onerror):
+            refresh_repository_lock()
             for filename in filenames:
+                refresh_repository_lock()
                 path = os.path.join(folder, filename)
                 # zipfile does not support storing symlinks, it dereferences them
                 if os.path.islink(path):
                     continue
-                backupzip.write(
-                    path, os.path.join(target, os.path.relpath(path, directory))
+                archive_path = os.path.join(target, os.path.relpath(path, directory))
+                file_info = ZipInfo.from_file(path, archive_path)
+                file_info.compress_type = backupzip.compression
+                # TODO: Use compress_level after dropping Python 3.12 support.
+                # ruff: ignore[private-member-access]
+                file_info._compresslevel = (  # type: ignore[attr-defined]
+                    backupzip.compresslevel
                 )
+                with (
+                    open(path, "rb") as source,
+                    backupzip.open(file_info, "w") as output,
+                ):
+                    while chunk := source.read(BACKUP_COPY_CHUNK_SIZE):
+                        output.write(chunk)
+                        refresh_repository_lock()
 
     def backup_json(self, backupzip: ZipFile, data: dict | list, target: str) -> None:
         with backupzip.open(target, "w") as handle:
@@ -267,10 +990,21 @@ class ProjectBackup:
 
         self.filename = filename.as_posix()
 
+    @property
+    def relative_filename(self) -> str:
+        return (
+            Path(self.filename).relative_to(data_path(PROJECTBACKUP_PREFIX)).as_posix()
+        )
+
     def backup_component(self, backupzip: ZipFile, component: Component) -> None:
+        component_fields = self.extend_fields(
+            self.component_schema["properties"]["component"]["required"],
+            *COMPONENT_BACKUP_FIELDS,
+        )
         data: dict = {
             "component": self.backup_object(
-                component, self.component_schema["properties"]["component"]["required"]
+                component,
+                component_fields,
             ),
             "translations": [
                 self.backup_object(
@@ -314,7 +1048,7 @@ class ProjectBackup:
                                                 "required"
                                             ],
                                         )
-                                        for vote in obj.votes.through.objects.filter(
+                                        for vote in Vote.objects.filter(
                                             suggestion=obj
                                         ).select_related("user")
                                     ],
@@ -354,7 +1088,7 @@ class ProjectBackup:
                     },
                 )
                 for pending_unit_change in PendingUnitChange.objects.for_component(
-                    component
+                    component, apply_filters=False
                 )
                 .prefetch_related("unit", "author")
                 .iterator(2000)
@@ -365,6 +1099,12 @@ class ProjectBackup:
             data["component"]["category"] = self.full_slug_without_project(
                 component.category
             )
+        for field in ("local_revision", "remote_revision"):
+            if not is_valid_revision_hash(data["component"][field]):
+                data["component"][field] = ""
+        for translation in data["translations"]:
+            if TRANSLATION_REVISION_RE.fullmatch(translation["revision"]) is None:
+                translation["revision"] = ""
 
         data["screenshots"] = screenshots = []
         for screenshot in Screenshot.objects.filter(
@@ -384,14 +1124,19 @@ class ProjectBackup:
                     },
                 )
             )
+            image_name = screenshot.image.name
+            if image_name is None:
+                raise ValidationError(gettext("Screenshot image is missing."))
             backupzip.write(
                 os.path.join(settings.MEDIA_ROOT, screenshot.image.path),
-                os.path.join("screenshots", os.path.basename(screenshot.image.name)),
+                os.path.join("screenshots", os.path.basename(image_name)),
             )
 
         validate_schema(data, "weblate-component.schema.json")
         self.backup_json(
-            backupzip, data, f"{self.COMPONENTS_PREFIX}{component.slug}.json"
+            backupzip,
+            data,
+            f"{self.COMPONENTS_PREFIX}{self.full_slug_without_project(component)}.json",
         )
 
         # Store VCS repo in case it is present
@@ -399,19 +1144,35 @@ class ProjectBackup:
             return
 
         # Compact the repository
-        with component.repository.lock:
-            component.repository.compact()
+        # Recovery can fail on damaged metadata before maintenance can handle it.
+        with component.repository.lock.without_recovery(), component.repository.lock:
+            try:
+                os.stat(component.full_path)
+            except FileNotFoundError:
+                component.log_warning(
+                    "skipping missing repository directory during project backup"
+                )
+                return
+            try:
+                component.repository.maintenance()
+            except RepositoryCommandError as error:
+                component.log_warning(
+                    "repository maintenance failed during project backup: %s", error
+                )
 
-        # Actually perform the backup
-        self.backup_dir(
-            backupzip,
-            component.full_path,
-            f"{self.VCS_PREFIX}{self.full_slug_without_project(component)}",
-        )
+            # Keep the checkout stable from validation through every archive read.
+            component.repository.lock.reacquire()
+            self.backup_dir(
+                backupzip,
+                component.full_path,
+                f"{self.VCS_PREFIX}{self.full_slug_without_project(component)}",
+                component.repository.lock.reacquire,
+            )
 
     @transaction.atomic
-    def backup_project(self, project: Project) -> None:
+    def backup_project(self, project: Project, user: User | None = None) -> None:
         """Backup whole project."""
+        project.log_info("creating project backup")
         # Generate data
         self.backup_data(project)
 
@@ -419,36 +1180,195 @@ class ProjectBackup:
         part_name = f"{self.filename}.part"
 
         # Create the zip with the content
-        with ZipFile(part_name, "x") as backupzip:
-            # Project data
-            self.backup_json(
-                backupzip,
-                self.data,
-                "weblate-backup.json",
-            )
+        # Exclusive creation must succeed before registering cleanup.
+        backupzip = ZipFile(part_name, "x")
+        try:
+            with backupzip:
+                # Project data
+                self.backup_json(
+                    backupzip,
+                    self.data,
+                    "weblate-backup.json",
+                )
 
-            # Translation memory, avoid using memory_db
-            self.backup_json(
-                backupzip,
-                [
-                    item.as_dict()
-                    for item in project.memory_set.using("default").iterator()
-                ],
-                "weblate-memory.json",
-            )
+                # Translation memory, avoid using memory_db
+                self.backup_json(
+                    backupzip,
+                    self.backup_memory(project),
+                    "weblate-memory.json",
+                )
 
-            # Components
-            for component in project.component_set.iterator():
-                self.backup_component(backupzip, component)
+                # Components
+                for component in project.component_set.iterator():
+                    self.backup_component(backupzip, component)
 
-        os.rename(part_name, self.filename)
+            os.rename(part_name, self.filename)
+        finally:
+            Path(part_name).unlink(missing_ok=True)
+        self.log_backup(project, user)
+
+    def log_backup(self, project: Project, user: User | None = None) -> None:
+        if user is None:
+            user = InternalBot.BACKUP.get_user()
+        project.log_info("project backup completed")
+        project.change_set.create(
+            action=ActionEvents.PROJECT_BACKUP,
+            user=user,
+            author=user,
+            details={"backup_filename": self.relative_filename},
+        )
+        for billing in project.billings:
+            self.log_backup_billing(project, billing)
+
+    def log_backup_billing(self, project: Project, billing: Billing) -> None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.billing.models import (
+            BillingEvent,
+        )
+
+        billing.billinglog_set.create(
+            event=BillingEvent.PROJECT_BACKUP,
+            summary=f"Backed up project {project}",
+            details={
+                "backup_filename": self.relative_filename,
+                "project_name": project.name,
+            },
+        )
+
+    def get_restore_history_details(self) -> dict[str, BackupValue]:
+        metadata = self.data["metadata"]
+        details: dict[str, BackupValue] = {
+            "backup_timestamp": metadata["timestamp"],
+            "backup_server": metadata["server"],
+            "backup_domain": metadata["domain"],
+        }
+        if self.skipped_components:
+            details["skipped_components"] = self.skipped_components
+        return details
+
+    @staticmethod
+    def get_component_backup_slug(data: dict[str, Any]) -> str:
+        slug = data["slug"]
+        if category := data.get("category"):
+            return f"{category}/{slug}"
+        return slug
 
     def list_components(self, zipfile: ZipFile) -> list[str]:
         return [
             name
             for name in zipfile.namelist()
-            if name.startswith(self.COMPONENTS_PREFIX)
+            if name.startswith(self.COMPONENTS_PREFIX) and name.endswith(".json")
         ]
+
+    @classmethod
+    def is_safe_vcs_path(cls, path: str, vcs: str | type[Repository] | None) -> bool:
+        normalized = path.replace("\\", "/").casefold()
+        parts = PurePosixPath(normalized).parts
+        repository_classes = VCS_REGISTRY.get_unfiltered_data()
+        metadata_dirs = {
+            repository_class.metadata_dir_name.casefold()
+            for repository_class in repository_classes.values()
+            if repository_class.metadata_dir_name is not None
+        }
+        if not isinstance(vcs, str) and vcs is not None and vcs.metadata_dir_name:
+            metadata_dirs.add(vcs.metadata_dir_name.casefold())
+        metadata_positions = [
+            index for index, part in enumerate(parts) if part in metadata_dirs
+        ]
+        if not metadata_positions:
+            return True
+        if len(metadata_positions) != 1 or metadata_positions[0] != 0:
+            return False
+
+        repository_class = repository_classes.get(vcs) if isinstance(vcs, str) else vcs
+        if (
+            repository_class is None
+            or repository_class.metadata_dir_name is None
+            or parts[0] != repository_class.metadata_dir_name.casefold()
+        ):
+            return False
+        return repository_class.is_safe_backup_metadata_path(parts[1:])
+
+    def get_vcs_component(self, path: str) -> str | None:
+        return next(
+            (
+                slug
+                for slug in self.component_slugs_by_length
+                if path == slug or path.startswith(f"{slug}/")
+            ),
+            None,
+        )
+
+    def finalize_restored_repositories(
+        self, project_path: Path, extracted_repositories: set[str]
+    ) -> None:
+        """Verify and rebuild repository state restored from the backup."""
+        if self.project is None:
+            raise TypeError
+        for component, repository_class in self.component_vcs.items():
+            if (
+                component in self.component_repo_links
+                or repository_class is None
+                or component not in extracted_repositories
+            ):
+                continue
+            repository = repository_class(str(project_path / component), local=True)
+            if repository.metadata_dir_name is not None:
+                metadata_path = project_path / component / repository.metadata_dir_name
+                try:
+                    metadata_stat = metadata_path.stat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(metadata_stat.st_mode):
+                    continue
+            try:
+                with repository.lock.without_recovery(), repository.lock:
+                    repository.finalize_backup_restore()
+            except RepositoryError as error:
+                self.project.log_warning(
+                    "could not restore repository %s from project backup: %s",
+                    component,
+                    error,
+                )
+            else:
+                self.restored_repositories.add(component)
+
+    @classmethod
+    def get_limit(cls, setting_name: str, default: int) -> int:
+        return int(getattr(settings, setting_name, default))
+
+    def validate_backup_zip_member(self, info: ZipInfo) -> None:
+        validate_filename(info.filename, check_prohibited=False)
+        if info.is_dir() or not info.filename.startswith(self.VCS_PREFIX):
+            return
+        validate_zip_member_path(info.filename[self.VCS_PREFIX_LEN :])
+
+    def validate_zip_members(self, zipfile: ZipFile) -> None:
+        validate_safe_zip_members(
+            zipfile,
+            limits=ZipSafetyLimits(
+                max_members=self.get_limit(
+                    "PROJECT_BACKUP_IMPORT_MAX_MEMBERS", self.MAX_ARCHIVE_MEMBERS
+                ),
+                max_compressed_entry_size=self.get_limit(
+                    "PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE",
+                    self.MAX_COMPRESSED_ENTRY_SIZE,
+                ),
+                min_compressed_ratio_size=self.get_limit(
+                    "PROJECT_BACKUP_IMPORT_MIN_RATIO_SIZE",
+                    self.MIN_COMPRESSED_RATIO_SIZE,
+                ),
+                max_compressed_entry_ratio=self.get_limit(
+                    "PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_RATIO",
+                    self.MAX_COMPRESSED_ENTRY_RATIO,
+                ),
+                max_total_uncompressed_size=self.get_limit(
+                    "PROJECT_BACKUP_IMPORT_MAX_TOTAL_UNCOMPRESSED_SIZE",
+                    self.MAX_TOTAL_UNCOMPRESSED_SIZE,
+                ),
+            ),
+            validate_member=self.validate_backup_zip_member,
+        )
 
     def load_data(self, zipfile: ZipFile) -> None:
         with zipfile.open("weblate-backup.json") as handle:
@@ -456,11 +1376,494 @@ class ProjectBackup:
         self.validate_data()
         self.timestamp = datetime.fromisoformat(self.data["metadata"]["timestamp"])
 
-    def load_memory(self, zipfile: ZipFile) -> dict:
+    def load_memory(self, zipfile: ZipFile) -> list[dict[str, Any]]:
+        if self.memory_loaded:
+            return self.memory_data
         with zipfile.open("weblate-memory.json") as handle:
             data = json.load(handle)
         validate_schema(data, "weblate-memory.schema.json")
+        self.validate_memory_objects(data)
+        self.memory_data = data
+        self.memory_loaded = True
         return data
+
+    # ruff: ignore[complex-structure, too-many-branches, too-many-statements, too-many-locals]
+    def validate_component_object(
+        self,
+        zipfile: ZipFile,
+        filename: str,
+        data: dict[str, Any],
+    ) -> None:
+        component = data["component"]
+        path = filename
+        for field in ("local_revision", "remote_revision"):
+            revision = component[field]
+            if revision and not is_valid_revision_hash(revision):
+                raise ValidationError(
+                    {
+                        f"{path}.component.{field}": [
+                            gettext(
+                                "Revision must be a complete hexadecimal object ID."
+                            )
+                        ]
+                    }
+                )
+        # Keep the established top-level error keys for repository URLs while
+        # still using the validators declared on the Component model fields.
+        self.validate_model_data(
+            Component,
+            {"repo": component["repo"], "push": component["push"]},
+            "",
+        )
+        component_object = self.validate_model_data(
+            Component,
+            component,
+            f"{path}.component",
+            exclude=frozenset(
+                {
+                    "category",
+                    "push",
+                    "repo",
+                    "secondary_language",
+                    "source_language",
+                }
+            ),
+            overrides={
+                "project": self.validation_project,
+                "push": component["push"],
+                "repo": component["repo"],
+            },
+        )
+        source_language = self.validate_language(
+            component["source_language"], f"{path}.component.source_language"
+        )
+        component_object.source_language = source_language
+        if secondary := component.get("secondary_language"):
+            component_object.secondary_language = self.validate_language(
+                secondary, f"{path}.component.secondary_language"
+            )
+        try:
+            component_object.clean_model_settings()
+            component_object.clean_branches()
+        except ValidationError as error:
+            raise self.contextualize_validation_error(
+                error, f"{path}.component"
+            ) from error
+        enforced_checks: set[str] = set()
+        for index, name in enumerate(component["enforced_checks"]):
+            self.validate_model_data(
+                Check,
+                {"name": name, "dismissed": False},
+                f"{path}.component.enforced_checks[{index}]",
+            )
+            if name in enforced_checks:
+                raise ValidationError(
+                    {
+                        f"{path}.component.enforced_checks[{index}]": [
+                            gettext("Duplicate check name.")
+                        ]
+                    }
+                )
+            enforced_checks.add(name)
+
+        category = component.get("category", "")
+        if category and category not in self.category_paths:
+            raise ValidationError(
+                {
+                    f"{path}.component.category": [
+                        gettext("Referenced category does not exist.")
+                    ]
+                }
+            )
+        sibling = (category, component["slug"])
+        if sibling in self.path_siblings:
+            raise ValidationError(
+                {
+                    f"{path}.component.slug": [
+                        gettext("Duplicate category or component slug.")
+                    ]
+                }
+            )
+        self.path_siblings.add(sibling)
+        name_sibling = (category, component["name"])
+        if name_sibling in self.name_siblings:
+            raise ValidationError(
+                {
+                    f"{path}.component.name": [
+                        gettext("Duplicate category or component name.")
+                    ]
+                }
+            )
+        self.name_siblings.add(name_sibling)
+        full_slug = f"{category}/{component['slug']}" if category else component["slug"]
+        expected_filename = f"{self.COMPONENTS_PREFIX}{full_slug}.json"
+        if filename != expected_filename:
+            raise ValidationError(
+                {
+                    filename: [
+                        gettext(
+                            "Component filename does not match its category and slug."
+                        )
+                    ]
+                }
+            )
+        if full_slug in self.component_full_slugs:
+            raise ValidationError({filename: [gettext("Duplicate component slug.")]})
+        self.component_full_slugs.add(full_slug)
+        self.component_vcs[full_slug] = VCS_REGISTRY.get_unfiltered_data().get(
+            component["vcs"]
+        )
+        if component["repo"].startswith("weblate:"):
+            self.component_repo_links.add(full_slug)
+
+        translation_ids: set[int] = set()
+        translation_languages: dict[int, str] = {}
+        language_sources: dict[str, str] = {}
+        source_translation_ids: list[int] = []
+        for index, item in enumerate(data["translations"]):
+            item_path = f"{path}.translations[{index}]"
+            if TRANSLATION_REVISION_RE.fullmatch(item["revision"]) is None:
+                raise ValidationError(
+                    {
+                        f"{item_path}.revision": [
+                            gettext("Translation revision has an invalid format.")
+                        ]
+                    }
+                )
+            self.validate_model_data(
+                Translation,
+                item,
+                item_path,
+                exclude=frozenset({"id", "plural"}),
+                allow_blank=frozenset({"filename"}),
+            )
+            if item["filename"]:
+                try:
+                    validate_filename(item["filename"])
+                except ValidationError as error:
+                    raise ValidationError(
+                        {f"{item_path}.filename": error.messages}
+                    ) from error
+            self.validate_model_data(Plural, item["plural"], f"{item_path}.plural")
+            language = self.validate_language(
+                item["language_code"], f"{item_path}.language_code", file_code=True
+            )
+            if item["id"] in translation_ids:
+                raise ValidationError(
+                    {f"{item_path}.id": [gettext("Duplicate translation identifier.")]}
+                )
+            if previous_code := language_sources.get(language.code):
+                values = [previous_code, item["language_code"]]
+                msg = (
+                    "Several languages from backup map to single language on this "
+                    f"server {values} -> {language.code}"
+                )
+                raise ValueError(msg)
+            translation_ids.add(item["id"])
+            translation_languages[item["id"]] = language.code
+            language_sources[language.code] = item["language_code"]
+            if language.code == source_language.code:
+                source_translation_ids.append(item["id"])
+        if len(source_translation_ids) != 1:
+            raise ValidationError(
+                {
+                    f"{path}.translations": [
+                        gettext(
+                            "Component has to contain exactly one source translation."
+                        )
+                    ]
+                }
+            )
+        source_translation_id = source_translation_ids[0]
+
+        unit_hashes_by_translation: dict[int, set[str]] = defaultdict(set)
+        for index, item in enumerate(data["units"]):
+            item_path = f"{path}.units[{index}]"
+            self.validate_model_data(
+                Unit,
+                item,
+                item_path,
+                # File imports can store empty sources, including keyed strings.
+                allow_blank=frozenset({"details", "source"}),
+                exclude=frozenset(
+                    {
+                        "checks",
+                        "comments",
+                        "id_hash",
+                        "labels",
+                        "pending",
+                        "suggestions",
+                        "translation_id",
+                    }
+                ),
+            )
+            self.validate_checksum(item["id_hash"], f"{item_path}.id_hash")
+            translation_id = item["translation_id"]
+            if translation_id not in translation_ids:
+                raise ValidationError(
+                    {
+                        f"{item_path}.translation_id": [
+                            gettext("Referenced translation does not exist.")
+                        ]
+                    }
+                )
+            if item["id_hash"] in unit_hashes_by_translation[translation_id]:
+                raise ValidationError(
+                    {f"{item_path}.id_hash": [gettext("Duplicate unit checksum.")]}
+                )
+            unit_hashes_by_translation[translation_id].add(item["id_hash"])
+            for label_index, label in enumerate(item["labels"]):
+                if label not in self.label_names:
+                    raise ValidationError(
+                        {
+                            f"{item_path}.labels[{label_index}]": [
+                                gettext("Referenced label does not exist.")
+                            ]
+                        }
+                    )
+            for comment_index, comment in enumerate(item["comments"]):
+                self.validate_model_data(
+                    Comment,
+                    comment,
+                    f"{item_path}.comments[{comment_index}]",
+                    exclude=frozenset({"user"}),
+                )
+            for suggestion_index, suggestion in enumerate(item["suggestions"]):
+                suggestion_path = f"{item_path}.suggestions[{suggestion_index}]"
+                self.validate_model_data(
+                    Suggestion,
+                    suggestion,
+                    suggestion_path,
+                    exclude=frozenset({"user", "votes"}),
+                )
+                for vote_index, vote in enumerate(suggestion["votes"]):
+                    self.validate_model_data(
+                        Vote,
+                        vote,
+                        f"{suggestion_path}.votes[{vote_index}]",
+                        exclude=frozenset({"user"}),
+                    )
+            check_names: set[str] = set()
+            for check_index, check in enumerate(item["checks"]):
+                self.validate_model_data(
+                    Check, check, f"{item_path}.checks[{check_index}]"
+                )
+                if check["name"] in check_names:
+                    raise ValidationError(
+                        {
+                            f"{item_path}.checks[{check_index}].name": [
+                                gettext("Duplicate check name.")
+                            ]
+                        }
+                    )
+                check_names.add(check["name"])
+
+        source_hashes = unit_hashes_by_translation[source_translation_id]
+        for translation_id, hashes in unit_hashes_by_translation.items():
+            if translation_id == source_translation_id:
+                continue
+            missing = hashes - source_hashes
+            if missing:
+                raise ValidationError(
+                    {
+                        f"{path}.units": [
+                            gettext(
+                                "A translated unit references a missing source unit."
+                            )
+                        ]
+                    }
+                )
+
+        for index, item in enumerate(data.get("pending_unit_changes", [])):
+            item_path = f"{path}.pending_unit_changes[{index}]"
+            self.validate_model_data(
+                PendingUnitChange,
+                item,
+                item_path,
+                exclude=frozenset({"author", "translation_id", "unit_id_hash"}),
+            )
+            self.validate_checksum(item["unit_id_hash"], f"{item_path}.unit_id_hash")
+            translation_id = item["translation_id"]
+            if translation_id not in translation_ids:
+                raise ValidationError(
+                    {
+                        f"{item_path}.translation_id": [
+                            gettext("Referenced translation does not exist.")
+                        ]
+                    }
+                )
+            if item["unit_id_hash"] not in unit_hashes_by_translation[translation_id]:
+                raise ValidationError(
+                    {
+                        f"{item_path}.unit_id_hash": [
+                            gettext("Referenced unit does not exist.")
+                        ]
+                    }
+                )
+
+        for index, item in enumerate(data["screenshots"]):
+            item_path = f"{path}.screenshots[{index}]"
+            self.validate_model_data(
+                Screenshot,
+                item,
+                item_path,
+                exclude=frozenset({"image", "translation_id", "units", "user"}),
+            )
+            translation_id = item["translation_id"]
+            if translation_id not in translation_ids:
+                raise ValidationError(
+                    {
+                        f"{item_path}.translation_id": [
+                            gettext("Referenced translation does not exist.")
+                        ]
+                    }
+                )
+            image = item["image"]
+            if (
+                image != os.path.basename(image)
+                or "/" in image
+                or "\\" in image
+                or not image
+            ):
+                raise ValidationError(
+                    {f"{item_path}.image": [gettext("Screenshot filename is invalid.")]}
+                )
+            member_name = f"screenshots/{image}"
+            try:
+                info = zipfile.getinfo(member_name)
+            except KeyError as error:
+                raise ValidationError(
+                    {
+                        f"{item_path}.image": [
+                            gettext("Referenced screenshot image does not exist.")
+                        ]
+                    }
+                ) from error
+            if info.file_size > settings.ALLOWED_ASSET_SIZE:
+                raise ValidationError(
+                    {f"{item_path}.image": [gettext("Uploaded file is too big.")]}
+                )
+            with zipfile.open(info) as handle:
+                content = handle.read(settings.ALLOWED_ASSET_SIZE + 1)
+            if len(content) > settings.ALLOWED_ASSET_SIZE:
+                raise ValidationError(
+                    {f"{item_path}.image": [gettext("Uploaded file is too big.")]}
+                )
+            restored_image = File(BytesIO(content), name=image)
+            try:
+                restored_image.name = normalize_screenshot_filename(restored_image)
+                Screenshot.validate_image_file(restored_image)
+            except ValidationError as error:
+                raise ValidationError(
+                    {
+                        f"{item_path}.image": [
+                            gettext("Could not validate screenshot: %(error)s")
+                            % {"error": error}
+                        ]
+                    }
+                ) from error
+            for unit_index, checksum in enumerate(item["units"]):
+                self.validate_checksum(checksum, f"{item_path}.units[{unit_index}]")
+                if checksum not in unit_hashes_by_translation[translation_id]:
+                    raise ValidationError(
+                        {
+                            f"{item_path}.units[{unit_index}]": [
+                                gettext("Referenced unit does not exist.")
+                            ]
+                        }
+                    )
+
+    def validate_team_references(self, *, validate_roles: bool) -> None:
+        if validate_roles:
+            roles = {role.name for role in Role.objects.all()}
+            assignable_roles = {
+                role.name for role in Role.objects.assignable_to_project_team()
+            }
+        else:
+            roles = assignable_roles = set()
+        for index, team in enumerate(self.data.get("teams", [])):
+            path = f"teams[{index}]"
+            for component_index, component in enumerate(team["components"]):
+                if component not in self.component_full_slugs:
+                    raise ValidationError(
+                        {
+                            f"{path}.components[{component_index}]": [
+                                gettext("Referenced component does not exist.")
+                            ]
+                        }
+                    )
+            if validate_roles:
+                for role_index, role in enumerate(team["roles"]):
+                    if role not in roles:
+                        raise ValidationError(
+                            {
+                                f"{path}.roles[{role_index}]": [
+                                    gettext("Referenced role does not exist.")
+                                ]
+                            }
+                        )
+                    if role not in assignable_roles:
+                        raise ValidationError(
+                            {
+                                f"{path}.roles[{role_index}]": [
+                                    gettext(
+                                        "Referenced role cannot be assigned to a project team."
+                                    )
+                                ]
+                            }
+                        )
+
+    def validate_vcs_component_paths(self, zipfile: ZipFile) -> None:
+        """Ensure every restored repository member belongs to a local component."""
+        for info in zipfile.infolist():
+            if info.is_dir() or not info.filename.startswith(self.VCS_PREFIX):
+                continue
+            path = info.filename[self.VCS_PREFIX_LEN :]
+            component = self.get_vcs_component(path)
+            if component is None:
+                raise ValidationError(
+                    {
+                        info.filename: [
+                            gettext(
+                                "Repository data does not belong to a restored component."
+                            )
+                        ]
+                    }
+                )
+            if component in self.component_repo_links:
+                raise ValidationError(
+                    {
+                        info.filename: [
+                            gettext(
+                                "Repository-linked components can not contain repository data."
+                            )
+                        ]
+                    }
+                )
+
+    @overload
+    def load_component(
+        self,
+        zipfile: ZipFile,
+        filename: str,
+        *,
+        skip_linked: bool = False,
+        do_restore: Literal[False] = False,
+        actor: None = None,
+        changes: None = None,
+    ) -> bool: ...
+
+    @overload
+    def load_component(
+        self,
+        zipfile: ZipFile,
+        filename: str,
+        *,
+        skip_linked: bool = False,
+        do_restore: Literal[True],
+        actor: User,
+        changes: list[Change],
+    ) -> bool: ...
 
     def load_component(
         self,
@@ -469,77 +1872,179 @@ class ProjectBackup:
         *,
         skip_linked: bool = False,
         do_restore: bool = False,
+        actor: User | None = None,
+        changes: list[Change] | None = None,
     ) -> bool:
-        with zipfile.open(filename) as handle:
-            data = json.load(handle)
+        try:
+            data = self.component_data[filename]
+        except KeyError:
+            with zipfile.open(filename) as handle:
+                data = json.load(handle)
             validate_schema(data, "weblate-component.schema.json")
-            if skip_linked and data["component"]["repo"].startswith("weblate:"):
-                return False
-            if data["component"]["vcs"] not in VCS_REGISTRY:
-                msg = f"Component {data['component']['name']} uses unsupported VCS: {data['component']['vcs']}"
-                raise ValueError(msg)
-            # Validate translations have unique languages
-            languages = defaultdict(list)
-            for item in data["translations"]:
-                language = self.import_language(item["language_code"])
-                languages[language.code].append(item["language_code"])
+            self.prepare_component_parameters(data["component"], filename)
+            self.validate_component_object(zipfile, filename, data)
+            self.component_data[filename] = data
+        if skip_linked and data["component"]["repo"].startswith("weblate:"):
+            return False
+        if do_restore:
+            if actor is None:
+                msg = "Need a restore actor."
+                raise TypeError(msg)
+            if changes is None:
+                msg = "Need a restore changes list."
+                raise TypeError(msg)
+            return self.restore_component(zipfile, data, actor, changes)
+        return True
 
-            for code, values in languages.items():
-                if len(values) > 1:
-                    msg = f"Several languages from backup map to single language on this server {values} -> {code}"
-                    raise ValueError(msg)
+    @overload
+    def load_components(
+        self,
+        zipfile: ZipFile,
+        *,
+        do_restore: Literal[False] = False,
+        actor: None = None,
+        changes: None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None: ...
 
-            if do_restore:
-                self.restore_component(zipfile, data)
-            return True
+    @overload
+    def load_components(
+        self,
+        zipfile: ZipFile,
+        *,
+        do_restore: Literal[True],
+        actor: User,
+        changes: list[Change],
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None: ...
 
-    def load_components(self, zipfile: ZipFile, *, do_restore: bool = False) -> None:
+    def load_components(
+        self,
+        zipfile: ZipFile,
+        *,
+        do_restore: bool = False,
+        actor: User | None = None,
+        changes: list[Change] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
         pending: list[str] = []
+        if do_restore:
+            if actor is None:
+                msg = "Need a restore actor."
+                raise TypeError(msg)
+            if changes is None:
+                msg = "Need a restore changes list."
+                raise TypeError(msg)
+            restored = 0
+            components = self.list_components(zipfile)
+            total = len(components)
+            for component in components:
+                processed = self.load_component(
+                    zipfile,
+                    component,
+                    skip_linked=True,
+                    do_restore=True,
+                    actor=actor,
+                    changes=changes,
+                )
+                if not processed:
+                    pending.append(component)
+                else:
+                    restored += 1
+                    if progress_callback is not None:
+                        progress_callback(restored, total)
+            for component in pending:
+                self.load_component(
+                    zipfile,
+                    component,
+                    skip_linked=False,
+                    do_restore=True,
+                    actor=actor,
+                    changes=changes,
+                )
+                restored += 1
+                if progress_callback is not None:
+                    progress_callback(restored, total)
+            return
+
         for component in self.list_components(zipfile):
             processed = self.load_component(
-                zipfile, component, skip_linked=True, do_restore=do_restore
+                zipfile,
+                component,
+                skip_linked=True,
+                do_restore=False,
             )
             if not processed:
                 pending.append(component)
         for component in pending:
             self.load_component(
-                zipfile, component, skip_linked=False, do_restore=do_restore
+                zipfile,
+                component,
+                skip_linked=False,
+                do_restore=False,
             )
 
     def validate(self) -> None:
-        if not self.supports_restore:
-            msg = "Restore is not supported on this database."
-            raise ValueError(msg)
         input_file = self.filename or self.fileio
         if input_file is None:
             msg = "Can not validate None file."
             raise TypeError(msg)
+        self.validated = False
         with ZipFile(input_file, "r") as zipfile:
-            names = zipfile.namelist()
-            if len(names) != len(set(names)):
-                msg = "The zip file contains duplicate files. Please generate a new backup with a newer version of Weblate."
-                raise ValueError(msg)
-            self.load_data(zipfile)
-            self.load_memory(zipfile)
-            self.load_components(zipfile)
-            for name in zipfile.namelist():
-                validate_filename(name)
+            self.validate_archive(zipfile)
+        self.validated = True
+
+    def validate_archive(
+        self,
+        zipfile: ZipFile,
+        *,
+        target_project_name: str | None = None,
+        target_project_slug: str | None = None,
+        validate_roles: bool = False,
+    ) -> None:
+        """Validate and cache all restore input before any state is changed."""
+        self.component_data.clear()
+        self.skipped_parameters.clear()
+        self.memory_data.clear()
+        self.memory_loaded = False
+        self.component_full_slugs = set()
+        self.component_slugs_by_length = []
+        self.component_repo_links = set()
+        self.component_vcs = {}
+        self.category_paths = set()
+        self.path_siblings = set()
+        self.name_siblings = set()
+        self.label_names = set()
+        self.validation_project = None
+        self.validate_zip_members(zipfile)
+        self.load_data(zipfile)
+        self.validate_project_objects(
+            target_project_name=target_project_name,
+            target_project_slug=target_project_slug,
+        )
+        self.load_memory(zipfile)
+        self.load_components(zipfile)
+        self.component_slugs_by_length = sorted(
+            self.component_full_slugs, key=len, reverse=True
+        )
+        self.validate_vcs_component_paths(zipfile)
+        self.validate_team_references(validate_roles=validate_roles)
 
     def restore_unit(
         self,
         item: dict,
         translation_lookup: dict[int, Translation],
-        source_unit_lookup: dict[int, Unit] | None = None,
+        source_unit_lookup: dict[int, int] | None = None,
     ) -> Unit:
         kwargs = item.copy()
         for skip in ("labels", "comments", "suggestions", "checks", "pending"):
             kwargs.pop(skip, None)
         kwargs["id_hash"] = checksum_to_hash(kwargs["id_hash"])
         kwargs["translation_id"] = translation_lookup[kwargs["translation_id"]].id
+        if source_unit_lookup is not None:
+            kwargs["source_unit_id"] = source_unit_lookup[item["id_hash"]]
         unit = Unit(**kwargs)
         unit.import_data = item
-        if source_unit_lookup is not None:
-            unit.source_unit = source_unit_lookup[item["id_hash"]]
         return unit
 
     def restore_user(self, username: str) -> User:
@@ -574,29 +2079,90 @@ class ProjectBackup:
             users.append(user)
         return users
 
+    def restore_team_members(
+        self, group: Group, members: list[str | dict[str, Any]]
+    ) -> None:
+        users: dict[str, User] = {}
+        limit_languages: dict[str, list[str]] = {}
+        for member in members:
+            if isinstance(member, str):
+                username = member
+                languages = []
+            else:
+                username = member["username"]
+                languages = member.get("limit_languages", [])
+            user = self.restore_user(username)
+            if user.username == settings.ANONYMOUS_USER_NAME:
+                continue
+            for language_code in dict.fromkeys(languages):
+                self.import_language(language_code)
+            if user.username in limit_languages and set(
+                limit_languages[user.username]
+            ) != set(languages):
+                warnings.warn(
+                    f"Conflicting language limits for {user.username!r} in backup.",
+                    stacklevel=2,
+                )
+            users[user.username] = user
+            limit_languages[user.username] = languages
+
+        with transaction.atomic():
+            user_list = list(users.values())
+            group.user_set.set(user_list)
+            memberships = list(
+                TeamMembership.objects.filter(
+                    group=group, user__in=user_list
+                ).select_related("user")
+            )
+            membership_ids = [membership.id for membership in memberships]
+            if not membership_ids:
+                return
+
+            through = TeamMembership.limit_languages.through
+            through.objects.filter(teammembership_id__in=membership_ids).delete()
+            through.objects.bulk_create(
+                through(teammembership_id=membership.id, language_id=language_id)
+                for membership in memberships
+                for language_id in sorted(
+                    {
+                        language.id
+                        for language in self.get_items_from_cache(
+                            self.languages_cache,
+                            limit_languages[membership.user.username],
+                        )
+                    }
+                )
+            )
+
     @staticmethod
     def get_items_from_cache(cache: dict[str, Any], keys: list[str]) -> list:
         return [value for key in keys if (value := cache.get(key))]
 
-    def restore_team(self, team: dict) -> None:
-        if team["name"] == "Administration":
-            group = Group.objects.get(name=team["name"], defining_project=self.project)
-        else:
-            group = Group(name=team["name"], defining_project=self.project)
+    def restore_team(self, team: dict, group: Group | None = None) -> None:
+        if group is None:
+            if self.project is None:
+                raise TypeError
+            group = Group(
+                name=team["name"],
+                defining_project=self.project,
+                internal=team.get("internal", False),
+                language_selection=team["language_selection"],
+                enforced_2fa=team["enforced_2fa"],
+            )
             group = Group.objects.bulk_create([group])[0]
+            group.projects.add(self.project)
 
         group.language_selection = team["language_selection"]
         group.enforced_2fa = team["enforced_2fa"]
+        group.save(update_fields=["language_selection", "enforced_2fa"])
 
         group.roles.set(self.get_items_from_cache(self.roles_cache, team["roles"]))
         group.components.set(
             self.get_items_from_cache(self.components_cache, team["components"])
         )
-        group.languages.set(
-            self.get_items_from_cache(self.languages_cache, team["languages"])
-        )
+        group.languages.set(self.import_language(code) for code in team["languages"])
         group.admins.set(self.restore_users(team["admins"]))
-        group.user_set.set(self.restore_users(team["members"]))
+        self.restore_team_members(group, team["members"])
 
         autogroups = [
             AutoGroup(match=match, group=group) for match in team["autogroups"]
@@ -604,62 +2170,433 @@ class ProjectBackup:
         AutoGroup.objects.bulk_create(autogroups)
 
     def restore_teams(self, data: list[dict]) -> None:
-        self.roles_cache = {r.name: r for r in Role.objects.all()}
+        self.roles_cache = {
+            role.name: role for role in Role.objects.assignable_to_project_team()
+        }
         self.create_language_cache()
-        for team in data:
-            self.restore_team(team)
+        if self.project is None:
+            raise TypeError
+        generated_teams = {
+            group.name: group
+            for group in self.project.defined_groups.filter(internal=True)
+        }
+        teams_by_name: dict[str, list[int]] = defaultdict(list)
+        for index, team in enumerate(data):
+            teams_by_name[team["name"]].append(index)
+        builtin_entries: set[int] = set()
+        for name, indexes in teams_by_name.items():
+            explicit = [
+                index for index in indexes if data[index].get("internal") is True
+            ]
+            if explicit:
+                builtin_entries.add(explicit[0])
+                continue
+            if (
+                name in generated_teams
+                and len(indexes) == 1
+                and "internal" not in data[indexes[0]]
+            ):
+                builtin_entries.add(indexes[0])
+            # Older duplicates have no team type, and roles can be customized.
+            # Keep every ambiguous entry editable rather than guess its type.
+        # Reserve built-in names even when a preceding custom entry has the
+        # same name and current settings did not generate the built-in team.
+        used_names = set(self.project.defined_groups.values_list("name", flat=True)) | {
+            data[index]["name"] for index in builtin_entries
+        }
+        # ruff: ignore[private-member-access]
+        allocator = TeamNameAllocator(
+            used_names | {team["name"] for team in data},
+            cast("int", Group._meta.get_field("name").max_length),
+        )
+        for index, team in enumerate(data):
+            name = team["name"]
+            is_builtin = index in builtin_entries
+            group = generated_teams.pop(name, None) if is_builtin else None
+            if not is_builtin and name in used_names:
+                new_name = allocator.allocate(name)
+                self.renamed_teams.append((name, new_name))
+                team = {**team, "name": new_name, "internal": False}
+            used_names.add(team["name"])
+            self.restore_team(team, group)
+
+    def get_restore_warnings(self) -> list[str]:
+        """Return user-facing warnings for all changes made during import."""
+        return (
+            [
+                gettext(
+                    "Component %(component)s was skipped because its linked repository is unavailable."
+                )
+                % {"component": component}
+                for component in self.skipped_components
+            ]
+            + get_team_rename_warnings(self.renamed_teams)
+            + [
+                (
+                    gettext(
+                        "Parameter %(parameter)s in %(family)s of %(component)s was skipped because it is unknown."
+                    )
+                    if unknown
+                    else gettext(
+                        "Parameter %(parameter)s in %(family)s of %(component)s was skipped because it is not applicable."
+                    )
+                )
+                % {
+                    "parameter": key,
+                    "family": (
+                        gettext("Version control parameters")
+                        if family == "vcs_params"
+                        else gettext("File format parameters")
+                    ),
+                    "component": component,
+                }
+                for component, family, key, unknown in self.skipped_parameters
+            ]
+        )
 
     def restore_pending_unit_changes(
         self,
         data: dict,
         *,
-        translation_lookup: dict,
-        source_units: list[Unit],
         units: list[Unit],
+        pending_unit_change_map: dict[tuple[int, int], list[dict]] | None = None,
     ) -> None:
         if "pending_unit_changes" in data:
-            all_units: dict[int, dict[int, Unit]] = defaultdict(dict)
-            for unit in chain(source_units, units):
-                all_units[unit.translation.id][unit.checksum] = unit
-
-            pending_unit_changes = []
-            for item in data["pending_unit_changes"]:
-                new_translation = translation_lookup[item["translation_id"]]
-                unit = all_units[new_translation.id][item["unit_id_hash"]]
-                pending_unit_changes.append(
-                    PendingUnitChange(
-                        unit=unit,
-                        author=self.restore_user(item["author"]),
-                        target=item["target"],
-                        explanation=item["explanation"],
-                        source_unit_explanation=item["source_unit_explanation"],
-                        timestamp=item["timestamp"],
-                        add_unit=item["add_unit"],
-                        state=item["state"],
+            pending_unit_changes: list[PendingUnitChange] = []
+            if pending_unit_change_map is None:
+                pending_unit_change_map = defaultdict(list)
+                for item in data["pending_unit_changes"]:
+                    pending_unit_change_map[
+                        item["translation_id"], item["unit_id_hash"]
+                    ].append(item)
+            for unit in units:
+                backup_unit = unit.import_data
+                pending_unit_changes.extend(
+                    (
+                        PendingUnitChange(
+                            unit=unit,
+                            author=self.restore_user(item["author"]),
+                            target=item["target"],
+                            explanation=item["explanation"],
+                            source_unit_explanation=item["source_unit_explanation"],
+                            timestamp=item["timestamp"],
+                            add_unit=item["add_unit"],
+                            state=item["state"],
+                        )
+                    )
+                    for item in pending_unit_change_map.get(
+                        (backup_unit["translation_id"], backup_unit["id_hash"]), []
                     )
                 )
         else:
+            pending_units = [unit for unit in units if unit.import_data.get("pending")]
+            if not pending_units:
+                return
+            anonymous_id = get_anonymous().pk
+            # django-stubs cannot track annotations returned by queryset helpers.
+            authors = dict(
+                Unit.objects.using(pending_units[0]._state.db or "default")  # type: ignore[misc]  # ruff: ignore[private-member-access]
+                .filter(pk__in=[unit.pk for unit in pending_units])
+                .with_last_content_author()
+                .values_list("pk", "last_content_author_id")
+            )
             pending_unit_changes = [
                 PendingUnitChange(
                     unit=unit,
-                    author=unit.get_last_content_change()[0],
+                    author_id=authors[unit.pk] or anonymous_id,
                     target=unit.target,
                     explanation=unit.explanation,
                     source_unit_explanation=unit.source_unit.explanation,
                     state=unit.state,
                     add_unit=unit.details.get("add_unit", False),
                 )
-                for unit in chain(source_units, units)
-                if unit.import_data.get("pending")
+                for unit in pending_units
             ]
 
         if pending_unit_changes:
-            PendingUnitChange.objects.bulk_create(pending_unit_changes)
+            PendingUnitChange.objects.bulk_create(
+                pending_unit_changes, batch_size=self.IMPORT_BATCH_SIZE
+            )
 
-    def restore_component(self, zipfile: ZipFile, data: dict) -> None:  # noqa: C901
+    def restore_unit_metadata(self, units: list[Unit]) -> None:
+        label_model = Unit.labels.through
+        for label_batch in batched(
+            (
+                label_model(unit=unit, label=self.labels_map[label])
+                for unit in units
+                for label in unit.import_data["labels"]
+            ),
+            self.IMPORT_BATCH_SIZE,
+        ):
+            label_model.objects.bulk_create(label_batch)
+
+        for comment_batch in batched(
+            (
+                Comment(unit=unit, **self.restore_with_user(comment))
+                for unit in units
+                for comment in unit.import_data["comments"]
+            ),
+            self.IMPORT_BATCH_SIZE,
+        ):
+            Comment.objects.bulk_create(comment_batch)
+
+        for check_batch in batched(
+            (
+                Check(unit=unit, **check)
+                for unit in units
+                for check in unit.import_data["checks"]
+            ),
+            self.IMPORT_BATCH_SIZE,
+        ):
+            Check.objects.bulk_create(check_batch)
+
+        for unit in units:
+            # Suggestions
+            if unit.import_data["suggestions"]:
+                suggestions = Suggestion.objects.bulk_create(
+                    Suggestion(
+                        unit=unit, **self.restore_with_user(suggestion, remove="votes")
+                    )
+                    for suggestion in unit.import_data["suggestions"]
+                )
+                suggestion_data = {
+                    item["target"]: item for item in unit.import_data["suggestions"]
+                }
+                for suggestion in suggestions:
+                    if suggestion_data[suggestion.target]["votes"]:
+                        # Ignore conflicts here as more users can be mapped to anonymous
+                        # in restore_user().
+                        Vote.objects.bulk_create(
+                            [
+                                Vote(
+                                    suggestion=suggestion,
+                                    **self.restore_with_user(vote),
+                                )
+                                for vote in suggestion_data[suggestion.target]["votes"]
+                            ],
+                            ignore_conflicts=True,
+                        )
+
+    def clear_unit_import_data(self, units: list[Unit]) -> None:
+        for unit in units:
+            unit.import_data = {}
+
+    def get_pending_unit_change_map(
+        self, data: dict
+    ) -> dict[tuple[int, int], list[dict]] | None:
+        if "pending_unit_changes" not in data:
+            return None
+
+        result: dict[tuple[int, int], list[dict]] = defaultdict(list)
+        for item in data["pending_unit_changes"]:
+            result[item["translation_id"], item["unit_id_hash"]].append(item)
+        return result
+
+    def restore_unit_batch(
+        self,
+        batch: list[Unit],
+        data: dict,
+        pending_unit_change_map: dict[tuple[int, int], list[dict]] | None,
+    ) -> list[Unit]:
+        if not batch:
+            return []
+
+        units = Unit.objects.bulk_create(batch, batch_size=self.IMPORT_BATCH_SIZE)
+        self.restore_unit_metadata(units)
+        self.restore_pending_unit_changes(
+            data,
+            units=units,
+            pending_unit_change_map=pending_unit_change_map,
+        )
+        self.clear_unit_import_data(units)
+        return units
+
+    def restore_source_unit_batch(
+        self,
+        batch: list[Unit],
+        data: dict,
+        pending_unit_change_map: dict[tuple[int, int], list[dict]] | None,
+        source_unit_lookup: dict[int, int],
+    ) -> None:
+        if not batch:
+            return
+
+        source_units = Unit.objects.bulk_create(
+            batch, batch_size=self.IMPORT_BATCH_SIZE
+        )
+        for unit in source_units:
+            unit.source_unit = unit
+        Unit.objects.filter(pk__in=[unit.pk for unit in source_units]).update(
+            source_unit_id=F("id")
+        )
+        source_unit_lookup.update(
+            {unit.checksum: unit.id for unit in source_units if unit.id is not None}
+        )
+        self.restore_unit_metadata(source_units)
+        self.restore_pending_unit_changes(
+            data,
+            units=source_units,
+            pending_unit_change_map=pending_unit_change_map,
+        )
+        self.clear_unit_import_data(source_units)
+
+    def restore_source_units(
+        self,
+        data: dict,
+        *,
+        translation_lookup: dict,
+        source_translation_id: int,
+        pending_unit_change_map: dict[tuple[int, int], list[dict]] | None,
+    ) -> dict[int, int]:
+        source_unit_lookup: dict[int, int] = {}
+        batch: list[Unit] = []
+        for item in data["units"]:
+            if item["translation_id"] != source_translation_id:
+                continue
+            batch.append(self.restore_unit(item, translation_lookup))
+            if len(batch) >= self.IMPORT_BATCH_SIZE:
+                self.restore_source_unit_batch(
+                    batch, data, pending_unit_change_map, source_unit_lookup
+                )
+                batch = []
+        self.restore_source_unit_batch(
+            batch, data, pending_unit_change_map, source_unit_lookup
+        )
+        return source_unit_lookup
+
+    def restore_translation_units(
+        self,
+        data: dict,
+        *,
+        translation_lookup: dict,
+        source_translation_id: int,
+        source_unit_lookup: dict[int, int],
+        pending_unit_change_map: dict[tuple[int, int], list[dict]] | None,
+    ) -> None:
+        batch: list[Unit] = []
+        for item in data["units"]:
+            if item["translation_id"] == source_translation_id:
+                continue
+            batch.append(
+                self.restore_unit(item, translation_lookup, source_unit_lookup)
+            )
+            if len(batch) >= self.IMPORT_BATCH_SIZE:
+                self.restore_unit_batch(batch, data, pending_unit_change_map)
+                batch = []
+        self.restore_unit_batch(batch, data, pending_unit_change_map)
+
+    def restore_memory(self, zipfile: ZipFile, project: Project) -> None:
+        memory = self.load_memory(zipfile)
+        memory_batch: list[Memory] = []
+        previous_identity: tuple[Any, ...] | None = None
+        restored: Memory | None = None
+
+        def flush_memory_batch() -> None:
+            with transaction.atomic():
+                Memory.objects.bulk_create(
+                    memory_batch, batch_size=self.IMPORT_BATCH_SIZE
+                )
+                MemoryScope.objects.bulk_create_for_memories(memory_batch)
+            memory_batch.clear()
+
+        # A memory row's project and project-file records are emitted next to
+        # each other by backup_memory(), while older backups contain at most one
+        # project scope per row. Keep the current row outside the write batch so
+        # both records merge even when they cross a batch boundary.
+        for entry in memory:
+            source_language = self.import_language(entry["source_language"])
+            target_language = self.import_language(entry["target_language"])
+            identity = (
+                source_language.pk,
+                target_language.pk,
+                entry["origin"],
+                entry["source"],
+                entry.get("context", ""),
+                entry["target"],
+                entry.get("status", Memory.STATUS_ACTIVE),
+            )
+            if restored is None or identity != previous_identity:
+                if restored is not None:
+                    memory_batch.append(restored)
+                    if len(memory_batch) >= self.IMPORT_BATCH_SIZE:
+                        flush_memory_batch()
+                restored = Memory(
+                    origin=entry["origin"],
+                    source=entry["source"],
+                    context=entry.get("context", ""),
+                    target=entry["target"],
+                    source_language=source_language,
+                    target_language=target_language,
+                    status=entry.get("status", Memory.STATUS_ACTIVE),
+                )
+                restored.pending_scopes = []
+                previous_identity = identity
+            pending_scopes = cast("list[MemoryScope]", restored.pending_scopes)
+            scope_type = (
+                MemoryScope.SCOPE_PROJECT_FILE
+                if entry.get("category") == CATEGORY_FILE
+                else MemoryScope.SCOPE_PROJECT
+            )
+            if not any(scope.scope == scope_type for scope in pending_scopes):
+                pending_scopes.append(
+                    MemoryScope(
+                        scope=scope_type,
+                        project=project,
+                    )
+                )
+
+        if restored is not None:
+            memory_batch.append(restored)
+        if memory_batch:
+            flush_memory_batch()
+
+        memory.clear()
+
+    @staticmethod
+    def get_accessible_linked_component(repo: str, actor: User) -> Component | None:
+        try:
+            linked_component = Component.objects.get_linked(repo)
+        except (Component.DoesNotExist, ValueError):
+            return None
+        if linked_component is None or linked_component.is_repo_link:
+            return None
+        if not actor.has_perm("component.edit", linked_component):
+            return None
+        return linked_component
+
+    def configure_restored_repository(self, component: Component) -> None:
+        if component.is_repo_link:
+            return
+        if self.full_slug_without_project(component) in self.restored_repositories:
+            component.configure_repo(pull=False)
+        else:
+            component.log_warning(
+                "repository metadata is missing or invalid in project backup; "
+                "restored available files and translation data"
+            )
+
+    def restore_component(
+        self, zipfile: ZipFile, data: dict, actor: User, changes: list[Change]
+    ) -> bool:
+        from weblate.trans.models.source import source_project_gate  # ruff: ignore[import-outside-top-level]
+
         if self.project is None:
             raise TypeError
+        with source_project_gate([self.project.pk], exclusive=True):
+            return self._restore_component(zipfile, data, actor, changes)
+
+    def _restore_component(
+        self,
+        zipfile: ZipFile,
+        data: dict,
+        actor: User,
+        changes: list[Change],
+    ) -> bool:
+        if self.project is None:
+            raise TypeError
+        original_slug = self.get_component_backup_slug(data["component"])
         kwargs = data["component"].copy()
+        self.import_inherited_settings(kwargs)
         source_language = kwargs["source_language"] = self.import_language(
             kwargs["source_language"]
         )
@@ -669,11 +2606,13 @@ class ProjectBackup:
             old_slug = f"weblate://{self.data['project']['slug']}/"
             new_slug = f"weblate://{self.project.slug}/"
             kwargs["repo"] = kwargs["repo"].replace(old_slug, new_slug)
-            # Update linked_component attribute
-            if kwargs["repo"].startswith(new_slug):
-                kwargs["linked_component"] = self.components_cache[
-                    kwargs["repo"].removeprefix(new_slug)
-                ]
+            linked_component = self.get_accessible_linked_component(
+                kwargs["repo"], actor
+            )
+            if linked_component is None:
+                self.skipped_components.append(original_slug)
+                return False
+            kwargs["linked_component"] = linked_component
 
         if "category" in kwargs:
             kwargs["category"] = self.categories_cache[kwargs["category"]]
@@ -687,6 +2626,15 @@ class ProjectBackup:
             using=None,
             update_fields=None,
         )
+
+        if component.file_format in {"po", "po-mono"} and (
+            "file_format_params" not in kwargs
+            or kwargs["file_format_params"].get("po_set_language_team") is None
+        ):
+            # fallback to project setting if not set in backup
+            component.file_format_params["po_set_language_team"] = (
+                self.set_language_team_project
+            )
         # Use bulk create to avoid triggering save() and any post_save signals
         component = Component.objects.bulk_create([component])[0]
 
@@ -718,6 +2666,7 @@ class ProjectBackup:
                 plural=plural,
                 revision=item["revision"],
             )
+            translation.sync_readonly_check_flag(save=False)
             translation.original_id = item["id"]
             if language == source_language:
                 source_translation_id = item["id"]
@@ -727,98 +2676,56 @@ class ProjectBackup:
             translation.original_id: translation for translation in translations
         }
 
-        # Create source units
-        source_units = [
-            self.restore_unit(item, translation_lookup)
-            for item in data["units"]
-            if item["translation_id"] == source_translation_id
-        ]
-        source_units = Unit.objects.bulk_create(source_units)
-        # Fix source unit links
-        for unit in source_units:
-            unit.source_unit = unit
-        Unit.objects.bulk_update(source_units, ["source_unit"])
-        source_unit_lookup = {unit.checksum: unit for unit in source_units}
+        pending_unit_change_map = self.get_pending_unit_change_map(data)
 
-        # Create translation units
-        units = [
-            self.restore_unit(item, translation_lookup, source_unit_lookup)
-            for item in data["units"]
-            if item["translation_id"] != source_translation_id
-        ]
-        units = Unit.objects.bulk_create(units)
-
-        # Apply metadata
-        for unit in chain(source_units, units):
-            # Labels
-            unit.labels.through.objects.bulk_create(
-                unit.labels.through(unit=unit, label=self.labels_map[label])
-                for label in unit.import_data["labels"]
-            )
-
-            # Comments
-            if unit.import_data["comments"]:
-                Comment.objects.bulk_create(
-                    Comment(unit=unit, **self.restore_with_user(comment))
-                    for comment in unit.import_data["comments"]
-                )
-
-            # Checks
-            if unit.import_data["checks"]:
-                Check.objects.bulk_create(
-                    Check(unit=unit, **check) for check in unit.import_data["checks"]
-                )
-
-            # Suggestions
-            if unit.import_data["suggestions"]:
-                suggestions = Suggestion.objects.bulk_create(
-                    Suggestion(
-                        unit=unit, **self.restore_with_user(suggestion, remove="votes")
-                    )
-                    for suggestion in unit.import_data["suggestions"]
-                )
-                suggestion_data = {
-                    item["target"]: item for item in unit.import_data["suggestions"]
-                }
-                for suggestion in suggestions:
-                    if suggestion_data[suggestion.target]["votes"]:
-                        # Ignore conflicts here as more users can be mapped to anonymous
-                        # in restore_user().
-                        Vote.objects.bulk_create(
-                            [
-                                Vote(
-                                    suggestion=suggestion,
-                                    **self.restore_with_user(vote),
-                                )
-                                for vote in suggestion_data[suggestion.target]["votes"]
-                            ],
-                            ignore_conflicts=True,
-                        )
-
-        self.restore_pending_unit_changes(
+        # Create source units first so translation units can link to them.
+        source_unit_lookup = self.restore_source_units(
             data,
             translation_lookup=translation_lookup,
-            source_units=source_units,
-            units=units,
+            source_translation_id=source_translation_id,
+            pending_unit_change_map=pending_unit_change_map,
         )
+
+        # Create translation units in batches to avoid keeping all Unit objects
+        # in memory for components with many languages.
+        self.restore_translation_units(
+            data,
+            translation_lookup=translation_lookup,
+            source_translation_id=source_translation_id,
+            source_unit_lookup=source_unit_lookup,
+            pending_unit_change_map=pending_unit_change_map,
+        )
+        data["units"].clear()
 
         # Create screenshots
         screenshots = []
         for item in data["screenshots"]:
-            handle = zipfile.open(os.path.join("screenshots", item["image"]))
             screenshot = Screenshot(
                 name=item["name"],
-                image=File(handle),
                 translation=translation_lookup[item["translation_id"]],
                 user=self.restore_user(item["user"]),
                 timestamp=item["timestamp"],
             )
+            member_name = f"screenshots/{item['image']}"
+            with zipfile.open(member_name) as handle:
+                restored_image = File(
+                    BytesIO(handle.read(settings.ALLOWED_ASSET_SIZE + 1)),
+                    name=os.path.basename(item["image"]),
+                )
+            image_name = normalize_screenshot_filename(restored_image)
+            restored_image.name = image_name
+            Screenshot.validate_image_file(restored_image)
+            screenshot.image.save(image_name, restored_image, save=False)
+            if screenshot.image.name is not None:
+                self.created_media.append(
+                    (screenshot.image.storage, screenshot.image.name)
+                )
             screenshot.import_data = item
-            screenshot.import_handle = handle
             screenshots.append(screenshot)
 
         screenshots = Screenshot.objects.bulk_create(screenshots)
         for screenshot in screenshots:
+            schedule_ocr(screenshot.pk)
             if screenshot.import_data["units"]:
                 screenshot.units.set(
                     screenshot.translation.unit_set.filter(
@@ -828,13 +2735,30 @@ class ProjectBackup:
                         ]
                     )
                 )
-            screenshot.import_handle.close()  # type: ignore[union-attr]
 
         # Trigger checks update, the implementation might have changed
-        component.schedule_update_checks()
+        transaction.on_commit(component.schedule_update_checks, robust=True)
+
+        self.configure_restored_repository(component)
+
+        from weblate.trans.models.source import reconcile_component_parents  # ruff: ignore[import-outside-top-level]
+
+        # Restored unit metadata can refer to workflows absent from the new project.
+        reconcile_component_parents(component)
+
+        changes.append(
+            Change(
+                component=component,
+                action=ActionEvents.COMPONENT_RESTORE,
+                user=actor,
+                author=actor,
+                details={"original_slug": original_slug},
+            )
+        )
 
         # Update cache
         self.components_cache[self.full_slug_without_project(component)] = component
+        return True
 
     def create_language_cache(self) -> None:
         if not self.languages_cache:
@@ -853,95 +2777,214 @@ class ProjectBackup:
     def restore_categories(
         self, categories: list[dict], parent_category: Category | None = None
     ) -> None:
-        category_objs = [
-            Category(
-                name=category["name"],
-                slug=category["slug"],
-                category=parent_category,
-                project=self.project,
-            )
-            for category in categories
-        ]
+        category_objs = []
+        child_categories = []
+        for category in categories:
+            kwargs = category.copy()
+            child_categories.append(kwargs.pop("categories"))
+            self.import_inherited_settings(kwargs)
+            kwargs["category"] = parent_category
+            kwargs["project"] = self.project
+            category_objs.append(Category(**kwargs))
         category_objs = Category.objects.bulk_create(category_objs)
-        for category, obj in zip(categories, category_objs, strict=False):
+        for nested_categories, obj in zip(
+            child_categories, category_objs, strict=False
+        ):
             self.categories_cache[self.full_slug_without_project(obj)] = obj
-            self.restore_categories(category["categories"], obj)
+            self.restore_categories(nested_categories, obj)
 
-    @transaction.atomic
     def restore(
         self,
         project_name: str,
         project_slug: str,
         user: User,
         billing: Billing | None = None,
+        workspace: Workspace | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> Project:
         if not self.filename:
             msg = "Need a filename string."
             raise ValueError(msg)
+        if not self.validated:
+            msg = "Project backup has to be validated before restore."
+            raise ValueError(msg)
+
+        self.skipped_components.clear()
+        self.renamed_teams.clear()
+        self.created_media.clear()
+        self.project = None
+        self.languages_cache.clear()
+        self.labels_map.clear()
+        self.components_cache.clear()
+        self.categories_cache.clear()
+        self.restored_repositories.clear()
+        project_path = Path(Project(name=project_name, slug=project_slug).full_path)
+        if project_path.exists():
+            raise ValidationError(
+                {"slug": [gettext("The project repository directory already exists.")]}
+            )
+
         with ZipFile(self.filename, "r") as zipfile:
-            self.load_data(zipfile)
-
-            # Create project
-            kwargs = self.data["project"].copy()
-            kwargs["name"] = project_name
-            kwargs["slug"] = project_slug
-            self.project = project = Project.objects.create(**kwargs)
-
-            # Handle billing and ACL (creating user needs access)
-            self.project.post_create(user, billing)
-
-            # Create labels
-            labels = Label.objects.bulk_create(
-                Label(project=project, **entry) for entry in self.data["labels"]
+            self.validate_archive(
+                zipfile,
+                target_project_name=project_name,
+                target_project_slug=project_slug,
+                validate_roles=True,
             )
-            self.labels_map = {label.name: label for label in labels}
-            if "categories" in self.data:
-                self.restore_categories(self.data["categories"], None)
-
-            # Import translation memory
-            memory = self.load_memory(zipfile)
-            Memory.objects.bulk_create(
-                [
-                    Memory(
-                        project=project,
-                        origin=entry["origin"],
-                        source=entry["source"],
-                        context=entry.get("context", ""),
-                        target=entry["target"],
-                        source_language=self.import_language(entry["source_language"]),
-                        target_language=self.import_language(entry["target_language"]),
-                        status=entry.get("status", Memory.STATUS_ACTIVE),
+            project_path_created = False
+            try:
+                project_path.mkdir(parents=True, exist_ok=False)
+                project_path_created = True
+                with transaction.atomic():
+                    project = self.restore_validated(
+                        zipfile,
+                        project_name,
+                        project_slug,
+                        user,
+                        billing=billing,
+                        workspace=workspace,
+                        progress_callback=progress_callback,
                     )
-                    for entry in memory
-                ]
+            except Exception:
+                restore_committed = (
+                    self.project is not None
+                    and self.project.pk is not None
+                    and Project.objects.filter(pk=self.project.pk).exists()
+                )
+                if not restore_committed:
+                    for storage, name in reversed(self.created_media):
+                        try:
+                            storage.delete(name)
+                        except Exception as error:
+                            warnings.warn(
+                                f"Could not remove restored media {name!r}: {error}",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                    if project_path_created and project_path.exists():
+                        remove_tree(project_path, ignore_errors=True)
+                raise
+
+        self.created_media.clear()
+        return project
+
+    def restore_validated(
+        self,
+        zipfile: ZipFile,
+        project_name: str,
+        project_slug: str,
+        user: User,
+        *,
+        billing: Billing | None,
+        workspace: Workspace | None,
+        progress_callback: Callable[[int, int], None] | None,
+    ) -> Project:
+        """Apply a fully validated restore plan inside a database transaction."""
+        workspace_id = workspace.pk if workspace is not None else None
+        if workspace_id is None and billing is not None:
+            workspace_id = billing.workspace_id
+        if workspace_id is not None and "weblate.billing" in settings.INSTALLED_APPS:
+            # ruff: ignore[import-outside-top-level]
+            from weblate.billing.models import Billing
+
+            billing = Billing.objects.lock_project_creation(workspace_id)
+        restore_changes: list[Change] = []
+
+        kwargs = self.data["project"].copy()
+        kwargs["name"] = project_name
+        kwargs["slug"] = project_slug
+        self.import_inherited_settings(kwargs)
+        if workspace is not None:
+            for field in INHERITABLE_COMPONENT_FLAGS:
+                kwargs[field] = False
+            kwargs["workspace"] = workspace
+        # The attribute is present in legacy backups prior to 5.17.1.
+        self.set_language_team_project = kwargs.pop("set_language_team", False)
+        self.project = project = Project.objects.create(**kwargs)
+
+        project.post_create(user, billing)
+
+        labels = Label.objects.bulk_create(
+            Label(project=project, **entry) for entry in self.data["labels"]
+        )
+        self.labels_map = {label.name: label for label in labels}
+        SavedSearch.objects.bulk_create(
+            SavedSearch(project=project, **entry)
+            for entry in self.data.get("saved_searches", [])
+        )
+        if "categories" in self.data:
+            self.restore_categories(self.data["categories"], None)
+
+        self.restore_memory(zipfile, project)
+
+        project_path = Path(project.full_path)
+        extracted_repositories: set[str] = set()
+
+        def skip_vcs_member(info: ZipInfo) -> bool:
+            if info.is_dir() or not info.filename.startswith(self.VCS_PREFIX):
+                return True
+            path = info.filename[self.VCS_PREFIX_LEN :]
+            component = self.get_vcs_component(path)
+            if component is None:
+                return True
+            repository_path = path.removeprefix(component).lstrip("/")
+            return path != os.path.normpath(path) or not self.is_safe_vcs_path(
+                repository_path, self.component_vcs[component]
             )
 
-            # Extract VCS
-            project_path = Path(project.full_path)
-            for name in zipfile.namelist():
-                if name.startswith(self.VCS_PREFIX):
-                    path = name[self.VCS_PREFIX_LEN :]
-                    # Skip potentially dangerous paths
-                    if path != os.path.normpath(path):
-                        continue
-                    targetpath = project_path / path
-                    # Make sure the directory exists
-                    targetpath.parent.mkdir(parents=True, exist_ok=True)
-                    with zipfile.open(name) as source, targetpath.open("wb") as target:
-                        copyfileobj(source, target)
-                    # Create possibly missing refs directory in .git, this is not restored as
-                    # all references are in packed_refs after `git gc`.
-                    if path.endswith(".git/packed-refs"):
-                        git_refs_dir = targetpath.parent / "refs"
-                        git_refs_dir.mkdir(parents=True, exist_ok=True)
+        def vcs_member_name(info: ZipInfo) -> str:
+            return info.filename[self.VCS_PREFIX_LEN :]
 
-            # Create components
-            self.load_components(zipfile, do_restore=True)
+        for info, targetpath in iter_safe_zip_members(
+            zipfile,
+            project_path,
+            skip_member=skip_vcs_member,
+            member_name=vcs_member_name,
+        ):
+            extract_zip_member(zipfile, info, targetpath)
+            component = self.get_vcs_component(vcs_member_name(info))
+            if component is not None:
+                extracted_repositories.add(component)
+            if vcs_member_name(info).endswith(".git/packed-refs"):
+                git_refs_dir = targetpath.parent / "refs"
+                git_refs_dir.mkdir(parents=True, exist_ok=True)
 
-            if "teams" in self.data:
-                self.restore_teams(self.data["teams"])
+        self.finalize_restored_repositories(project_path, extracted_repositories)
 
-        return self.project
+        self.load_components(
+            zipfile,
+            do_restore=True,
+            actor=user,
+            changes=restore_changes,
+            progress_callback=progress_callback,
+        )
+
+        # Components have to exist before restored memory can be attributed.
+        # ruff: ignore[import-outside-top-level]
+        from weblate.memory.tasks import attribute_memory_scope_queryset
+
+        attribute_memory_scope_queryset(
+            MemoryScope.objects.using("default").filter(
+                scope=MemoryScope.SCOPE_PROJECT,
+                project=project,
+                source_component__isnull=True,
+            )
+        )
+
+        if "teams" in self.data:
+            self.restore_teams(self.data["teams"])
+
+        restore_changes.append(
+            Change(
+                project=project,
+                action=ActionEvents.PROJECT_RESTORE,
+                user=user,
+                author=user,
+                details=self.get_restore_history_details(),
+            )
+        )
+        Change.objects.bulk_create(restore_changes, batch_size=500)
+        return project
 
     def store_for_import(self) -> str:
         backup_dir = data_path(PROJECTBACKUP_PREFIX) / "import"

@@ -9,14 +9,9 @@ Installing on Debian and Ubuntu
 
    apt install -y \
       libxml2-dev libxslt-dev libfreetype6-dev libjpeg-dev libz-dev libyaml-dev \
-      libffi-dev libcairo-dev gir1.2-pango-1.0 gir1.2-rsvg-2.0 libgirepository-2.0-dev \
+      libffi-dev \
       libacl1-dev liblz4-dev libzstd-dev libxxhash-dev libssl-dev libpq-dev libjpeg-dev build-essential \
       python3-gdbm python3-dev git
-
-.. hint::
-
-   Older distributions do not have ``libgirepository-2.0-dev``, use
-   ``libgirepository1.0-dev`` instead. See also :ref:`troubleshoot-pip-install`.
 
 .. include:: steps/install-system-optional.rst
 
@@ -36,8 +31,8 @@ Installing on Debian and Ubuntu
     # Web server option 2: Apache with ``mod_wsgi``
     apt install -y apache2 libapache2-mod-wsgi-py3
 
-    # Caching backend: Redis
-    apt install -y redis-server
+    # Caching backend: Valkey
+    apt install -y valkey-server
 
     # Database server: PostgreSQL
     apt install -y postgresql postgresql-contrib
@@ -45,7 +40,7 @@ Installing on Debian and Ubuntu
     # SMTP server
     apt install -y exim4
 
-    # Gettext for the msgmerge add-on
+    # Gettext tools for gettext POT/PO update add-ons
     apt install -y gettext
 
 .. include:: steps/install-uv.rst

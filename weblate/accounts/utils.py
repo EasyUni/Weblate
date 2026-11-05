@@ -5,12 +5,22 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Literal
+import time
+from datetime import timedelta
+from functools import wraps
+from typing import TYPE_CHECKING, Final, Literal
 
 from django.conf import settings
+from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q
+from django.http import HttpResponseBase, HttpResponseRedirect
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.http import urlencode
 from django.utils.translation import gettext
+from django_otp import DEVICE_ID_SESSION_KEY
 from django_otp.plugins.otp_static.models import StaticDevice
 from django_otp.plugins.otp_totp.models import TOTPDevice
 from django_otp_webauthn.helpers import WebAuthnHelper
@@ -19,27 +29,267 @@ from rest_framework.authtoken.models import Token
 from social_django.models import Code
 
 from weblate.accounts.models import AuditLog, VerifiedEmail
-from weblate.auth.models import AuthenticatedHttpRequest, User
+from weblate.auth.models import User
+from weblate.memory.models import Memory, MemoryScope
 from weblate.trans.signals import user_pre_delete
+from weblate.utils.email import email_key, email_key_expression
+from weblate.utils.token import get_token
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from django.http import HttpRequest
     from django_otp.models import Device
+
+    from weblate.accounts.types import DeviceType
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 SESSION_WEBAUTHN_AUDIT = "weblate:second_factor:webauthn_audit_log"
 SESSION_SECOND_FACTOR_USER = "weblate:second_factor:user"
+SESSION_SECOND_FACTOR_HASH = "weblate:second_factor:auth_hash"
+SESSION_SECOND_FACTOR_TIMESTAMP = "weblate:second_factor:timestamp"
 SESSION_SECOND_FACTOR_SOCIAL = "weblate:second_factor:social"
-SESSION_SECOND_FACTOR_TOTP = "weblate:second_factor:totp_key"
+SESSION_SECOND_FACTOR_TOTP = "weblate:second_factor:totp_device"
+SESSION_FIRST_FACTOR_GRANT = "weblate:first_factor:grant"
+SESSION_FIRST_FACTOR_SSO = "weblate:first_factor:sso"
+SESSION_SENSITIVE_FACTOR_GRANT = "weblate:sensitive:factor_grant"
+SESSION_FIRST_WEBAUTHN_NAME = "weblate:first_factor:webauthn_name"
+SESSION_EXPIRY_SCOPE = "weblate:session_expiry_scope"
+SESSION_EXPIRY_AGE = "weblate:session_expiry_age"
+SESSION_EXPIRY_REFRESHED = "weblate:session_expiry_refreshed"
+SESSION_EXPIRY_SCOPE_OIDC: Final = "oidc"
+SESSION_EXPIRY_SCOPE_2FA: Final = "2fa"
+SESSION_EXPIRY_SCOPE_LOGIN: Final = "login"
+SESSION_EXPIRY_SCOPE_AUTHENTICATED: Final = "authenticated"
+SESSION_EXPIRY_REFRESH_MIN_SECONDS = 60
+SESSION_EXPIRY_REFRESH_MAX_SECONDS = 86_400
+SESSION_EXPIRY_OIDC_SECONDS = 60
 
-DeviceType = Literal["totp", "webauthn", "recovery"]
+SECOND_FACTOR_VERIFY_SECONDS = 600
+FIRST_FACTOR_VERIFY_SECONDS = 600
+TOTP_ENROLLMENT_SECONDS = 24 * 60 * 60
+SessionExpiryScope = Literal["oidc", "2fa", "login", "authenticated"]
 
 
-def remove_user(user: User, request: AuthenticatedHttpRequest, **params) -> None:
+def has_recent_second_factor(
+    request: AuthenticatedHttpRequest, *, user: User | None = None
+) -> bool:
+    """Check whether a configured second factor was used recently in this session."""
+    user = user or request.user
+    if not user.is_authenticated or not user.profile.has_2fa:
+        return True
+    verification = request.session.get(SESSION_SECOND_FACTOR_TIMESTAMP)
+    if not isinstance(verification, dict) or verification.get("user") != user.pk:
+        return False
+    timestamp = verification.get("time")
+    return (
+        isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and timestamp + SECOND_FACTOR_VERIFY_SECONDS >= int(time.time())
+    )
+
+
+def has_recent_sensitive_verification(request: AuthenticatedHttpRequest) -> bool:
+    """Require fresh proof of an existing credential for a sensitive action."""
+    user = request.user
+    if not user.is_authenticated:
+        return False
+    if user.profile.has_2fa:
+        return has_recent_second_factor(request)
+    grant = request.session.get(SESSION_SENSITIVE_FACTOR_GRANT)
+    if not isinstance(grant, dict):
+        return False
+    timestamp = grant.get("time")
+    return (
+        isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and timestamp <= int(time.time())
+        and timestamp + FIRST_FACTOR_VERIFY_SECONDS >= int(time.time())
+        and grant.get("user") == user.pk
+        and grant.get("hash") == user.get_session_auth_hash()
+    )
+
+
+def grant_sensitive_verification(
+    request: AuthenticatedHttpRequest, *, user: User | None = None
+) -> None:
+    user = user or request.user
+    request.session[SESSION_SENSITIVE_FACTOR_GRANT] = {
+        "user": user.pk,
+        "hash": user.get_session_auth_hash(),
+        "time": int(time.time()),
+    }
+
+
+def valid_first_factor_sso_intent(
+    request: AuthenticatedHttpRequest, intent: object, provider: str
+) -> bool:
+    """Validate the session-bound intent before starting or completing SSO proof."""
+    if not request.user.is_authenticated or not isinstance(intent, dict):
+        return False
+    timestamp = intent.get("time")
+    association = intent.get("association")
+    now = int(time.time())
+    return (
+        isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and timestamp <= now <= timestamp + FIRST_FACTOR_VERIFY_SECONDS
+        and intent.get("user") == request.user.pk
+        and intent.get("hash") == request.user.get_session_auth_hash()
+        and intent.get("provider") == provider
+        and intent.get("target") in {"totp", "webauthn", "sensitive"}
+        and isinstance(association, int)
+        and request.user.social_auth.filter(pk=association, provider=provider).exists()
+        and not request.user.profile.has_2fa
+    )
+
+
+def grant_first_factor(request: AuthenticatedHttpRequest) -> None:
+    """Authorize first enrollment in this session after primary authentication."""
+    user = request.user
+    request.session[SESSION_FIRST_FACTOR_GRANT] = {
+        "user": user.pk,
+        "hash": user.get_session_auth_hash(),
+        "time": int(time.time()),
+    }
+
+
+def clear_pending_first_factor(request: AuthenticatedHttpRequest) -> None:
+    """Discard enrollment secrets created before primary reauthentication."""
+    TOTPDevice.objects.filter(user=request.user, confirmed=False).delete()
+    request.session.pop(SESSION_SECOND_FACTOR_TOTP, None)
+    request.session.pop("otp_webauthn_register_state", None)
+    request.session.pop(SESSION_FIRST_WEBAUTHN_NAME, None)
+    request.session.pop(SESSION_SECOND_FACTOR_TIMESTAMP, None)
+
+
+def has_first_factor_grant(request: AuthenticatedHttpRequest) -> bool:
+    """Check the short-lived, account-bound first-enrollment authorization."""
+    grant = request.session.get(SESSION_FIRST_FACTOR_GRANT)
+    if not isinstance(grant, dict) or not request.user.is_authenticated:
+        return False
+    timestamp = grant.get("time")
+    return (
+        isinstance(timestamp, int)
+        and not isinstance(timestamp, bool)
+        and timestamp <= int(time.time())
+        and timestamp + FIRST_FACTOR_VERIFY_SECONDS >= int(time.time())
+        and grant.get("user") == request.user.pk
+        and grant.get("hash") == request.user.get_session_auth_hash()
+    )
+
+
+def second_factor_verification_redirect(
+    request: AuthenticatedHttpRequest, next_url: str
+) -> HttpResponseRedirect:
+    """Start a fresh second-factor challenge for the current user."""
+    messages.info(
+        request,
+        gettext(
+            "Please confirm your identity using a second factor before proceeding."
+        ),
+    )
+    user = request.user
+    set_second_factor_session(request, user, "weblate.accounts.auth.WeblateUserBackend")
+    login_url = reverse(
+        "2fa-login", kwargs={"backend": user.profile.get_second_factor_type()}
+    )
+    return HttpResponseRedirect(f"{login_url}?{urlencode({'next': next_url})}")
+
+
+def sensitive_verification_redirect(
+    request: AuthenticatedHttpRequest, next_url: str
+) -> HttpResponseRedirect:
+    if request.user.profile.has_2fa:
+        return second_factor_verification_redirect(request, next_url)
+    messages.info(request, gettext("Please confirm your identity before proceeding."))
+    return HttpResponseRedirect(
+        f"{reverse('first-factor-verify')}?{urlencode({'target': 'sensitive', 'next': next_url})}"
+    )
+
+
+def require_sensitive_verification(
+    view: Callable[..., HttpResponseBase],
+) -> Callable[..., HttpResponseBase]:
+    @wraps(view)
+    def wrapped(
+        request: AuthenticatedHttpRequest, *args: object, **kwargs: object
+    ) -> HttpResponseBase:
+        if not has_recent_sensitive_verification(request):
+            return sensitive_verification_redirect(request, request.path)
+        return view(request, *args, **kwargs)
+
+    return wrapped
+
+
+def require_project_sensitive_verification(
+    view: Callable[..., HttpResponseBase],
+) -> Callable[..., HttpResponseBase]:
+    """Return project access POST actions to a GET page after verification."""
+
+    @wraps(view)
+    def wrapped(
+        request: AuthenticatedHttpRequest, *args: object, **kwargs: object
+    ) -> HttpResponseBase:
+        if not has_recent_sensitive_verification(request):
+            project = kwargs["project"]
+            return sensitive_verification_redirect(
+                request, reverse("manage-access", kwargs={"project": project})
+            )
+        return view(request, *args, **kwargs)
+
+    return wrapped
+
+
+def require_recent_second_factor(
+    view: Callable[..., HttpResponseBase],
+) -> Callable[..., HttpResponseBase]:
+    """Require a fresh second factor before an authenticated account action."""
+
+    @wraps(view)
+    def wrapped(
+        request: AuthenticatedHttpRequest, *args: object, **kwargs: object
+    ) -> HttpResponseBase:
+        if not has_recent_second_factor(request):
+            return second_factor_verification_redirect(request, request.path)
+        return view(request, *args, **kwargs)
+
+    return wrapped
+
+
+def create_api_token(user: User) -> Token:
+    """Create an API token for a user."""
+    return Token.objects.create(
+        user=user, key=get_token("wlp" if user.is_bot else "wlu")
+    )
+
+
+def delete_api_tokens(user: User) -> None:
+    """Delete all API tokens for a user."""
+    Token.objects.filter(user=user).delete()
+
+
+def reset_api_token(user: User) -> Token:
+    """Reset API token for a user."""
+    delete_api_tokens(user)
+    return create_api_token(user)
+
+
+def remove_user(
+    user: User,
+    request: AuthenticatedHttpRequest | None,
+    *,
+    activity: str = "removed",
+    **params,
+) -> None:
     """Remove user account."""
     # Send signal (to commit any pending changes)
     user_pre_delete.send(instance=user, sender=user.__class__)
 
     # Store activity log and notify
-    AuditLog.objects.create(user, request, "removed", **params)
+    if activity == "removed":
+        params["email"] = user.email
+    AuditLog.objects.create(user, request, activity, **params)
 
     # Remove any email validation codes
     invalidate_reset_codes(user)
@@ -68,7 +318,13 @@ def remove_user(user: User, request: AuthenticatedHttpRequest, **params) -> None
     user.administered_group_set.clear()
 
     # Remove user translation memory
-    user.memory_set.all().delete()
+    scope_query = Q(
+        scope__in=(MemoryScope.SCOPE_USER, MemoryScope.SCOPE_USER_FILE), user=user
+    )
+    Memory.objects.filter(
+        id__in=MemoryScope.objects.filter(scope_query).values("memory_id")
+    ).delete_scope(scope_query, delete_legacy=False)
+    Memory.objects.filter(legacy_user=user, scopes__isnull=True).delete()
 
     # Clear subscriptions
     user.subscription_set.all().delete()
@@ -93,16 +349,20 @@ def remove_user(user: User, request: AuthenticatedHttpRequest, **params) -> None
         profile.save()
 
     # Delete API tokens
-    Token.objects.filter(user=user).delete()
+    delete_api_tokens(user)
 
 
 def lock_user(
     user: User,
     reason: Literal["locked", "admin-locked"],
     request: AuthenticatedHttpRequest | None = None,
+    *,
+    regenerate_api_key: bool = True,
 ) -> None:
     user.set_unusable_password()
     user.save(update_fields=["password"])
+    if regenerate_api_key:
+        reset_api_token(user)
     AuditLog.objects.create(user, request, reason)
 
 
@@ -130,10 +390,17 @@ def get_all_user_mails(user: User, entries=None, filter_deliverable=True):
 
 
 def invalidate_reset_codes(user=None, entries=None, emails=None) -> None:
-    """Invalidate email activation codes for an user."""
+    """Invalidate email activation codes for a user."""
     if emails is None:
-        emails = get_all_user_mails(user, entries)
-    Code.objects.filter(email__in=emails).delete()
+        emails = get_all_user_mails(user, entries, filter_deliverable=False)
+    email_query = Q()
+    for email in emails:
+        if email:
+            email_query |= Q(normalized_email=email_key(email))
+    if email_query:
+        Code.objects.alias(normalized_email=email_key_expression("email")).filter(
+            email_query
+        ).delete()
 
 
 def cycle_session_keys(request: AuthenticatedHttpRequest, user: User) -> None:
@@ -146,31 +413,143 @@ def cycle_session_keys(request: AuthenticatedHttpRequest, user: User) -> None:
     # Change unusable password hash to be able to invalidate other sessions
     if not user.has_usable_password():
         user.set_unusable_password()
+        user.save(update_fields=["password"])
     # Cycle session key
     update_session_auth_hash(request, user)
 
 
+def get_session_expiry_refresh_seconds(expiry_age: int) -> int:
+    """Return how often authenticated session expiry should be refreshed."""
+    if expiry_age <= 1:
+        return 0
+    if expiry_age <= SESSION_EXPIRY_REFRESH_MIN_SECONDS:
+        return max(expiry_age // 2, 1)
+    return min(
+        expiry_age - SESSION_EXPIRY_REFRESH_MIN_SECONDS,
+        expiry_age // 2,
+        SESSION_EXPIRY_REFRESH_MAX_SECONDS,
+    )
+
+
+def get_session_expiry_scope(
+    *,
+    request: AuthenticatedHttpRequest,
+    user: User,
+    is_login: bool,
+) -> SessionExpiryScope:
+    """Return the session expiry scope for current authentication state."""
+    if request.session.get("oidc_only", False):
+        return SESSION_EXPIRY_SCOPE_OIDC
+    if (
+        user.profile.has_2fa
+        and DEVICE_ID_SESSION_KEY not in request.session
+        and not user.is_verified()
+    ):
+        return SESSION_EXPIRY_SCOPE_2FA
+
+    if is_login:
+        return SESSION_EXPIRY_SCOPE_LOGIN
+
+    return SESSION_EXPIRY_SCOPE_AUTHENTICATED
+
+
+def get_session_expiry_age(scope: SessionExpiryScope) -> int:
+    """Return session expiry age for a session scope."""
+    if scope == SESSION_EXPIRY_SCOPE_OIDC:
+        return SESSION_EXPIRY_OIDC_SECONDS
+    if scope == SESSION_EXPIRY_SCOPE_2FA:
+        return settings.SESSION_COOKIE_AGE_2FA
+    if scope == SESSION_EXPIRY_SCOPE_LOGIN:
+        return settings.SESSION_COOKIE_AGE
+    return settings.SESSION_COOKIE_AGE_AUTHENTICATED
+
+
+def should_update_session_expiry(
+    *,
+    request: AuthenticatedHttpRequest,
+    scope: SessionExpiryScope,
+    expiry_age: int,
+    now: int,
+    force: bool,
+) -> bool:
+    """Return whether session expiry metadata should be updated."""
+    if force:
+        return True
+    if request.session.get(SESSION_EXPIRY_SCOPE) != scope:
+        return True
+    if request.session.get(SESSION_EXPIRY_AGE) != expiry_age:
+        return True
+    if scope != SESSION_EXPIRY_SCOPE_AUTHENTICATED:
+        return False
+
+    refreshed = request.session.get(SESSION_EXPIRY_REFRESHED)
+    if not isinstance(refreshed, (int, float)):
+        return True
+    return now - refreshed >= get_session_expiry_refresh_seconds(expiry_age)
+
+
 def adjust_session_expiry(
-    request: AuthenticatedHttpRequest, *, is_login: bool = True
+    *,
+    request: AuthenticatedHttpRequest,
+    user: User,
+    is_login: bool = True,
+    scope: SessionExpiryScope | None = None,
+    force: bool = False,
 ) -> None:
     """
     Adjust session expiry based on scope.
 
     - Set longer expiry for authenticated users.
-    - Set short lived session for SAML authentication flow.
+    - Set short lived sessions for identity-provider authentication flows.
     """
-    if "saml_only" not in request.session:
-        if is_login:
-            next_url = request.POST.get("next", request.GET.get("next"))
-            request.session["saml_only"] = next_url == "/idp/login/process/"
-        else:
-            request.session["saml_only"] = False
+    if scope is None:
+        scope = get_session_expiry_scope(
+            request=request,
+            user=user,
+            is_login=is_login,
+        )
+    expiry_age = get_session_expiry_age(scope)
+    now = int(time.time())
+    if not should_update_session_expiry(
+        request=request,
+        scope=scope,
+        expiry_age=expiry_age,
+        now=now,
+        force=force or is_login,
+    ):
+        return
 
-    if request.session["saml_only"]:
-        # Short lived session for SAML authentication only
-        request.session.set_expiry(60)
+    if scope == SESSION_EXPIRY_SCOPE_OIDC:
+        request.session.set_expiry(timezone.now() + timedelta(seconds=expiry_age))
     else:
-        request.session.set_expiry(settings.SESSION_COOKIE_AGE_AUTHENTICATED)
+        request.session.set_expiry(expiry_age)
+    request.session[SESSION_EXPIRY_SCOPE] = scope
+    request.session[SESSION_EXPIRY_AGE] = expiry_age
+    request.session[SESSION_EXPIRY_REFRESHED] = now
+
+
+def set_second_factor_session(
+    request: HttpRequest,
+    user: User,
+    backend: str,
+    *,
+    social: bool = False,
+) -> None:
+    request.session[SESSION_SECOND_FACTOR_USER] = (user.id, backend)
+    request.session[SESSION_SECOND_FACTOR_HASH] = user.get_session_auth_hash()
+    if social:
+        request.session[SESSION_SECOND_FACTOR_SOCIAL] = True
+    else:
+        request.session.pop(SESSION_SECOND_FACTOR_SOCIAL, None)
+
+
+def clear_second_factor_session(
+    request: HttpRequest, *, preserve_social: bool = False
+) -> None:
+    request.session.pop(SESSION_SECOND_FACTOR_USER, None)
+    request.session.pop(SESSION_SECOND_FACTOR_HASH, None)
+    if not preserve_social:
+        request.session.pop(SESSION_SECOND_FACTOR_SOCIAL, None)
 
 
 def get_key_name(device: Device) -> str:
@@ -191,6 +570,14 @@ def get_key_name(device: Device) -> str:
         device_label = gettext("Authentication app (%s)")
 
     return device_label % device_id
+
+
+def get_totp_device_label(device: TOTPDevice) -> str:
+    """Display a TOTP app with its stable device ID."""
+    return gettext("%(name)s (#%(id)s)") % {
+        "name": device.name or gettext("Authentication app"),
+        "id": device.pk,
+    }
 
 
 def get_key_type(device: Device) -> DeviceType:

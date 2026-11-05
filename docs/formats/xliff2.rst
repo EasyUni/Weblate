@@ -1,0 +1,60 @@
+XLIFF 2.0
+---------
+
+.. versionadded:: 5.15
+
+.. versionchanged:: 2026.9
+
+.. include:: /snippets/format-in-development.rst
+
+.. note::
+
+   :doc:`/formats/xliff` is a different format and is not compatible with XLIFF 2.0.
+
+XML-based format created to standardize translation files, but in the end it
+is one of `many standards <https://xkcd.com/927/>`_, in this area.
+
+`XML Localization Interchange File Format (XLIFF) 2.0` is currently only supported as bilingual.
+
+
+Weblate supports XLIFF 2.0 as a single file format. Placeables handling is
+controlled by the ``xliff_placeables`` :ref:`file_format_params`:
+
+* :guilabel:`Plain text` — escape XML elements in the content (the historical
+  default for existing XLIFF 2.0 components).
+* :guilabel:`Placeables` — preserve placeables and other XML elements (the
+  default for new components). Tags then appear as placeholders in the editor.
+
+.. seealso::
+
+    * `XML Localization Interchange File Format (XLIFF) 2.0`_ specification
+    * `XLIFF on Wikipedia <https://en.wikipedia.org/wiki/XLIFF>`_
+    * :doc:`tt:formats/xliff`
+    * :ref:`file_format_params`
+
+.. _XML Localization Interchange File Format (XLIFF) 2.0: https://docs.oasis-open.org/xliff/xliff-core/v2.0/xliff-core-v2.0.html
+
+Example files
++++++++++++++
+
+Example XLIFF file:
+
+.. literalinclude:: ../../weblate/trans/tests/data/cs.xliff2
+    :language: xml
+
+.. include:: /snippets/format-features/xliff2-features.rst
+
+Weblate configuration
++++++++++++++++++++++
+
++-----------------------------------------------------------------------+
+| Typical Weblate :ref:`component`                                      |
++================================+======================================+
+| File mask                      | ``localizations/*.xliff``            |
++--------------------------------+--------------------------------------+
+| Monolingual base language file | `Empty`                              |
++--------------------------------+--------------------------------------+
+| Template for new translations  | ``localizations/en-US.xliff``        |
++--------------------------------+--------------------------------------+
+| File format                    | `XLIFF 2.0 Translation File`         |
++--------------------------------+--------------------------------------+

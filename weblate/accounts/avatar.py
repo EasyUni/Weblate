@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import hashlib
-import os.path
+from pathlib import Path
 from ssl import CertificateError
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
+import httpx2
 from django.conf import settings
 from django.contrib.staticfiles import finders
 from django.core.cache import InvalidCacheBackendError, caches
@@ -16,14 +17,17 @@ from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.translation import gettext, pgettext
 
+from weblate.accounts.visibility import can_view_profile, public_profile_render
 from weblate.utils.errors import report_error
-from weblate.utils.requests import request
+from weblate.utils.requests import fetch_url
 
 if TYPE_CHECKING:
+    from django.contrib.auth.models import AnonymousUser
+
     from weblate.auth.models import User
 
 
-def avatar_for_email(email, size=80) -> str:
+def avatar_for_email(email: str, username: str, size: int = 80) -> str:
     """Generate url for avatar."""
     # Safely handle blank e-mail
     if not email:
@@ -33,28 +37,35 @@ def avatar_for_email(email, size=80) -> str:
 
     querystring = urlencode({"d": settings.AVATAR_DEFAULT_IMAGE, "s": str(size)})
 
-    return f"{settings.AVATAR_URL_PREFIX}avatar/{mail_hash}?{querystring}"
+    return settings.AVATAR_URL_TEMPLATE.format(
+        AVATAR_URL_PREFIX=settings.AVATAR_URL_PREFIX,
+        mail_hash=mail_hash,
+        querystring=querystring,
+        username=quote(username),
+        size=size,
+    )
 
 
-def get_fallback_avatar_url(size: int, name: Literal["weblate", "api"] = "weblate"):
+def get_fallback_avatar_url(
+    size: int, name: Literal["weblate", "api"] = "weblate"
+) -> str:
     """Return URL of fallback avatar."""
-    return os.path.join(settings.STATIC_URL, f"{name}-{size}.png")
+    return f"{settings.STATIC_URL.rstrip('/')}/{name}-{size}.png"
 
 
-def get_fallback_avatar(size: int):
+def get_fallback_avatar(size: int) -> bytes:
     """Return fallback avatar."""
     filename = finders.find(f"weblate-{size}.png")
     if filename is None:
         msg = f"Missing fallback avatar file for {size=}!"
         raise OSError(msg)
-    with open(filename, "rb") as handle:
-        return handle.read()
+    return Path(filename).read_bytes()
 
 
-def get_avatar_image(user: User, size: int):
+def get_avatar_image(user: User, size: int) -> bytes:
     """Return avatar image from cache (if available) or download it."""
     username = user.username
-    cache_key = "-".join(("avatar-img", username, str(size)))
+    cache_key = f"avatar-img-{username}-{size!s}"
 
     # Try using avatar specific cache if available
     try:
@@ -65,29 +76,51 @@ def get_avatar_image(user: User, size: int):
     image = cache.get(cache_key)
     if image is None:
         try:
-            image = download_avatar_image(user.email, size)
+            image = download_avatar_image(user.email, username, size)
             cache.set(cache_key, image)
-        except (OSError, CertificateError):
+        except (OSError, CertificateError, httpx2.HTTPError):
             report_error(f"Could not fetch avatar for {username}")
             return get_fallback_avatar(size)
 
     return image
 
 
-def download_avatar_image(email: str, size: int):
+def download_avatar_image(email: str, username: str, size: int) -> bytes:
     """Download avatar image from remote server."""
-    url = avatar_for_email(email, size)
-    response = request("get", url, timeout=1.0)
+    url = avatar_for_email(email, username, size)
+    response = fetch_url("get", url, timeout=1.0)
     return response.content
 
 
-def get_user_display(user: User, icon: bool = True, link: bool = False):
+def get_user_avatar_url(
+    user: User | None,
+    size: int = 32,
+    *,
+    viewer: User | AnonymousUser | None = None,
+) -> str:
+    """Return an avatar URL accessible to the viewer."""
+    if (
+        user is None
+        or not can_view_profile(viewer, user)
+        or user.email == "noreply@weblate.org"
+    ):
+        return get_fallback_avatar_url(size)
+    return reverse("user_avatar", kwargs={"user": user.username, "size": size})
+
+
+@public_profile_render()
+def get_user_display(
+    user: User | None,
+    icon: bool = True,
+    link: bool = False,
+    *,
+    viewer: User | AnonymousUser | None = None,
+) -> str:
     """Nicely format user for display."""
     # Did we get any user?
     if user is None:
         # None user, probably remotely triggered action
         username = full_name = pgettext("No known user", "None")
-        email = "noreply@weblate.org"
     else:
         # Get basic info
         username = user.username
@@ -103,10 +136,7 @@ def get_user_display(user: User, icon: bool = True, link: bool = False):
 
     # Icon requested?
     if icon and settings.ENABLE_AVATARS:
-        if email == "noreply@weblate.org":
-            avatar = get_fallback_avatar_url(32)
-        else:
-            avatar = reverse("user_avatar", kwargs={"user": user.username, "size": 32})
+        avatar = get_user_avatar_url(user, viewer=viewer)
 
         username = format_html(
             '<img src="{}" class="avatar w32" loading="lazy" alt="{}" /> {}',
@@ -115,7 +145,7 @@ def get_user_display(user: User, icon: bool = True, link: bool = False):
             username,
         )
 
-    if link and user is not None:
+    if link and user is not None and can_view_profile(viewer, user):
         return format_html(
             '<a href="{}" title="{}" class="user-link"><span>{}</span></a>',
             user.get_absolute_url(),

@@ -4,61 +4,334 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import math
 import os
 import time
 import warnings
-from contextlib import contextmanager
-from datetime import timedelta
-from typing import TYPE_CHECKING, Literal, cast, overload
+from contextlib import contextmanager, suppress
+from copy import deepcopy
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from unittest.mock import patch
+from urllib.parse import urlencode
 
 from django.conf import settings
 from django.core import mail
+from django.core.cache import cache
+from django.core.files import File
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.core.handlers.wsgi import WSGIRequest
+from django.db import transaction
+from django.http import HttpRequest
+from django.template.loader import render_to_string
 from django.test.utils import modify_settings, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.functional import cached_property
+from lxml import etree
+from PIL import Image
 from selenium import webdriver
 from selenium.common.exceptions import (
-    ElementNotVisibleException,
+    ElementClickInterceptedException,
+    ElementNotInteractableException,
     NoSuchElementException,
+    TimeoutException,
     WebDriverException,
 )
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.remote.remote_connection import RemoteConnection
 from selenium.webdriver.support.expected_conditions import (
+    element_to_be_clickable,
+    invisibility_of_element_located,
     presence_of_element_located,
     staleness_of,
+    visibility_of_element_located,
 )
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
-from weblate.fonts.tests.utils import FONT
+from weblate.auth.models import AutoGroup, Group, Role, User
+from weblate.automation.addon import AutomationAddon
+from weblate.fonts.tests.utils import FONT, FONT_SOURCE
+from weblate.gitexport.models import get_export_url
 from weblate.lang.models import Language
-from weblate.screenshots.views import ensure_tesseract_language
+from weblate.machinery.base import MACHINERY_DEFAULT_THRESHOLD
+from weblate.machinery.dummy import DummyTranslation
+from weblate.machinery.models import MachineryExclusion, MachineryInstallation
+from weblate.machinery.weblatetm import WeblateTranslation
+from weblate.memory.machine import WeblateMemory
+from weblate.memory.models import Memory
+from weblate.metrics.models import Metric
+from weblate.metrics.wrapper import MetricsWrapper
+from weblate.screenshots.models import Screenshot, ScreenshotOCR
+from weblate.screenshots.ocr import ensure_tesseract_language
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Change, Component, Project, Translation, Unit
+from weblate.trans.models import (
+    Announcement,
+    Change,
+    Component,
+    ComponentList,
+    ContributorAgreement,
+    Project,
+    Report,
+    Suggestion,
+    Translation,
+    Unit,
+)
+from weblate.trans.tests.browser import create_browser
+from weblate.trans.tests.github import github_fixture_repositories
+from weblate.trans.tests.selenium_fixtures import (
+    ReusableSeleniumDemoMixin,
+    reuse_demo_fixture,
+)
 from weblate.trans.tests.test_models import BaseLiveServerTestCase
 from weblate.trans.tests.test_views import RegistrationTestMixin
 from weblate.trans.tests.utils import (
+    RepoTestMixin,
     TempDirMixin,
+    clear_users_cache,
+    create_another_user,
     create_test_billing,
     create_test_user,
+    get_test_actor,
     get_test_file,
     social_core_override_settings,
 )
-from weblate.utils.db import TransactionsTestMixin
-from weblate.vcs.ssh import get_key_data
-from weblate.wladmin.models import ConfigurationError, SupportStatus
+from weblate.trans.views.about import FALLBACK_STATS, DonateView
+from weblate.trans.widgets import WIDGETS
+from weblate.utils.change_origin import acting_user_context
+from weblate.utils.const import SUPPORT_STATUS_CACHE_KEY
+from weblate.utils.data import data_dir
+from weblate.utils.files import remove_tree
+from weblate.utils.hash import hash_to_checksum
+from weblate.utils.ratelimit import reset_rate_limit
+from weblate.utils.state import STATE_EMPTY, STATE_FUZZY, STATE_TRANSLATED
+from weblate.utils.stats import GlobalStats, ProjectLanguage, WorkspaceLanguage
+from weblate.vcs.base import RepositoryError
+from weblate.vcs.git import LocalRepository
+from weblate.vcs.ssh import ssh_file
+from weblate.wladmin.models import BackupService, ConfigurationError, SupportStatus
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from selenium.webdriver.remote.webdriver import WebDriver
     from selenium.webdriver.remote.webelement import WebElement
 
-    from weblate.auth.models import User
+    from weblate.machinery.types import DownloadTranslations
+    from weblate.utils.stats import BaseStats
+
+
+class SeleniumDummyTranslation(DummyTranslation):
+    """Dummy machine translation for Selenium hotkey tests."""
+
+    name = "Selenium Dummy"
+
+    def download_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit,
+        user,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        _ = (source_language, target_language, unit, user, threshold)
+        yield {
+            "text": "initial machinery 1",
+            "quality": self.max_score,
+            "service": self.name,
+            "source": text,
+        }
+        yield {
+            "text": "initial machinery 2",
+            "quality": self.max_score,
+            "service": self.name,
+            "source": text,
+        }
+
+
+class SeleniumMergeTranslation(DummyTranslation):
+    """Dummy machine translation returning results which merge into single rows."""
+
+    name = "Selenium Merge"
+
+    def download_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit,
+        user,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        _ = (source_language, target_language, unit, user, threshold)
+        # Same text and source merges into a single row, the context is carried
+        # by the lower quality result in both possible orders.
+        yield {
+            "text": "merged target A",
+            "quality": 95,
+            "service": self.name,
+            "source": text,
+            "context": "context.a",
+        }
+        yield {
+            "text": "merged target A",
+            "quality": 100,
+            "service": self.name,
+            "source": text,
+        }
+        yield {
+            "text": "merged target B",
+            "quality": 100,
+            "service": self.name,
+            "source": text,
+        }
+        yield {
+            "text": "merged target B",
+            "quality": 95,
+            "service": self.name,
+            "source": text,
+            "context": "context.b",
+        }
+        # A better result has to take over the place of the row it replaces
+        # instead of being appended after the worse ones.
+        yield {
+            "text": "reordered target",
+            "quality": 90,
+            "service": self.name,
+            "source": text,
+        }
+        yield {
+            "text": "lower target",
+            "quality": 85,
+            "service": self.name,
+            "source": text,
+        }
+        yield {
+            "text": "reordered target",
+            "quality": 95,
+            "service": self.name,
+            "source": text,
+        }
+
+
+class SeleniumEmptyTranslation(DummyTranslation):
+    """Dummy machine translation which never returns any result."""
+
+    name = "Selenium Empty"
+
+    def download_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit,
+        user,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        _ = (source_language, target_language, text, unit, user, threshold)
+        return
+        yield
+
+
+class SeleniumScoredTranslation(DummyTranslation):
+    """Dummy machine translation reporting a quality score as the memory does."""
+
+    name = "Selenium Memory"
+
+    def download_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit,
+        user,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        _ = (source_language, target_language, unit, user, threshold)
+        yield {
+            "text": "machinery target",
+            "quality": 100,
+            "service": self.name,
+            "source": text,
+            "show_quality": True,
+            "origin": "Project: WeblateOrg/Django",
+            "context": "machinery.context",
+        }
+
+
+class SeleniumEngineTranslation(DummyTranslation):
+    """Dummy machine translation without any quality score."""
+
+    name = "Selenium Engine"
+
+    def download_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit,
+        user,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        _ = (source_language, target_language, unit, user, threshold)
+        # The first result merges into the scored one from the memory
+        yield {
+            "text": "machinery target",
+            "quality": 90,
+            "service": self.name,
+            "source": text,
+        }
+        yield {
+            "text": "another machinery target",
+            "quality": 85,
+            "service": self.name,
+            "source": text,
+        }
+
+
+class SeleniumOriginsTranslation(DummyTranslation):
+    """Dummy machine translation finding a result in many origins."""
+
+    name = "Selenium Origins"
+
+    def download_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit,
+        user,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        _ = (source_language, target_language, unit, user, threshold)
+        for index, quality in enumerate((90, 95, 100, 80, 85, 75, 70)):
+            yield {
+                "text": "machinery target",
+                "quality": quality,
+                "service": self.name,
+                "source": text,
+                "show_quality": True,
+                "origin": f"Component {index}",
+            }
+        # The same origin repeated, for example for another plural form
+        yield {
+            "text": "machinery target",
+            "quality": 100,
+            "service": self.name,
+            "source": text,
+            "show_quality": True,
+            "origin": "Component 2",
+        }
+
 
 TEST_BACKENDS = (
     "social_core.backends.email.EmailAuth",
@@ -72,20 +345,44 @@ TEST_BACKENDS = (
     "weblate.accounts.auth.WeblateUserBackend",
 )
 
-SOURCE_FONT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-    "static",
-    "js",
-    "vendor",
-    "fonts",
-    "font-source",
-    "TTF",
-    "SourceSans3-Bold.ttf",
+SCREENSHOT_SITE_DOMAIN = "weblate.example.com"
+SCREENSHOT_DATE = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+SCREENSHOT_GIT_REVISION = "0123456789abcdef0123456789abcdef01234567"
+SCREENSHOT_GIT_LINK = (
+    f"https://github.com/WeblateOrg/weblate/commits/{SCREENSHOT_GIT_REVISION}"
 )
+SELENIUM_GPG_KEY_ID = "B17C8337FA04DF8D4D3569AF882B2A22730AAF03"
+SELENIUM_SSH_KEY_FIXTURES = (
+    ("id_rsa.pub", "selenium-keys/id_rsa.pub"),
+    ("id_ed25519.pub", "selenium-keys/id_ed25519.pub"),
+)
+PERFORMANCE_REPORT_DISK_USAGE = SimpleNamespace(
+    total=1024 * 1024 * 1024 * 1024,
+    used=400 * 1024 * 1024 * 1024,
+    free=624 * 1024 * 1024 * 1024,
+)
+PERFORMANCE_REPORT_HEADERS = {
+    "Host": SCREENSHOT_SITE_DOMAIN,
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Selenium screenshot browser",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
+    "Referer": f"http://{SCREENSHOT_SITE_DOMAIN}/",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "en,en-US;q=0.9",
+}
 
 
+@override_settings(STATS_LAZY=False)
 class SeleniumTests(
-    TransactionsTestMixin, BaseLiveServerTestCase, RegistrationTestMixin, TempDirMixin
+    ReusableSeleniumDemoMixin,
+    BaseLiveServerTestCase,
+    RegistrationTestMixin,
+    TempDirMixin,
 ):
     _driver: WebDriver | None = None
     _driver_error: str = ""
@@ -93,69 +390,93 @@ class SeleniumTests(
     site_domain = ""
 
     @contextmanager
-    def wait_for_page_load(self, timeout: int = 30) -> Iterator[None]:
+    def wait_for_page_load(self, timeout: int = 30) -> Generator[None, None, None]:
         old_page = self.driver.find_element(By.TAG_NAME, "html")
-        yield
+        success = False
         try:
-            WebDriverWait(self.driver, timeout).until(staleness_of(old_page))
+            yield
+            success = True
+        finally:
+            if success:
+                try:
+                    WebDriverWait(self.driver, timeout).until(staleness_of(old_page))
+                except WebDriverException:
+                    # Retry the same condition to workaround issue in
+                    # Chromedriver/Selenium, see
+                    # https://github.com/SeleniumHQ/selenium/issues/15401
+                    time.sleep(0.1)
+                    WebDriverWait(self.driver, timeout).until(staleness_of(old_page))
+                WebDriverWait(self.driver, timeout).until(self.is_page_loaded)
+
+    @staticmethod
+    def is_page_loaded(driver: WebDriver) -> bool:
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    if (document.readyState !== "complete") {
+                        return false;
+                    }
+                    if (!document.querySelector('meta[name="argon2id-worker-url"]')) {
+                        return true;
+                    }
+                    const status = {
+                        slugify: typeof window.slugify !== "undefined",
+                        DateRangePicker: typeof window.DateRangePicker !== "undefined",
+                        getNumber: typeof window.getNumber === "function",
+                        quoteSearch: typeof window.quoteSearch === "function",
+                        compareCells: typeof window.compareCells === "function",
+                    };
+                    return Object.values(status).every(Boolean);
+                    """
+                )
+            )
         except WebDriverException:
-            # Retry the same condition to workaround issue in Chomedriver/Selenium, see
-            # https://github.com/SeleniumHQ/selenium/issues/15401
-            time.sleep(0.1)
-            WebDriverWait(self.driver, timeout).until(staleness_of(old_page))
+            return False
 
     @classmethod
     def setUpClass(cls) -> None:
         # Screenshots storage
         if not os.path.exists(cls.image_path):
             os.makedirs(cls.image_path)
-        # Build Chrome driver
-        options = Options()
-        # Run headless
-        options.add_argument("--headless=new")
-        # Seems to help in some corner cases, see
-        # https://stackoverflow.com/a/50642913/225718
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-
-        # Force Chrome in English
-        options.add_argument("--lang=en")
-        # Accept English as primary language, this does not seem to work
-        options.add_experimental_option("prefs", {"intl.accept_languages": "en,en_US"})
-
-        # Need to revert fontconfig custom config for starting chrome
-        backup_fc = os.environ.get("FONTCONFIG_FILE")
-        if backup_fc is not None:
-            del os.environ["FONTCONFIG_FILE"]
-
-        # Force English locales, the --lang and accept_language settings does not
-        # work in some cases
-        backup_lang = os.environ.get("LANG")
-        os.environ["LANG"] = "en_US.UTF-8"
-
         try:
-            cls._driver = webdriver.Chrome(options=options)
+            cls._driver = create_browser()
         except WebDriverException as error:
             cls._driver_error = str(error)
             if "CI_SELENIUM" in os.environ:
                 raise
-
-        # Restore custom fontconfig settings
-        if backup_fc is not None:
-            os.environ["FONTCONFIG_FILE"] = backup_fc
-        # Restore locales
-        if backup_lang is None:
-            del os.environ["LANG"]
         else:
-            os.environ["LANG"] = backup_lang
+            # Increase webdriver timeout to avoid occasional errors in CI
+            cls._driver.command_executor.client_config.timeout = 300
+            cls._driver.execute_cdp_cmd(
+                "Network.setCacheDisabled", {"cacheDisabled": True}
+            )
+            cls._driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+            # Track in-flight fetch() requests so screenshots can wait for AJAX
+            cls._driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": """
+                    (() => {
+                        window.__weblateActiveFetches = 0;
+                        const original = window.fetch;
+                        if (typeof original !== "function" || original.__weblateWrapped) {
+                            return;
+                        }
+                        const wrapped = (...args) => {
+                            window.__weblateActiveFetches += 1;
+                            return original.apply(window, args).finally(() => {
+                                window.__weblateActiveFetches -= 1;
+                            });
+                        };
+                        wrapped.__weblateWrapped = true;
+                        window.fetch = wrapped;
+                    })();
+                    """
+                },
+            )
 
         if cls._driver is not None:
-            # Increase webdriver timeout to avoid occasssional errors
-            # in macos CI
-            if isinstance(cls._driver.command_executor, RemoteConnection):
-                cls._driver.command_executor.set_timeout(240)
-
             cls._driver.implicitly_wait(5)
 
         # Configure verbose logging to be shown in case of the test failure
@@ -177,8 +498,17 @@ class SeleniumTests(
 
     def setUp(self) -> None:
         super().setUp()
-        self.driver.get("{}{}".format(self.live_server_url, reverse("home")))
+        # TransactionTestCase replaces users between tests; cached prototypes
+        # must refer to the current database before the live server handles requests.
+        clear_users_cache()
+        self.driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+        self.driver.execute_cdp_cmd(
+            "Storage.clearDataForOrigin",
+            {"origin": self.live_server_url, "storageTypes": "local_storage"},
+        )
         self.driver.set_window_size(1200, 1024)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('home')}")
         self.site_domain = settings.SITE_DOMAIN
         settings.SITE_DOMAIN = f"{self.host}:{self.server_thread.port}"
 
@@ -193,21 +523,542 @@ class SeleniumTests(
             cls._driver.quit()
             cls._driver = None
 
+    @override_settings(
+        BOT_PROTECTION_ENABLED=True,
+        BOT_PROTECTION_CHALLENGE_AGE=300,
+        CACHES={
+            "default": {
+                "BACKEND": "django.core.cache.backends.redis.RedisCache",
+                "LOCATION": "redis://localhost:6379/0",
+            }
+        },
+        BOT_PROTECTION_CRAWLER_RULES={},
+        BOT_PROTECTION_UNWANTED_AGENTS=[],
+        BOT_PROTECTION_EXEMPT_PATHS=[],
+        LANGUAGE_CODE="en",
+    )
+    def test_bot_protection(self) -> None:
+        """Capture the anonymous challenge with a stable feature tip and status."""
+        tip = "Press ? in the translation editor to discover keyboard shortcuts."
+        self.driver.delete_all_cookies()
+        # The live server starts before method-level settings overrides. Rebuild
+        # its middleware so bot protection observes this test's configuration.
+        handler = self.server_thread.httpd.get_app()
+        original_chains = []
+        while True:
+            original_chains.append((handler, handler._middleware_chain))  # ruff: ignore[private-member-access]
+            handler.load_middleware()
+            if not hasattr(handler, "application"):
+                break
+            handler = handler.application
+        self.driver.execute_cdp_cmd(
+            "Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-color-scheme", "value": "light"}]},
+        )
+        # Hold only the proof worker pending so real verification cannot navigate
+        # away or update the attempt count while the screenshot is captured.
+        script = self.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+                const OriginalWorker = window.Worker;
+                window.Worker = class extends OriginalWorker {
+                    constructor(url, options) {
+                        if (new URL(url, location.href).pathname.endsWith('/js/bot-worker.js')) {
+                            return { postMessage() {}, terminate() {} };
+                        }
+                        super(url, options);
+                    }
+                };
+                """
+            },
+        )
+        try:
+            with patch("weblate.utils.bot_protection.random.choice", return_value=tip):
+                self.driver.get(f"{self.live_server_url}/?language=en")
+                self.wait_for_screenshot_ready()
+                self.assert_text_contains("h1", "Checking your browser")
+                self.assert_text_contains("#pow-tip", tip)
+                self.assert_text_contains("#pow-status", "Working…")
+                self.assertTrue(
+                    self.driver.find_element(By.ID, "pow-retry").is_displayed()
+                )
+                self.assertTrue(
+                    self.driver.find_element(By.LINK_TEXT, "Sign in").is_displayed()
+                )
+                self.screenshot("bot-protection.png")
+        finally:
+            for handler, chain in original_chains:
+                handler._middleware_chain = chain  # ruff: ignore[private-member-access]
+            self.driver.execute_cdp_cmd(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                {"identifier": script["identifier"]},
+            )
+            self.driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"features": []})
+
     def scroll_top(self) -> None:
-        self.driver.execute_script("window.scrollTo(0, 0)")
+        self.driver.execute_script(
+            "window.scrollTo({top: 0, left: 0, behavior: 'instant'})"
+        )
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.execute_script(
+                "return window.scrollX === 0 && window.scrollY === 0"
+            )
+        )
+
+    def assert_text_contains(self, css_selector: str, text: str) -> None:
+        """Assert the element matching css_selector contains text."""
+        self.assertIn(
+            text,
+            self.driver.find_element(By.CSS_SELECTOR, css_selector).text,
+        )
+
+    def install_selenium_ssh_keys(self) -> None:
+        """Install deterministic display-only SSH keys for screenshots."""
+        for filename, fixture in SELENIUM_SSH_KEY_FIXTURES:
+            path = ssh_file(filename)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                Path(get_test_file(fixture)).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+    def clear_project_stats_cache(self, project: Project) -> None:
+        """Drop stats cache entries that can survive the flushed test database."""
+        translations = list(
+            Translation.objects.filter(component__project=project).select_related(
+                "language"
+            )
+        )
+        stats = [
+            project.stats,
+            *(component.stats for component in project.component_set.all()),
+            *(translation.stats for translation in translations),
+            *(
+                ProjectLanguage(project, language).stats
+                for language in {translation.language for translation in translations}
+            ),
+        ]
+        cache.delete_many({stat.cache_key for stat in stats})
+
+    def clear_weblateorg_fixture_path(self) -> None:
+        """Drop VCS state left by earlier flushed Selenium tests."""
+        remove_tree(os.path.join(data_dir("vcs"), "weblateorg"), ignore_errors=True)
+
+    def populate_global_activity_metrics(self) -> None:
+        """Create deterministic metric rows for the generated activity history."""
+        today = timezone.now().date()
+        scope = Metric.SCOPE_GLOBAL
+        relation = 0
+        cache.delete(GlobalStats().cache_key)
+        Metric.objects.filter_metric(scope, relation).delete()
+
+        wrapper = MetricsWrapper(None, scope, relation)
+        cache_keys = []
+        activity_months = []
+        last_month_date = today.replace(day=1) - timedelta(days=1)
+        month = last_month_date.month
+        year = last_month_date.year
+        for _unused in range(12):
+            activity_months.append((year, month))
+            cache_keys.extend(
+                (
+                    wrapper.get_month_cache_key(year, month),
+                    wrapper.get_month_cache_key(year - 1, month),
+                )
+            )
+            month -= 1
+            if month < 1:
+                month = 12
+                year -= 1
+        cache.delete_many(cache_keys)
+
+        Metric.objects.bulk_create(
+            [
+                Metric(
+                    scope=scope,
+                    relation=relation,
+                    secondary=0,
+                    date=date(year, month, 15),
+                    changes=18 + position * 6,
+                )
+                for position, (year, month) in enumerate(reversed(activity_months))
+            ]
+            + [
+                Metric(
+                    scope=scope,
+                    relation=relation,
+                    secondary=0,
+                    date=date(year - 1, month, 15),
+                    changes=8 + position * 3,
+                )
+                for position, (year, month) in enumerate(reversed(activity_months))
+            ]
+        )
+        Metric.objects.collect_global()
+
+    def count_elements(self, css_selector: str) -> int:
+        """Return the count of elements matching css_selector on the current page."""
+        return len(self.driver.find_elements(By.CSS_SELECTOR, css_selector))
+
+    def find_elements_now(self, by: str, value: str) -> list[WebElement]:
+        """Inspect an already settled page without waiting for absent elements."""
+        implicit_wait = self.driver.timeouts.implicit_wait
+        self.driver.implicitly_wait(0)
+        try:
+            return self.driver.find_elements(by, value)
+        finally:
+            self.driver.implicitly_wait(implicit_wait)
+
+    def assert_labeled_control(self, htmlid: str, label_text: str) -> None:
+        """Assert a form control has a visible label associated by ID."""
+        self.driver.find_element(By.ID, htmlid)
+        labels = self.driver.find_elements(By.CSS_SELECTOR, f'label[for="{htmlid}"]')
+        self.assertTrue(labels, f"Missing label for #{htmlid}")
+        self.assertTrue(
+            any(label_text in label.text for label in labels),
+            f"Missing label text {label_text!r} for #{htmlid}",
+        )
+
+    def wait_for_ajax_tab(
+        self, tab_target: str, expected_text: str, timeout: int = 30
+    ) -> None:
+        """Wait for AJAX-loaded tab content to be rendered."""
+        WebDriverWait(self.driver, timeout).until(
+            lambda driver: driver.execute_script(
+                """
+                const tabTarget = arguments[0];
+                const expectedText = arguments[1];
+                const tab = Array.from(
+                    document.querySelectorAll(
+                        '[data-bs-toggle="tab"][data-bs-target]',
+                    ),
+                ).find(
+                    (element) =>
+                        element.getAttribute("data-bs-target") === tabTarget,
+                );
+                const content = document.querySelector(tabTarget);
+                if (!tab || !content) {
+                    return false;
+                }
+                const text = content.textContent || "";
+                return Boolean(tab.dataset.loaded) &&
+                    !text.includes("Loading") &&
+                    text.includes(expectedText);
+                """,
+                tab_target,
+                expected_text,
+            )
+        )
+
+    def get_stable_naturaltime_timestamp(self) -> datetime:
+        """Return a recent timestamp that renders consistently in screenshots."""
+        return timezone.now() - timedelta(minutes=1)
+
+    def stabilize_stats_timestamp(self, stats: BaseStats) -> None:
+        """Freeze an existing stats cache timestamp for screenshots."""
+        data = stats.load().copy()
+        if not data:
+            return
+        data["stats_timestamp"] = self.get_stable_naturaltime_timestamp().timestamp()
+        stats.set_data(data)
+        stats.save(update_parents=False)
+
+    def stabilize_global_stats_timestamp(self) -> None:
+        """Freeze global stats cache timestamp for activity screenshots."""
+        self.stabilize_stats_timestamp(GlobalStats())
+
+    def use_screenshot_site_domain_for_git_export(self, component: Component) -> None:
+        """Store the displayed Git export URL with the screenshot domain."""
+        with override_settings(SITE_DOMAIN=SCREENSHOT_SITE_DOMAIN, ENABLE_HTTPS=False):
+            component.git_export = get_export_url(component)
+            component.save(update_fields=("git_export",))
+
+    @contextmanager
+    def stable_git_revision(self) -> Generator[None, None, None]:
+        """Use deterministic Git revision text in management screenshots."""
+        with (
+            patch("weblate.wladmin.views.GIT_LINK", SCREENSHOT_GIT_LINK),
+            patch("weblate.wladmin.views.GIT_REVISION", SCREENSHOT_GIT_REVISION),
+        ):
+            yield
+
+    def wait_for_screenshot_ready(self, timeout: int = 10) -> None:
+        """Wait for browser-side rendering that can affect screenshots."""
+        WebDriverWait(self.driver, timeout).until(self.is_page_loaded)
+        self.driver.execute_script(
+            """
+            for (const image of document.images) {
+                if (image.loading === "lazy") {
+                    image.loading = "eager";
+                }
+            }
+            """
+        )
+        self.driver.execute_async_script(
+            """
+            const done = arguments[0];
+            if (!document.fonts) {
+                done(true);
+                return;
+            }
+            document.fonts.ready.then(() => done(true), () => done(false));
+            """
+        )
+        WebDriverWait(self.driver, timeout).until(
+            lambda driver: driver.execute_script(
+                """
+                const imagesLoaded = Array.from(document.images).every((image) => {
+                    const source = image.getAttribute("src");
+                    return !source || (image.complete && image.naturalWidth > 0);
+                });
+                const ajaxIdle =
+                    typeof window.__weblateActiveFetches === "undefined" ||
+                    window.__weblateActiveFetches === 0;
+                const loadingIdle = Array.from(
+                    document.querySelectorAll('[id^="loading-"]')
+                ).every((element) => {
+                    const style = getComputedStyle(element);
+                    return (
+                        style.display === "none" ||
+                        style.visibility === "hidden" ||
+                        Number(style.opacity) === 0 ||
+                        element.offsetParent === null
+                    );
+                });
+                const animationsIdle =
+                    !document.getAnimations ||
+                    document.getAnimations({ subtree: true }).every((animation) => {
+                        const target = animation.effect?.target;
+                        if (!(target instanceof Element)) {
+                            return true;
+                        }
+                        const style = getComputedStyle(target);
+                        if (
+                            style.display === "none" ||
+                            style.visibility === "hidden" ||
+                            Number(style.opacity) === 0
+                        ) {
+                            return true;
+                        }
+                        const timing = animation.effect.getComputedTiming();
+                        return (
+                            timing.iterations === Infinity ||
+                            !["pending", "running"].includes(animation.playState)
+                        );
+                    });
+                return imagesLoaded && ajaxIdle && loadingIdle && animationsIdle;
+                """
+            )
+        )
+        self.driver.execute_async_script(
+            """
+            const done = arguments[0];
+            let lastSnapshot = null;
+            let stableFrames = 0;
+
+            function snapshot() {
+                const body = document.body;
+                const doc = document.documentElement;
+                return [
+                    window.scrollX,
+                    window.scrollY,
+                    body?.scrollWidth,
+                    body?.scrollHeight,
+                    body?.offsetWidth,
+                    body?.offsetHeight,
+                    doc?.scrollWidth,
+                    doc?.scrollHeight,
+                    doc?.offsetWidth,
+                    doc?.offsetHeight,
+                    doc?.clientWidth,
+                    doc?.clientHeight,
+                ].join(":");
+            }
+
+            function check() {
+                const currentSnapshot = snapshot();
+                if (currentSnapshot === lastSnapshot) {
+                    stableFrames += 1;
+                } else {
+                    stableFrames = 0;
+                    lastSnapshot = currentSnapshot;
+                }
+                if (stableFrames >= 3) {
+                    done(true);
+                    return;
+                }
+                requestAnimationFrame(check);
+            }
+
+            requestAnimationFrame(check);
+            """
+        )
 
     def screenshot(self, name: str) -> None:
         """Capture named full page screenshot."""
+        self.driver.set_window_size(1200, 1024)
+        self.wait_for_screenshot_ready()
         self.scroll_top()
-        # Get window and document dimensions
-        scroll_height = self.driver.execute_script("return document.body.scrollHeight")
-        scroll_width = self.driver.execute_script("return document.body.scrollWidth")
-        # Resize the window
-        self.driver.set_window_size(max(1200, scroll_width), scroll_height + 180)
-        time.sleep(0.2)
-        # Get screenshot
-        with open(os.path.join(self.image_path, name), "wb") as handle:
-            handle.write(self.driver.get_screenshot_as_png())
+        dimensions = self.driver.execute_script(
+            """
+            const body = document.body;
+            const doc = document.documentElement;
+            return {
+                width: Math.max(
+                    body.scrollWidth,
+                    body.offsetWidth,
+                    body.clientWidth,
+                    doc.scrollWidth,
+                    doc.offsetWidth,
+                    doc.clientWidth
+                ),
+                height: Math.max(
+                    body.scrollHeight,
+                    body.offsetHeight,
+                    doc.scrollHeight,
+                    doc.offsetHeight
+                ),
+            };
+            """
+        )
+        self.driver.set_window_size(
+            max(1200, math.ceil(dimensions["width"])),
+            math.ceil(dimensions["height"] + 180),
+        )
+        self.wait_for_screenshot_ready()
+        self.scroll_top()
+        Path(os.path.join(self.image_path, name)).write_bytes(
+            self.driver.get_screenshot_as_png()
+        )
+
+    def screenshot_viewport(self, name: str, width: int, height: int = 1024) -> None:
+        """
+        Capture screenshot of a fixed size viewport.
+
+        Unlike screenshot(), the window is not grown to fit the whole document,
+        so that responsive layout and scrollbars are captured as the user sees
+        them at the given width.
+        """
+        self.driver.set_window_size(width, height)
+        self.wait_for_screenshot_ready()
+        self.scroll_top()
+        Path(os.path.join(self.image_path, name)).write_bytes(
+            self.driver.get_screenshot_as_png()
+        )
+
+    def use_live_server_widget_preview(self) -> None:
+        """Load widget preview from the live server while displaying public URLs."""
+        protocol = "https" if settings.ENABLE_HTTPS else "http"
+        display_site_url = f"{protocol}://{SCREENSHOT_SITE_DOMAIN}"
+        self.driver.execute_script(
+            """
+            const image = document.getElementById("widget-image");
+            if (image !== null) {
+                image.src = image.src.replace(arguments[0], arguments[1]);
+            }
+            """,
+            display_site_url,
+            self.live_server_url,
+        )
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.execute_script(
+                """
+                const image = document.getElementById("widget-image");
+                return image === null || (image.complete && image.naturalWidth > 0);
+                """
+            )
+        )
+
+    def screenshot_widget(self, name: str) -> None:
+        """Capture a widget preview for visual comparison in Argos CI."""
+        self.use_live_server_widget_preview()
+        self.wait_for_screenshot_ready()
+        widget = self.driver.find_element(By.ID, "widget-image")
+        Path(os.path.join(self.image_path, f"widget-{name}.png")).write_bytes(
+            widget.screenshot_as_png
+        )
+
+    @contextmanager
+    def stable_performance_report_inputs(self) -> Generator[None, None, None]:
+        """Use deterministic server-side values for the performance screenshot."""
+        original_wsgi_request_init = WSGIRequest.__init__
+        missing = object()
+        original_celery_encoding = cache.get("celery_encoding", missing)
+        original_celery_latency = cache.get("celery_latency", missing)
+        cache.set("celery_encoding", ("utf-8", "utf-8"))
+        cache.set("celery_latency", 3)
+
+        def wsgi_request_init(request, environ) -> None:
+            original_wsgi_request_init(request, environ)
+            request.META["REMOTE_ADDR"] = "127.0.0.1"
+
+        def get_host(_request) -> str:
+            return SCREENSHOT_SITE_DOMAIN
+
+        def is_secure(_request) -> bool:
+            return False
+
+        def measure_database_latency() -> int:
+            return 5
+
+        def measure_cache_latency() -> int:
+            return 1
+
+        try:
+            with (
+                override_settings(
+                    SITE_DOMAIN=SCREENSHOT_SITE_DOMAIN, ENABLE_HTTPS=False
+                ),
+                patch.object(WSGIRequest, "__init__", wsgi_request_init),
+                patch.object(
+                    HttpRequest,
+                    "headers",
+                    new=property(lambda _: PERFORMANCE_REPORT_HEADERS.copy()),
+                ),
+                patch.object(HttpRequest, "get_host", get_host),
+                patch.object(HttpRequest, "is_secure", is_secure),
+                patch(
+                    "weblate.wladmin.views.disk_usage",
+                    return_value=PERFORMANCE_REPORT_DISK_USAGE,
+                ),
+                patch(
+                    "weblate.wladmin.views.get_queue_stats",
+                    return_value={
+                        "backup": 0,
+                        "celery": 0,
+                        "memory": 0,
+                        "notify": 0,
+                        "translate": 0,
+                    },
+                ),
+                patch(
+                    "weblate.wladmin.views.measure_database_latency",
+                    measure_database_latency,
+                ),
+                patch(
+                    "weblate.wladmin.views.measure_cache_latency",
+                    measure_cache_latency,
+                ),
+                patch(
+                    "weblate.wladmin.views.get_database_size",
+                    return_value=123456789,
+                ),
+                patch(
+                    "weblate.wladmin.views.get_database_disk_usage",
+                    return_value=None,
+                ),
+            ):
+                yield
+        finally:
+            if original_celery_encoding is missing:
+                cache.delete("celery_encoding")
+            else:
+                cache.set("celery_encoding", original_celery_encoding)
+            if original_celery_latency is missing:
+                cache.delete("celery_latency")
+            else:
+                cache.set("celery_latency", original_celery_latency)
 
     def click(self, element: WebElement | str = "", htmlid: str | None = None) -> None:
         """Click on element and scroll it into view."""
@@ -217,23 +1068,113 @@ class SeleniumTests(
             if isinstance(element, str):
                 element = self.driver.find_element(By.LINK_TEXT, element)
         except NoSuchElementException:
-            print(self.driver.page_source)  # noqa: T201
+            # ruff: ignore[print]
+            print(self.driver.page_source)
             raise
 
-        try:
+        def click_when_ready(driver: WebDriver) -> bool:
+            if not element_to_be_clickable(element)(driver):
+                return False
+            # Bootstrap enables smooth scrolling. Finish scrolling before the
+            # native click so WebDriver does not race an ongoing scroll.
+            driver.execute_script(
+                """
+                arguments[0].scrollIntoView({
+                    behavior: "instant", block: "center", inline: "nearest"
+                });
+                """,
+                element,
+            )
             element.click()
-        except ElementNotVisibleException:
-            self.actions.move_to_element(element).perform()
-            element.click()
+            return True
 
-    def upload_file(self, element: WebElement, filename: str) -> None:
-        filename = os.path.abspath(filename)
-        if not os.path.exists(filename):
+        try:
+            WebDriverWait(
+                self.driver,
+                timeout=10,
+                ignored_exceptions=(
+                    ElementClickInterceptedException,
+                    ElementNotInteractableException,
+                ),
+            ).until(click_when_ready)
+        except TimeoutException as error:
+            try:
+                state = self.driver.execute_script(
+                    """
+                    const target = arguments[0];
+                    const style = getComputedStyle(target);
+                    return {
+                        activeTabs: Array.from(
+                            document.querySelectorAll('.tab-pane.active'),
+                            pane => pane.id
+                        ),
+                        target: {
+                            id: target.id,
+                            pane: target.closest('.tab-pane')?.id,
+                            rect: target.getBoundingClientRect().toJSON(),
+                            display: style.display,
+                            visibility: style.visibility,
+                            disabled: target.matches(':disabled')
+                        },
+                        scroll: {x: window.scrollX, y: window.scrollY},
+                        viewport: {width: innerWidth, height: innerHeight}
+                    };
+                    """,
+                    element,
+                )
+            except WebDriverException as diagnostic_error:
+                error.add_note(f"Could not inspect click target: {diagnostic_error}")
+            else:
+                error.add_note(f"Click state: {state}")
+            raise
+
+    def select_component_license(self, license_id: str) -> None:
+        inherit_license = self.driver.find_element(By.ID, "id_inherit_license")
+        if inherit_license.is_selected():
+            self.click(inherit_license)
+        Select(self.driver.find_element(By.ID, "id_license")).select_by_value(
+            license_id
+        )
+
+    def upload_file(self, element: WebElement, filename: str | Path) -> None:
+        name: str
+        exists: bool
+        if isinstance(filename, Path):
+            name = filename.as_posix()
+            exists = filename.exists()
+        else:
+            name = os.path.abspath(filename)
+            exists = os.path.exists(filename)
+        if not exists:
             msg = f"Test file not found: {filename}"
             raise ValueError(msg)
-        element.send_keys(filename)
+        element.send_keys(name)
 
-    def do_login(self, *, create: bool = True, superuser: bool = False) -> User:
+    def set_image_clipboard(self, filename: str | Path) -> None:
+        image = base64.b64encode(Path(filename).read_bytes()).decode("ascii")
+        error = self.driver.execute_async_script(
+            """
+            const image = Uint8Array.from(atob(arguments[0]), (byte) =>
+                byte.charCodeAt(0),
+            );
+            const done = arguments[arguments.length - 1];
+            navigator.clipboard.write([
+                new ClipboardItem({
+                    "image/png": new Blob([image], {type: "image/png"}),
+                }),
+            ]).then(() => done(null), (exception) => done(String(exception)));
+            """,
+            image,
+        )
+        self.assertIsNone(error, error)
+
+    @overload
+    def do_login(self, *, create: Literal[False], superuser: bool = False) -> None: ...
+    @overload
+    def do_login(
+        self, *, create: Literal[True] = True, superuser: bool = False
+    ) -> User: ...
+    def do_login(self, *, create=True, superuser=False):
         # login page
         with self.wait_for_page_load():
             self.click(htmlid="login-button")
@@ -262,6 +1203,18 @@ class SeleniumTests(
             self.click(self.driver.find_element(By.XPATH, '//input[@value="Sign in"]'))
         return user
 
+    def confirm_sensitive_password(self) -> None:
+        """Complete the browser step-up before sensitive Selenium operations."""
+        url = reverse("first-factor-verify")
+        query = urlencode({"target": "sensitive", "next": reverse("home")})
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{url}?{query}")
+        self.driver.find_element(By.ID, "id_password").send_keys("testpassword")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+            )
+
     @overload
     def open_manage(self, *, login: Literal[True] = True) -> User: ...
     @overload
@@ -287,11 +1240,3199 @@ class SeleniumTests(
             self.click("Django admin interface")
         return user
 
+    def test_automatic_translation_task_errors(self) -> None:
+        task_id = "01234567-89ab-cdef-0123-456789abcdef"
+        task_url = reverse("api:task-detail", kwargs={"pk": task_id})
+        markup = render_to_string(
+            "message.html",
+            {
+                "task_id": task_id,
+                "message": "Automatic translation in progress",
+                "tags": "success",
+                "progress": 0,
+            },
+        )
+        result = {
+            "completed": True,
+            "progress": 100,
+            "result": {
+                "message": "Automatic translation completed with errors, 1 string was updated.",
+                "errors": ["Dummy (batch 1): <img src=x onerror=alert(1)>"],
+                "warnings": ["A translation warning."],
+            },
+        }
+        source = (
+            """
+            const taskUrl = TASK_URL;
+            const originalFetch = window.fetch;
+            window.fetch = (url, ...args) => url === taskUrl
+                ? Promise.resolve(new Response(JSON.stringify(TASK_RESULT)))
+                : originalFetch(url, ...args);
+            const observer = new MutationObserver(() => {
+                if (document.body) {
+                    observer.disconnect();
+                    document.body.insertAdjacentHTML("afterbegin", TASK_MARKUP);
+                }
+            });
+            observer.observe(document, {childList: true, subtree: true});
+        """.replace("TASK_URL", json.dumps(task_url))
+            .replace("TASK_RESULT", json.dumps(result))
+            .replace("TASK_MARKUP", json.dumps(markup))
+        )
+        script = self.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": source}
+        )
+        try:
+            with self.wait_for_page_load():
+                self.driver.get(f"{self.live_server_url}{reverse('login')}")
+            WebDriverWait(self.driver, 10).until(
+                lambda driver: (
+                    "<img" in driver.find_element(By.CSS_SELECTOR, ".task-errors").text
+                )
+            )
+            message = self.driver.find_element(By.CSS_SELECTOR, "[data-task]")
+            self.assertIn("alert-danger", message.get_attribute("class"))
+            self.assertNotIn("alert-success", message.get_attribute("class"))
+            errors = message.find_element(By.CLASS_NAME, "task-errors")
+            self.assertEqual(errors.get_attribute("role"), "alert")
+            self.assertEqual(
+                errors.text, "Error: Dummy (batch 1): <img src=x onerror=alert(1)>"
+            )
+            self.assertEqual(errors.find_elements(By.TAG_NAME, "img"), [])
+            self.assertEqual(
+                message.find_element(By.CLASS_NAME, "task-warnings").text,
+                "A translation warning.",
+            )
+            self.assertIn(
+                "1 string was updated",
+                message.find_element(By.CLASS_NAME, "task-message").text,
+            )
+            self.assertEqual(
+                message.find_element(By.CLASS_NAME, "task-message").get_attribute(
+                    "role"
+                ),
+                "status",
+            )
+        finally:
+            self.driver.execute_cdp_cmd(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                {"identifier": script["identifier"]},
+            )
+
     def test_failed_login(self) -> None:
         self.do_login(create=False)
 
         # We should end up on login page as user was invalid
         self.driver.find_element(By.ID, "id_username")
+
+    def test_history_badge_tooltips(self) -> None:
+        """Explain dynamically loaded badges with keyboard and mouse access."""
+        change = Change(
+            details={
+                "change_origin": {
+                    "scope": "automation",
+                    "automation": {"addon_id": 12, "activity_id": 34},
+                }
+            }
+        )
+        badge_html = render_to_string(
+            "snippets/history-badge.html",
+            {
+                "label": change.get_origin_display(),
+                "description": change.get_origin_description(),
+                "prefix": "Origin:",
+            },
+        )
+        # Insert the real template after page initialization, like AJAX history.
+        self.driver.execute_script(
+            """
+            const history = document.createElement('div');
+            history.className = 'history-author';
+            history.style.padding = '30px';
+            const before = document.createElement('button');
+            before.id = 'before-history-badge';
+            before.textContent = 'Before badge';
+            history.append(before);
+            history.insertAdjacentHTML('beforeend', arguments[0]);
+            document.body.prepend(history);
+            """,
+            badge_html,
+        )
+        before = self.driver.find_element(By.ID, "before-history-badge")
+        badge = self.driver.find_element(By.CSS_SELECTOR, ".history-author .badge")
+        self.assertIn("Automation", badge.text)
+        self.assertNotIn("#12", badge.text)
+        before.click()
+        before.send_keys(Keys.TAB)
+        self.assertEqual(self.driver.switch_to.active_element, badge)
+        tooltip = WebDriverWait(self.driver, 10).until(
+            visibility_of_element_located(
+                (By.CSS_SELECTOR, ".history-tooltip .tooltip-inner")
+            )
+        )
+        self.assertEqual(tooltip.text, str(change.get_origin_description()))
+        badge.send_keys(Keys.ESCAPE)
+        WebDriverWait(self.driver, 10).until(
+            invisibility_of_element_located((By.CSS_SELECTOR, ".history-tooltip"))
+        )
+
+        self.driver.execute_script("arguments[0].focus()", before)
+        self.actions.move_to_element(badge).perform()
+        tooltip = WebDriverWait(self.driver, 10).until(
+            visibility_of_element_located(
+                (By.CSS_SELECTOR, ".history-tooltip .tooltip-inner")
+            )
+        )
+        self.actions.move_to_element(tooltip).perform()
+        # Wait beyond the hide delay to check that hovering the tooltip keeps it open.
+        self.driver.execute_async_script("setTimeout(arguments[0], 250)")
+        self.assertTrue(tooltip.is_displayed())
+        self.actions.move_to_element(before).perform()
+        WebDriverWait(self.driver, 10).until(
+            invisibility_of_element_located((By.CSS_SELECTOR, ".history-tooltip"))
+        )
+
+    def test_login_form_accessibility(self) -> None:
+        """Check labels and keyboard order on the public sign-in form."""
+        with self.wait_for_page_load():
+            self.click(htmlid="login-button")
+
+        self.assert_labeled_control("id_username", "Username or e-mail")
+        self.assert_labeled_control("id_password", "Password")
+
+        username_input = self.driver.find_element(By.ID, "id_username")
+        username_input.click()
+        username_input.send_keys(Keys.TAB)
+        self.assertEqual(
+            self.driver.switch_to.active_element.get_attribute("id"),
+            "id_password",
+        )
+
+        self.driver.switch_to.active_element.send_keys(Keys.TAB)
+        submit_button = self.driver.switch_to.active_element
+        self.assertEqual(submit_button.get_attribute("type"), "submit")
+        self.assertEqual(submit_button.get_attribute("value"), "Sign in")
+
+    @contextmanager
+    def capture_authentication_submissions(self) -> Generator[None, None, None]:
+        """Exercise the real login page without navigating to external providers."""
+        script = self.driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": """
+                window.authenticationSubmissions = [];
+                HTMLFormElement.prototype.submit = function () {
+                    window.authenticationSubmissions.push({
+                        action: this.getAttribute('action'),
+                        params: Array.from(new FormData(this).entries()),
+                    });
+                };
+                """
+            },
+        )
+        try:
+            with self.wait_for_page_load():
+                self.driver.get(
+                    f"{self.live_server_url}{reverse('login')}?"
+                    + urlencode({"next": "/projects/?sort=name"})
+                )
+            yield
+        finally:
+            self.driver.execute_cdp_cmd(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                {"identifier": script["identifier"]},
+            )
+
+    def assert_authentication_submissions(self, count: int, action: str) -> None:
+        submissions = self.driver.execute_script(
+            "return window.authenticationSubmissions;"
+        )
+        self.assertEqual(len(submissions), count)
+        self.assertEqual(submissions[-1]["action"], action)
+        params = submissions[-1]["params"]
+        self.assertEqual(
+            [value for name, value in params if name == "next"],
+            ["/projects/?sort=name"],
+        )
+        self.assertTrue(
+            any(name == "csrfmiddlewaretoken" and value for name, value in params)
+        )
+
+    @social_core_override_settings(
+        AUTHENTICATION_BACKENDS=(
+            "social_core.backends.github.GithubOAuth2",
+            "weblate.accounts.auth.WeblateUserBackend",
+        )
+    )
+    def test_authentication_auto_submission_guard(self) -> None:
+        with self.capture_authentication_submissions():
+            action = reverse("social:begin", args=("github",))
+            control = self.driver.find_element(By.CSS_SELECTOR, ".link-auth")
+            self.assertEqual(control.get_attribute("aria-disabled"), "true")
+            # Include a queued/programmatic activation despite disabled styling.
+            self.driver.execute_script("arguments[0].click();", control)
+            self.assert_authentication_submissions(1, action)
+
+            self.driver.execute_script(
+                "window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: false}));"
+            )
+            self.driver.execute_script("arguments[0].click();", control)
+            self.assert_authentication_submissions(1, action)
+
+            self.driver.execute_script(
+                "window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}));"
+            )
+            self.assertIsNone(control.get_attribute("aria-disabled"))
+            self.assertNotIn("disabled", (control.get_attribute("class") or "").split())
+            self.assert_authentication_submissions(1, action)
+            control.send_keys(Keys.ENTER)
+            self.driver.execute_script("arguments[0].click();", control)
+            self.assert_authentication_submissions(2, action)
+
+    @social_core_override_settings(
+        AUTHENTICATION_BACKENDS=(
+            "social_core.backends.github.GithubOAuth2",
+            "social_core.backends.google.GoogleOAuth2",
+            "weblate.accounts.auth.WeblateUserBackend",
+        )
+    )
+    def test_authentication_manual_submission_guard(self) -> None:
+        with self.capture_authentication_submissions():
+            controls = self.driver.find_elements(By.CSS_SELECTOR, ".link-auth")
+            self.assertEqual(len(controls), 2)
+            action = controls[0].get_attribute("data-href")
+            assert action is not None
+            controls[0].click()
+            self.driver.execute_script(
+                "arguments[0].click(); arguments[1].click();", *controls
+            )
+            self.assert_authentication_submissions(1, action)
+            for control in controls:
+                self.assertEqual(control.get_attribute("aria-disabled"), "true")
+
+            # The shared form remains usable by unrelated POST actions.
+            self.driver.execute_script("""
+                const link = document.createElement('a');
+                link.className = 'link-post';
+                link.dataset.href = '/unrelated-action/';
+                document.body.appendChild(link);
+                link.click();
+                link.click();
+                link.remove();
+            """)
+            self.assert_authentication_submissions(3, "/unrelated-action/")
+
+            self.driver.execute_script("""
+                const link = document.createElement('a');
+                link.className = 'link-post';
+                link.dataset.href = 'https://outside.example/action/';
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+            """)
+            self.assert_authentication_submissions(3, "/unrelated-action/")
+
+            self.driver.execute_script(
+                "window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}));"
+            )
+            self.driver.execute_script("""
+                const form = document.getElementById('link-post');
+                form.submit = () => { throw new Error('Submission failed'); };
+                window.addEventListener('error', (event) => event.preventDefault(), {once: true});
+                document.querySelector('.link-auth').click();
+                delete form.submit;
+            """)
+            for control in controls:
+                self.assertIsNone(control.get_attribute("aria-disabled"))
+            controls[1].send_keys(Keys.ENTER)
+            other_action = controls[1].get_attribute("data-href")
+            assert other_action is not None
+            self.assert_authentication_submissions(4, other_action)
+
+    @social_core_override_settings(
+        AUTHENTICATION_BACKENDS=(
+            "social_core.backends.email.EmailAuth",
+            "social_core.backends.github.GithubOAuth2",
+            "social_core.backends.google.GoogleOAuth2",
+            "weblate.accounts.auth.WeblateUserBackend",
+        )
+    )
+    def test_authentication_submission_guard_covers_registration_and_profile(
+        self,
+    ) -> None:
+        with self.capture_authentication_submissions():
+            with self.wait_for_page_load():
+                self.driver.get(
+                    f"{self.live_server_url}{reverse('register')}?"
+                    + urlencode({"next": "/projects/?sort=name"})
+                )
+            controls = self.driver.find_elements(By.CSS_SELECTOR, ".link-auth")
+            self.assertEqual(len(controls), 2)
+            action = controls[0].get_attribute("data-href")
+            assert action is not None
+            self.driver.execute_script(
+                "arguments[0].click(); arguments[1].click();",
+                controls[0],
+                controls[1],
+            )
+            submissions = self.driver.execute_script(
+                "return window.authenticationSubmissions;"
+            )
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(submissions[0]["action"], action)
+            self.assertTrue(
+                any(
+                    name == "csrfmiddlewaretoken" and value
+                    for name, value in submissions[0]["params"]
+                )
+            )
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('login')}")
+        self.do_login()
+        with self.capture_authentication_submissions():
+            with self.wait_for_page_load():
+                self.driver.get(f"{self.live_server_url}{reverse('profile')}")
+            controls = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                ".link-auth[data-href*='/accounts/login/']:not([data-href*='/email/'])",
+            )
+            self.assertGreaterEqual(len(controls), 1)
+            action = controls[0].get_attribute("data-href")
+            assert action is not None
+            self.driver.execute_script(
+                "arguments[0].click(); arguments[0].click();", controls[0]
+            )
+            submissions = self.driver.execute_script(
+                "return window.authenticationSubmissions;"
+            )
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(submissions[0]["action"], action)
+            self.assertTrue(
+                any(
+                    name == "csrfmiddlewaretoken" and value
+                    for name, value in submissions[0]["params"]
+                )
+            )
+
+    def test_support_page_navigation(self) -> None:
+        """Keep the purchase offer and its exit accessible on narrow screens."""
+        cache.delete(SUPPORT_STATUS_CACHE_KEY)
+        self.do_login(superuser=True)
+        with (
+            patch.object(DonateView, "get_stats", return_value=FALLBACK_STATS),
+            self.wait_for_page_load(),
+        ):
+            self.driver.get(f"{self.live_server_url}{reverse('donate')}")
+
+        for width in (1200, 390):
+            with self.subTest(width=width):
+                self.driver.set_window_size(width, 844)
+                self.assertTrue(
+                    self.driver.execute_script(
+                        "return document.documentElement.scrollWidth <= window.innerWidth"
+                    )
+                )
+                purchase = self.driver.find_element(By.LINK_TEXT, "Purchase support")
+                self.driver.execute_script("arguments[0].focus()", purchase)
+                purchase.send_keys(Keys.TAB)
+                self.assertEqual(
+                    self.driver.switch_to.active_element.text, "Continue to Weblate"
+                )
+                self.driver.switch_to.active_element.send_keys(Keys.TAB)
+                self.assertEqual(
+                    self.driver.switch_to.active_element.text,
+                    "Already purchased? Link your support package",
+                )
+
+        self.screenshot_viewport("support-mobile.png", 390, 844)
+        continuation = self.driver.find_element(By.LINK_TEXT, "Continue to Weblate")
+        with self.wait_for_page_load():
+            continuation.send_keys(Keys.ENTER)
+        self.assertEqual(
+            self.driver.current_url, f"{self.live_server_url}{reverse('home')}"
+        )
+
+    def test_slug_autofill(self) -> None:
+        """Check that base JavaScript initializes slug autogeneration."""
+        self.do_login(superuser=True)
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('create-project')}")
+
+        name_input = self.driver.find_element(By.ID, "id_name")
+        slug_input = self.driver.find_element(By.ID, "id_slug")
+        name_input.send_keys("Example.Project Name")
+
+        WebDriverWait(self.driver, 5).until(
+            lambda _driver: slug_input.get_attribute("value") == "example-project-name"
+        )
+
+    def test_flag_editor_disabled_and_external_updates(self) -> None:
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('languages')}")
+        self.driver.execute_script(
+            """
+            const input = document.createElement("input");
+            input.id = "disabled-flags";
+            input.className = "flag-editor";
+            input.disabled = true;
+            input.value = "max-length:10";
+            input.dataset.flagChoicesUrl = arguments[0];
+            document.body.appendChild(input);
+            window.initFlagEditor(input);
+            """,
+            reverse("js-flag-choices"),
+        )
+        self.assertFalse(
+            self.driver.find_element(By.ID, "disabled-flags-ts-input").is_enabled()
+        )
+        self.driver.execute_script(
+            """
+            const input = document.getElementById("disabled-flags");
+            input.value = 'placeholders:"one,two", ignore-same';
+            input.dispatchEvent(new Event("change", {bubbles: true}));
+            """
+        )
+        values = self.driver.execute_script(
+            "return Array.from(document.querySelectorAll('.ts-control .item'), item => item.dataset.value);"
+        )
+        self.assertEqual(values, ['placeholders:"one,two"', "ignore-same"])
+
+    def test_flag_editor_edit_existing(self) -> None:
+        """Check that already added flags can be turned back into editable text."""
+        # Load a page so that flag-editor.js and TomSelect are loaded
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('languages')}")
+
+        self.driver.execute_script(
+            """
+            const input = document.createElement("input");
+            input.id = "flag-editor-test";
+            input.className = "flag-editor";
+            input.value = "max-length:100, ignore-same";
+            input.dataset.flagChoicesUrl = arguments[0];
+            document.body.appendChild(input);
+            window.initFlagEditor(input);
+            """,
+            reverse("js-flag-choices"),
+        )
+
+        hidden_input = self.driver.find_element(By.ID, "flag-editor-test")
+        text_box = self.driver.find_element(
+            By.CSS_SELECTOR, ".ts-wrapper.flag-editor-select .ts-control > input"
+        )
+
+        def send_keys(*keys) -> None:
+            # The text box is moved off-screen while a flag is selected, so the
+            # keys have to be sent to whatever is focused instead of an element.
+            webdriver.ActionChains(self.driver).send_keys(*keys).perform()
+
+        def selected_flags() -> list[str]:
+            return [
+                item.get_attribute("data-value")
+                for item in self.find_elements_now(
+                    By.CSS_SELECTOR, ".ts-wrapper.flag-editor-select .item.active"
+                )
+            ]
+
+        # Clicking a flag turns it back into editable text
+        self.driver.find_element(
+            By.CSS_SELECTOR,
+            '.ts-wrapper.flag-editor-select .item[data-value="max-length:100"] code',
+        ).click()
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: text_box.get_attribute("value") == "max-length:100"
+        )
+        self.assertEqual(hidden_input.get_attribute("value"), "ignore-same")
+
+        # Committing the edited text adds the flag back in its original place
+        # instead of appending it to the end
+        send_keys("0", Keys.ENTER)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: (
+                hidden_input.get_attribute("value") == "max-length:1000, ignore-same"
+            )
+        )
+        self.assertEqual(text_box.get_attribute("value"), "")
+
+        # Arrow keys walk the flags without a mouse
+        send_keys(Keys.ARROW_LEFT)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: selected_flags() == ["ignore-same"]
+        )
+        send_keys(Keys.ARROW_LEFT)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: selected_flags() == ["max-length:1000"]
+        )
+        # Moving past the last flag returns to the text box
+        send_keys(Keys.ARROW_RIGHT, Keys.ARROW_RIGHT)
+        WebDriverWait(self.driver, 10).until(lambda _driver: selected_flags() == [])
+
+        # A selected flag stays legible against the highlighted background
+        send_keys(Keys.ARROW_LEFT)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: selected_flags() == ["ignore-same"]
+        )
+        active_item = self.driver.find_element(
+            By.CSS_SELECTOR, ".ts-wrapper.flag-editor-select .item.active"
+        )
+        active_code = active_item.find_element(By.CSS_SELECTOR, "code")
+        self.assertEqual(
+            active_code.value_of_css_property("color"),
+            active_item.value_of_css_property("color"),
+        )
+        self.assertEqual(
+            active_code.value_of_css_property("background-color"), "rgba(0, 0, 0, 0)"
+        )
+
+        # Enter opens the selected flag for editing
+        send_keys(Keys.ENTER)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: text_box.get_attribute("value") == "ignore-same"
+        )
+        self.assertEqual(hidden_input.get_attribute("value"), "max-length:1000")
+
+        # Committing a flag that is already in the catalog unchanged puts it
+        # back in place and leaves no text behind in the text box
+        send_keys(Keys.ENTER)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: (
+                hidden_input.get_attribute("value") == "max-length:1000, ignore-same"
+            )
+        )
+        self.assertEqual(text_box.get_attribute("value"), "")
+
+    def test_flag_editor_quoted_comma(self) -> None:
+        """Check that a comma inside a quoted value does not split the flag."""
+        # Load a page so that flag-editor.js and TomSelect are loaded
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('languages')}")
+
+        self.driver.execute_script(
+            """
+            const input = document.createElement("input");
+            input.id = "flag-editor-test";
+            input.className = "flag-editor";
+            input.dataset.flagChoicesUrl = arguments[0];
+            document.body.appendChild(input);
+            window.initFlagEditor(input);
+            """,
+            reverse("js-flag-choices"),
+        )
+
+        hidden_input = self.driver.find_element(By.ID, "flag-editor-test")
+        text_box = self.driver.find_element(
+            By.CSS_SELECTOR, ".ts-wrapper.flag-editor-select .ts-control > input"
+        )
+
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.execute_script(
+                """
+                return "regex" in
+                    document.querySelector(".flag-editor-select").tomselect.options;
+                """
+            )
+        )
+
+        def type_flags(text: str, pending: str) -> None:
+            """Type flags and commit the text left in the box afterwards."""
+            text_box.send_keys(text)
+            WebDriverWait(self.driver, 10).until(
+                lambda driver: driver.execute_script(
+                    """
+                    const ts =
+                        document.querySelector(".flag-editor-select").tomselect;
+                    return ts.lastValue === arguments[0]
+                        && ts.refreshTimeout === null;
+                    """,
+                    pending,
+                )
+            )
+            text_box.send_keys(Keys.ENTER)
+
+        # A quoted value is kept in a single flag
+        regex_flag = 'regex:"^[a-z]{1,32}$"'
+        text_box.click()
+        type_flags(regex_flag, regex_flag)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: hidden_input.get_attribute("value") == regex_flag
+        )
+
+        # A comma outside of quotes still separates the flags
+        type_flags("max-length:100,priority:10", "priority:10")
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: (
+                hidden_input.get_attribute("value")
+                == f"{regex_flag}, max-length:100, priority:10"
+            )
+        )
+        self.assertEqual(text_box.get_attribute("value"), "")
+
+        # Pasting a flag list splits it the same way
+        self.driver.execute_script(
+            """
+            const box = arguments[0];
+            box.focus();
+            box.value = arguments[1];
+            box.dispatchEvent(new Event("paste", {bubbles: true}));
+            """,
+            text_box,
+            'placeholders:"a,b", ignore-same',
+        )
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: (
+                hidden_input.get_attribute("value")
+                == f"{regex_flag}, max-length:100, priority:10, "
+                'placeholders:"a,b", ignore-same'
+            )
+        )
+
+    def test_glossary_copy_uses_last_active_alternative(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(
+            name="Glossary copying", slug="glossary-copying"
+        )
+        component = fixture.create_po(project=project)
+        unit = component.translation_set.get(language_code="cs").unit_set.get(
+            source__contains="Orangutan"
+        )
+        self.do_login(superuser=True)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+        editors = self.driver.find_elements(
+            By.CSS_SELECTOR, ".translation-form .translation-editor"
+        )
+        self.assertEqual(len(editors), 3)
+        for editor in editors:
+            editor.clear()
+        button = self.driver.execute_script("""
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "glossary-copy";
+            button.dataset.glossaryText = "alternative";
+            button.textContent = "Copy alternative";
+            document.querySelector(".translation-form").append(button);
+            return button;
+        """)
+        editors[1].click()
+        button.send_keys(Keys.SPACE)
+        self.assertEqual(
+            [editor.get_attribute("value") for editor in editors],
+            ["", "alternative", ""],
+        )
+        editors[2].click()
+        self.click(button)
+        self.assertEqual(
+            [editor.get_attribute("value") for editor in editors],
+            ["", "alternative", "alternative"],
+        )
+        machinery_button = self.driver.execute_script("""
+            const row = document.createElement("div");
+            row.className = "machinery-row";
+            row.dataset.raw = JSON.stringify({text: "suggestion", plural_forms: [9], multivalue: true});
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "js-copy-machinery";
+            button.textContent = "Copy suggestion";
+            row.append(button);
+            document.querySelector(".translation-form").append(row);
+            return button;
+        """)
+        editors[1].click()
+        machinery_button.send_keys(Keys.SPACE)
+        self.assertEqual(
+            [editor.get_attribute("value") for editor in editors],
+            ["", "suggestion", "alternative"],
+        )
+
+    def test_new_unit_plural_switch(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="New plural", slug="new-plural")
+        component = fixture.create_po(project=project, manage_units=True)
+        translation = component.translation_set.get(language_code="cs")
+        self.do_login(superuser=True)
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{translation.get_absolute_url()}#new"
+            )
+        singular = self.driver.find_element(By.ID, "new-singular")
+        plural = self.driver.find_element(By.ID, "new-plural")
+        self.assertTrue(singular.is_displayed())
+        self.assertFalse(plural.is_displayed())
+
+        self.click(
+            singular.find_element(
+                By.CSS_SELECTOR, "input[name='new-unit-form-type'][value='plural']"
+            )
+        )
+        self.assertFalse(singular.is_displayed())
+        self.assertTrue(plural.is_displayed())
+
+        self.click(
+            plural.find_element(
+                By.CSS_SELECTOR, "input[name='new-unit-form-type'][value='singular']"
+            )
+        )
+        self.assertTrue(singular.is_displayed())
+        self.assertFalse(plural.is_displayed())
+
+    def test_retained_translation_is_unsaved(self) -> None:
+        """Retained plural drafts warn on navigation without further input."""
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="Retained edits", slug="retained-edits")
+        component = fixture.create_po(project=project)
+        unit = component.translation_set.get(language_code="cs").unit_set.get(
+            source__contains="Orangutan"
+        )
+        self.do_login(superuser=True)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+
+        selector = ".translation-form .translation-editor"
+        self.assertFalse(
+            self.driver.execute_script("return WLT.Utils.editorHasChanges();")
+        )
+        editors = self.driver.find_elements(By.CSS_SELECTOR, selector)
+        self.assertEqual(len(editors), 3)
+        drafts = [f"Překlad %d {idx}\n" for idx in range(3)]
+        for editor, draft in zip(editors, drafts, strict=True):
+            editor.clear()
+            editor.send_keys(draft)
+        self.driver.execute_script(
+            "document.querySelector('.translation-form input[name=contentsum]').value = 'aaa';"
+        )
+        with self.wait_for_page_load():
+            self.driver.find_element(By.NAME, "save-stay").send_keys(Keys.ENTER)
+
+        self.assert_text_contains(
+            ".alert-danger", "The source string has changed meanwhile."
+        )
+        editors = self.driver.find_elements(By.CSS_SELECTOR, selector)
+        self.assertEqual([editor.get_attribute("value") for editor in editors], drafts)
+        for editor in editors:
+            self.assertIn("has-changes", editor.get_attribute("class") or "")
+        self.assertEqual(
+            len(self.driver.find_elements(By.CSS_SELECTOR, "#unsaved-label")), 3
+        )
+        # Exercise both ordinary navigation and Refresh's submit listeners
+        # without relying on WebDriver's handling of native browser dialogs.
+        for submit_search in (False, True):
+            self.assertTrue(
+                self.driver.execute_script(
+                    """
+                    if (arguments[0]) {
+                        document.querySelector('.result-page-form').dispatchEvent(
+                            new Event('submit', {bubbles: true, cancelable: true})
+                        );
+                    }
+                    const event = new Event('beforeunload', {cancelable: true});
+                    window.dispatchEvent(event);
+                    return WLT.Utils.editorHasChanges() && event.defaultPrevented;
+                    """,
+                    submit_search,
+                )
+            )
+
+        with self.wait_for_page_load():
+            self.driver.find_element(By.NAME, "save-stay").send_keys(Keys.ENTER)
+        self.assertFalse(
+            self.driver.execute_script("return WLT.Utils.editorHasChanges();")
+        )
+        self.assertEqual(self.find_elements_now(By.CSS_SELECTOR, "#unsaved-label"), [])
+        unit.refresh_from_db()
+        self.assertEqual(unit.get_target_plurals(), drafts)
+
+    def test_all_strings_filter(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="Search filters", slug="search-filters")
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        self.do_login(superuser=True)
+        search_url = f"{self.live_server_url}{reverse('search', kwargs={'path': translation.get_url_path()})}"
+        query_builder_url = f"{self.live_server_url}{reverse('search')}"
+        with self.wait_for_page_load():
+            self.driver.get(query_builder_url)
+        query_input = self.driver.find_element(By.ID, "id_q")
+        query_input.send_keys("state:empty")
+        self.click(htmlid="query-dropdown")
+        option = self.driver.find_element(By.CSS_SELECTOR, '[data-filter="all"]')
+        option.send_keys(Keys.ENTER)
+        self.assertEqual(query_input.get_attribute("value"), "")
+        self.assertEqual(self.driver.current_url, query_builder_url)
+        self.assertEqual(self.driver.switch_to.active_element, query_input)
+        self.assertEqual(
+            self.driver.find_element(By.ID, "query-dropdown").get_attribute(
+                "aria-expanded"
+            ),
+            "false",
+        )
+        original_dark_mode = self.driver.execute_script(
+            "return matchMedia('(prefers-color-scheme: dark)').matches;"
+        )
+        try:
+            for theme in ("light", "dark"):
+                self.driver.execute_cdp_cmd(
+                    "Emulation.setEmulatedMedia",
+                    {"features": [{"name": "prefers-color-scheme", "value": theme}]},
+                )
+                for width in (1280, 480):
+                    self.driver.set_window_size(width, 900)
+                    self.click(htmlid="query-dropdown")
+                    marker = self.driver.find_element(
+                        By.CSS_SELECTOR, '[data-filter="translated"] .filter-marker'
+                    )
+                    self.assertTrue(marker.is_displayed())
+                    self.assertEqual(marker.get_attribute("aria-hidden"), "true")
+                    self.screenshot_viewport(
+                        f"search-filters-{theme}-{width}.png", width, 900
+                    )
+                    self.driver.find_element(
+                        By.CSS_SELECTOR, '[data-filter="all"]'
+                    ).send_keys(Keys.ESCAPE)
+                self.driver.set_window_size(1280, 900)
+        finally:
+            self.driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"features": []})
+        self.assertEqual(
+            self.driver.execute_script(
+                "return matchMedia('(prefers-color-scheme: dark)').matches;"
+            ),
+            original_dark_mode,
+        )
+        # Ordinary filters still insert at the cursor in the query builder.
+        query_input.send_keys("state:empty")
+        self.click(htmlid="query-dropdown")
+        self.driver.find_element(By.CSS_SELECTOR, '[data-filter="suggestions"]').click()
+        self.assertEqual(
+            query_input.get_attribute("value"), "state:empty has:suggestion "
+        )
+        self.click(htmlid="query-dropdown")
+        self.driver.find_element(By.CSS_SELECTOR, '[data-filter="all"]').click()
+        with self.wait_for_page_load():
+            query_input.submit()
+        self.assertEqual(
+            self.driver.find_element(By.ID, "id_q").get_attribute("value"), ""
+        )
+
+        # Results and the editor apply the empty query immediately.
+        filtered_query = urlencode(
+            {"q": "state:<translated", "sort_by": "source", "offset": 2}
+        )
+        for url, query in (
+            (search_url, ""),
+            (search_url, f"?{filtered_query}"),
+            (
+                f"{self.live_server_url}{translation.get_translate_url()}",
+                f"?{filtered_query}",
+            ),
+        ):
+            with self.subTest(url=url, query=query):
+                with self.wait_for_page_load():
+                    self.driver.get(f"{url}{query}")
+                sort_by = self.driver.find_element(By.NAME, "sort_by").get_attribute(
+                    "value"
+                )
+                if not query:
+                    self.driver.find_element(By.ID, "id_q").send_keys("state:empty")
+                self.click(htmlid="query-dropdown")
+                with self.wait_for_page_load():
+                    self.driver.find_element(
+                        By.CSS_SELECTOR, '[data-filter="all"]'
+                    ).send_keys(Keys.ENTER)
+                self.assertEqual(
+                    self.driver.find_element(By.ID, "id_q").get_attribute("value"), ""
+                )
+                self.assertEqual(
+                    self.driver.find_element(By.NAME, "sort_by").get_attribute("value"),
+                    sort_by,
+                )
+                self.assertNotIn("offset=2", self.driver.current_url)
+                if url == search_url:
+                    self.assertEqual(
+                        self.count_elements("tbody.unit-listing-body tr"),
+                        translation.unit_set.count(),
+                    )
+                else:
+                    count = (
+                        self.driver.find_element(By.CSS_SELECTOR, ".position-input")
+                        .text.split("/")[-1]
+                        .strip()
+                    )
+                    self.assertEqual(int(count), translation.unit_set.count())
+
+    def test_bulk_edit_preview(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="Bulk operations", slug="bulk-operations")
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        user = self.do_login(superuser=True)
+        unit.translate(user, "Hello, world!\n", STATE_TRANSLATED)
+        self.open_component(component, project)
+        self.click("Operations")
+        self.click("Bulk edit")
+        self.driver.find_element(By.ID, "id_bulk_q").send_keys(
+            'source:"Hello, world!" AND language:cs'
+        )
+        self.click(self.driver.find_element(By.ID, "id_bulk_search_type_1"))
+        self.driver.find_element(By.ID, "id_bulk_search").send_keys("(Hello), (world)")
+        self.driver.find_element(By.ID, "id_bulk_replacement").send_keys(
+            r"\g<2>, \g<1>"
+        )
+        self.screenshot("bulk-edit.png")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, "#bulk-edit input[type='submit']"
+                )
+            )
+        self.assert_text_contains("body", "world, Hello!")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Hello, world!\n")
+        self.screenshot("bulk-edit-preview.png")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    "form:has(input[name='bulk_confirmation']) button[type='submit']",
+                )
+            )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "world, Hello!\n")
+        self.click("Operations")
+        self.click("Bulk edit")
+        self.driver.find_element(By.ID, "id_bulk_q").send_keys(
+            'source:"Hello, world!" AND language:cs'
+        )
+        Select(self.driver.find_element(By.ID, "id_bulk_state")).select_by_value("0")
+        self.click(self.driver.find_element(By.ID, "id_bulk_preview"))
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, "#bulk-edit input[type='submit']"
+                )
+            )
+        unit.refresh_from_db()
+        self.assertEqual((unit.target, unit.state), ("", 0))
+
+    def test_bulk_edit_selection(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="Bulk selection", slug="bulk-selection")
+        project.label_set.create(name="Terminology", color="navy")
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        user = self.do_login(superuser=True)
+        for offset, unit in enumerate(translation.unit_set.order_by("position")[:2]):
+            unit.translate(user, f"Ahoj {offset}", STATE_TRANSLATED)
+        search_url = (
+            f"{self.live_server_url}"
+            f"{reverse('search', kwargs={'path': translation.get_url_path()})}"
+        )
+        with self.wait_for_page_load():
+            self.driver.get(f"{search_url}?q=state%3Atranslated")
+
+        checkboxes = self.driver.find_elements(
+            By.CSS_SELECTOR, ".table-embed-units .bulk-edit-select"
+        )
+        self.assertTrue(checkboxes)
+        toggle = self.driver.find_element(By.ID, "bulk-edit-toggle-selection")
+        submit = self.driver.find_element(By.ID, "bulk-edit-submit")
+        counter = self.driver.find_element(By.ID, "bulk-edit-selection-count")
+        self.assertFalse(submit.is_enabled())
+        self.assertEqual(counter.text, "No strings selected")
+
+        # Selecting a single string
+        self.click(checkboxes[0])
+        self.assertTrue(submit.is_enabled())
+        self.assertEqual(counter.text, "1 string selected")
+        self.assertEqual(toggle.get_property("indeterminate"), len(checkboxes) > 1)
+
+        # Selecting all strings on the page
+        self.click(toggle)
+        self.assertTrue(all(checkbox.is_selected() for checkbox in checkboxes))
+        self.assertEqual(counter.text, f"{len(checkboxes)} strings selected")
+        self.assertFalse(toggle.get_property("indeterminate"))
+        self.wait_for_screenshot_ready()
+        add_flags = self.driver.find_element(By.ID, "id_bulk_add_flags-ts-input")
+        remove_flags = self.driver.find_element(By.ID, "id_bulk_remove_flags-ts-input")
+        self.assertEqual(add_flags.get_attribute("placeholder"), "Choose flags to add…")
+        self.assertEqual(
+            remove_flags.get_attribute("placeholder"), "Choose flags to remove…"
+        )
+        self.assertEqual(add_flags.accessible_name, "Add flags")
+        self.assertEqual(remove_flags.accessible_name, "Remove flags")
+        self.screenshot("bulk-edit-selection.png")
+        self.assertAlmostEqual(add_flags.rect["y"], remove_flags.rect["y"], delta=2)
+        self.driver.set_window_size(375, 900)
+        self.assertGreater(remove_flags.rect["y"], add_flags.rect["y"])
+        self.driver.set_window_size(1200, 1024)
+
+        # Unselecting all strings on the page
+        self.click(toggle)
+        self.assertFalse(any(checkbox.is_selected() for checkbox in checkboxes))
+        self.assertFalse(submit.is_enabled())
+        self.assertEqual(counter.text, "No strings selected")
+
+        # Applying an operation to the selected string
+        unit = Unit.objects.get(pk=int(checkboxes[0].get_attribute("value")))
+        self.click(checkboxes[0])
+        Select(self.driver.find_element(By.ID, "id_bulk_state")).select_by_visible_text(
+            "Needs editing"
+        )
+        with self.wait_for_page_load():
+            self.click(submit)
+        self.assert_text_contains("body", "Review and confirm the bulk edit changes.")
+        apply_all = self.driver.find_element(By.ID, "bulk-apply-all")
+        row = self.driver.find_element(By.CSS_SELECTOR, ".bulk-preview-select")
+        self.click(apply_all)
+        self.assertFalse(row.is_enabled())
+        self.click(apply_all)
+        self.assertTrue(row.is_enabled())
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    "form:has(input[name='bulk_confirmation']) button[type='submit']",
+                )
+            )
+        self.assertEqual(self.driver.current_url, f"{search_url}?q=state%3Atranslated")
+        self.assert_text_contains(
+            ".alert", "Bulk edit completed, 1 string was updated."
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, STATE_FUZZY)
+
+    def test_translation_search_refresh(self) -> None:
+        """Refresh and query Enter replace results; navigation preserves them."""
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(
+            name="Search navigation", slug="search-navigation"
+        )
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        self.do_login(superuser=True)
+        query = "state:<translated"
+        url = f"{self.live_server_url}{translation.get_translate_url()}?{urlencode({'q': query})}"
+        with self.wait_for_page_load():
+            self.driver.get(url)
+
+        def assert_compact_refresh() -> None:
+            original_size = self.driver.get_window_size()
+            for width in (1280, 768, 480):
+                self.driver.set_window_size(width, 900)
+                refresh = self.driver.find_element(
+                    By.CSS_SELECTOR, '.query-field button[name="refresh"]'
+                )
+                query_input = self.driver.find_element(By.CSS_SELECTOR, '[name="q"]')
+                self.assertEqual(refresh.get_attribute("aria-label"), "Refresh results")
+                self.assertAlmostEqual(
+                    refresh.rect["y"], query_input.rect["y"], delta=1
+                )
+                self.assertLess(refresh.rect["width"], 60)
+                self.assertGreater(query_input.rect["width"], 100)
+            self.driver.set_window_size(original_size["width"], original_size["height"])
+
+        assert_compact_refresh()
+
+        def current_checksum() -> str:
+            value = self.driver.find_element(
+                By.CSS_SELECTOR, '.translation-form input[name="checksum"]'
+            ).get_attribute("value")
+            self.assertIsNotNone(value)
+            return cast("str", value)
+
+        def result_count() -> int:
+            return int(
+                self.driver.find_element(By.CSS_SELECTOR, ".position-input")
+                .text.split("/")[-1]
+                .strip()
+            )
+
+        checksum = current_checksum()
+        unit = next(
+            unit for unit in translation.unit_set.all() if unit.checksum == checksum
+        )
+        count = result_count()
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_TRANSLATED)
+        # Use a navigation URL, as initial searches intentionally omit offset.
+        with self.wait_for_page_load():
+            self.click(htmlid="button-first")
+        self.assertEqual(current_checksum(), checksum)
+        with self.wait_for_page_load():
+            self.driver.refresh()
+        self.assertEqual(result_count(), count)
+        self.assertEqual(current_checksum(), checksum)
+
+        self.click(htmlid="query-sort-dropdown")
+        with self.wait_for_page_load():
+            self.driver.find_element(By.CSS_SELECTOR, 'a[data-sort="source"]').click()
+        self.assertEqual(result_count(), count)
+        self.assertEqual(current_checksum(), checksum)
+
+        # Enter in the position field is navigation, not a fresh search.
+        self.driver.find_element(By.CSS_SELECTOR, ".position-input").click()
+        position = self.driver.find_element(By.ID, "position-input-editable-input")
+        position.clear()
+        position.send_keys("2")
+        with self.wait_for_page_load():
+            position.send_keys(Keys.ENTER)
+        self.assertEqual(result_count(), count)
+
+        with self.wait_for_page_load():
+            self.driver.find_element(By.ID, "id_q").send_keys(Keys.ENTER)
+        self.assertEqual(result_count(), count - 1)
+        self.assertNotEqual(current_checksum(), checksum)
+        self.assertNotIn("refresh=", self.driver.current_url)
+
+        # Refresh must retain the editor's unsaved-changes protection.
+        editor = self.driver.find_element(
+            By.CSS_SELECTOR, ".translator .translation-editor"
+        )
+        editor.send_keys("Unsaved translation")
+        refresh = self.driver.find_element(By.CSS_SELECTOR, 'button[name="refresh"]')
+        # Check the real listeners without relying on WebDriver's handling of
+        # native browser dialogs.
+        self.assertTrue(
+            self.driver.execute_script(
+                """
+                document.querySelector(".result-page-form").dispatchEvent(
+                    new Event("submit", {bubbles: true, cancelable: true})
+                );
+                const event = new Event("beforeunload", {cancelable: true});
+                window.dispatchEvent(event);
+                return WLT.Utils.editorHasChanges() && event.defaultPrevented;
+                """
+            )
+        )
+        self.assertEqual(editor.get_attribute("value"), "Unsaved translation")
+        self.driver.execute_script(
+            "arguments[0].value = ''; arguments[0].classList.remove('has-changes');",
+            editor,
+        )
+        with self.wait_for_page_load():
+            refresh.send_keys(Keys.ENTER)
+        self.assertEqual(result_count(), count - 1)
+
+        zen_url = reverse("zen", kwargs={"path": translation.get_url_path()})
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{zen_url}?{urlencode({'q': query, 'offset': 1})}"
+            )
+        self.assertEqual(result_count(), count - 1)
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_EMPTY)
+        with self.wait_for_page_load():
+            self.driver.find_element(By.CSS_SELECTOR, 'button[name="refresh"]').click()
+        self.assertEqual(result_count(), count)
+
+        assert_compact_refresh()
+
+        # Pending edits in later Zen rows must warn before autosave starts.
+        self.assertTrue(
+            self.driver.execute_script(
+                """
+                const editors = document.querySelectorAll(
+                    ".translator .translation-editor"
+                );
+                const editor = editors[1];
+                editor.focus();
+                editor.value = "Pending Zen translation";
+                editor.dispatchEvent(new Event("input", {bubbles: true}));
+                document.querySelector('button[name="refresh"]').focus();
+                document.querySelector(".result-page-form").dispatchEvent(
+                    new Event("submit", {bubbles: true, cancelable: true})
+                );
+                const event = new Event("beforeunload", {cancelable: true});
+                window.dispatchEvent(event);
+                return !editors[0].classList.contains("has-changes")
+                    && WLT.Utils.editorHasChanges()
+                    && event.defaultPrevented;
+                """
+            )
+        )
+
+    def test_zen_review_state_conflict(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(
+            name="Zen review state", slug="zen-review-state"
+        )
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        user = self.do_login(superuser=True)
+        zen_url = reverse("zen", kwargs={"path": translation.get_url_path()})
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{zen_url}")
+
+        row = self.driver.find_element(By.ID, f"row-edit-{unit.checksum}")
+        editor = row.find_element(By.CSS_SELECTOR, ".translation-editor")
+        initial_state = row.find_element(By.CSS_SELECTOR, "input[name=initial_state]")
+
+        def edit(target: str) -> None:
+            self.driver.execute_script(
+                "arguments[0].classList.remove('translation-saved');", row
+            )
+            editor.clear()
+            editor.send_keys(target)
+            self.driver.execute_script("arguments[0].blur();", editor)
+
+        # Saving a state transition refreshes the baseline for subsequent saves.
+        self.assertEqual(initial_state.get_attribute("value"), str(STATE_EMPTY))
+        for target in ("Ahoj svete!", "Nazdar svete!"):
+            edit(target)
+            WebDriverWait(self.driver, 15).until(
+                lambda _driver: (
+                    "translation-saved" in (row.get_attribute("class") or "")
+                )
+            )
+            self.assertEqual(
+                initial_state.get_attribute("value"), str(STATE_TRANSLATED)
+            )
+            unit.refresh_from_db()
+            self.assertEqual(unit.target, f"{target}\n")
+
+        # A state-only change in another tab must leave the draft unsaved.
+        unit.translate(user, unit.target, STATE_FUZZY, propagate=False)
+        edit("Unsaved draft")
+        WebDriverWait(self.driver, 15).until(
+            lambda driver: driver.execute_script(
+                """
+                const expectedText = arguments[0];
+                return Array.from(
+                    document.querySelectorAll("#popup-toasts .toast-body"),
+                ).some((alert) => alert.innerText.includes(expectedText));
+                """,
+                "The review state of this string has changed",
+            )
+        )
+        self.assertEqual(editor.get_attribute("value"), "Unsaved draft")
+        self.assertIn("has-changes", editor.get_attribute("class") or "")
+        self.assertIn("translation-modified", row.get_attribute("class") or "")
+        self.assertNotIn("translation-saved", row.get_attribute("class") or "")
+        self.assertEqual(initial_state.get_attribute("value"), str(STATE_TRANSLATED))
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Nazdar svete!\n")
+        self.assertEqual(unit.state, STATE_FUZZY)
+
+    @override_settings(RATELIMIT_TRANSLATE_ATTEMPTS=1)
+    def test_zen_rate_limit_retry(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="Zen rate limit", slug="zen-rate-limit")
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        user = self.do_login()
+        user.groups.add(Group.objects.get(name="Users"))
+        self.assertFalse(user.is_superuser)
+        self.assertTrue(user.has_perm("unit.edit", unit))
+        reset_rate_limit("translate", user=user)
+        zen_url = reverse("zen", kwargs={"path": translation.get_url_path()})
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{zen_url}")
+
+        row = self.driver.find_element(By.ID, f"row-edit-{unit.checksum}")
+        editor = row.find_element(By.CSS_SELECTOR, ".translation-editor")
+        editor.send_keys("First Zen translation", Keys.TAB)
+        WebDriverWait(self.driver, 15).until(
+            lambda _driver: "translation-saved" in (row.get_attribute("class") or "")
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First Zen translation\n")
+
+        editor.clear()
+        editor.send_keys("Pending Zen translation", Keys.TAB)
+        rejection = WebDriverWait(self.driver, 15).until(
+            lambda driver: next(
+                (
+                    toast
+                    for toast in driver.find_elements(
+                        By.CSS_SELECTOR, "#popup-toasts .toast-body"
+                    )
+                    if "Your request was rejected" in toast.text
+                ),
+                None,
+            )
+        )
+        self.assertEqual(
+            rejection.text,
+            "Your request was rejected because you have performed too many "
+            "operations recently. Please try again later.",
+        )
+        self.assertEqual(editor.get_attribute("value"), "Pending Zen translation")
+        self.assertIn("has-changes", editor.get_attribute("class") or "")
+        self.assertNotIn("translation-saved", row.get_attribute("class") or "")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First Zen translation\n")
+
+        reset_rate_limit("translate", user=user)
+        editor.click()
+        editor.send_keys(Keys.TAB)
+        WebDriverWait(self.driver, 15).until(
+            lambda _driver: "translation-saved" in (row.get_attribute("class") or "")
+        )
+        self.assertNotIn("has-changes", editor.get_attribute("class") or "")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Pending Zen translation\n")
+
+    def test_zen_queued_review_change(self) -> None:
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(
+            name="Zen queued review", slug="zen-queued-review", translation_review=True
+        )
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        user = self.do_login(superuser=True)
+        unit.translate(user, "Nazdar svete!\n", STATE_TRANSLATED, propagate=False)
+        zen_url = reverse("zen", kwargs={"path": translation.get_url_path()})
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{zen_url}")
+
+        # Hold the first save response while the reviewer makes another choice.
+        self.driver.execute_script(
+            """
+            const originalFetch = window.fetch;
+            const saveUrl = arguments[0];
+            window.zenReviewRequests = [];
+            window.fetch = function (url, options) {
+                if (url !== saveUrl) {
+                    return originalFetch.apply(this, arguments);
+                }
+                const payload = new URLSearchParams(options?.body);
+                if (!payload.has("initial_state")) {
+                    return originalFetch.apply(this, arguments);
+                }
+                window.zenReviewRequests.push({
+                    review: payload.get("review"),
+                    initial_state: payload.get("initial_state"),
+                });
+                const response = originalFetch.apply(this, arguments);
+                if (window.zenReviewRequests.length !== 1) {
+                    return response;
+                }
+                return response.then(result => new Promise(resolve => {
+                    window.releaseZenReview = () => resolve(result);
+                }));
+            };
+            """,
+            reverse("save_zen", kwargs={"path": translation.get_url_path()}),
+        )
+        row = self.driver.find_element(By.ID, f"row-edit-{unit.checksum}")
+        row.find_element(By.CSS_SELECTOR, 'input[name=review][value="30"]').click()
+        WebDriverWait(self.driver, 15).until(
+            lambda driver: driver.execute_script(
+                "return typeof window.releaseZenReview === 'function';"
+            )
+        )
+        translated = row.find_element(By.CSS_SELECTOR, 'input[name=review][value="20"]')
+        translated.click()
+        self.driver.execute_script("window.releaseZenReview();")
+        WebDriverWait(self.driver, 15).until(
+            lambda driver: driver.execute_script(
+                "return window.zenReviewRequests.length === 2 && "
+                "arguments[0].querySelector('input[name=initial_state]').value === '20' && "
+                "arguments[0].classList.contains('translation-saved');",
+                row,
+            )
+        )
+        self.assertEqual(
+            self.driver.execute_script("return window.zenReviewRequests;"),
+            [
+                {"review": "30", "initial_state": "20"},
+                {"review": "20", "initial_state": "30"},
+            ],
+        )
+        self.assertTrue(translated.is_selected())
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+
+    def test_zen_suggestions(self) -> None:
+        """Suggestions are handled in place in the Zen editor."""
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="Zen suggestions", slug="zen-suggestions")
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        user = self.do_login(superuser=True)
+        first, _ = Suggestion.objects.add(unit, ["Nazdar svete!\n"], None, user=user)
+        second, _ = Suggestion.objects.add(unit, ["Ahoj svete!\n"], None, user=user)
+        assert first is not None
+        assert second is not None
+
+        zen_url = reverse("zen", kwargs={"path": translation.get_url_path()})
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{zen_url}?{urlencode({'q': 'has:suggestion'})}"
+            )
+        row_selector = f"#row-suggestions-{unit.checksum}"
+        WebDriverWait(self.driver, 15).until(
+            presence_of_element_located((By.CSS_SELECTOR, row_selector))
+        )
+
+        def suggestion_rows() -> list[WebElement]:
+            return self.find_elements_now(
+                By.CSS_SELECTOR, f"{row_selector} .history-row"
+            )
+
+        def editor() -> WebElement:
+            return self.driver.find_element(
+                By.CSS_SELECTOR,
+                f"#row-edit-{unit.checksum} .translation-editor",
+            )
+
+        def wait_idle() -> None:
+            WebDriverWait(self.driver, 15).until(
+                lambda driver: (
+                    "unit-state-saving"
+                    not in driver.find_element(
+                        By.ID, f"status-{unit.checksum}"
+                    ).get_attribute("class")
+                )
+            )
+
+        self.assertEqual(len(suggestion_rows()), 2)
+
+        # Suggestions are hidden by default, the choice is remembered
+        def suggestions_row() -> WebElement:
+            return self.driver.find_element(By.CSS_SELECTOR, row_selector)
+
+        def toggle_label() -> str:
+            button = self.driver.find_element(By.ID, "zen-toggle-suggestions")
+            label = self.driver.find_element(By.ID, "zen-toggle-suggestions-label")
+            self.assertEqual(
+                button.get_attribute("aria-label"), label.get_attribute("textContent")
+            )
+            return cast("str", button.get_attribute("aria-label"))
+
+        self.assertFalse(suggestions_row().is_displayed())
+        self.assertEqual(toggle_label(), "Show suggestions")
+        self.driver.find_element(By.ID, "zen-toggle-suggestions").click()
+        self.assertTrue(suggestions_row().is_displayed())
+        self.assertEqual(toggle_label(), "Hide suggestions")
+        self.assertEqual(
+            self.driver.execute_script(
+                "return localStorage.getItem('zen-suggestions');"
+            ),
+            "shown",
+        )
+        with self.wait_for_page_load():
+            self.driver.refresh()
+        WebDriverWait(self.driver, 15).until(
+            presence_of_element_located((By.CSS_SELECTOR, row_selector))
+        )
+        self.assertTrue(suggestions_row().is_displayed())
+        self.assertEqual(toggle_label(), "Hide suggestions")
+        self.driver.find_element(By.ID, "zen-toggle-suggestions").click()
+        self.assertFalse(suggestions_row().is_displayed())
+        self.assertEqual(toggle_label(), "Show suggestions")
+        self.assertEqual(
+            self.driver.execute_script(
+                "return localStorage.getItem('zen-suggestions');"
+            ),
+            "hidden",
+        )
+        self.driver.find_element(By.ID, "zen-toggle-suggestions").click()
+        self.assertTrue(suggestions_row().is_displayed())
+
+        # Cloning fills the editor of this unit and marks it as changed
+        next(
+            button
+            for button in self.driver.find_elements(
+                By.CSS_SELECTOR, f"{row_selector} .js-copy-suggestion"
+            )
+            if button.get_attribute("data-text-0") == "Ahoj svete!\n"
+        ).click()
+        self.assertEqual(editor().get_attribute("value"), "Ahoj svete!\n")
+        self.assertIn("has-changes", editor().get_attribute("class") or "")
+
+        # Accepting with pending edits is refused, they are kept intact
+        self.driver.execute_script(
+            """
+            const form = document.querySelector(arguments[0] + " form");
+            form.requestSubmit(form.querySelector('button[name="accept"]'));
+            """,
+            row_selector,
+        )
+        WebDriverWait(self.driver, 15).until(
+            lambda driver: (
+                "Save or discard your changes before accepting"
+                in driver.find_element(
+                    By.CSS_SELECTOR, "#popup-toasts .bg-warning-subtle .toast-body"
+                ).get_attribute("textContent")
+            )
+        )
+        self.assertEqual(editor().get_attribute("value"), "Ahoj svete!\n")
+        self.assertEqual(len(suggestion_rows()), 2)
+        self.assertEqual(Suggestion.objects.count(), 2)
+
+        # Discard the pending edit
+        self.driver.execute_script(
+            """
+            const editor = arguments[0];
+            editor.value = "";
+            editor.classList.remove("has-changes");
+            document.querySelector("#unsaved-label")?.remove();
+            """,
+            editor(),
+        )
+
+        # Rejecting uses the reason typed next to the clicked suggestion
+        first_row = self.driver.find_element(
+            By.CSS_SELECTOR, f'{row_selector} button[name="delete"][value="{first.pk}"]'
+        ).find_element(By.XPATH, "ancestor::div[contains(@class, 'history-row')]")
+        first_row.find_element(By.CSS_SELECTOR, "input[name=rejection]").send_keys(
+            "not good"
+        )
+        first_row.find_element(By.CSS_SELECTOR, 'button[name="delete"]').click()
+        WebDriverWait(self.driver, 15).until(
+            lambda _driver: len(suggestion_rows()) == 1
+        )
+        wait_idle()
+        self.assertEqual(
+            list(Suggestion.objects.values_list("pk", flat=True)), [second.pk]
+        )
+        change = Change.objects.get(action=ActionEvents.SUGGESTION_DELETE)
+        self.assertEqual(change.details["rejection_reason"], "not good")
+        # Rejecting leaves the editor alone
+        self.assertEqual(editor().get_attribute("value"), "")
+
+        # Saving refreshes the suggestion diff against the new target, moving
+        # into the suggestions keeps the typed rejection reason and focus
+        def diff_insertions() -> str:
+            return "".join(
+                cast("str", element.get_attribute("textContent"))
+                for element in self.driver.find_elements(
+                    By.CSS_SELECTOR, f"{row_selector} .comment-content ins"
+                )
+            )
+
+        self.assertIn("Ahoj", diff_insertions())
+        editor().send_keys("Ahoj")
+        rejection = self.driver.find_element(
+            By.CSS_SELECTOR, f"{row_selector} input[name=rejection]"
+        )
+        rejection.click()
+        rejection.send_keys("typed")
+        WebDriverWait(self.driver, 15).until(
+            presence_of_element_located(
+                (By.CSS_SELECTOR, f"#row-edit-{unit.checksum}.translation-saved")
+            )
+        )
+        wait_idle()
+        self.assertNotIn("Ahoj", diff_insertions())
+        self.assertIn("svete", diff_insertions())
+        rejection = self.driver.find_element(
+            By.CSS_SELECTOR, f"{row_selector} input[name=rejection]"
+        )
+        self.assertEqual(rejection.get_attribute("value"), "typed")
+        self.assertEqual(self.driver.switch_to.active_element, rejection)
+        rejection.clear()
+        # Let the later edit wait for its own save
+        self.driver.execute_script(
+            "arguments[0].classList.remove('translation-saved');",
+            self.driver.find_element(By.ID, f"row-edit-{unit.checksum}"),
+        )
+
+        # Accepting updates the row in place
+        self.driver.find_element(
+            By.CSS_SELECTOR, f'{row_selector} button[name="accept"]'
+        ).click()
+        WebDriverWait(self.driver, 15).until_not(
+            presence_of_element_located((By.CSS_SELECTOR, row_selector))
+        )
+        wait_idle()
+        self.assertEqual(Suggestion.objects.count(), 0)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Ahoj svete!\n")
+        self.assertEqual(editor().get_attribute("value"), "Ahoj svete!\n")
+        self.assertNotIn("has-changes", editor().get_attribute("class") or "")
+        self.assertEqual(
+            len(self.find_elements_now(By.CSS_SELECTOR, "#unsaved-label")), 0
+        )
+        self.assertIn(
+            "unit-state-translated",
+            self.driver.find_element(By.ID, f"status-{unit.checksum}").get_attribute(
+                "class"
+            ),
+        )
+        self.assertEqual(
+            self.driver.find_element(
+                By.CSS_SELECTOR, f"#row-edit-{unit.checksum} input[name=translationsum]"
+            ).get_attribute("value"),
+            hash_to_checksum(unit.get_target_hash()),
+        )
+        self.assertEqual(
+            len(
+                self.find_elements_now(
+                    By.CSS_SELECTOR, "#popup-toasts .bg-danger-subtle"
+                )
+            ),
+            0,
+        )
+
+        # A subsequent edit saves without a stale translationsum conflict
+        editor().clear()
+        editor().send_keys("Upraveno")
+        self.driver.find_element(By.ID, "id_q").click()
+        WebDriverWait(self.driver, 15).until(
+            presence_of_element_located(
+                (By.CSS_SELECTOR, f"#row-edit-{unit.checksum}.translation-saved")
+            )
+        )
+        wait_idle()
+        self.assertEqual(
+            len(
+                self.find_elements_now(
+                    By.CSS_SELECTOR, "#popup-toasts .bg-danger-subtle"
+                )
+            ),
+            0,
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Upraveno\n")
+
+    def test_zen_suggestions_indicator(self) -> None:
+        """Suggestions are counted per string, the count toggles them."""
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(
+            name="Zen suggestions indicator", slug="zen-suggestions-indicator"
+        )
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        user = self.do_login(superuser=True)
+        first, _ = Suggestion.objects.add(unit, ["Nazdar svete!\n"], None, user=user)
+        assert first is not None
+        Suggestion.objects.add(unit, ["Ahoj svete!\n"], None, user=user)
+
+        zen_url = reverse("zen", kwargs={"path": translation.get_url_path()})
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{zen_url}?{urlencode({'q': 'has:suggestion'})}"
+            )
+        # Start from the default visibility regardless of earlier tests
+        self.driver.execute_script("localStorage.removeItem('zen-suggestions');")
+        with self.wait_for_page_load():
+            self.driver.refresh()
+
+        row_selector = f"#row-suggestions-{unit.checksum}"
+        indicator_selector = f"#row-status-{unit.checksum} .zen-suggestions-indicator"
+
+        def indicator() -> WebElement:
+            return self.driver.find_element(By.CSS_SELECTOR, indicator_selector)
+
+        def indicator_count() -> str | None:
+            return (
+                indicator()
+                .find_element(By.CSS_SELECTOR, ".zen-suggestions-count")
+                .get_attribute("textContent")
+            )
+
+        self.assertTrue(indicator().is_displayed())
+        self.assertEqual(indicator_count(), "2")
+        self.assertEqual(indicator().get_attribute("title"), "2 suggestions")
+        self.assertEqual(indicator().get_attribute("aria-expanded"), "false")
+
+        # Clicking it shows the suggestions and moves to those of the string
+        indicator().click()
+        self.assertTrue(
+            self.driver.find_element(By.CSS_SELECTOR, row_selector).is_displayed()
+        )
+        self.assertTrue(indicator().is_displayed())
+        self.assertEqual(indicator().get_attribute("aria-expanded"), "true")
+        self.assertEqual(
+            self.driver.switch_to.active_element,
+            self.driver.find_element(By.ID, f"suggestions-{unit.checksum}"),
+        )
+        self.assertEqual(
+            self.driver.find_element(By.ID, "zen-toggle-suggestions").get_attribute(
+                "aria-label"
+            ),
+            "Hide suggestions",
+        )
+        self.assertEqual(
+            self.driver.execute_script(
+                "return localStorage.getItem('zen-suggestions');"
+            ),
+            "shown",
+        )
+
+        # Clicking it again hides them
+        indicator().click()
+        WebDriverWait(self.driver, 10).until(
+            invisibility_of_element_located((By.CSS_SELECTOR, row_selector))
+        )
+        self.assertFalse(
+            self.driver.find_element(By.CSS_SELECTOR, row_selector).is_displayed()
+        )
+        self.assertTrue(indicator().is_displayed())
+        self.assertEqual(indicator().get_attribute("aria-expanded"), "false")
+        self.assertEqual(
+            self.driver.execute_script(
+                "return localStorage.getItem('zen-suggestions');"
+            ),
+            "hidden",
+        )
+        indicator().click()
+
+        self.driver.find_element(
+            By.CSS_SELECTOR, f'{row_selector} button[name="delete"][value="{first.pk}"]'
+        ).click()
+        WebDriverWait(self.driver, 15).until(lambda _driver: indicator_count() == "1")
+        self.assertEqual(indicator().get_attribute("title"), "1 suggestion")
+
+        self.driver.find_element(
+            By.CSS_SELECTOR, f'{row_selector} button[name="accept"]'
+        ).click()
+        WebDriverWait(self.driver, 15).until_not(
+            presence_of_element_located((By.CSS_SELECTOR, indicator_selector))
+        )
+
+    @reuse_demo_fixture
+    def test_search_preview_scopes_boolean_query(self) -> None:
+        project = self.create_component()
+        component = Component.objects.get(project=project, slug="language-names")
+        self.do_login(superuser=True)
+        self.open_component(component, project)
+        self.click("Operations")
+        self.click("Bulk edit")
+
+        self.driver.execute_script(
+            """
+            window.previewRequestUrl = null;
+            window.fetch = (url) => {
+                window.previewRequestUrl = url;
+                return Promise.resolve({ok: false});
+            };
+            """
+        )
+        self.driver.find_element(By.ID, "id_bulk_q").send_keys('"a" OR ""')
+
+        preview_url = WebDriverWait(self.driver, 5).until(
+            lambda driver: driver.execute_script("return window.previewRequestUrl;")
+        )
+        preview_query = self.driver.execute_script(
+            """
+            return new URL(arguments[0], document.baseURI).searchParams.get("q");
+            """,
+            preview_url,
+        )
+        self.assertEqual(
+            preview_query,
+            f'path:{component.full_slug} AND ("a" OR "")',
+        )
+
+    def test_js_unit_tests(self) -> None:
+        self.assertEqual(self.driver.execute_script("return getNumber('1,23');"), 1.23)
+        self.assertEqual(self.driver.execute_script("return getNumber('1.23');"), 1.23)
+        self.assertIsNone(
+            self.driver.execute_script("return getNumber('not-a-number');")
+        )
+
+        self.assertEqual(
+            self.driver.execute_script("return quoteSearch('simple');"), "simple"
+        )
+        self.assertEqual(
+            self.driver.execute_script("return quoteSearch('two words');"),
+            '"two words"',
+        )
+
+        self.assertEqual(self.driver.execute_script("return compareCells(1, 2);"), -1)
+        self.assertEqual(
+            self.driver.execute_script("return compareCells('2,5%', '1,0%');"), 1
+        )
+        self.assertEqual(
+            self.driver.execute_script("return compareCells('abc', 'Abc');"), 0
+        )
+
+        self.assertEqual(
+            self.driver.execute_script(
+                "const cell = document.createElement('td'); cell.setAttribute('data-value', 'x-val'); return extractText(cell);"
+            ),
+            "x-val",
+        )
+        self.assertEqual(
+            self.driver.execute_script(
+                "const cell = document.createElement('td'); cell.textContent = 'inner'; return extractText(cell);"
+            ),
+            "inner",
+        )
+
+    def test_table_sorting(self) -> None:
+        """Clicking sortable table headers reorders the rows client-side."""
+        # Load a page so that loader-bootstrap.js is loaded
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('languages')}")
+
+        result = self.driver.execute_script(
+            r"""
+            const table = document.createElement("table");
+            table.className = "sort";
+            table.innerHTML = `
+              <thead><tr>
+                <th class="sort-skip"></th>
+                <th class="sort-cell">Name</th>
+                <th class="number sort-cell"><span class="sort-icon"> </span>Count</th>
+              </tr></thead>
+              <tbody>
+                <tr id="9row-1"><td></td><th class="object-link">Beta</th><td class="number" data-value="30">30</td></tr>
+                <tr data-parent="9row-1"><td colspan="3">progress</td></tr>
+                <tr id="9row-2"><td></td><th class="object-link">Alpha</th><td class="number" data-value="10">10</td></tr>
+                <tr data-parent="9row-2"><td colspan="3">progress</td></tr>
+                <tr id="9row-3"><td></td><th class="object-link">Gamma</th><td class="number" data-value="20">20</td></tr>
+                <tr data-parent="9row-3"><td colspan="3">progress</td></tr>
+              </tbody>`;
+            document.body.appendChild(table);
+            loadTableSorting();
+            const header = table.querySelectorAll("thead th")[2];
+            const readNames = () => Array.from(
+                table.querySelectorAll("tbody tr[id] th.object-link")
+            ).map((el) => el.textContent.trim());
+            header.click();
+            const ascending = readNames();
+            header.click();
+            const descending = readNames();
+            return {ascending: ascending, descending: descending};
+            """
+        )
+        self.assertEqual(result["ascending"], ["Alpha", "Gamma", "Beta"])
+        self.assertEqual(result["descending"], ["Beta", "Gamma", "Alpha"])
+
+    def test_automation_editor(self) -> None:
+        """The automation workflow editor round-trips between its panes."""
+        workflow: dict[str, Any] = {
+            "version": 1,
+            "triggers": [
+                {"trigger": "change", "events": ["translation_changed"]},
+            ],
+            "conditions": [{"condition": "language", "value": "cs"}],
+            "actions": [
+                {
+                    "action": "weblate.bulk_edit",
+                    "id": "flagit",
+                    "settings": {
+                        "q": "state:translated",
+                        "state": STATE_FUZZY,
+                        "search_type": "regex",
+                        "search": r" (Hello), (?P<word>world) ",
+                        "replacement": r" \g<word> \g<1> ",
+                    },
+                }
+            ],
+        }
+        project = self.create_component()
+        component = Component.objects.get(project=project, slug="language-names")
+        user = self.do_login(superuser=True)
+        addon = AutomationAddon.create(
+            acting_user=user,
+            configuration={"workflow": deepcopy(workflow)},
+            run=False,
+            component=component,
+        )
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{addon.instance.get_absolute_url()}"
+            )
+
+        editor = self.driver.find_element(By.CSS_SELECTOR, "[data-automation-editor]")
+        pane = editor.find_element(By.CSS_SELECTOR, "[data-automation-pane='editor']")
+        yaml_pane = self.driver.find_element(By.ID, "div_id_workflow")
+        self.assertTrue(pane.is_displayed())
+        self.assertFalse(yaml_pane.is_displayed())
+
+        # The saved workflow is shown as one node per trigger, condition, and
+        # action, and serializes back unchanged.
+        self.assertEqual(
+            self.driver.execute_script(
+                "return Array.from("
+                "document.querySelectorAll('[data-automation-legend]'),"
+                " (el) => el.textContent);"
+            ),
+            ["Change event", "Language", "Bulk editing"],
+        )
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            workflow,
+        )
+
+        first_action = pane.find_element(
+            By.CSS_SELECTOR, "[data-automation-instance='action:weblate.bulk_edit']"
+        )
+        self.assertTrue(
+            first_action.find_element(
+                By.CSS_SELECTOR, "input[data-workflow-key='search_type'][value='regex']"
+            ).is_selected()
+        )
+        Select(
+            self.driver.find_element(By.ID, "automation-add-action")
+        ).select_by_value("action:weblate.bulk_edit")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, "[data-automation-add='actions']")
+        )
+        action_nodes = pane.find_elements(
+            By.CSS_SELECTOR, "[data-automation-instance='action:weblate.bulk_edit']"
+        )
+        second_action = action_nodes[1]
+        self.assertTrue(
+            second_action.find_element(
+                By.CSS_SELECTOR, "input[data-workflow-key='search_type'][value='text']"
+            ).is_selected()
+        )
+        self.assertTrue(
+            first_action.find_element(
+                By.CSS_SELECTOR, "input[data-workflow-key='search_type'][value='regex']"
+            ).is_selected()
+        )
+        query = second_action.find_element(By.CSS_SELECTOR, "[data-workflow-key='q']")
+        query.send_keys("language:cs")
+        Select(
+            second_action.find_element(By.CSS_SELECTOR, "[data-workflow-key='state']")
+        ).select_by_value("0")
+        workflow["actions"].append(
+            {
+                "action": "weblate.bulk_edit",
+                "settings": {
+                    "q": "language:cs",
+                    "state": 0,
+                    "search_type": "text",
+                },
+            }
+        )
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            workflow,
+        )
+
+        # Adding a node through the editor extends the workflow.
+        Select(
+            self.driver.find_element(By.ID, "automation-add-trigger")
+        ).select_by_value("trigger:daily")
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "[data-automation-add='triggers']"
+            )
+        )
+        expected = deepcopy(workflow)
+        expected["triggers"].append({"trigger": "daily"})
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            expected,
+        )
+
+        # Switching to YAML writes the workflow out, and switching back parses
+        # it into the same tree.
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "label[for='automation-mode-yaml']"
+            )
+        )
+        self.assertFalse(pane.is_displayed())
+        self.assertTrue(yaml_pane.is_displayed())
+        self.assertIn(
+            "trigger: daily",
+            self.driver.find_element(By.ID, "id_workflow").get_attribute("value") or "",
+        )
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "label[for='automation-mode-editor']"
+            )
+        )
+        self.assertTrue(pane.is_displayed())
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            expected,
+        )
+
+        # Saving submits what the editor produced.
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, "#addon-form input[type='submit']"
+                )
+            )
+        addon.instance.refresh_from_db()
+        self.assertEqual(
+            addon.instance.configuration["workflow"]["triggers"],
+            expected["triggers"],
+        )
+
+        # Workflows the editor cannot show yet stay in the YAML pane. Saving
+        # reloaded the page, so the earlier references are gone.
+        editor = self.driver.find_element(By.CSS_SELECTOR, "[data-automation-editor]")
+        pane = editor.find_element(By.CSS_SELECTOR, "[data-automation-pane='editor']")
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "label[for='automation-mode-yaml']"
+            )
+        )
+        field = self.driver.find_element(By.ID, "id_workflow")
+        field.clear()
+        field.send_keys(
+            "version: 1\ntriggers: []\nactions:\n- action: weblate.from_the_future\n  settings: {}\n"
+        )
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "label[for='automation-mode-editor']"
+            )
+        )
+        alert = editor.find_element(By.CSS_SELECTOR, "[data-automation-alert]")
+        self.assertTrue(alert.is_displayed())
+        self.assertIn("cannot show", alert.text)
+        self.assertFalse(pane.is_displayed())
+        self.assertTrue(
+            self.driver.find_element(By.ID, "automation-mode-yaml").is_selected()
+        )
+
+        field = self.driver.find_element(By.ID, "id_workflow")
+        field.clear()
+        field.send_keys(
+            "version: 1\ntriggers: []\nconditions:\n- condition: and\n"
+            "  conditions:\n    condition: language\n    value: cs\nactions: []\n"
+        )
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "label[for='automation-mode-editor']"
+            )
+        )
+        self.assertTrue(alert.is_displayed())
+        self.assertIn("cannot show", alert.text)
+        self.assertFalse(pane.is_displayed())
+        self.assertIn(
+            "condition: language",
+            self.driver.find_element(By.ID, "id_workflow").get_attribute("value"),
+        )
+
+        # A rejected workflow reopens in the YAML pane, where its message is.
+        field = self.driver.find_element(By.ID, "id_workflow")
+        field.clear()
+        field.send_keys("version: [unfinished")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, "#addon-form input[type='submit']"
+                )
+            )
+        self.assertFalse(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "[data-automation-pane='editor']"
+            ).is_displayed()
+        )
+        self.assertTrue(
+            self.driver.find_element(By.ID, "div_id_workflow").is_displayed()
+        )
+        self.assertEqual(
+            self.driver.find_element(By.ID, "id_workflow").get_attribute("value"),
+            "version: [unfinished",
+        )
+
+        # An action added through the editor keeps the defaults Django renders,
+        # while a saved action that omits a setting is left as it was saved.
+        with acting_user_context(user):
+            addon.configure(
+                {
+                    "workflow": {
+                        "version": 1,
+                        "triggers": [],
+                        "actions": [
+                            {
+                                "action": "weblate.automatic_translation",
+                                "settings": {},
+                            }
+                        ],
+                    }
+                }
+            )
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{addon.instance.get_absolute_url()}"
+            )
+        saved = self.driver.execute_script(
+            "return automationEditor.serializeWorkflow();"
+        )
+        # A select cannot express an absent key, so mode keeps the value the
+        # server would have defaulted to; the settings that would change what
+        # the action does are left alone.
+        self.assertEqual(saved["actions"][0]["settings"], {"mode": "suggest"})
+        Select(
+            self.driver.find_element(By.ID, "automation-add-action")
+        ).select_by_value("action:weblate.automatic_translation")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, "[data-automation-add='actions']")
+        )
+        added = self.driver.execute_script(
+            "return automationEditor.serializeWorkflow();"
+        )["actions"][1]["settings"]
+        self.assertEqual(added["q"], "state:<translated")
+        self.assertEqual(added["threshold"], MACHINERY_DEFAULT_THRESHOLD)
+
+        # Condition groups and branches nest, and survive a round trip through
+        # both panes unchanged.
+        nested = {
+            "version": 1,
+            "triggers": [],
+            "conditions": [
+                {
+                    "condition": "and",
+                    "conditions": [
+                        {"condition": "language", "value": "cs"},
+                        {
+                            "condition": "or",
+                            "conditions": [
+                                {"condition": "unit_state", "value": STATE_TRANSLATED},
+                                {
+                                    "condition": "not",
+                                    "conditions": [
+                                        {"condition": "language", "value": "de"}
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+            "actions": [
+                {
+                    "choose": [
+                        {
+                            "conditions": [{"condition": "language", "value": "cs"}],
+                            "sequence": [
+                                {
+                                    "action": "weblate.select",
+                                    "id": "picked",
+                                    "settings": {"q": "state:translated"},
+                                }
+                            ],
+                        },
+                        {
+                            "conditions": [{"condition": "language", "value": "de"}],
+                            "sequence": [
+                                {
+                                    "action": "weblate.select",
+                                    "settings": {"q": "state:needs-editing"},
+                                }
+                            ],
+                        },
+                    ],
+                    "default": [
+                        {
+                            "sequence": [
+                                {
+                                    "action": "weblate.select",
+                                    "scope": "result:picked",
+                                    "settings": {"q": ""},
+                                },
+                                {
+                                    "action": "weblate.select",
+                                    "settings": {"q": "state:translated"},
+                                },
+                            ]
+                        }
+                    ],
+                },
+                {
+                    "action": "weblate.bulk_edit",
+                    "scope": "result:picked",
+                    "settings": {"q": "state:translated", "state": STATE_FUZZY},
+                },
+            ],
+        }
+        with acting_user_context(user):
+            addon.configure({"workflow": deepcopy(nested)})
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{addon.instance.get_absolute_url()}"
+            )
+        self.assertFalse(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "[data-automation-alert]"
+            ).is_displayed()
+        )
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            nested,
+        )
+        # Round trip through the YAML pane and back.
+        for mode in ("yaml", "editor"):
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, f"label[for='automation-mode-{mode}']"
+                )
+            )
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            nested,
+        )
+
+        # A not holds exactly one condition, so its add control is blocked
+        # while the hundred-node and eight-level limits leave others open.
+        blocked = self.driver.execute_script(
+            "return Array.from("
+            'document.querySelectorAll("[data-automation-slot]"),'
+            " (slot) => [slot.dataset.automationSlot,"
+            '  slot.closest("[data-automation-instance]")?.dataset'
+            "    .automationInstance ?? null,"
+            "  slot.querySelector("
+            '   ":scope > [data-automation-slot-controls] > [data-automation-add]"'
+            "  ).disabled]);"
+        )
+        self.assertIn(["conditions", "condition:not", True], blocked)
+        self.assertIn(["conditions", "condition:and", False], blocked)
+
+        scopes = self.driver.execute_script(
+            "return Array.from("
+            'document.querySelectorAll("[data-automation-result-scope]"),'
+            " (select) => Array.from(select.options, (o) => o.value));"
+        )
+        self.assertEqual(
+            scopes,
+            [
+                ["", "component", "trigger"],
+                ["", "component", "trigger"],
+                ["", "component", "trigger", "result:picked"],
+                ["", "component", "trigger"],
+                ["", "component", "trigger", "result:picked"],
+            ],
+        )
+
+        # Choose branches count towards the hundred nodes like on the server.
+        self.driver.execute_script(
+            "automationEditor.buildTree(arguments[0]);",
+            {
+                "version": 1,
+                "triggers": [],
+                "conditions": [{"condition": "language", "value": "cs"}] * 90,
+                "actions": [
+                    {"choose": [{"conditions": [], "sequence": []}] * 9},
+                ],
+            },
+        )
+        self.assertTrue(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "[data-automation-add='conditions']"
+            ).get_attribute("disabled")
+        )
+
+    def test_automation_editor_nesting_depth(self) -> None:
+        """The automation editor offers every nesting level the backend takes."""
+        deep: dict[str, Any] = {"condition": "language", "value": "cs"}
+        for _ in range(7):
+            deep = {"condition": "and", "conditions": [deep]}
+        project = self.create_component()
+        component = Component.objects.get(project=project, slug="language-names")
+        user = self.do_login(superuser=True)
+        addon = AutomationAddon.create(
+            acting_user=user,
+            configuration={
+                "workflow": {
+                    "version": 1,
+                    "triggers": [],
+                    "conditions": [deep],
+                    "actions": [
+                        {
+                            "action": "weblate.select",
+                            "settings": {"q": "state:translated"},
+                        }
+                    ],
+                }
+            },
+            run=False,
+            component=component,
+        )
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{addon.instance.get_absolute_url()}"
+            )
+        blocked_depths = (
+            "return Array.from("
+            "document.querySelectorAll(\"[data-automation-slot='conditions']\"),"
+            " (slot) => slot.querySelector("
+            '  ":scope > [data-automation-slot-controls] > [data-automation-add]"'
+            " ).disabled);"
+        )
+        self.assertEqual(self.driver.execute_script(blocked_depths), [False] * 8)
+        deepest = self.driver.find_elements(
+            By.CSS_SELECTOR, "[data-automation-slot='conditions']"
+        )[-1]
+        Select(
+            deepest.find_element(By.CSS_SELECTOR, "[data-automation-picker]")
+        ).select_by_value("condition:and")
+        self.click(deepest.find_element(By.CSS_SELECTOR, "[data-automation-add]"))
+        self.assertEqual(
+            self.driver.execute_script(blocked_depths), [False] * 8 + [True]
+        )
+
+    def test_automation_editor_required_query(self) -> None:
+        """The editor reports a cleared query instead of saving it as empty."""
+        workflow: dict[str, Any] = {
+            "version": 1,
+            "triggers": [],
+            "actions": [
+                {
+                    "action": "weblate.select",
+                    "id": "picked",
+                    "settings": {"q": "state:translated"},
+                },
+                {
+                    "action": "weblate.select",
+                    "scope": "result:picked",
+                    "settings": {"q": ""},
+                },
+            ],
+        }
+        project = self.create_component()
+        component = Component.objects.get(project=project, slug="language-names")
+        user = self.do_login(superuser=True)
+        addon = AutomationAddon.create(
+            acting_user=user,
+            configuration={"workflow": deepcopy(workflow)},
+            run=False,
+            component=component,
+        )
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{addon.instance.get_absolute_url()}"
+            )
+
+        queries = self.driver.find_elements(
+            By.CSS_SELECTOR,
+            "[data-automation-root='actions'] [data-workflow-key='q']",
+        )
+        queries[0].clear()
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "#addon-form input[type='submit']"
+            )
+        )
+        self.assertTrue(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "[data-automation-alert]"
+            ).is_displayed()
+        )
+        self.assertEqual(
+            self.driver.execute_script(
+                "const element = document.activeElement;"
+                " const node = element.closest('[data-automation-instance]');"
+                " return [element.dataset.workflowKey,"
+                "  Array.from(node.parentElement.children).indexOf(node)];"
+            ),
+            ["q", 0],
+        )
+        addon.instance.refresh_from_db()
+        self.assertEqual(addon.instance.configuration["workflow"], workflow)
+
+        # Entering a query saves the workflow, empty result-scoped query
+        # included.
+        queries[0].send_keys("state:approved")
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR, "#addon-form input[type='submit']"
+            )
+        )
+        saved = deepcopy(workflow)
+        saved["actions"][0]["settings"]["q"] = "state:approved"
+        for _unused in range(300):
+            addon.instance.refresh_from_db()
+            if addon.instance.configuration["workflow"] == saved:
+                break
+            time.sleep(0.1)
+        self.assertEqual(addon.instance.configuration["workflow"], saved)
+        WebDriverWait(self.driver, 30).until(self.is_page_loaded)
+
+    def test_automation_editor_result_scopes_and_focus(self) -> None:
+        """The automation editor shows result scopes and keeps keyboard focus."""
+        project = self.create_component()
+        component = Component.objects.get(project=project, slug="language-names")
+        user = self.do_login(superuser=True)
+        addon = AutomationAddon.create(
+            acting_user=user,
+            configuration={
+                "workflow": {
+                    "version": 1,
+                    "triggers": [],
+                    "actions": [
+                        {
+                            "action": "weblate.select",
+                            "id": "picked",
+                            "settings": {"q": "state:translated"},
+                        },
+                        {
+                            "action": "weblate.bulk_edit",
+                            "scope": "result:picked",
+                            "settings": {"q": "state:translated", "state": STATE_FUZZY},
+                        },
+                        {
+                            "action": "weblate.automatic_translation",
+                            "settings": {"mode": "approved"},
+                        },
+                    ],
+                }
+            },
+            run=False,
+            component=component,
+        )
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{addon.instance.get_absolute_url()}"
+            )
+        pane = self.driver.find_element(
+            By.CSS_SELECTOR, "[data-automation-pane='editor']"
+        )
+        self.assertTrue(pane.is_displayed())
+        saved = addon.instance.configuration["workflow"]
+        self.assertEqual(
+            self.driver.execute_script("return automationEditor.serializeWorkflow();"),
+            saved,
+        )
+
+        # Earlier action IDs are offered as result scopes, including ones typed
+        # into the editor.
+        scope_options = (
+            "return Array.from(document.querySelectorAll("
+            "\"[data-automation-root='actions'] [data-workflow-key='scope']\"),"
+            " (el) => Array.from(el.options, (option) => option.value));"
+        )
+        self.assertEqual(
+            self.driver.execute_script(scope_options),
+            [
+                ["", "component", "trigger"],
+                ["", "component", "trigger", "result:picked"],
+                ["", "component", "trigger", "result:picked"],
+            ],
+        )
+        self.driver.find_elements(
+            By.CSS_SELECTOR,
+            "[data-automation-root='actions'] [data-workflow-key='id']",
+        )[1].send_keys("edited")
+        self.assertEqual(
+            self.driver.execute_script(scope_options)[2],
+            ["", "component", "trigger", "result:picked", "result:edited"],
+        )
+
+        # Removing a node moves focus to its neighbor instead of the page.
+        remove = self.driver.find_elements(
+            By.CSS_SELECTOR,
+            "[data-automation-root='actions'] [data-automation-remove]",
+        )[2]
+        remove.send_keys(Keys.ENTER)
+        self.assertEqual(
+            self.driver.execute_script(
+                "const node = document.activeElement.closest("
+                "'[data-automation-instance]');"
+                " return node && node.dataset.automationInstance;"
+            ),
+            "action:weblate.bulk_edit",
+        )
+
+        self.driver.execute_script(
+            "automationEditor.buildTree(arguments[0]);",
+            {
+                "version": 1,
+                "triggers": [],
+                "conditions": [
+                    {
+                        "condition": "not",
+                        "conditions": [{"condition": "language", "value": "cs"}],
+                    }
+                ],
+                "actions": [
+                    {"action": "weblate.select", "settings": {"q": "state:translated"}}
+                ],
+            },
+        )
+        self.driver.find_element(
+            By.CSS_SELECTOR,
+            "[data-automation-instance='condition:language'] [data-automation-remove]",
+        ).send_keys(Keys.ENTER)
+        self.assertEqual(
+            self.driver.execute_script(
+                "const active = document.activeElement;"
+                " return [active.dataset.automationAdd ?? null,"
+                " active.closest('[data-automation-instance]')?.dataset"
+                "   .automationInstance ?? null];"
+            ),
+            ["conditions", "condition:not"],
+        )
+
+        # Adding a node with an enhanced select focuses its visible control.
+        Select(
+            self.driver.find_element(By.ID, "automation-add-trigger")
+        ).select_by_value("trigger:change")
+        self.driver.find_element(
+            By.CSS_SELECTOR, "[data-automation-add='triggers']"
+        ).send_keys(Keys.ENTER)
+        self.assertTrue(
+            self.driver.execute_script(
+                "const active = document.activeElement;"
+                " return active.closest(\"[data-automation-root='triggers']\")"
+                " !== null && active.closest('.ts-wrapper') !== null;"
+            )
+        )
+
+        # Adding a node without fields focuses its own controls.
+        Select(
+            self.driver.find_element(By.ID, "automation-add-trigger")
+        ).select_by_value("trigger:daily")
+        self.driver.find_element(
+            By.CSS_SELECTOR, "[data-automation-add='triggers']"
+        ).send_keys(Keys.ENTER)
+        self.assertEqual(
+            self.driver.execute_script(
+                "const node = document.activeElement.closest("
+                "'[data-automation-instance]');"
+                " return node && node.dataset.automationInstance;"
+            ),
+            "trigger:daily",
+        )
+
+    def test_hotkeys(self) -> None:
+        """Test hotkeys functionality."""
+        # Check that the hotkeys library is loaded and the filter is overridden by our wrapper.
+        self.assertTrue(
+            self.driver.execute_script(
+                "return typeof window.hotkeys === 'function'"
+                " && typeof window.hotkeys.filter === 'function';"
+            )
+        )
+
+        # Why this test exists: the wrapper overrides hotkeys.filter to always
+        # return true so bindings still fire inside inputs and textareas
+        # (mousetrap-global-bind used to cover this). Dropping that override
+        # would silently break every in-editor shortcut.
+        self.driver.execute_script(
+            """
+            window.__hotkeyFired = 0;
+            window.hotkeys('ctrl+alt+b', () => {
+                window.__hotkeyFired += 1;
+                return false;
+            });
+            const ta = document.createElement('textarea');
+            ta.id = '__hotkey_test_ta';
+            document.body.appendChild(ta);
+            ta.focus();
+            """
+        )
+        textarea = self.driver.find_element(By.ID, "__hotkey_test_ta")
+        (
+            self.actions.key_down(Keys.CONTROL)
+            .key_down(Keys.ALT)
+            .send_keys_to_element(textarea, "b")
+            .key_up(Keys.ALT)
+            .key_up(Keys.CONTROL)
+            .perform()
+        )
+        self.assertEqual(self.driver.execute_script("return window.__hotkeyFired;"), 1)
+
+        # Shift+/ on a non-input element opens the shortcuts help modal.
+        body = self.driver.find_element(By.TAG_NAME, "body")
+        self.actions.send_keys_to_element(body, "?").perform()
+        WebDriverWait(self.driver, 5).until(
+            lambda driver: (
+                "show"
+                in driver.find_element(By.ID, "shortcuts-modal").get_attribute("class")
+            )
+        )
+        modal = self.driver.find_element(By.ID, "shortcuts-modal")
+        self.assertEqual(modal.get_attribute("role"), "dialog")
+        modal_label = modal.get_attribute("aria-labelledby")
+        self.assertEqual(
+            self.driver.find_element(By.ID, modal_label).text,
+            "Keyboard shortcuts",
+        )
+        self.assertEqual(
+            self.driver.execute_script(
+                """
+                const ids = Array.from(arguments[0].querySelectorAll("[id]"))
+                    .map((element) => element.id);
+                return ids.filter((id, index) => ids.indexOf(id) !== index);
+                """,
+                modal,
+            ),
+            [],
+        )
+
+    def open_machinery_unit(
+        self, *identifiers: str, slugs: dict[str, str] | None = None
+    ) -> Unit:
+        """Open the machinery tab of a unit with given services enabled."""
+        project = self.create_component()
+        for engine in (
+            MachineryInstallation.objects.filter(
+                project__isnull=True, workspace__isnull=True
+            )
+            .values_list("engine", flat=True)
+            .distinct()
+        ):
+            MachineryExclusion.objects.create(project=project, engine=engine)
+        for identifier in identifiers:
+            MachineryInstallation.objects.create(
+                project=project,
+                engine=identifier,
+                slug=slugs.get(identifier, "") if slugs else "",
+            )
+
+        self.do_login(superuser=True)
+        unit = (
+            Unit.objects.filter(
+                translation__component__project=project,
+                translation__language_code="cs",
+            )
+            .exclude(source="")
+            .first()
+        )
+        self.assertIsNotNone(unit)
+        unit = cast("Unit", unit)
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+
+        self.click(htmlid="toggle-machinery")
+        return unit
+
+    def wait_for_machinery_rows(self, count: int) -> None:
+        """Wait until the machinery tab settles on given number of results."""
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: (
+                len(
+                    driver.find_elements(
+                        By.CSS_SELECTOR, "#machinery-translations .machinery-row"
+                    )
+                )
+                == count
+                and not driver.find_element(By.ID, "loading-machinery").is_displayed()
+            )
+        )
+
+    @reuse_demo_fixture
+    @override_settings(
+        WEBLATE_MACHINERY=(
+            *settings.WEBLATE_MACHINERY,
+            "weblate.trans.tests.test_selenium.SeleniumDummyTranslation",
+        )
+    )
+    def test_machinery_hotkeys_use_current_results(self) -> None:
+        """Test that machinery hotkeys use current result rows."""
+        self.open_machinery_unit(SeleniumDummyTranslation.get_identifier())
+        self.wait_for_machinery_rows(2)
+
+        self.driver.execute_script(
+            """
+            const translations = document.getElementById("machinery-translations");
+            translations.replaceChildren();
+            const cloneTemplate = (id) => document
+                .getElementById(id)
+                .content.firstElementChild.cloneNode(true);
+            ["stale replacement 1", "current replacement 2"].forEach((text, idx) => {
+                const key = String((idx + 1) % 10);
+                const row = cloneTemplate("machinery-row");
+                row.setAttribute("data-machinery-key", key);
+                row.setAttribute("data-raw", JSON.stringify({
+                    plural_forms: [0],
+                    text: text,
+                }));
+                const kbd = document.createElement("kbd");
+                kbd.textContent = key;
+                row.querySelector(".machinery-number").replaceChildren(kbd);
+                row.querySelector(".history-data").prepend(
+                    cloneTemplate("machinery-actions"),
+                );
+                translations.appendChild(row);
+            });
+            document.querySelector(".translator .translation-editor").value = "";
+            """
+        )
+
+        editor = self.driver.find_element(
+            By.CSS_SELECTOR, ".translator .translation-editor"
+        )
+        editor.click()
+        (
+            self.actions.key_down(Keys.CONTROL)
+            .send_keys("m")
+            .key_up(Keys.CONTROL)
+            .send_keys("2")
+            .perform()
+        )
+
+        self.assertEqual(
+            self.driver.execute_script(
+                'return document.querySelector(".translator .translation-editor").value;'
+            ),
+            "current replacement 2",
+        )
+
+    @reuse_demo_fixture
+    @override_settings(
+        WEBLATE_MACHINERY=(
+            *settings.WEBLATE_MACHINERY,
+            "weblate.trans.tests.test_selenium.SeleniumMergeTranslation",
+        )
+    )
+    def test_machinery_merge_keeps_context(self) -> None:
+        """Merging results of equal text keeps the context of either of them."""
+        self.open_machinery_unit(SeleniumMergeTranslation.get_identifier())
+        self.wait_for_machinery_rows(4)
+
+        # The context has to survive both merge directions: the row being
+        # replaced by a better result and a better result being merged into.
+        contexts = self.driver.execute_script(
+            """
+            const result = {};
+            for (const row of document.querySelectorAll(".machinery-row")) {
+                const context = row.querySelector(".machinery-context");
+                result[JSON.parse(row.dataset.raw).text] = context.hidden
+                    ? null
+                    : context.textContent;
+            }
+            return result;
+            """
+        )
+        self.assertEqual(
+            contexts,
+            {
+                "merged target A": "context.a",
+                "merged target B": "context.b",
+                "reordered target": None,
+                "lower target": None,
+            },
+        )
+
+        # The results stay sorted by the quality even when a merge replaces
+        # an already displayed row.
+        self.assertEqual(
+            self.driver.execute_script(
+                """
+                return Array.from(
+                    document.querySelectorAll(".machinery-row"),
+                ).map((row) => JSON.parse(row.dataset.raw).text);
+                """
+            ),
+            [
+                "merged target B",
+                "merged target A",
+                "reordered target",
+                "lower target",
+            ],
+        )
+
+    @reuse_demo_fixture
+    @override_settings(
+        WEBLATE_MACHINERY=(
+            "weblate.trans.tests.test_selenium.SeleniumOriginsTranslation",
+        )
+    )
+    def test_machinery_origins(self) -> None:
+        """Machinery origins are grouped by service and collapsed when many."""
+        self.open_machinery_unit(SeleniumOriginsTranslation.get_identifier())
+        self.wait_for_machinery_rows(1)
+
+        row = self.driver.find_element(
+            By.CSS_SELECTOR, "#machinery-translations .machinery-row"
+        )
+        # The service is named once for all its origins.
+        self.assertEqual(
+            [
+                element.text
+                for element in row.find_elements(
+                    By.CSS_SELECTOR, ".machinery-service-name"
+                )
+            ],
+            [SeleniumOriginsTranslation.name],
+        )
+
+        # Each origin is listed once with its score, the best ones first, and
+        # the ones over the limit are collapsed.
+        details = row.find_element(By.CSS_SELECTOR, ".machinery-origin-more")
+        self.assertIsNone(details.get_attribute("open"))
+        summary = details.find_element(By.TAG_NAME, "summary")
+        self.assertEqual(summary.text, "2 more origins")
+        origins = row.find_elements(By.CSS_SELECTOR, "div.machinery-origin-detail")
+        self.assertEqual(
+            [element.text for element in origins if element.is_displayed()],
+            [
+                "Component 2 (100%)",
+                "Component 1 (95%)",
+                "Component 0 (90%)",
+                "Component 4 (85%)",
+                "Component 3 (80%)",
+            ],
+        )
+
+        summary.send_keys(Keys.ENTER)
+        self.assertEqual(
+            [element.text for element in origins if element.is_displayed()][5:],
+            [
+                "Component 5 (75%)",
+                "Component 6 (70%)",
+            ],
+        )
+
+    @reuse_demo_fixture
+    @override_settings(
+        WEBLATE_MACHINERY=(
+            "weblate.trans.tests.test_selenium.SeleniumEmptyTranslation",
+        )
+    )
+    def test_machinery_empty_results(self) -> None:
+        """Machinery tab tells apart no results from not being loaded."""
+        self.open_machinery_unit(SeleniumEmptyTranslation.get_identifier())
+        empty = self.driver.find_element(By.ID, "machinery-empty")
+        WebDriverWait(self.driver, 10).until(lambda _driver: empty.is_displayed())
+        self.assertEqual(
+            self.find_elements_now(
+                By.CSS_SELECTOR, "#machinery-translations .machinery-row"
+            ),
+            [],
+        )
+
+    @reuse_demo_fixture
+    @override_settings(
+        WEBLATE_MACHINERY=(
+            "weblate.trans.tests.test_selenium.SeleniumScoredTranslation",
+            "weblate.trans.tests.test_selenium.SeleniumEngineTranslation",
+        )
+    )
+    def test_machinery_results(self) -> None:
+        """Machinery results label each service with its own quality score."""
+        self.open_machinery_unit(
+            SeleniumScoredTranslation.get_identifier(),
+            SeleniumEngineTranslation.get_identifier(),
+            slugs={SeleniumScoredTranslation.get_identifier(): "preferred"},
+        )
+        # The results of both services merge into a single row, the second
+        # result of the engine is listed separately.
+        self.wait_for_machinery_rows(2)
+
+        rows = self.driver.find_elements(
+            By.CSS_SELECTOR, "#machinery-translations .machinery-row"
+        )
+        # The score is displayed with the origin it belongs to, the service
+        # without a score is listed without one.
+        self.assertEqual(
+            [
+                element.text
+                for element in rows[0].find_elements(
+                    By.CSS_SELECTOR, ".machinery-service-name"
+                )
+            ],
+            [
+                SeleniumScoredTranslation.name,
+                SeleniumEngineTranslation.name,
+            ],
+        )
+        self.assertEqual(
+            [
+                element.text
+                for element in rows[0].find_elements(
+                    By.CSS_SELECTOR, ".machinery-origin-detail"
+                )
+            ],
+            [
+                "Project: WeblateOrg/Django · Slug: preferred (100%)",
+            ],
+        )
+        self.assertEqual(
+            [
+                element.text
+                for element in rows[1].find_elements(
+                    By.CSS_SELECTOR, ".machinery-service-name"
+                )
+            ],
+            [SeleniumEngineTranslation.name],
+        )
+
+        # The keyboard shortcut hint shows up only while the modifier is held.
+        number = rows[0].find_element(By.CSS_SELECTOR, ".machinery-number")
+        self.assertFalse(number.is_displayed())
+
+        self.screenshot("machinery.png")
+
+        self.actions.key_down(Keys.CONTROL).perform()
+        try:
+            WebDriverWait(self.driver, 10).until(lambda _driver: number.is_displayed())
+        finally:
+            self.actions.key_up(Keys.CONTROL).perform()
+        WebDriverWait(self.driver, 10).until(lambda _driver: not number.is_displayed())
+
+    @reuse_demo_fixture
+    def test_machinery_no_services(self) -> None:
+        """Machinery tab reports the empty state with no service configured."""
+        self.open_machinery_unit()
+        empty = self.driver.find_element(By.ID, "machinery-empty")
+        WebDriverWait(self.driver, 10).until(lambda _driver: empty.is_displayed())
+
+    @reuse_demo_fixture
+    def test_editing_survives_comment(self) -> None:
+        """Posting a comment keeps pending translation and string state."""
+        project = self.create_component()
+        self.do_login(superuser=True)
+        unit = (
+            Unit.objects.filter(
+                translation__component__project=project,
+                translation__language_code="cs",
+            )
+            .exclude(source="")
+            .first()
+        )
+        self.assertIsNotNone(unit)
+        unit = cast("Unit", unit)
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+
+        editor = self.driver.find_element(
+            By.CSS_SELECTOR, ".translator .translation-editor"
+        )
+        editor.click()
+        editor.send_keys("pending translation")
+        # Ticking this has to happen after typing, entering a translation
+        # marks the string as translated.
+        self.click(htmlid=f"id_{unit.checksum}_fuzzy")
+
+        # Comment on the string, that reloads the page
+        self.click(htmlid="toggle-comments")
+        self.click(htmlid="id_comment")
+        comment = self.driver.find_element(By.ID, "id_comment")
+        comment.send_keys("Comment posted while translating")
+        with self.wait_for_page_load():
+            comment.submit()
+
+        self.assertIn(
+            "pending translation",
+            self.driver.find_element(
+                By.CSS_SELECTOR, ".translator .translation-editor"
+            ).get_attribute("value"),
+        )
+        self.assertTrue(
+            self.driver.find_element(By.ID, f"id_{unit.checksum}_fuzzy").is_selected()
+        )
+
+    def test_string_details_stay_open(self) -> None:
+        """The string details panel keeps its open state across strings."""
+        fixture = RepoTestMixin()
+        fixture.clone_test_repos()
+        project = Project.objects.create(name="String details", slug="string-details")
+        component = fixture.create_po(project=project)
+        translation = component.translation_set.get(language_code="cs")
+        first = translation.unit_set.get(source="Hello, world!\n")
+        second = translation.unit_set.get(source="Thank you for using Weblate.")
+        self.do_login(superuser=True)
+
+        def open_unit(unit: Unit) -> tuple[WebElement, WebElement]:
+            with self.wait_for_page_load():
+                self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+            button = self.driver.find_element(
+                By.CSS_SELECTOR,
+                f'[data-bs-target="#string-info-details-{unit.id}"]',
+            )
+            panel = self.driver.find_element(By.ID, f"string-info-details-{unit.id}")
+            return button, panel
+
+        def stored() -> str | None:
+            return self.driver.execute_script(
+                "return localStorage.getItem('translate-details');"
+            )
+
+        def wait_settled(panel: WebElement) -> None:
+            WebDriverWait(self.driver, 15).until(
+                lambda _driver: "collapsing" not in (panel.get_attribute("class") or "")
+            )
+
+        # Collapsed by default
+        button, panel = open_unit(first)
+        self.assertFalse(panel.is_displayed())
+        self.assertEqual(button.get_attribute("aria-expanded"), "false")
+
+        # Opening is remembered on the next string, without animating
+        self.click(button)
+        wait_settled(panel)
+        self.assertTrue(panel.is_displayed())
+        self.assertEqual(stored(), "shown")
+
+        button, panel = open_unit(second)
+        self.assertIn("show", panel.get_attribute("class") or "")
+        self.assertNotIn("collapsing", panel.get_attribute("class") or "")
+        self.assertTrue(panel.is_displayed())
+        self.assertEqual(button.get_attribute("aria-expanded"), "true")
+        self.assertNotIn("collapsed", button.get_attribute("class") or "")
+
+        # A panel restored open can be closed, and that is remembered too
+        self.click(button)
+        wait_settled(panel)
+        self.assertFalse(panel.is_displayed())
+        self.assertEqual(button.get_attribute("aria-expanded"), "false")
+        self.assertEqual(stored(), "hidden")
+
+        button, panel = open_unit(first)
+        self.assertFalse(panel.is_displayed())
+        self.assertEqual(button.get_attribute("aria-expanded"), "false")
+
+    @reuse_demo_fixture
+    @override_settings(
+        WEBLATE_MACHINERY=(
+            *settings.WEBLATE_MACHINERY,
+            "weblate.machinery.dummy.DummyTranslation",
+        )
+    )
+    def test_auto_translate_mt_ignores_persisted_component(self) -> None:
+        """Test MT auto-translation with persisted component form state."""
+        identifier = DummyTranslation.get_identifier()
+
+        def clear_auto_translation_storage() -> None:
+            with suppress(WebDriverException):
+                self.driver.execute_script(
+                    'window.localStorage.removeItem("auto-translation");'
+                )
+
+        self.addCleanup(clear_auto_translation_storage)
+
+        project = self.create_component()
+        for engine in (
+            MachineryInstallation.objects.filter(
+                project__isnull=True, workspace__isnull=True
+            )
+            .values_list("engine", flat=True)
+            .distinct()
+        ):
+            MachineryExclusion.objects.create(project=project, engine=engine)
+        MachineryInstallation.objects.create(project=project, engine=identifier)
+
+        target_component = project.component_set.get(slug="django")
+        for index in range(28):
+            Component.objects.create(
+                name=f"Extra {index}",
+                slug=f"extra-{index}",
+                project=project,
+                repo="weblate://weblateorg/language-names",
+                filemask=f"extra/{index}/*.po",
+                new_base=f"extra/{index}/django.pot",
+                file_format="po",
+                source_language=target_component.source_language,
+            )
+
+        self.do_login(superuser=True)
+        self.driver.execute_script(
+            """
+            window.localStorage.setItem(
+                "auto-translation",
+                JSON.stringify({component: "missing-component"}),
+            );
+            """
+        )
+
+        self.open_component(component=target_component, project=project)
+        self.click("Operations")
+        self.click("Batch automatic translation")
+        self.click(htmlid="id_auto_auto_source_1")
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.execute_script(
+                """
+                const engines = document.getElementById("id_auto_engines");
+                return Boolean(engines && engines.tomselect);
+                """
+            )
+        )
+        self.driver.execute_script(
+            """
+            const engines = document.getElementById("id_auto_engines");
+            engines.tomselect.addItem(arguments[0]);
+            engines.dispatchEvent(new Event("change", {bubbles: true}));
+            """,
+            identifier,
+        )
+        query = self.driver.find_element(By.ID, "id_auto_q")
+        query.clear()
+        query.send_keys("state:empty")
+
+        with self.wait_for_page_load():
+            self.driver.find_element(
+                By.CSS_SELECTOR, 'form[data-persist="auto-translation"]'
+            ).submit()
+
+        body = self.driver.find_element(By.TAG_NAME, "body").text
+        self.assertIn("Automatic translation completed", body)
+        self.assertNotIn("Error in parameter component", body)
+        self.assertNotIn("Could not process form!", body)
+
+    def test_profile_team_search(self) -> None:
+        user = self.do_login(superuser=True)
+        groups = [
+            Group.objects.create(name=f"Remote team {index:02}") for index in range(30)
+        ]
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{user.get_absolute_url()}#groups")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, '[data-bs-target="#groups"]')
+        )
+        select = self.driver.find_element(By.ID, "id_add_group")
+        self.assertEqual(len(Select(select).options), 1)
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, "#div_id_add_group .ts-control")
+        )
+        control = self.driver.find_element(By.ID, "id_add_group-ts-control")
+        self.driver.execute_script("""
+            const originalFetch = window.fetch;
+            let failLookup = true;
+            window.fetch = (url, ...options) => {
+                if (failLookup && new URL(url, location.origin).searchParams.get("q") === "Remote team") {
+                    failLookup = false;
+                    return Promise.reject(new Error("Test lookup failure"));
+                }
+                return originalFetch(url, ...options);
+            };
+        """)
+        control.send_keys("Remote team")
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: (
+                "Could not load teams"
+                in self.driver.find_element(By.ID, "popup-toasts").text
+            )
+        )
+        # Retrying the same search after a failure must remain possible.
+        control.clear()
+        control.send_keys("Remote team")
+        self.assertEqual(control.get_attribute("value"), "Remote team")
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: self.driver.execute_script(
+                "const ts = document.getElementById('id_add_group').tomselect;"
+                "return ts.loading === 0 && !!ts.options[arguments[0]];",
+                str(groups[24].pk),
+            )
+        )
+        # Keyboard navigation must be able to reach results beyond the first page.
+        for _index in range(27):
+            control.send_keys(Keys.ARROW_DOWN)
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: self.driver.execute_script(
+                "return !!document.getElementById('id_add_group').tomselect.options[arguments[0]];",
+                str(groups[-1].pk),
+            )
+        )
+        control.send_keys(Keys.ESCAPE)
+        control.clear()
+        control.send_keys("Remote team 29")
+        self.assertEqual(control.get_attribute("value"), "Remote team 29")
+        WebDriverWait(self.driver, 10).until(
+            lambda _driver: self.driver.find_element(
+                By.CSS_SELECTOR,
+                f'#id_add_group-ts-dropdown [data-value="{groups[-1].pk}"]',
+            ).is_displayed()
+        )
+        control.send_keys(Keys.ARROW_DOWN, Keys.ENTER)
+        self.assertEqual(
+            Select(select).first_selected_option.get_attribute("value"),
+            str(groups[-1].pk),
+        )
 
     def test_login(self) -> None:
         # Do proper login with new user
@@ -354,10 +4495,18 @@ class SeleniumTests(
             except WebDriverException as error:
                 # This usually happens when browser fails to delete some
                 # of the cookies for whatever reason.
-                warnings.warn(f"Ignoring: {error}", stacklevel=4)
+                warnings.warn(f"Ignoring: {error}", stacklevel=1)
 
         # Confirm account
         self.driver.get(url)
+        if "Confirm registration" in self.driver.find_element(By.TAG_NAME, "body").text:
+            self.screenshot("registration-confirmation.png")
+            with self.wait_for_page_load():
+                self.click(
+                    self.driver.find_element(
+                        By.CSS_SELECTOR, "form button[type='submit']"
+                    )
+                )
 
         # Check we got message
         self.assertIn(
@@ -376,31 +4525,44 @@ class SeleniumTests(
 
     @override_settings(WEBLATE_GPG_IDENTITY="Weblate <weblate@example.com>")
     def test_gpg(self) -> None:
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.ID, "footer-about-link"))
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.PARTIAL_LINK_TEXT, "Keys"))
-        self.screenshot("about-gpg.png")
+        self.install_selenium_ssh_keys()
+        gpg_key = Path(get_test_file("selenium-keys/weblate-public.asc")).read_text(
+            encoding="utf-8"
+        )
+        with (
+            patch(
+                "weblate.trans.views.about.get_gpg_public_key",
+                return_value=gpg_key,
+            ),
+            patch(
+                "weblate.trans.views.about.get_gpg_sign_key",
+                return_value=SELENIUM_GPG_KEY_ID,
+            ),
+        ):
+            with self.wait_for_page_load():
+                self.click(self.driver.find_element(By.ID, "footer-about-link"))
+            with self.wait_for_page_load():
+                self.click(self.driver.find_element(By.PARTIAL_LINK_TEXT, "Keys"))
+            self.screenshot("about-gpg.png")
 
     def test_ssh(self) -> None:
         """Test SSH admin interface."""
-        self.open_admin()
-
-        time.sleep(0.2)
-        self.screenshot("admin.png")
+        self.install_selenium_ssh_keys()
+        self.open_manage()
 
         # Open SSH page
         with self.wait_for_page_load():
-            self.click("SSH keys")
-
-        # Generate SSH key
-        if get_key_data() is None:
-            with self.wait_for_page_load():
-                self.click(htmlid="generate-ssh-button")
+            self.driver.get(f"{self.live_server_url}{reverse('manage-ssh')}")
 
         # Add SSH host key
         self.driver.find_element(By.ID, "id_host").send_keys("github.com")
-        with self.wait_for_page_load():
+        with (
+            patch.dict(
+                os.environ,
+                {"PATH": f"{get_test_file('')}:{os.environ.get('PATH', '')}"},
+            ),
+            self.wait_for_page_load(),
+        ):
             self.click(htmlid="ssh-add-button")
 
         self.screenshot("ssh-keys-added.png")
@@ -411,12 +4573,37 @@ class SeleniumTests(
         self.screenshot("ssh-keys.png")
 
     def create_component(self) -> Project:
+        if "_demo_fixture_project_pk" in self.__dict__:
+            return self.get_demo_fixture()
+        return self._build_demo_component()
+
+    def configure_screenshot_machinery(
+        self, project: Project, *, memory_only: bool = False
+    ) -> None:
+        """Give screenshots fixed internal engines regardless of fixture order."""
+        services = (
+            (WeblateMemory,) if memory_only else (WeblateTranslation, WeblateMemory)
+        )
+        MachineryInstallation.objects.filter(
+            project__isnull=True, workspace__isnull=True
+        ).delete()
+        MachineryInstallation.objects.bulk_create(
+            [
+                MachineryInstallation(engine=service.get_identifier())
+                for service in services
+            ]
+        )
+
+    def _build_demo_component(self) -> Project:
+        self.use_github_fixtures()
+        self.clear_weblateorg_fixture_path()
         project = Project.objects.create(name="WeblateOrg", slug="weblateorg")
         Component.objects.create(
             name="Language names",
             slug="language-names",
             project=project,
             repo="https://github.com/WeblateOrg/demo.git",
+            branch="main",
             filemask="weblate/langdata/locale/*/LC_MESSAGES/django.po",
             new_base="weblate/langdata/locale/django.pot",
             file_format="po",
@@ -430,7 +4617,13 @@ class SeleniumTests(
             new_base="weblate/locale/django.pot",
             file_format="po",
         )
+        self.clear_project_stats_cache(project)
         return project
+
+    def use_github_fixtures(self) -> None:
+        """Install local GitHub transports once for this test."""
+        if "github_fixtures" not in self.__dict__:
+            self.github_fixtures = self.enterContext(github_fixture_repositories())
 
     def create_glossary(
         self, user: User, project: Project, language: Language
@@ -441,61 +4634,335 @@ class SeleniumTests(
         glossary.add_unit(
             None, "", "machine translation", "strojový překlad", author=user
         )
-        glossary.add_unit(None, "", "project", "projekt", author=user)
+        unit = glossary.add_unit(
+            None,
+            "",
+            "project",
+            ["projekt", "překladový projekt", "projektík"],
+            explanation="A collection of related translation components.",
+            author=user,
+        )
+        assert unit is not None
+        glossary.commit_pending("test", user)
+        store = glossary.store
+        term, _ = store.find_unit(unit.context, unit.source)
+        term.unit.set_source_terms(["project", "translation project"])
+        groups = term.unit.get_target_dom().findall("tig")
+        for group, status in zip(
+            groups, ("preferred", "admitted", "forbidden"), strict=True
+        ):
+            etree.SubElement(
+                group, "termNote", type="administrativeStatus"
+            ).text = status
+        etree.SubElement(
+            groups[2], "note", {"from": "translator"}
+        ).text = "Avoid this informal diminutive."
+        store.save()
+        glossary.drop_store_cache()
+        glossary.component.unload_sources()
+        with transaction.atomic():
+            glossary.check_sync(force=True)
         return glossary
 
     def view_site(self) -> None:
         with self.wait_for_page_load():
             self.click(htmlid="return-to-weblate")
 
+    def open_project(self, project: Project | str = "WeblateOrg") -> None:
+        """Open project dashboard from the global project menu."""
+        project_name = project.name if isinstance(project, Project) else project
+        self.click(htmlid="projects-menu")
+        with self.wait_for_page_load():
+            self.click("Browse all projects")
+        with self.wait_for_page_load():
+            self.click(project_name)
+
+    def open_component(
+        self,
+        component: Component | str = "Language names",
+        project: Project | str = "WeblateOrg",
+    ) -> None:
+        """Open component dashboard from a project dashboard."""
+        component_name = (
+            component.name if isinstance(component, Component) else component
+        )
+        self.open_project(project)
+        self.click("Components")
+        with self.wait_for_page_load():
+            self.click(component_name)
+
+    def open_translation(
+        self,
+        language: str = "Czech",
+        component: str = "Django",
+        project: Project | str = "WeblateOrg",
+    ) -> None:
+        """Open a translation dashboard from a project dashboard."""
+        self.open_project(project)
+        with self.wait_for_page_load():
+            self.click(language)
+        self.click("Components")
+        with self.wait_for_page_load():
+            self.click(component)
+
+    def create_android_component(self, project: Project) -> Component:
+        """Create Android component used by translation screenshots."""
+        component = Component(
+            name="Android",
+            slug="android",
+            project=project,
+            repo="weblate://weblateorg/language-names",
+            filemask="app/src/main/res/values-*/strings.xml",
+            template="app/src/main/res/values/strings.xml",
+            file_format="aresource",
+        )
+        self.enterContext(acting_user_context(get_test_actor(self)))
+        component.save()
+        self.clear_project_stats_cache(project)
+        return component
+
+    def populate_dashboard_activity(self) -> None:
+        """Create synthetic chart history using the normal bulk change hooks."""
+        days = [
+            day
+            for day in range(365)
+            for _unused in range(int(10 + 10 * math.sin(2 * math.pi * day / 30)))
+        ]
+        user = get_test_actor(self)
+        changes = Change.objects.bulk_create(
+            [
+                Change(
+                    user=user,
+                    action=ActionEvents.CREATE_PROJECT,
+                )
+                for _unused in days
+            ]
+        )
+        # auto_now_add sets timestamps during insertion; backdate them together
+        # afterwards, without dispatching thousands of individual save signals.
+        for change, day in zip(changes, days, strict=True):
+            change.timestamp -= timedelta(days=day)
+        Change.objects.bulk_update(changes, ["timestamp"])
+
+    @reuse_demo_fixture
     def test_dashboard(self) -> None:
         self.do_login()
+        self.create_component()
         # Generate nice changes data
-        for day in range(365):
-            for _unused in range(int(10 + 10 * math.sin(2 * math.pi * day / 30))):
-                change = Change.objects.create(action=ActionEvents.CREATE_PROJECT)
-                change.timestamp -= timedelta(days=day)
-                change.save()
+        self.populate_dashboard_activity()
 
         # Screenshot search
         self.click("Search")
         self.screenshot("search.png")
 
         # Render activity
-        self.click("Insights")
-        with self.wait_for_page_load():
-            self.click("Statistics")
-        self.screenshot("activity.png")
+        with patch("django.utils.timezone.now", return_value=SCREENSHOT_DATE):
+            self.populate_global_activity_metrics()
+            self.click("Insights")
+            with self.wait_for_page_load():
+                self.click("Statistics")
+            self.stabilize_global_stats_timestamp()
+            with self.wait_for_page_load():
+                self.driver.refresh()
+            self.screenshot("activity.png")
 
+    @override_settings(PRIVATE_COMMIT_NAME_TEMPLATE="{site_title} user")
     @social_core_override_settings(AUTHENTICATION_BACKENDS=TEST_BACKENDS)
     def test_auth_backends(self) -> None:
         user = self.do_login()
-        user.social_auth.create(provider="google-oauth2", uid=user.email)
-        user.social_auth.create(provider="github", uid="123456")
-        user.social_auth.create(provider="bitbucket", uid="weblate")
+        # Keep migrated e-mail and username identifiers for the screenshot.
+        user.social_auth.create(
+            provider="google-oauth2", uid=user.email, id_key="email"
+        )
+        user.social_auth.create(provider="github", uid="123456", id_key="id")
+        user.social_auth.create(
+            provider="bitbucket-oauth2", uid="weblate", id_key="username"
+        )
         self.click(htmlid="user-dropdown")
         with self.wait_for_page_load():
             self.click(htmlid="settings-button")
-        self.click("Account")
+        self.click(htmlid="profile-tab-account")
+        self.screenshot("profile-account.png")
+        self.click(htmlid="profile-tab-security")
         self.screenshot("authentication.png")
+        self.assert_text_contains("#security", "Security keys")
 
+    @reuse_demo_fixture
     def test_screenshot_filemask_repository_filename(self) -> None:
         """Test of mask of files to allow discovery/update of screenshots."""
         self.create_component()
         self.do_login(superuser=True)
-        self.click(htmlid="projects-menu")
-        with self.wait_for_page_load():
-            self.click("Browse all projects")
-        with self.wait_for_page_load():
-            self.click("WeblateOrg")
-        self.click("Components")
-        with self.wait_for_page_load():
-            self.click("Django")
+        self.open_component("Django")
         self.click("Operations")
         with self.wait_for_page_load():
             self.click("Screenshots")
+        self.click("Add screenshot")
+        self.assert_text_contains("#screenshots-add", "Repository path to screenshot")
         self.screenshot("screenshot-filemask-repository-filename.png")
 
+    @reuse_demo_fixture
+    def test_select_existing_screenshot(self) -> None:
+        project = self.create_component()
+        self.do_login(superuser=True)
+        unit = Unit.objects.filter(
+            translation__component__project=project,
+            translation__component__slug="django",
+            translation__language__code="cs",
+        ).first()
+        assert unit is not None
+        screenshot = Screenshot.objects.create(
+            name="Source strings", translation=unit.source_unit.translation
+        )
+        translated_screenshot = Screenshot.objects.create(
+            name="Translated strings", translation=unit.translation
+        )
+        for image in (screenshot, translated_screenshot):
+            with open(get_test_file("screenshot.png"), "rb") as handle:
+                image.image.save("picker.png", File(handle))
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+        editor_url = self.driver.current_url
+        trigger = self.driver.find_element(
+            By.CSS_SELECTOR, '[data-bs-target="#select-screenshot-modal"]'
+        )
+        trigger.send_keys(Keys.ENTER)
+        search = WebDriverWait(self.driver, 10).until(
+            element_to_be_clickable((By.ID, "screenshot-picker-q"))
+        )
+        WebDriverWait(self.driver, 5).until(
+            lambda driver: driver.switch_to.active_element == search
+        )
+        search_button = self.driver.find_element(
+            By.CSS_SELECTOR, "#screenshot-picker-search button"
+        )
+        self.assertEqual(search.rect["y"], search_button.rect["y"])
+        self.assertEqual(search.size["height"], search_button.size["height"])
+        self.screenshot_viewport("screenshot-picker.png", 1200)
+        search.send_keys("strings", Keys.ENTER)
+        WebDriverWait(self.driver, 10).until(staleness_of(search))
+        radio = WebDriverWait(self.driver, 10).until(
+            element_to_be_clickable((By.ID, f"screenshot-choice-{screenshot.pk}"))
+        )
+        card = radio.find_element(By.XPATH, "ancestor::label")
+        selected_status = card.find_element(By.CLASS_NAME, "screenshot-selected")
+        initial_border = card.value_of_css_property("border-top-color")
+        self.assertFalse(selected_status.is_displayed())
+        self.assertEqual(radio.size, {"height": 1, "width": 1})
+        # Tab from search through its submit button to the radio group.
+        self.driver.switch_to.active_element.send_keys(Keys.TAB, Keys.TAB)
+        self.assertEqual(self.driver.switch_to.active_element, radio)
+        self.assertEqual(card.value_of_css_property("outline-style"), "solid")
+        radio.send_keys(Keys.SPACE)
+        self.assertTrue(selected_status.is_displayed())
+        self.assertNotEqual(
+            card.value_of_css_property("border-top-color"), initial_border
+        )
+        other_radio = self.driver.find_element(
+            By.ID, f"screenshot-choice-{translated_screenshot.pk}"
+        )
+        other_radio.find_element(By.XPATH, "ancestor::label").click()
+        self.assertTrue(other_radio.is_selected())
+        self.assertFalse(radio.is_selected())
+        self.assertFalse(selected_status.is_displayed())
+        other_radio.send_keys(Keys.ARROW_LEFT)
+        self.assertTrue(radio.is_selected())
+        self.assertTrue(selected_status.is_displayed())
+        self.screenshot_viewport("screenshot-picker-selected.png", 1200)
+        add = self.driver.find_element(By.ID, "screenshot-picker-add")
+        self.assertTrue(add.is_enabled())
+        with self.wait_for_page_load():
+            add.send_keys(Keys.ENTER)
+        self.assertEqual(self.driver.current_url, editor_url)
+        self.assertTrue(screenshot.units.filter(pk=unit.source_unit.pk).exists())
+        self.assertFalse(translated_screenshot.units.exists())
+        self.screenshot_viewport("screenshot-picker-associated.png", 1200)
+        trigger = self.driver.find_element(
+            By.CSS_SELECTOR, '[data-bs-target="#select-screenshot-modal"]'
+        )
+        trigger.send_keys(Keys.ENTER)
+        search = WebDriverWait(self.driver, 10).until(
+            element_to_be_clickable((By.ID, "screenshot-picker-q"))
+        )
+        self.assertEqual(
+            self.find_elements_now(By.ID, f"screenshot-choice-{screenshot.pk}"), []
+        )
+        self.assert_text_contains("#screenshot-picker-content", "Translated strings")
+        search.clear()
+        search.send_keys("unmatched screenshot", Keys.ENTER)
+        WebDriverWait(self.driver, 10).until(staleness_of(search))
+        search = WebDriverWait(self.driver, 10).until(
+            element_to_be_clickable((By.ID, "screenshot-picker-q"))
+        )
+        self.assert_text_contains(
+            "#screenshot-picker-content", "No matching screenshots available."
+        )
+        search.send_keys(Keys.ESCAPE)
+        WebDriverWait(self.driver, 5).until(
+            lambda driver: driver.switch_to.active_element == trigger
+        )
+
+    @reuse_demo_fixture
+    def test_screenshot_clipboard_paste(self) -> None:
+        """Test uploading a screenshot pasted from the clipboard."""
+        project = self.create_component()
+        self.do_login(superuser=True)
+        unit = Unit.objects.filter(
+            translation__component__project=project,
+            translation__component__slug="django",
+            translation__language__code="cs",
+        ).first()
+        assert unit is not None
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+        self.click("Upload screenshot")
+        modal = WebDriverWait(self.driver, 5).until(
+            element_to_be_clickable((By.ID, "add-screenshot-form"))
+        )
+        modal.find_element(By.ID, "id_name").send_keys("Clipboard screenshot")
+
+        origin = self.driver.execute_script("return window.location.origin;")
+        self.driver.execute_cdp_cmd(
+            "Browser.grantPermissions",
+            {
+                "origin": origin,
+                "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"],
+            },
+        )
+        try:
+            expected_image_path = get_test_file("screenshot.png")
+            self.set_image_clipboard(expected_image_path)
+            self.click(htmlid="paste-screenshot-btn")
+            image_input = modal.find_element(By.ID, "id_image")
+            WebDriverWait(self.driver, 5).until(
+                lambda driver: driver.execute_script(
+                    "return arguments[0].files.length === 1;", image_input
+                )
+            )
+            self.assert_text_contains("#paste-screenshot-info-label", "Image Pasted!")
+            with self.wait_for_page_load():
+                self.click(modal.find_element(By.CSS_SELECTOR, 'input[type="submit"]'))
+        finally:
+            self.driver.execute_cdp_cmd("Browser.resetPermissions", {})
+
+        screenshot = Screenshot.objects.get(name="Clipboard screenshot")
+        self.assertTrue(screenshot.units.filter(pk=unit.pk).exists())
+        screenshot.image.open("rb")
+        try:
+            with (
+                Image.open(expected_image_path) as expected_image,
+                Image.open(screenshot.image) as uploaded_image,
+            ):
+                self.assertEqual(uploaded_image.format, "PNG")
+                self.assertEqual(uploaded_image.size, expected_image.size)
+                self.assertEqual(
+                    uploaded_image.convert("RGBA").tobytes(),
+                    expected_image.convert("RGBA").tobytes(),
+                )
+        finally:
+            screenshot.image.close()
+
+    @reuse_demo_fixture
     def test_screenshots(self) -> None:
         """Screenshot tests."""
         # Make sure tesseract data is present and not downloaded at request time
@@ -504,6 +4971,7 @@ class SeleniumTests(
 
         user = self.do_login(superuser=True)
 
+        # Identify a string in the bundled demo project, not the current UI help.
         text = (
             "Automatic translation via machine translation uses active "
             "machine translation engines to get the best possible "
@@ -511,38 +4979,61 @@ class SeleniumTests(
         )
         project = self.create_component()
         language = Language.objects.get(code="cs")
+        # A single engine avoids response-order differences when both internal
+        # engines return the same translation and their origins are merged.
+        self.configure_screenshot_machinery(project, memory_only=True)
 
         source = cast(
             "Unit",
             Unit.objects.get(source=text, translation__language=language).source_unit,
         )
+        component = source.translation.component
         source.explanation = "Help text for automatic translation tool"
         source.save()
         self.create_glossary(user, project, language)
-        source.translation.component.alert_set.all().delete()
+        component.alert_set.all().delete()
+        target_unit = Unit.objects.get(source=text, translation__language=language)
+        Memory.objects.update_entry(
+            source=target_unit.source,
+            target=target_unit.target,
+            source_language=component.source_language,
+            target_language=language,
+            context=target_unit.context,
+            origin="Screenshot context",
+            status=Memory.STATUS_ACTIVE,
+            user=None,
+            project=project,
+            from_file=True,
+            shared=False,
+        )
 
         def capture_unit(name, tab) -> None:
             unit = Unit.objects.get(source=text, translation__language=language)
             with self.wait_for_page_load():
                 self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
             self.click(htmlid=tab)
+            if name == "screenshot-context.png":
+                self.wait_for_machinery_rows(1)
+                self.assert_text_contains("#machinery-translations", target_unit.target)
+                self.assert_text_contains(
+                    "#machinery-translations", "Weblate Translation Memory"
+                )
+                self.assert_text_contains(
+                    "#machinery-translations", "Screenshot context"
+                )
+            if name == "source-information.png":
+                self.assert_text_contains("#glossary-terms", "překladový projekt")
+                self.assert_text_contains(
+                    "#glossary-terms", "Avoid this informal diminutive."
+                )
+                forbidden = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    '#glossary-terms button[data-glossary-text="projektík"]',
+                )
+                self.assertFalse(forbidden.is_enabled())
             self.screenshot(name)
             with self.wait_for_page_load():
                 self.click("Dashboard")
-
-        def wait_search() -> None:
-            time.sleep(0.1)
-            WebDriverWait(self.driver, 15).until(
-                presence_of_element_located(
-                    (
-                        By.XPATH,
-                        (
-                            '//div[@id="search-results"]'
-                            '//tbody[@class="unit-listing-body"]//tr'
-                        ),
-                    )
-                )
-            )
 
         capture_unit("source-information.png", "toggle-nearby")
         self.click(htmlid="projects-menu")
@@ -558,96 +5049,267 @@ class SeleniumTests(
             self.click("Screenshots")
 
         # Upload screenshot
+        upload_filename = "automatic-translation.png"
+        default_storage.delete(f"screenshots/{upload_filename}")
+        self.click("Add screenshot")
         self.driver.find_element(By.ID, "id_name").send_keys("Automatic translation")
         element = self.driver.find_element(By.ID, "id_image")
-        self.upload_file(element, get_test_file("screenshot.png"))
-        with self.wait_for_page_load():
-            element.submit()
+        with TemporaryDirectory(prefix="weblate-selenium-upload-") as upload_dir:
+            upload_path = Path(upload_dir) / upload_filename
+            upload_path.write_bytes(Path(get_test_file("screenshot.png")).read_bytes())
+            self.upload_file(element, upload_path)
+            with self.wait_for_page_load():
+                element.submit()
+        uploaded_screenshot = Screenshot.objects.get(name="Automatic translation")
 
-        # Perform OCR
-        self.click(htmlid="screenshots-auto")
-        wait_search()
+        listing_filename = "main-menu.png"
+        default_storage.delete(f"screenshots/{listing_filename}")
+        with open(get_test_file("screenshot.png"), "rb") as handle:
+            listing_screenshot = Screenshot.objects.create(
+                name="Main menu",
+                repository_filename="fastlane/metadata/android/en-US/images/menu.png",
+                image=File(handle, name=listing_filename),
+                translation=component.source_translation,
+                user=user,
+            )
+        listing_screenshot.add_unit(source, user)
+
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}"
+                f"{reverse('screenshots', kwargs={'path': component.get_url_path()})}"
+            )
+        self.assert_text_contains(".tab-content", "Automatic translation")
+        self.assert_text_contains(".tab-content", "Main menu")
+        self.assert_text_contains(".tab-content", "fastlane")
+        self.screenshot("screenshot-listing.png")
+
+        Screenshot.objects.update(timestamp=self.get_stable_naturaltime_timestamp())
+        with self.wait_for_page_load():
+            self.click("Automatic translation")
+
+        # Image text suggestions load automatically, including an empty result.
+        WebDriverWait(self.driver, 30).until(
+            lambda driver: (
+                driver.find_element(
+                    By.CSS_SELECTOR, "#screenshot-image-text"
+                ).get_attribute("aria-busy")
+                == "false"
+                and driver.find_element(
+                    By.CSS_SELECTOR,
+                    "#screenshot-image-text .screenshots-search-summary",
+                ).text
+            )
+        )
+        self.assert_text_contains(
+            "#screenshot-image-text .screenshots-search-summary",
+            "matching source strings found",
+        )
 
         self.screenshot("screenshot-ocr.png")
 
-        # Add string manually
-        self.driver.find_element(By.ID, "search-input").send_keys(f"{text!r}")
-        self.click(htmlid="screenshots-search")
-        wait_search()
-        self.click(self.driver.find_element(By.CLASS_NAME, "add-string"))
+        # Pre-assign a string which sorts after the one added below, so that
+        # appending is observable (it would be listed first when sorted).
+        other_units = source.translation.unit_set.exclude(pk=source.pk)
+        other = (
+            other_units.filter(priority=source.priority, position__gt=source.position)
+            .order_by("position")
+            .first()
+        ) or other_units.order().first()
+        uploaded_screenshot.add_unit(other, user)
+        with self.wait_for_page_load():
+            self.driver.refresh()
+
+        def assigned_unit_ids() -> list[str]:
+            return [
+                row.get_attribute("data-unit-id")
+                for row in self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "#sources-listing tbody.unit-listing-body tr[data-unit-id]",
+                )
+            ]
+
+        self.assertEqual(assigned_unit_ids(), [str(other.pk)])
+
+        self.search_while_screenshot_recognition_pending(
+            uploaded_screenshot, source, text
+        )
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR,
+                f'#screenshot-search .add-string[data-pk="{source.pk}"]',
+            )
+        )
+        WebDriverWait(self.driver, 15).until(
+            lambda _driver: (
+                Screenshot.objects.get(pk=uploaded_screenshot.pk)
+                .units.filter(pk=source.pk)
+                .exists()
+            )
+        )
+        # Newly added string is appended without reordering existing rows
+        WebDriverWait(self.driver, 15).until(
+            lambda _driver: assigned_unit_ids() == [str(other.pk), str(source.pk)]
+        )
+
+        self.assertFalse(
+            self.find_elements_now(
+                By.CSS_SELECTOR,
+                f'#search-results .screenshot-source-select[value="{source.pk}"]',
+            )
+        )
+
+        # Removing keeps the remaining rows in place without reloading the page
+        self.click(
+            self.driver.find_element(
+                By.CSS_SELECTOR,
+                f'#sources-listing tr[data-unit-id="{other.pk}"] button[type=submit]',
+            )
+        )
+        WebDriverWait(self.driver, 15).until(
+            lambda _driver: assigned_unit_ids() == [str(source.pk)]
+        )
+        self.assertFalse(
+            Screenshot.objects.get(pk=uploaded_screenshot.pk)
+            .units.filter(pk=other.pk)
+            .exists()
+        )
+
+        self.check_screenshot_recognition_retry(uploaded_screenshot)
 
         # Unit should have screenshot assigned now
         capture_unit("screenshot-context.png", "toggle-machinery")
 
+    def search_while_screenshot_recognition_pending(
+        self, screenshot: Screenshot, source: Unit, text: str
+    ) -> None:
+        # Leave recognition pending while searching in the other tab.
+        ScreenshotOCR.objects.filter(screenshot=screenshot).update(data=None, error="")
+        with patch("weblate.api.views.AsyncResult") as task_result:
+            task = task_result.return_value
+            task.id = str(ScreenshotOCR.objects.get(screenshot=screenshot).task_id)
+            task.ready.return_value = False
+            task.result = None
+            task.state = "PENDING"
+            with self.wait_for_page_load():
+                self.driver.refresh()
+            WebDriverWait(self.driver, 15).until(
+                lambda driver: (
+                    "Finding strings in image"
+                    in driver.find_element(
+                        By.CSS_SELECTOR,
+                        "#screenshot-image-text .screenshots-search-summary",
+                    ).text
+                )
+            )
+            # Bootstrap tabs support arrow-key navigation.
+            image_tab = self.driver.find_element(By.ID, "screenshot-image-text-tab")
+            image_tab.send_keys(Keys.ARROW_RIGHT)
+            WebDriverWait(self.driver, 15).until(
+                lambda driver: (
+                    driver.find_element(By.ID, "screenshot-search-tab").get_attribute(
+                        "aria-selected"
+                    )
+                    == "true"
+                )
+            )
+            search_input = self.driver.find_element(By.ID, "search-input")
+            search_input.clear()
+            search_input.send_keys(f"{text!r}")
+            self.click(htmlid="screenshots-search")
+            selection = WebDriverWait(self.driver, 15).until(
+                presence_of_element_located(
+                    (
+                        By.CSS_SELECTOR,
+                        f'#screenshot-search .screenshot-source-select[value="{source.pk}"]',
+                    )
+                )
+            )
+            selection.click()
+            ScreenshotOCR.objects.filter(screenshot=screenshot).update(
+                data={"passes": [{"lines": [{"text": source.source}]}]}
+            )
+            task.result = {"status": "completed"}
+            task.state = "SUCCESS"
+            task.ready.return_value = True
+            WebDriverWait(self.driver, 15).until(
+                lambda driver: (
+                    driver.find_element(By.ID, "screenshot-image-text").get_attribute(
+                        "aria-busy"
+                    )
+                    == "false"
+                )
+            )
+            self.assertTrue(selection.is_selected())
+            self.assertEqual(
+                self.driver.find_element(By.ID, "screenshot-search-tab").get_attribute(
+                    "aria-selected"
+                ),
+                "true",
+            )
+
+    def check_screenshot_recognition_retry(self, screenshot: Screenshot) -> None:
+        ScreenshotOCR.objects.filter(screenshot=screenshot).update(
+            data=None, error="download"
+        )
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{screenshot.get_absolute_url()}")
+        WebDriverWait(self.driver, 15).until(
+            lambda driver: driver.find_element(
+                By.ID, "screenshots-recognition-retry"
+            ).is_displayed()
+        )
+        self.assert_text_contains(
+            "#screenshot-image-text", "Text recognition data could not be downloaded"
+        )
+        with (
+            patch("weblate.screenshots.tasks.get_tesseract"),
+            patch("weblate.screenshots.tasks.ocr_get_lines", return_value=([], False)),
+        ):
+            self.driver.find_element(By.ID, "screenshots-recognition-retry").send_keys(
+                Keys.ENTER
+            )
+            WebDriverWait(self.driver, 15).until(
+                lambda driver: (
+                    driver.find_element(By.ID, "screenshot-image-text").get_attribute(
+                        "aria-busy"
+                    )
+                    == "false"
+                    and "matching source strings found"
+                    in driver.find_element(
+                        By.CSS_SELECTOR,
+                        "#screenshot-image-text .screenshots-search-summary",
+                    ).text
+                )
+            )
+        self.assertFalse(
+            self.driver.find_element(
+                By.ID, "screenshots-recognition-retry"
+            ).is_displayed()
+        )
+
+    @reuse_demo_fixture
     def test_admin(self) -> None:
-        """Test admin interface."""
+        """Test admin dashboard and announcements."""
         ConfigurationError.objects.create(
             name="test", message="Testing configuration error"
         )
-        self.do_login(superuser=True)
+        user = self.do_login(superuser=True)
         self.screenshot("admin-wrench.png")
-        self.create_component()
-        # Open admin page
-        self.open_admin(login=False)
-
-        # Component list
-        with self.wait_for_page_load():
-            self.click("Component lists")
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "addlink"))
-        element = self.driver.find_element(By.ID, "id_name")
-        element.send_keys("All components")
-        self.click("Add another Automatic component list assignment")
-        element = self.driver.find_element(
-            By.ID, "id_autocomponentlist_set-0-project_match"
+        project = self.create_component()
+        language = Language.objects.get(code="cs")
+        Announcement.objects.create(
+            user=user,
+            project=project,
+            message="Translations will be used only if they reach 60%.",
         )
-        element.clear()
-        element.send_keys("^.*$")
-        element = self.driver.find_element(
-            By.ID, "id_autocomponentlist_set-0-component_match"
+        Announcement.objects.create(
+            user=user, language=language, message="Czech translators rock!"
         )
-        element.clear()
-        element.send_keys("^.*$")
-        self.screenshot("componentlist-add.png")
-        with self.wait_for_page_load():
-            element.submit()
-
-        # Ensure the component list is there
-        with self.wait_for_page_load():
-            self.click("All components")
-
-        # Announcement
-        with self.wait_for_page_load():
-            self.click("Weblate translations")
-        with self.wait_for_page_load():
-            self.click("Announcements")
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "addlink"))
-        Select(self.driver.find_element(By.ID, "id_project")).select_by_visible_text(
-            "WeblateOrg"
-        )
-        element = self.driver.find_element(By.ID, "id_message")
-        element.send_keys("Translations will be used only if they reach 60%.")
-        self.screenshot("announcement.png")
-        with self.wait_for_page_load():
-            element.submit()
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "addlink"))
-        Select(self.driver.find_element(By.ID, "id_language")).select_by_visible_text(
-            "Czech"
-        )
-        element = self.driver.find_element(By.ID, "id_message")
-        element.send_keys("Czech translators rock!")
-        with self.wait_for_page_load():
-            element.submit()
 
         # Announcement display
-        self.view_site()
-        self.click(htmlid="projects-menu")
-        with self.wait_for_page_load():
-            self.click("Browse all projects")
-        with self.wait_for_page_load():
-            self.click("WeblateOrg")
+        self.open_project(project)
+        self.assert_text_contains(".announcement", "60%")
         self.click("Operations")
         self.click("Post announcement")
         self.screenshot("announcement-project.png")
@@ -660,128 +5322,249 @@ class SeleniumTests(
         with self.wait_for_page_load():
             self.click("Czech")
         self.screenshot("announcement-language.png")
+        self.assert_text_contains(".announcement", "Czech translators rock!")
 
-    def test_weblate(self) -> None:  # noqa: PLR0915
-        user = self.open_admin()
-        language_regex = "^(cs|he|hu)$"
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_workspaces(self) -> None:
+        """Test workspaces management interface."""
+        workspace = Workspace.objects.create(name="Localization workspace")
+        Project.objects.create(
+            name="Website translations",
+            slug="website-translations",
+            web="https://example.com/",
+            workspace=workspace,
+        )
+        Project.objects.create(
+            name="Mobile application",
+            slug="mobile-application",
+            web="https://example.com/mobile/",
+            workspace=workspace,
+        )
+        Project.objects.create(
+            name="Documentation portal",
+            slug="documentation-portal",
+            web="https://example.com/docs/",
+            workspace=workspace,
+        )
 
-        # Add project
+        user = self.do_login(superuser=True)
+        workspace.add_owner(user)
+
         with self.wait_for_page_load():
-            self.click("Projects")
+            self.driver.get(f"{self.live_server_url}{reverse('manage-workspaces')}")
+
+        self.assert_text_contains("h4.card-title", "Manage workspaces")
+        self.assert_text_contains("table.table-striped", "Localization workspace")
+        self.assert_text_contains("table.table-striped", "3")
+
         with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "addlink"))
-        self.driver.find_element(By.ID, "id_name").send_keys("WeblateOrg")
-        Select(self.driver.find_element(By.ID, "id_access_control")).select_by_value(
-            "1"
-        )
-        self.driver.find_element(By.ID, "id_web").send_keys("https://weblate.org/")
-        self.driver.find_element(By.ID, "id_instructions").send_keys(
-            "https://weblate.org/contribute/"
-        )
-        self.screenshot("add-project.png")
+            self.click("Add workspace")
+        self.assert_labeled_control("id_name", "Workspace name")
+        self.driver.find_element(By.ID, "id_name").send_keys("Documentation workspace")
         with self.wait_for_page_load():
             self.driver.find_element(By.ID, "id_name").submit()
 
-        # Add bilingual component
-        with self.wait_for_page_load():
-            self.click("Home")
-        with self.wait_for_page_load():
-            self.click("Components")
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "addlink"))
+        self.assertTrue(
+            Workspace.objects.filter(name="Documentation workspace").exists()
+        )
 
-        self.driver.find_element(By.ID, "id_name").send_keys("Language names")
-        Select(self.driver.find_element(By.ID, "id_project")).select_by_visible_text(
-            "WeblateOrg"
-        )
-        self.driver.find_element(By.ID, "id_repo").send_keys(
-            "https://github.com/WeblateOrg/demo.git"
-        )
-        self.driver.find_element(By.ID, "id_repoweb").send_keys(
-            "https://github.com/WeblateOrg/demo/blob/{{branch}}/{{filename}}#L{{line}}"
-        )
-        self.driver.find_element(By.ID, "id_filemask").send_keys(
-            "weblate/langdata/locale/*/LC_MESSAGES/django.po"
-        )
-        self.driver.find_element(By.ID, "id_new_base").send_keys(
-            "weblate/langdata/locale/django.pot"
-        )
-        Select(self.driver.find_element(By.ID, "id_file_format")).select_by_value("po")
-        Select(self.driver.find_element(By.ID, "id_license")).select_by_value(
-            "GPL-3.0-or-later"
-        )
-        element = self.driver.find_element(By.ID, "id_language_regex")
-        element.clear()
-        element.send_keys(language_regex)
-        self.screenshot("add-component.png")
-        # This takes long
-        with self.wait_for_page_load(timeout=1200):
-            self.driver.find_element(By.ID, "id_name").submit()
         with self.wait_for_page_load():
-            self.click("Language names")
+            self.driver.get(f"{self.live_server_url}{reverse('manage-workspaces')}")
+        self.screenshot("workspaces.png")
 
-        # Add monolingual component
         with self.wait_for_page_load():
-            self.click("Components")
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "addlink"))
-        self.driver.find_element(By.ID, "id_name").send_keys("Android")
-        Select(self.driver.find_element(By.ID, "id_project")).select_by_visible_text(
-            "WeblateOrg"
-        )
-        self.driver.find_element(By.ID, "id_repo").send_keys(
-            "weblate://weblateorg/language-names"
-        )
-        self.driver.find_element(By.ID, "id_filemask").send_keys(
-            "app/src/main/res/values-*/strings.xml"
-        )
-        self.driver.find_element(By.ID, "id_template").send_keys(
-            "app/src/main/res/values/strings.xml"
-        )
-        Select(self.driver.find_element(By.ID, "id_file_format")).select_by_value(
-            "aresource"
-        )
-        Select(self.driver.find_element(By.ID, "id_license")).select_by_value("MIT")
-        self.screenshot("add-component-mono.png")
-        # This takes long
-        with self.wait_for_page_load(timeout=1200):
-            self.driver.find_element(By.ID, "id_name").submit()
-        with self.wait_for_page_load():
-            self.click("Android")
+            self.click("Localization workspace")
+        self.assert_text_contains(".nav-pills", "Projects")
+        self.assert_text_contains(".tab-content", "Website translations")
+        self.assert_text_contains(".tab-content", "Mobile application")
+        self.assert_text_contains(".tab-content", "Documentation portal")
+        self.screenshot("workspace-projects.png")
 
-        # Load Weblate project page
-        self.view_site()
-        self.click(htmlid="projects-menu")
+        self.click("Operations")
         with self.wait_for_page_load():
-            self.click("Browse all projects")
+            self.click("Access control")
+        self.assert_text_contains("table.table-striped", "Owners")
+        self.assert_text_contains("table.table-striped", "Project creators")
+        self.screenshot("workspace-access.png")
+
+    def test_workspace_navigation_keyboard_and_mobile(self) -> None:
+        user = self.do_login()
+        first = Workspace.objects.create(name="Alpha workspace")
+        second = Workspace.objects.create(name="Beta workspace")
+        first.add_owner(user)
+        second.add_owner(user)
+
+        for width in (1200, 390):
+            with self.subTest(width=width):
+                self.driver.set_window_size(width, 844)
+                with self.wait_for_page_load():
+                    self.driver.get(f"{self.live_server_url}{reverse('about')}")
+                if width == 390:
+                    self.driver.find_element(By.ID, "navbar-toggle").send_keys(
+                        Keys.ENTER
+                    )
+                    WebDriverWait(self.driver, 5).until(
+                        lambda driver: driver.find_element(
+                            By.ID, "workspaces-menu"
+                        ).is_displayed()
+                    )
+
+                toggle = self.driver.find_element(By.ID, "workspaces-menu")
+                toggle.send_keys(Keys.ARROW_DOWN)
+                self.assertEqual(toggle.get_attribute("aria-expanded"), "true")
+                links = self.driver.find_elements(
+                    By.CSS_SELECTOR, '[aria-labelledby="workspaces-menu"] a'
+                )
+                self.assertEqual(
+                    [link.text for link in links],
+                    [first.name, second.name, "My workspaces"],
+                )
+                self.assertEqual(self.driver.switch_to.active_element, links[0])
+                links[0].send_keys(Keys.ESCAPE)
+                self.assertEqual(toggle.get_attribute("aria-expanded"), "false")
+                self.assertEqual(self.driver.switch_to.active_element, toggle)
+                self.assertTrue(
+                    self.driver.execute_script(
+                        "return document.documentElement.scrollWidth <= window.innerWidth"
+                    )
+                )
+                self.assertTrue(
+                    self.driver.find_element(By.ID, "projects-menu").is_displayed()
+                )
+                self.assertTrue(
+                    self.driver.find_element(By.ID, "languages-menu").is_displayed()
+                )
+
+                toggle.send_keys(Keys.ARROW_DOWN)
+                with self.wait_for_page_load():
+                    self.driver.switch_to.active_element.send_keys(Keys.ENTER)
+                self.assertEqual(
+                    self.driver.current_url,
+                    f"{self.live_server_url}{first.get_absolute_url()}",
+                )
+
+    @reuse_demo_fixture
+    def test_workspace_languages_keyboard_navigation(self) -> None:
+        project = self.create_component()
+        self.configure_screenshot_machinery(project, memory_only=True)
+        user = self.do_login(superuser=True)
+        with acting_user_context(user):
+            workspace = Workspace.objects.create(name="Review workspace")
+            project.workspace = workspace
+            project.save(update_fields=["workspace"])
+        scope = WorkspaceLanguage(workspace, Language.objects.get(code="cs"))
         with self.wait_for_page_load():
-            self.click("WeblateOrg")
+            self.driver.get(f"{self.live_server_url}{workspace.get_absolute_url()}")
+
+        projects_tab = self.driver.find_element(
+            By.CSS_SELECTOR, '[data-bs-target="#projects"]'
+        )
+        languages_tab = self.driver.find_element(
+            By.CSS_SELECTOR, '[data-bs-target="#languages"]'
+        )
+        projects_tab.send_keys(Keys.ARROW_RIGHT)
+        self.assertEqual(self.driver.switch_to.active_element, languages_tab)
+        languages_tab.send_keys(Keys.ENTER)
+        WebDriverWait(self.driver, 5).until(
+            lambda driver: (
+                "active"
+                in (
+                    driver.find_element(By.ID, "languages").get_attribute("class") or ""
+                )
+            )
+        )
+        language_link = self.driver.find_element(
+            By.CSS_SELECTOR, f'#languages a[href="{scope.get_absolute_url()}"]'
+        )
+        with self.wait_for_page_load():
+            language_link.send_keys(Keys.ENTER)
+        self.assertEqual(
+            self.driver.current_url, f"{self.live_server_url}{scope.get_absolute_url()}"
+        )
+        with self.wait_for_page_load():
+            self.driver.find_element(
+                By.CSS_SELECTOR, "#translation a.btn-primary"
+            ).send_keys(Keys.ENTER)
+        self.assertTrue(
+            self.driver.current_url.startswith(
+                f"{self.live_server_url}{scope.get_translate_url()}"
+            )
+        )
+
+    @reuse_demo_fixture
+    def test_project_operations(self) -> None:
+        """Test project-level screenshots."""
+        project = self.create_component()
+        self.configure_screenshot_machinery(project)
+        self.do_login(superuser=True)
+        self.open_project(project)
 
         self.screenshot("project-overview.png")
+        self.confirm_sensitive_password()
+        self.open_project(project)
 
         # User management
         self.click("Operations")
         with self.wait_for_page_load():
             self.click("Users")
-        element = self.driver.find_element(By.ID, "id_user")
-        element.send_keys("testuser")
+        invited_user = create_another_user()
+        element = self.driver.find_element(By.ID, "id_project_add_user_user")
+        element.send_keys(invited_user.username)
+        # Typing starts an autocomplete request using the same session; let it
+        # finish before submitting so it can not race one-shot flash messages.
+        user_choice = WebDriverWait(self.driver, 5).until(
+            lambda driver: next(
+                (
+                    result
+                    for result in driver.find_elements(
+                        By.CSS_SELECTOR, ".autoComplete_result"
+                    )
+                    if invited_user.username in result.text
+                ),
+                None,
+            )
+        )
+        self.click(user_choice)
+        Select(
+            self.driver.find_element(By.ID, "id_project_add_user_group")
+        ).select_by_index(1)
         with self.wait_for_page_load():
             element.submit()
-        with self.wait_for_page_load():
-            self.click("Access control")
+        self.assert_text_contains(
+            ".alert .task-message", "User invitation e-mail was sent."
+        )
+        self.assertTrue(
+            invited_user.invitation_set.filter(
+                group__defining_project__name="WeblateOrg"
+            ).exists()
+        )
         self.screenshot("manage-users.png")
-        # Automatic suggestions
-        self.click(htmlid="projects-menu")
-        with self.wait_for_page_load():
-            self.click("WeblateOrg")
+        self.assertGreater(self.count_elements("table.table-striped tbody tr"), 0)
+
+        # Translation services
+        self.open_project(project)
         self.click("Operations")
-        with self.wait_for_page_load():
-            self.click("Automatic suggestions")
-        self.screenshot("project-machinery.png")
+        hidden_machinery_services = {
+            "weblate.machinery.dummy.DummyTranslation",
+            "weblate.trans.tests.test_selenium.SeleniumDummyTranslation",
+        }
+        machinery_services = tuple(
+            path
+            for path in settings.WEBLATE_MACHINERY
+            if path not in hidden_machinery_services
+        )
+        with override_settings(WEBLATE_MACHINERY=machinery_services):
+            with self.wait_for_page_load():
+                self.click("Translation services")
+            self.assert_text_contains(
+                ".card:first-of-type tbody", "Weblate Translation Memory"
+            )
+            self.assert_text_contains(".card:first-of-type tbody", "Weblate")
+            self.assertEqual(self.count_elements(".card:first-of-type tbody tr"), 2)
+            self.screenshot("project-machinery.png")
+
         # Access control settings
-        self.click(htmlid="projects-menu")
-        with self.wait_for_page_load():
-            self.click("WeblateOrg")
+        self.open_project(project)
         self.click("Operations")
         with self.wait_for_page_load():
             self.click("Settings")
@@ -789,30 +5572,47 @@ class SeleniumTests(
         self.screenshot("project-access.png")
         self.click("Workflow")
         self.screenshot("project-workflow.png")
-        # The project is now watched
-        self.click(htmlid="projects-menu")
-        with self.wait_for_page_load():
-            self.click("WeblateOrg")
 
         # Engage page
+        self.open_project(project)
         self.click("Community")
+        with override_settings(SITE_DOMAIN=SCREENSHOT_SITE_DOMAIN):
+            with self.wait_for_page_load():
+                self.click("Status widgets")
+            self.use_live_server_widget_preview()
+            self.screenshot("promote.png")
+            widget_select = Select(self.driver.find_element(By.ID, "widget-type"))
+            language_select = Select(
+                self.driver.find_element(By.ID, "translation-language")
+            )
+            for language, suffix in (("", ""), ("he", "-rtl")):
+                language_select.select_by_value(language)
+                for widget_name in WIDGETS:
+                    widget_select.select_by_value(widget_name)
+                    self.screenshot_widget(f"{widget_name}{suffix}")
         with self.wait_for_page_load():
-            self.click("Status widgets")
-        self.screenshot("promote.png")
-        with self.wait_for_page_load():
-            self.click(htmlid="engage-link")
+            self.driver.get(
+                f"{self.live_server_url}"
+                f"{reverse('engage', kwargs={'path': project.get_url_path()})}"
+            )
         self.screenshot("engage.png")
         with self.wait_for_page_load():
             self.click(htmlid="engage-project")
 
-        self.click("Components")
-        with self.wait_for_page_load():
-            self.click("Language names")
+    @reuse_demo_fixture
+    def test_component_operations(self) -> None:
+        """Test component operation screenshots."""
+        language_regex = "^(cs|he|hu)$"
+        project = self.create_component()
+        component = Component.objects.get(project=project, slug="language-names")
+        self.use_screenshot_site_domain_for_git_export(component)
+        user = self.do_login(superuser=True)
+        self.open_component(component, project)
 
         # Repository
         self.click("Operations")
         self.click("Repository maintenance")
-        time.sleep(0.2)
+        self.wait_for_ajax_tab("#repository", "Repository status")
         self.click("Operations")
         self.screenshot("component-repository.png")
 
@@ -857,10 +5657,82 @@ class SeleniumTests(
         self.click("Insights")
         self.screenshot("reporting.png")
 
+        translation = component.translation_set.get(language__code="cs")
+        Change.objects.create(
+            action=ActionEvents.CHANGE,
+            user=user,
+            author=user,
+            project=project,
+            component=component,
+            translation=translation,
+            language=translation.language,
+        )
+        credits_form = self.driver.find_element(
+            By.XPATH,
+            '//h4[contains(@class, "card-title") and '
+            'contains(normalize-space(), "Credits")]/ancestor::form',
+        )
+        period = credits_form.find_element(By.NAME, "period")
+        self.click(period)
+        self.click(credits_form.find_elements(By.CSS_SELECTOR, ".datepicker-preset")[2])
+        with (
+            patch("django.utils.timezone.now", return_value=SCREENSHOT_DATE),
+            self.wait_for_page_load(),
+        ):
+            credits_form.submit()
+        self.assertEqual(
+            Report.objects.get(creator=user, component=component).created,
+            SCREENSHOT_DATE,
+        )
+        self.assertEqual(
+            [
+                item.text
+                for item in self.driver.find_elements(
+                    By.CSS_SELECTOR, ".breadcrumb-item"
+                )
+            ],
+            ["WeblateOrg", "Language names", "Translation reports", "Credits"],
+        )
+        self.assert_text_contains(".card-title", "Credits")
+        self.assert_text_contains("#report-metadata", "testuser")
+        self.assert_text_contains("#report-metadata", "2026")
+        self.assert_text_contains("#report-content", "Weblate Test")
+        for download_format in ("JSON", "HTML", "reStructuredText"):
+            self.driver.find_element(By.LINK_TEXT, f"Download {download_format}")
+        self.assertLess(
+            self.driver.find_element(By.ID, "report-downloads").rect["y"],
+            self.driver.find_element(By.ID, "report-content").rect["y"],
+        )
+        self.screenshot("report-view.png")
+
+        # Component tools
+        self.open_component(component, project)
+        self.click("Operations")
+        self.click("Bulk edit")
+        self.assert_text_contains("#bulk-edit", "Bulk edit")
+
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}"
+                f"{reverse('matrix', kwargs={'path': component.get_url_path()})}"
+                "?lang=cs&lang=he"
+            )
+        WebDriverWait(self.driver, 15).until(
+            presence_of_element_located((By.CSS_SELECTOR, ".matrix tbody tr"))
+        )
+        self.screenshot("matrix-view.png")
+
         # Contributor license agreement
+        self.open_component(component, project)
         self.click("Operations")
         with self.wait_for_page_load():
             self.click("Settings")
+        inherit_agreement = self.find_elements_now(By.ID, "id_inherit_agreement")
+        if inherit_agreement and inherit_agreement[0].is_selected():
+            self.click(inherit_agreement[0])
+            WebDriverWait(self.driver, 5).until(
+                lambda driver: driver.find_element(By.ID, "id_agreement").is_enabled()
+            )
         element = self.driver.find_element(By.ID, "id_agreement")
         element.send_keys("This is an agreement.")
         with self.wait_for_page_load():
@@ -875,22 +5747,47 @@ class SeleniumTests(
         with self.wait_for_page_load():
             element.submit()
 
-        # Translation page
-        with self.wait_for_page_load():
-            self.click("Czech")
-        with self.wait_for_page_load():
-            self.click("Django")
+    @reuse_demo_fixture
+    def test_translation_workflow(self) -> None:
+        """Test translation workflow screenshots."""
+        project = self.create_component()
+        self.configure_screenshot_machinery(project)
+        user = self.do_login(superuser=True)
+        self.open_translation(project=project)
         self.screenshot("strings-to-check.png")
+        count_text = self.driver.find_element(By.CSS_SELECTOR, ".card th.number").text
+        self.assertGreater(int(count_text.replace(",", "")), 0)
         self.click("Files")
         self.click("Upload translation")
         self.click("Files")
         self.screenshot("file-upload.png")
+        self.assert_text_contains("#upload", "File upload mode")
+        self.screenshot("file-import-methods.png")
         self.click("Customize download")
         self.click("Files")
         self.screenshot("file-download.png")
         self.click("Operations")
-        self.click("Automatic translation")
+        self.click("Batch automatic translation")
         self.click(htmlid="id_auto_auto_source_1")
+        expected_engines = {
+            WeblateTranslation.get_identifier(),
+            WeblateMemory.get_identifier(),
+        }
+        expected_engines.update(
+            installation.selector
+            for installation in MachineryInstallation.objects.filter(
+                project__isnull=True, workspace__isnull=True
+            )
+        )
+        self.assertEqual(
+            {
+                option.get_attribute("value")
+                for option in Select(
+                    self.driver.find_element(By.ID, "id_auto_engines")
+                ).options
+            },
+            expected_engines,
+        )
         self.click("Operations")
         self.screenshot("automatic-translation.png")
         self.click("Search")
@@ -956,6 +5853,358 @@ class SeleniumTests(
             self.click(self.driver.find_element(By.PARTIAL_LINK_TEXT, "All strings"))
         self.screenshot("visual-keyboard.png")
 
+        translation = Component.objects.get(
+            project=project, slug="django"
+        ).translation_set.get(language__code="he")
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}"
+                f"{reverse('zen', kwargs={'path': translation.get_url_path()})}"
+                "?q=word"
+            )
+        WebDriverWait(self.driver, 15).until(
+            presence_of_element_located((By.CSS_SELECTOR, ".zen-unit"))
+        )
+        self.screenshot("zen-mode.png")
+
+    def create_translation_quality_scene(self, user: User) -> Unit:
+        """Show translation context, terminology, and a real placeholder warning."""
+        project = Project.objects.create(name="Orbit", slug="orbit")
+        remove_tree(project.full_path, ignore_errors=True)
+        self.addCleanup(remove_tree, project.full_path, True)
+        LocalRepository.from_files(
+            os.path.join(project.full_path, "billing"),
+            {"fr.po": Path(get_test_file("translation-quality.po")).read_bytes()},
+        )
+        component = project.scratch_create_component(
+            "Billing",
+            "billing",
+            Language.objects.get(code="en"),
+            "po",
+            new_base="fr.po",
+            new_lang="add",
+            acting_user=user,
+        )
+        # Secondary-language choices only include languages used by the site.
+        self.assertIsNotNone(
+            component.add_new_language(Language.objects.get(code="de"), None),
+            component.new_lang_error_message,
+        )
+        language = Language.objects.get(code="fr")
+        translation = component.translation_set.get(language=language)
+        team = Group.objects.create(name="Orbit translators")
+        team.projects.add(project)
+        team.roles.add(Role.objects.get(name="Translate"))
+        team.languages.add(language)
+        user.groups.set([team])
+        user.profile.theme = "light"
+        user.profile.save()
+        draft = "La période d’essai de votre espace de travail se termine bientôt."  # codespell:ignore
+        preferred_term = "espace de travail"  # codespell:ignore
+        unit = translation.add_unit(
+            None,
+            "",
+            [
+                "Your workspace trial ends in %(days)s day.",
+                "Your workspace trial ends in %(days)s days.",
+            ],
+            [draft, draft],
+            # This deliberately number-free draft is grammatical for both forms.
+            extra_flags="python-format, ignore-same-plurals",
+            author=user,
+        )
+        assert unit is not None
+        source = unit.source_unit
+        assert source is not None
+        source.explanation = (
+            "Shown in the billing banner. Keep the tone helpful and concise."
+        )
+        source.save()
+        self.assertEqual(
+            list(unit.check_set.values_list("name", flat=True)), ["python_format"]
+        )
+
+        glossary = project.glossaries[0].translation_set.get(language=language)
+        term = glossary.add_unit(None, "", "workspace", preferred_term, author=user)
+        assert term is not None
+        glossary.commit_pending("test", user)
+        store = glossary.store
+        entry, _ = store.find_unit(term.context, term.source)
+        group = entry.unit.get_target_dom().find("tig")
+        etree.SubElement(
+            group, "termNote", type="administrativeStatus"
+        ).text = "preferred"
+        store.save()
+        glossary.drop_store_cache()
+        glossary.component.unload_sources()
+        with transaction.atomic():
+            glossary.check_sync(force=True)
+
+        # Render a fixed application fixture, without changing the editor's DOM.
+        html = Path(get_test_file("translation-quality.html")).read_bytes()
+        self.driver.get("data:text/html;base64," + base64.b64encode(html).decode())
+        banner = self.driver.find_element(By.TAG_NAME, "main")
+        screenshot = Screenshot.objects.create(
+            name="Orbit billing banner", translation=component.source_translation
+        )
+        screenshot.image.save(
+            "orbit-billing.png", ContentFile(banner.screenshot_as_png)
+        )
+        screenshot.add_unit(source, user)
+        self.clear_project_stats_cache(project)
+
+        return unit
+
+    def test_translator_onboarding(self) -> None:
+        """Select languages, translate, resolve a quality warning, and suggest an edit."""
+        user = self.do_login()
+        unit = self.create_translation_quality_scene(user)
+        user.profile.languages.clear()
+        user.profile.secondary_languages.clear()
+        translation = unit.translation
+        component = translation.component
+        project = component.project
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('home')}")
+
+        self.click(htmlid="user-dropdown")
+        with self.wait_for_page_load():
+            self.click(htmlid="settings-button")
+        self.click(htmlid="profile-tab-languages")
+        for field, language, code in (
+            ("languages", "French", "fr"),
+            ("secondary_languages", "German", "de"),
+        ):
+            control = self.driver.find_element(By.ID, f"id_{field}-ts-control")
+            control.click()
+            control.send_keys(language)
+            language_id = Language.objects.get(code=code).pk
+            option_selector = f"#id_{field}-ts-dropdown [data-value='{language_id}']"
+            # Focus can render highlights before the throttled search finishes.
+            # Wait for Tom Select's internal timer so it cannot reopen this
+            # dropdown and steal focus after we move to the next field.
+            WebDriverWait(self.driver, 10).until(
+                lambda driver, field=field, language=language: driver.execute_script(
+                    """
+                    const select = document.getElementById(arguments[0]).tomselect;
+                    return select.control_input.value === arguments[1] &&
+                        select.lastQuery === arguments[1] &&
+                        select.refreshTimeout === null;
+                    """,
+                    f"id_{field}",
+                    language,
+                ),
+                message=f"Language search did not finish in {field}: {language}",
+            )
+            option = WebDriverWait(self.driver, 10).until(
+                element_to_be_clickable((By.CSS_SELECTOR, option_selector))
+            )
+            self.click(option)
+            control.send_keys(Keys.ESCAPE, Keys.TAB)
+            WebDriverWait(self.driver, 10).until(
+                invisibility_of_element_located((By.ID, f"id_{field}-ts-dropdown"))
+            )
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, '#languages button[type="submit"]'
+                )
+            )
+        self.assertEqual(
+            list(user.profile.languages.values_list("code", flat=True)), ["fr"]
+        )
+        self.assertEqual(
+            list(user.profile.secondary_languages.values_list("code", flat=True)),
+            ["de"],
+        )
+        self.screenshot("onboarding-languages.png")
+
+        self.open_translation(
+            language="French", component=component.name, project=project
+        )
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(By.PARTIAL_LINK_TEXT, "Untranslated strings")
+            )
+        editor = self.driver.find_element(
+            By.CSS_SELECTOR, ".translation-form .translation-editor"
+        )
+        billing = translation.unit_set.get(source="Billing")
+        self.assertEqual(editor.get_attribute("id"), f"id_{billing.checksum}_0")
+        editor.send_keys("Facturation")
+        with self.wait_for_page_load():
+            self.click(self.driver.find_element(By.NAME, "save"))
+        billing.refresh_from_db()
+        self.assertEqual(billing.target, "Facturation")
+        self.assertEqual(billing.state, STATE_TRANSLATED)
+        self.clear_project_stats_cache(project)
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+        self.assert_text_contains(
+            "#glossary-terms",
+            "espace de travail",  # codespell:ignore
+        )
+        self.assert_text_contains("#glossary-terms", "preferred")
+        self.assert_text_contains(".check-item", "Python format")
+        self.assert_text_contains(
+            ".check-description", "The following format strings are missing: %(days)s"
+        )
+        self.assert_text_contains(
+            ".source-info",
+            "Shown in the billing banner. Keep the tone helpful and concise.",
+        )
+        editors = self.driver.find_elements(By.CSS_SELECTOR, ".translation-editor")
+        self.assertEqual(
+            [editor.get_attribute("value") for editor in editors],
+            unit.get_target_plurals(),
+        )
+        for name in ("save", "suggest"):
+            self.assertTrue(self.driver.find_element(By.NAME, name).is_displayed())
+        self.assertTrue(
+            self.driver.find_element(By.ID, f"id_{unit.checksum}_fuzzy").is_displayed()
+        )
+        self.wait_for_screenshot_ready()
+        context_image = self.driver.find_element(
+            By.CSS_SELECTOR, 'img[alt="Orbit billing banner"]'
+        )
+        self.assertTrue(context_image.is_displayed())
+        self.assertGreater(
+            self.driver.execute_script(
+                "return arguments[0].naturalWidth", context_image
+            ),
+            0,
+        )
+        self.screenshot("translation-quality.png")
+
+        corrected = [
+            "La période d’essai de votre espace de travail se termine dans %(days)s jour.",  # codespell:ignore
+            "La période d’essai de votre espace de travail se termine dans %(days)s jours.",  # codespell:ignore
+        ]
+        for editor, target in zip(editors, corrected, strict=True):
+            editor.clear()
+            editor.send_keys(target)
+        with self.wait_for_page_load():
+            self.click(self.driver.find_element(By.NAME, "save"))
+        unit.refresh_from_db()
+        self.assertEqual(unit.get_target_plurals(), corrected)
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+        self.assertFalse(unit.check_set.exists())
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{unit.get_absolute_url()}")
+        self.assertFalse(self.find_elements_now(By.CSS_SELECTOR, ".check-item"))
+        proposed = [
+            target.replace("La période d’essai", "L’essai") for target in corrected
+        ]
+        editors = self.driver.find_elements(By.CSS_SELECTOR, ".translation-editor")
+        for editor, target in zip(editors, proposed, strict=True):
+            editor.clear()
+            editor.send_keys(target)
+        with self.wait_for_page_load():
+            self.click(self.driver.find_element(By.NAME, "suggest"))
+        suggestion = unit.suggestion_set.get(user=user)
+        self.assertEqual(suggestion.get_target_plurals(), proposed)
+        unit.refresh_from_db()
+        self.assertEqual(unit.get_target_plurals(), corrected)
+
+    def test_profile_validates_only_active_tab(self) -> None:
+        """Save other tabs when a legacy account lacks its required full name."""
+        user = self.do_login()
+        self.confirm_sensitive_password()
+        user.full_name = ""
+        user.save(update_fields=["full_name"])
+
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('profile')}#profile")
+        website = self.driver.find_element(By.ID, "id_website")
+        website.send_keys("invalid-url")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, '#profile button[type="submit"]')
+        )
+        self.assertEqual(
+            self.driver.execute_script("return document.activeElement.id"),
+            "id_website",
+        )
+        user.profile.refresh_from_db()
+        self.assertEqual(user.profile.website, "")
+
+        website.clear()
+        website.send_keys("https://example.org/profile")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, '#profile button[type="submit"]'
+                )
+            )
+        self.assertTrue(self.driver.current_url.endswith("#profile"))
+        user.profile.refresh_from_db()
+        self.assertEqual(user.profile.website, "https://example.org/profile")
+
+        self.click(htmlid="profile-tab-preferences")
+        self.click(htmlid="id_wide_tables")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, '#preferences button[type="submit"]'
+                )
+            )
+        self.assertTrue(self.driver.current_url.endswith("#preferences"))
+        user.profile.refresh_from_db()
+        self.assertTrue(user.profile.wide_tables)
+        user.refresh_from_db()
+        self.assertEqual(user.full_name, "")
+
+        self.click(htmlid="profile-tab-account")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, '#account button[type="submit"]')
+        )
+        self.assertEqual(
+            self.driver.execute_script("return document.activeElement.id"),
+            "id_full_name",
+        )
+        self.driver.find_element(By.ID, "id_full_name").send_keys("Updated name")
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, '#account button[type="submit"]'
+                )
+            )
+        self.assertTrue(self.driver.current_url.endswith("#account"))
+        user.refresh_from_db()
+        self.assertEqual(user.full_name, "Updated name")
+
+    @reuse_demo_fixture
+    def test_profile_dashboard(self) -> None:
+        """Test profile and dashboard screenshots."""
+        project = self.create_component()
+        components = project.component_set.all()
+        components.update(license="GPL-3.0-or-later", inherit_license=False)
+        language_names = components.get(slug="language-names")
+        django = components.get(slug="django")
+        language_names.agreement = (
+            "Translations are contributed under the project license."
+        )
+        language_names.inherit_agreement = False
+        self.enterContext(acting_user_context(get_test_actor(self)))
+        language_names.save(update_fields=["agreement", "inherit_agreement"])
+        user = self.do_login(superuser=True)
+
+        languages = Language.objects.filter(code__in=("cs", "he", "hu"))
+        user.profile.languages.set(languages)
+        user.profile.watched.add(project)
+        ContributorAgreement.objects.create(user=user, component=language_names)
+        for translation in django.translation_set.filter(language__in=languages):
+            Change.objects.create(
+                action=ActionEvents.CHANGE,
+                user=user,
+                author=user,
+                project=project,
+                component=django,
+                translation=translation,
+                language=translation.language,
+            )
+
         # Profile
         self.click(htmlid="user-dropdown")
         with self.wait_for_page_load():
@@ -973,80 +6222,355 @@ class SeleniumTests(
         time.sleep(0.2)
         self.screenshot("your-translations.png")
 
+    def get_dashboard_listing_scroll(self) -> dict:
+        """Measure horizontal scrolling of the watched translations listing."""
+        return self.driver.execute_script(
+            """
+            const wrapper = document.querySelector(
+                "#your-subscriptions .table-listing-wrapper"
+            );
+            if (wrapper === null) {
+                return null;
+            }
+            const header = wrapper.querySelector(".sticky-header");
+            const hidden = Array.from(
+                wrapper.querySelectorAll("thead th[class*='zero-width-']")
+            ).filter((cell) => getComputedStyle(cell).display === "none");
+            // Scroll to the end to see how far the listing actually scrolls
+            wrapper.scrollLeft = wrapper.scrollWidth;
+            const scrollLeft = wrapper.scrollLeft;
+            wrapper.scrollLeft = 0;
+            const doc = document.documentElement;
+            return {
+                scrollable: wrapper.classList.contains("table-scroll"),
+                overflow: wrapper.scrollWidth - wrapper.clientWidth,
+                hiddenColumns: hidden.length,
+                scrollLeft: scrollLeft,
+                headerPosition: header === null ? "" : getComputedStyle(header).position,
+                documentOverflow: doc.scrollWidth - doc.clientWidth,
+                tabindex: wrapper.getAttribute("tabindex"),
+            };
+            """
+        )
+
+    @reuse_demo_fixture
+    def test_dashboard_wide_tables(self) -> None:
+        """Test horizontal scrolling of the dashboard listing."""
+        # Window narrow enough for the responsive rules to hide some columns
+        narrow_width = 900
+
+        project = self.create_component()
+        user = self.do_login()
+        user.profile.watched.add(project)
+
+        self.driver.set_window_size(narrow_width, 1024)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('home')}")
+
+        # Columns are hidden and the listing does not scroll by default
+        before = self.get_dashboard_listing_scroll()
+        self.assertIsNotNone(before)
+        self.assertFalse(before["scrollable"])
+        self.assertGreater(before["hiddenColumns"], 0)
+        self.assertEqual(before["scrollLeft"], 0)
+        self.assertEqual(before["documentOverflow"], 0)
+        self.assertIsNone(before["tabindex"])
+        self.assertEqual(before["headerPosition"], "sticky")
+        self.screenshot_viewport("dashboard-narrow-columns.png", narrow_width)
+
+        # Turn the preference on in the settings
+        self.driver.set_window_size(1200, 1024)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('profile')}")
+        self.click("Preferences")
+        wide_tables = self.driver.find_element(By.ID, "id_wide_tables")
+        self.assertFalse(wide_tables.is_selected())
+        self.click(wide_tables)
+        with self.wait_for_page_load():
+            self.click(
+                self.driver.find_element(
+                    By.CSS_SELECTOR, "#preferences button[type='submit']"
+                )
+            )
+        user.profile.refresh_from_db()
+        self.assertTrue(user.profile.wide_tables)
+
+        self.driver.set_window_size(narrow_width, 1024)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{reverse('home')}")
+
+        # All columns are shown and the listing scrolls horizontally instead
+        after = self.get_dashboard_listing_scroll()
+        self.assertIsNotNone(after)
+        self.assertTrue(after["scrollable"])
+        self.assertEqual(after["hiddenColumns"], 0)
+        self.assertGreater(after["overflow"], 0)
+        self.assertGreater(after["scrollLeft"], 0)
+        # Only the listing scrolls, the page itself must not overflow
+        self.assertEqual(after["documentOverflow"], 0)
+        # Sticky header does not work inside a scrolling container
+        self.assertEqual(after["headerPosition"], "static")
+        self.screenshot_viewport("dashboard-wide-tables.png", narrow_width)
+
+        # The listing is keyboard focusable and scrollable
+        self.assertEqual(after["tabindex"], "0")
+        wrapper = self.driver.find_element(
+            By.CSS_SELECTOR, "#your-subscriptions .table-listing-wrapper"
+        )
+        self.driver.execute_script("arguments[0].focus();", wrapper)
+        for _ in range(3):
+            wrapper.send_keys(Keys.ARROW_RIGHT)
+        time.sleep(0.2)
+        self.assertGreater(
+            self.driver.execute_script("return arguments[0].scrollLeft;", wrapper), 0
+        )
+
+    @reuse_demo_fixture
+    def test_team_management(self) -> None:
+        """Test team management screenshots."""
+        project = self.create_component()
+        component_list = ComponentList.objects.create(
+            name="Website components", slug="website-components"
+        )
+        component_list.components.set(project.component_set.all())
+        team = Group.objects.create(name="Spanish Admin-Reviewers")
+        team.roles.set(Role.objects.without_global_permissions()[:2])
+        team.projects.set([project])
+        team.componentlists.set([component_list])
+        team.languages.set(Language.objects.filter(code__in=("cs", "he")))
+        AutoGroup.objects.create(group=team, match=r".*@example\.org$")
+
+        self.do_login(superuser=True)
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{team.get_absolute_url()}")
+        self.assert_text_contains("#basic", "Project selection")
+        self.screenshot("team-scope.png")
+
+        self.click("Automatic assignments")
+        self.assertEqual(
+            self.driver.find_element(By.ID, "id_autogroup_set-0-match").get_attribute(
+                "value"
+            ),
+            r".*@example\.org$",
+        )
+        self.screenshot("team-automatic-assignments.png")
+
+    @reuse_demo_fixture
+    def test_component_branches_load_on_demand(self) -> None:
+        project = self.create_component()
+        component = project.component_set.get(slug="language-names")
+        self.do_login(superuser=True)
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches",
+            side_effect=RepositoryError(1, "Repository unavailable"),
+        ) as discover:
+            with self.wait_for_page_load():
+                self.driver.get(
+                    f"{self.live_server_url}{reverse('create-component')}?project={project.pk}"
+                )
+            discover.assert_not_called()
+            tab = self.driver.find_element(
+                By.CSS_SELECTOR, '[data-bs-target="#branch"]'
+            )
+            tab.send_keys(Keys.ENTER)
+            select = WebDriverWait(self.driver, 10).until(
+                element_to_be_clickable((By.ID, "id_branch_component"))
+            )
+            Select(select).select_by_value(str(component.pk))
+            retry = WebDriverWait(self.driver, 10).until(
+                element_to_be_clickable((By.CSS_SELECTOR, ".branch-retry"))
+            )
+            self.assertFalse(
+                self.driver.find_element(By.ID, "create-branch").is_enabled()
+            )
+            discover.assert_called_once_with(timeout=15)
+            discover.side_effect = None
+            discover.return_value = [component.branch, "new-branch"]
+            retry.send_keys(Keys.ENTER)
+            submit = WebDriverWait(self.driver, 10).until(
+                element_to_be_clickable((By.ID, "create-branch"))
+            )
+            branch = self.driver.find_element(By.ID, "id_branch_branch")
+            WebDriverWait(self.driver, 10).until(
+                lambda driver: driver.switch_to.active_element == branch
+            )
+            self.assertEqual(
+                [option.text for option in Select(branch).options], ["new-branch"]
+            )
+            status = self.driver.find_element(By.CSS_SELECTOR, ".branch-status")
+            self.assertEqual(status.get_attribute("role"), "status")
+            self.assertEqual(status.text, "Repository branches loaded.")
+            discover.return_value = []
+            # Native select Home/End behavior differs across operating systems.
+            Select(select).select_by_value("")
+            WebDriverWait(self.driver, 10).until(
+                lambda _driver: (
+                    status.text == "Select a component to load repository branches."
+                )
+            )
+            Select(select).select_by_value(str(component.pk))
+            WebDriverWait(self.driver, 10).until(
+                lambda _driver: (
+                    status.text == "No additional repository branches are available."
+                )
+            )
+            self.assertFalse(submit.is_enabled())
+
+            # Resolve two requests in reverse order, ignoring abort signals.
+            self.driver.execute_script(
+                """
+                const originalFetch = window.fetch;
+                window.pendingBranches = [];
+                window.fetch = (url, options) => {
+                    if (!url.endsWith('/js/component-branches/')) {
+                        return originalFetch(url, options);
+                    }
+                    return new Promise((resolve) => pendingBranches.push(resolve));
+                };
+                const select = document.getElementById('id_branch_component');
+                const value = select.value;
+                select.dispatchEvent(new Event('change'));
+                select.value = '';
+                select.dispatchEvent(new Event('change'));
+                select.value = value;
+                select.dispatchEvent(new Event('change'));
+                """
+            )
+            self.assertFalse(submit.is_enabled())
+            self.assertEqual(status.text, "Loading repository branches…")
+            self.driver.execute_async_script(
+                """
+                const done = arguments[0];
+                const response = (branch) => new Response(
+                    JSON.stringify({branches: [branch]}),
+                    {headers: {'Content-Type': 'application/json'}},
+                );
+                pendingBranches[1](response('current'));
+                setTimeout(() => {
+                    pendingBranches[0](response('obsolete'));
+                    setTimeout(done, 0);
+                }, 0);
+                """
+            )
+            WebDriverWait(self.driver, 10).until(lambda _driver: submit.is_enabled())
+            self.assertEqual(
+                [option.text for option in Select(branch).options], ["current"]
+            )
+
     @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
     def test_add_component(self) -> None:
         """Test user adding project and component."""
+        self.use_github_fixtures()
+        self.clear_weblateorg_fixture_path()
         user = self.do_login()
-        create_test_billing(user)
+        with patch("django.utils.timezone.now", return_value=SCREENSHOT_DATE):
+            billing = create_test_billing(user, invoice=False)
+            billing.invoice_set.create(
+                amount=19,
+                start=SCREENSHOT_DATE.date() - timedelta(days=1),
+                end=SCREENSHOT_DATE.date() + timedelta(days=1),
+            )
 
-        # Open billing page
-        self.click(htmlid="user-dropdown")
-        with self.wait_for_page_load():
-            self.click(htmlid="billing-button")
-        self.screenshot("user-billing.png")
+            # Open billing page
+            self.click(htmlid="user-dropdown")
+            with self.wait_for_page_load():
+                self.click(htmlid="billing-button")
+            self.screenshot("user-billing.png")
 
-        # Click on add project
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.CLASS_NAME, "billing-add-project"))
+            # Click on add project
+            with self.wait_for_page_load():
+                self.click(
+                    self.driver.find_element(By.CLASS_NAME, "billing-add-project")
+                )
 
-        # Add project
-        self.driver.find_element(By.ID, "id_name").send_keys("WeblateOrg")
-        self.driver.find_element(By.ID, "id_web").send_keys("https://weblate.org/")
-        self.driver.find_element(By.ID, "id_instructions").send_keys(
-            "https://weblate.org/contribute/"
-        )
-        self.screenshot("user-add-project.png")
-        with self.wait_for_page_load():
-            self.driver.find_element(By.ID, "id_name").submit()
-        self.screenshot("user-add-project-done.png")
+            # Add project
+            self.driver.find_element(By.ID, "id_name").send_keys("WeblateOrg")
+            self.driver.find_element(By.ID, "id_web").send_keys("https://weblate.org/")
+            self.driver.find_element(By.ID, "id_instructions").send_keys(
+                "https://weblate.org/contribute/"
+            )
+            self.screenshot("user-add-project.png")
+            with self.wait_for_page_load():
+                self.driver.find_element(By.ID, "id_name").submit()
 
-        # Click on add component
-        with self.wait_for_page_load():
-            self.click(self.driver.find_element(By.ID, "list-add-button"))
+            project = Project.objects.get(name="WeblateOrg")
+            self.assertEqual(project.access_control, Project.ACCESS_PRIVATE)
+            project.public_sharing = True
+            self.enterContext(acting_user_context(user))
+            project.save(update_fields=["public_sharing"])
+            with self.wait_for_page_load():
+                self.driver.refresh()
 
-        # Add component
-        self.driver.find_element(By.ID, "id_name").send_keys("Language names")
-        self.driver.find_element(By.ID, "id_repo").send_keys(
-            "https://github.com/WeblateOrg/demo.git"
-        )
-        self.screenshot("user-add-component-init.png")
-        with self.wait_for_page_load(timeout=1200):
-            self.driver.find_element(By.ID, "id_name").submit()
+            self.assertTrue(
+                self.driver.find_element(By.LINK_TEXT, "Community").is_displayed()
+            )
+            self.screenshot("user-add-project-done.png")
+            self.assertIn("WeblateOrg", self.driver.title)
 
-        self.screenshot("user-add-component-discovery.png")
-        self.driver.find_element(By.ID, "id_discovery_1").click()
-        with self.wait_for_page_load(timeout=1200):
-            self.driver.find_element(By.ID, "id_name").submit()
+            # Click on add component
+            with self.wait_for_page_load():
+                self.click(self.driver.find_element(By.ID, "list-add-button"))
 
-        self.driver.find_element(By.ID, "id_repoweb").send_keys(
-            "https://github.com/WeblateOrg/demo/blob/{{branch}}/{{filename}}#L{{line}}"
-        )
-        self.driver.find_element(By.ID, "id_filemask").send_keys(
-            "weblate/langdata/locale/*/LC_MESSAGES/django.po"
-        )
-        self.driver.find_element(By.ID, "id_new_base").send_keys(
-            "weblate/langdata/locale/django.pot"
-        )
-        Select(self.driver.find_element(By.ID, "id_file_format")).select_by_value("po")
-        Select(self.driver.find_element(By.ID, "id_license")).select_by_value(
-            "GPL-3.0-or-later"
-        )
-        element = self.driver.find_element(By.ID, "id_language_regex")
-        element.clear()
-        element.send_keys("^(cs|he|hu)$")
-        self.screenshot("user-add-component.png")
+            # Add component
+            self.driver.find_element(By.ID, "id_name").send_keys("Language names")
+            self.driver.find_element(By.ID, "id_repo").send_keys(
+                "https://github.com/WeblateOrg/demo.git"
+            )
+            self.driver.find_element(By.ID, "id_branch").send_keys("main")
+            self.screenshot("user-add-component-init.png")
+            with self.wait_for_page_load(timeout=1200):
+                self.driver.find_element(By.ID, "id_name").submit()
+
+            self.screenshot("user-add-component-discovery.png")
+            discovery_choice = WebDriverWait(self.driver, 30).until(
+                element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        (
+                            '//label[.//code[text()="weblate/langdata/locale/*/LC_MESSAGES/django.po"]]'
+                            '/preceding-sibling::input[@name="discovery"]'
+                        ),
+                    )
+                )
+            )
+            discovery_choice.click()
+            with self.wait_for_page_load(timeout=1200):
+                self.driver.find_element(By.ID, "id_name").submit()
+
+            self.driver.find_element(By.ID, "id_repoweb").send_keys(
+                "https://github.com/WeblateOrg/demo/blob/{{branch}}/{{filename}}#L{{line}}"
+            )
+            self.driver.find_element(By.ID, "id_filemask").send_keys(
+                "weblate/langdata/locale/*/LC_MESSAGES/django.po"
+            )
+            self.driver.find_element(By.ID, "id_new_base").send_keys(
+                "weblate/langdata/locale/django.pot"
+            )
+            Select(self.driver.find_element(By.ID, "id_file_format")).select_by_value(
+                "po"
+            )
+            self.select_component_license("GPL-3.0-or-later")
+            element = self.driver.find_element(By.ID, "id_language_regex")
+            element.clear()
+            element.send_keys("^(cs|he|hu)$")
+            self.screenshot("user-add-component.png")
 
     def test_alerts(self) -> None:
+        self.use_github_fixtures()
+        self.clear_weblateorg_fixture_path()
         project = Project.objects.create(name="WeblateOrg", slug="weblateorg")
-        Component.objects.create(
+        duplicates = Component.objects.create(
             name="Duplicates",
             slug="duplicates",
             project=project,
             repo="https://github.com/WeblateOrg/test.git",
+            branch="main",
             filemask="po-duplicates/*.dpo",
             new_base="po-duplicates/hello.pot",
             file_format="po",
         )
+        alert_timestamp = self.get_stable_naturaltime_timestamp()
+        duplicates.alert_set.update(timestamp=alert_timestamp, updated=alert_timestamp)
         self.do_login(superuser=True)
         self.click(htmlid="projects-menu")
         with self.wait_for_page_load():
@@ -1056,14 +6580,174 @@ class SeleniumTests(
         self.click("Components")
         with self.wait_for_page_load():
             self.click("Duplicates")
-        self.click("Alerts")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, 'a[data-bs-target="#alerts"]')
+        )
         self.screenshot("alerts.png")
+        self.assertGreater(self.count_elements("#alerts .card"), 0)
 
-        self.click("Insights")
+        guidance = Component.objects.create(
+            name="Guidance",
+            slug="guidance",
+            project=project,
+            repo="https://github.com/WeblateOrg/test.git",
+            branch="main",
+            filemask="po/*.po",
+            file_format="po",
+        )
+        guidance.add_alert("MissingTranslationInstructions")
+        alert_timestamp = self.get_stable_naturaltime_timestamp()
+        guidance.alert_set.update(timestamp=alert_timestamp, updated=alert_timestamp)
+        self.driver.get(f"{self.live_server_url}{guidance.get_absolute_url()}")
+        self.click(
+            self.driver.find_element(By.CSS_SELECTOR, 'a[data-bs-target="#alerts"]')
+        )
+        self.screenshot("component-diagnostics.png")
+        self.assert_text_contains("#alerts", "Define translation instructions")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_diagnostics_overviews(self) -> None:
+        """Test project and workspace diagnostics overviews."""
+        workspace = Workspace.objects.create(name="Product localization")
+        website = Project.objects.create(
+            name="Website translations",
+            slug="website-translations",
+            web="https://example.com/website/",
+            workspace=workspace,
+        )
+        mobile = Project.objects.create(
+            name="Mobile applications",
+            slug="mobile-applications",
+            web="https://example.com/mobile/",
+            workspace=workspace,
+        )
+        checkout, account, android, ios = Component.objects.bulk_create(
+            [
+                Component(
+                    name="Checkout interface",
+                    slug="checkout-interface",
+                    project=website,
+                    repo="local:",
+                    filemask="checkout/*.po",
+                    file_format="po",
+                ),
+                Component(
+                    name="Account emails",
+                    slug="account-emails",
+                    project=website,
+                    repo="local:",
+                    filemask="account/*.po",
+                    file_format="po",
+                ),
+                Component(
+                    name="Android application",
+                    slug="android-application",
+                    project=mobile,
+                    repo="local:",
+                    filemask="android/*.po",
+                    file_format="po",
+                ),
+                Component(
+                    name="iOS application",
+                    slug="ios-application",
+                    project=mobile,
+                    repo="local:",
+                    filemask="ios/*.po",
+                    file_format="po",
+                ),
+            ]
+        )
+        self.clear_project_stats_cache(website)
+        self.clear_project_stats_cache(mobile)
+
+        user = self.do_login(superuser=True)
+        workspace.add_owner(user)
+        checkout.add_alert(
+            "ParseError",
+            occurrences=[{"filename": "checkout/cs.po", "error": "Invalid PO"}],
+        )
+        account.add_alert(
+            "ParseError",
+            occurrences=[{"filename": "account/cs.po", "error": "Invalid PO"}],
+        )
+        android.add_alert(
+            "ParseError",
+            occurrences=[{"filename": "android/cs.po", "error": "Invalid PO"}],
+        )
+        for component in (checkout, account, android):
+            component.add_alert("MissingTranslationInstructions")
+        ios.add_alert("UnusedScreenshot")
+        with patch("django.utils.timezone.now", return_value=SCREENSHOT_DATE):
+            ios.alert_set.get(name="UnusedScreenshot").dismiss(
+                user, "Reviewed for documentation"
+            )
+        for component in (checkout, account, android, ios):
+            component.alert_set.update(
+                timestamp=SCREENSHOT_DATE, updated=SCREENSHOT_DATE
+            )
+
         with self.wait_for_page_load():
-            self.click("Community localization checklist")
-        self.screenshot("guide.png")
+            self.driver.get(
+                f"{self.live_server_url}{website.get_absolute_url()}#diagnostics"
+            )
+        self.wait_for_ajax_tab("#diagnostics", "Could not parse translation files.")
+        project_diagnostics = self.driver.find_element(By.ID, "diagnostics").text
+        self.assertEqual(
+            project_diagnostics.count(
+                "Define translation instructions to help translators."
+            ),
+            1,
+        )
+        self.assertIn("Active: 2", project_diagnostics)
+        self.assertIn("Account emails", project_diagnostics)
+        self.assertIn("Checkout interface", project_diagnostics)
+        self.assertTrue(
+            any(
+                badge.text == "Active: 2"
+                for badge in self.driver.find_elements(
+                    By.CSS_SELECTOR, "#diagnostics .card-header .badge"
+                )
+            )
+        )
+        self.assertFalse(
+            any(
+                badge.text.startswith(("Active:", "Dismissed:"))
+                for badge in self.find_elements_now(
+                    By.CSS_SELECTOR, "#diagnostics .card-body .badge"
+                )
+            )
+        )
+        self.screenshot("project-diagnostics.png")
 
+        with self.wait_for_page_load():
+            self.driver.get(
+                f"{self.live_server_url}{workspace.get_absolute_url()}"
+                "?diagnostic_state=all#diagnostics"
+            )
+        self.wait_for_ajax_tab("#diagnostics", "Unused screenshot")
+        workspace_diagnostics = self.driver.find_element(By.ID, "diagnostics").text
+        self.assertEqual(
+            workspace_diagnostics.count(
+                "Define translation instructions to help translators."
+            ),
+            1,
+        )
+        self.assertIn(
+            "Website translations / Checkout interface", workspace_diagnostics
+        )
+        self.assertIn(
+            "Mobile applications / Android application", workspace_diagnostics
+        )
+        self.assertIn("Dismissed: 1", workspace_diagnostics)
+        self.assertEqual(
+            Select(
+                self.driver.find_element(By.ID, "id_diagnostic_state")
+            ).first_selected_option.text,
+            "All",
+        )
+        self.screenshot("workspace-diagnostics.png")
+
+    @reuse_demo_fixture
     def test_fonts(self) -> None:
         self.create_component()
         self.do_login(superuser=True)
@@ -1080,7 +6764,7 @@ class SeleniumTests(
 
         # Upload font
         element = self.driver.find_element(By.ID, "id_font")
-        self.upload_file(element, FONT.as_posix())
+        self.upload_file(element, FONT)
         with self.wait_for_page_load():
             self.click(htmlid="upload_font_submit")
 
@@ -1091,7 +6775,7 @@ class SeleniumTests(
 
         # Upload second font
         element = self.driver.find_element(By.ID, "id_font")
-        self.upload_file(element, SOURCE_FONT)
+        self.upload_file(element, FONT_SOURCE)
         with self.wait_for_page_load():
             self.click(htmlid="upload_font_submit")
 
@@ -1134,8 +6818,13 @@ class SeleniumTests(
         self.screenshot("font-group-list.png")
 
     def test_backup(self) -> None:
+        fixed_timestamp = datetime(2026, 1, 6, 12, 0, tzinfo=UTC)
+        display_repository = "ssh://weblate@backup.example.com/backups"
+        display_passphrase = "example-backup-passphrase-for-screenshot-2026"
+
         self.create_temp()
-        try:
+        self.addCleanup(self.remove_temp)
+        with patch("django.utils.timezone.now", return_value=fixed_timestamp):
             self.open_manage()
             with self.wait_for_page_load():
                 self.click("Backups")
@@ -1144,34 +6833,57 @@ class SeleniumTests(
             with self.wait_for_page_load():
                 element.submit()
             with self.wait_for_page_load():
-                self.click(self.driver.find_element(By.CLASS_NAME, "runbackup"))
-            self.click(self.driver.find_element(By.CLASS_NAME, "createdbackup"))
-            time.sleep(0.2)
-            self.screenshot("backups.png")
-            SupportStatus.objects.create(secret="123", name="community")
+                self.click(self.driver.find_element(By.NAME, "trigger"))
+
+            service = BackupService.objects.get()
+            service.repository = display_repository
+            service.passphrase = display_passphrase
+            service.timestamp = fixed_timestamp
+            service.save(update_fields=("repository", "passphrase", "timestamp"))
+            service.backuplog_set.update(timestamp=fixed_timestamp)
+
             with self.wait_for_page_load():
-                self.click("Weblate status")
-            self.screenshot("support-discovery.png")
-        finally:
-            self.remove_temp()
+                self.driver.refresh()
+            credentials = self.driver.find_element(
+                By.CSS_SELECTOR, 'button[aria-controls$="-credentials"]'
+            )
+            credentials_id = cast("str", credentials.get_attribute("aria-controls"))
+            self.click(credentials)
+            WebDriverWait(self.driver, 5).until(
+                lambda driver: (
+                    "show"
+                    in driver.find_element(By.ID, credentials_id).get_attribute("class")
+                )
+            )
+            self.screenshot("backups.png")
+            # The login session was created with the patched clock and expires
+            # once the real clock is restored.
+            SupportStatus.objects.create(secret="123", name="community")
+            with self.stable_git_revision():
+                with self.wait_for_page_load():
+                    self.click("Weblate status")
+                self.assert_text_contains("h4.card-title", "Weblate support status")
+                self.screenshot("support-discovery.png")
 
     def test_manage(self) -> None:
-        self.open_manage()
-        self.screenshot("support.png")
-        self.click("Appearance")
+        with (
+            patch("weblate.wladmin.views.GIT_LINK", None),
+            patch("weblate.wladmin.views.GIT_REVISION", None),
+        ):
+            self.open_manage()
+            self.screenshot("support.png")
+        with self.wait_for_page_load():
+            self.click("Appearance")
         self.screenshot("appearance-settings.png")
+        with self.stable_performance_report_inputs():
+            with self.wait_for_page_load():
+                self.click("Performance report")
+            self.screenshot("performance-report.png")
 
+    @reuse_demo_fixture
     def test_explanation(self) -> None:
         project = self.create_component()
-        Component.objects.create(
-            name="Android",
-            slug="android",
-            project=project,
-            repo="weblate://weblateorg/language-names",
-            filemask="app/src/main/res/values-*/strings.xml",
-            template="app/src/main/res/values/strings.xml",
-            file_format="aresource",
-        )
+        self.create_android_component(project)
 
         self.do_login(superuser=True)
         self.click(htmlid="projects-menu")
@@ -1225,6 +6937,8 @@ class SeleniumTests(
         element.send_keys("Monday")
         with self.wait_for_page_load():
             element.submit()
+        # Select explicitly because localStorage remembers tabs from other tests.
+        self.click(self.driver.find_element(By.PARTIAL_LINK_TEXT, "Other languages"))
         self.screenshot("source-review-detail.png")
 
         # Display variants
@@ -1233,13 +6947,46 @@ class SeleniumTests(
 
         # Edit context
         self.click(htmlid="edit-context")
-        time.sleep(0.2)
+        WebDriverWait(self.driver, 10).until(
+            lambda driver: driver.execute_script(
+                "return document.activeElement?.id === 'id_explanation';"
+            )
+        )
+        self.driver.execute_script(
+            "document.getElementById('context-edit-form').focus({preventScroll: true});"
+        )
         self.screenshot("source-review-edit.png")
 
         # Close modal dialog
-        self.driver.find_element(By.ID, "id_extra_flags").send_keys(Keys.ESCAPE)
+        self.driver.find_element(By.ID, "context-edit-form").send_keys(Keys.ESCAPE)
         time.sleep(0.2)
 
+    @reuse_demo_fixture
+    def test_dark_theme(self) -> None:
+        project = self.create_component()
+        self.create_android_component(project)
+        self.do_login()
+        self.click(htmlid="user-dropdown")
+        with self.wait_for_page_load():
+            self.click(htmlid="settings-button")
+        self.click("Preferences")
+        element = self.driver.find_element(By.ID, "id_theme")
+        Select(element).select_by_visible_text("Dark")
+        with self.wait_for_page_load():
+            element.submit()
+        time.sleep(0.2)
+        self.screenshot("dark-theme.png")
+        with self.wait_for_page_load():
+            self.driver.get(f"{self.live_server_url}{project.get_absolute_url()}")
+        self.screenshot("dark-theme-dashboard.png")
+        with self.wait_for_page_load():
+            self.click("Czech")
+        self.screenshot("dark-theme-language.png")
+        with self.wait_for_page_load():
+            self.click("Translate")
+        self.screenshot("dark-theme-translate.png")
+
+    @reuse_demo_fixture
     def test_glossary(self) -> None:
         user = self.do_login()
         project = self.create_component()
@@ -1255,9 +7002,90 @@ class SeleniumTests(
         with self.wait_for_page_load():
             self.click("Browse")
         self.screenshot("glossary-browse.png")
+        self.assertGreaterEqual(self.count_elements("tbody.unit-listing-body tr"), 2)
 
         with self.wait_for_page_load():
             self.click(self.driver.find_element(By.PARTIAL_LINK_TEXT, "projekt"))
 
+        self.click(
+            self.driver.find_element(
+                By.XPATH,
+                '//summary[normalize-space()="Term information from the translation file"]',
+            )
+        )
+        self.assert_text_contains("details[open]", "Avoid this informal diminutive.")
         self.click(htmlid="unit_tools_dropdown")
         self.screenshot("glossary-tools.png")
+
+    def test_date_range_picker(self) -> None:
+        """Test date range picker."""
+        self.do_login()
+        start_date = SCREENSHOT_DATE.date()
+        end_date = start_date + timedelta(days=6)
+        period = f"{start_date:%m/%d/%Y} - {end_date:%m/%d/%Y}"
+        self.driver.get(
+            f"{self.live_server_url}{reverse('changes')}?{urlencode({'period': period})}"
+        )
+
+        period_input = self.driver.find_element(By.ID, "id_period")
+        pickers = self.driver.find_elements(By.CSS_SELECTOR, ".datepicker")
+        self.assertEqual(len(pickers), 1)
+        picker = pickers[0]
+
+        self.assertEqual(picker.value_of_css_property("display"), "none")
+
+        self.click(period_input)
+        self.assertNotEqual(picker.value_of_css_property("display"), "none")
+        self.screenshot("date-range-picker-open.png")
+
+        period_input.send_keys(Keys.ESCAPE)
+        self.assertEqual(picker.value_of_css_property("display"), "none")
+
+        self.click(period_input)
+
+        presets = self.driver.find_elements(By.CSS_SELECTOR, ".datepicker-preset")
+        last_7_days = presets[2]
+        self.click(last_7_days)
+
+        value = period_input.get_attribute("value")
+        self.assertRegex(value, r"\d{2}/\d{2}/\d{4} - \d{2}/\d{2}/\d{4}")
+
+        self.assertEqual(picker.value_of_css_property("display"), "none")
+
+        self.click(period_input)
+        clear_btn = self.driver.find_element(By.CSS_SELECTOR, ".datepicker-btn-clear")
+        self.click(clear_btn)
+
+        self.assertEqual(period_input.get_attribute("value"), "")
+        self.assertEqual(picker.value_of_css_property("display"), "none")
+
+        self.click(period_input)
+
+        title = self.driver.find_element(By.CSS_SELECTOR, ".datepicker-cal-title")
+        initial_title = title.text
+
+        prev_btn = self.driver.find_element(
+            By.CSS_SELECTOR, ".datepicker-nav[aria-label='Previous month']"
+        )
+        self.click(prev_btn)
+
+        title = self.driver.find_element(By.CSS_SELECTOR, ".datepicker-cal-title")
+        self.assertNotEqual(title.text, initial_title)
+
+        next_btn = self.driver.find_element(
+            By.CSS_SELECTOR, ".datepicker-nav[aria-label='Next month']"
+        )
+        self.click(next_btn)
+        # Need to find the button again otherwise selenium will complain about the element being stale
+        next_btn = self.driver.find_element(
+            By.CSS_SELECTOR, ".datepicker-nav[aria-label='Next month']"
+        )
+        self.click(next_btn)
+
+        title = self.driver.find_element(By.CSS_SELECTOR, ".datepicker-cal-title")
+        self.assertNotEqual(title.text, initial_title)
+
+        # Click the search heading outside the picker.
+        self.click(self.driver.find_element(By.CSS_SELECTOR, "form .card-header"))
+
+        self.assertEqual(picker.value_of_css_property("display"), "none")

@@ -19,6 +19,7 @@ from weblate.fonts.utils import get_font_name
 from weblate.trans.actions import ActionEvents
 from weblate.trans.models import Change, Project
 from weblate.utils import messages
+from weblate.utils.files import read_file_bytes
 from weblate.utils.views import parse_path
 
 if TYPE_CHECKING:
@@ -119,7 +120,7 @@ class FontDetailView(ProjectViewMixin, DetailView):
             messages.error(request, gettext("Font deleted."))
             return redirect("fonts", project=self.project.slug)
 
-        form = self._fort_form = FontForm(data=request.POST, files=request.FILES)
+        form = self._font_form = FontForm(data=request.POST, files=request.FILES)
         if not form.is_valid():
             return self.get(request, **kwargs)
 
@@ -141,9 +142,9 @@ class FontDetailView(ProjectViewMixin, DetailView):
 
         # Compare file content
         current_content = self.object.font.read()
-        self.object.font.seek(0)
+        self.object.font.close()
 
-        if new_file.loaded_font.font_bytes == current_content:
+        if read_file_bytes(new_file) == current_content:
             messages.info(
                 request,
                 gettext("The uploaded font file is identical to the current one."),
@@ -166,8 +167,8 @@ class FontDetailView(ProjectViewMixin, DetailView):
 @method_decorator(login_required, name="dispatch")
 class FontGroupDetailView(ProjectViewMixin, DetailView):
     model = FontGroup
-    _form: FontOverrideForm | FontGroupForm | None = None
-    _override_form = None
+    _form: FontGroupForm | None = None
+    _override_form: FontOverrideForm | None = None
 
     def get_queryset(self):
         return self.project.fontgroup_set.all()
@@ -177,7 +178,9 @@ class FontGroupDetailView(ProjectViewMixin, DetailView):
         result["form"] = self._form or FontGroupForm(
             instance=self.object, project=self.project
         )
-        result["override_form"] = self._override_form or FontOverrideForm()
+        result["override_form"] = self._override_form or FontOverrideForm(
+            project=self.project
+        )
         result["can_edit"] = self.request.user.has_perm("project.edit", self.project)
         return result
 
@@ -205,7 +208,9 @@ class FontGroupDetailView(ProjectViewMixin, DetailView):
                     return redirect(self.object)
             return self.get(request, **kwargs)
         if "language" in request.POST:
-            form = self._form = FontOverrideForm(request.POST)
+            form = self._override_form = FontOverrideForm(
+                request.POST, project=self.project
+            )
             if form.is_valid():
                 instance = form.save(commit=False)
                 instance.group = self.object

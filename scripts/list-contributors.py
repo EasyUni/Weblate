@@ -3,23 +3,60 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
 import argparse
+import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from git import Commit, Repo
-from git.diff import Diff
+from git import Repo
+from sphinx.util.rst import escape
 
 import weblate.utils.version
 
+if TYPE_CHECKING:
+    from git import Commit
+    from git.diff import Diff
+
 VERSION = weblate.utils.version.VERSION_BASE
 ROOT_DIR = Path(__file__).parent.parent
+WHITESPACE_RE = re.compile(r"\s\s+")
+# Require a version so human names such as Claude Monet remain eligible.
+LLM_AUTHOR_RE = re.compile(
+    r"(?:(?:Anthropic|Google|OpenAI|xAI|Meta|Alibaba|Mistral AI)[ -])?"
+    r"(?:Claude|GPT|ChatGPT|Codex|Gemini|Grok|DeepSeek|Llama|Qwen|Mistral)"
+    r"(?:[ -][a-z]+)*[ -]?[a-z]?[0-9]+(?:\.[0-9]+)*"
+    r"(?:[a-z][a-z0-9]*)?(?:[ -][a-z0-9]+(?:\.[0-9]+)*)*",
+    re.IGNORECASE,
+)
 
 CategoryType = Literal["code", "translations", "docs"]
 
-IGNORE_AUTHORS: set[str] = {"GitHub", "Anonymous", "Hosted Weblate"}
+# Ignore known bots
+IGNORE_AUTHORS: tuple[str, ...] = (
+    "GitHub",
+    "Anonymous",
+    "Hosted Weblate",
+    "Weblate CI",
+    "Copilot",
+    "root",
+)
+
+# Match these identities exactly to preserve names that merely start with them.
+IGNORE_EXACT_AUTHORS = frozenset(
+    author.casefold()
+    for author in ("Deleted User", "Codex", "GPT", "ChatGPT", "DeepSeek", "Qwen")
+)
+
+# GitHub sometimes uses username instead of full name
+MAP_AUTHORS: dict[str, str] = {
+    "nijel": "Michal Čihař",
+    "gersona": "Gersona",
+    "gers": "Gersona",
+    "KarenKonou": "Karen Konou",
+}
 
 CATEGORIES: dict[CategoryType, str] = {
     "code": "Code contributions",
@@ -58,7 +95,9 @@ def is_valid_author(author: str) -> bool:
         "(bot)" not in author
         and "[bot]" not in author
         and "add-on" not in author
-        and author not in IGNORE_AUTHORS
+        and not author.startswith(IGNORE_AUTHORS)
+        and author.casefold() not in IGNORE_EXACT_AUTHORS
+        and LLM_AUTHOR_RE.fullmatch(author) is None
     )
 
 
@@ -71,13 +110,20 @@ def get_commit_authors(commit: Commit) -> set[str]:
         for line in str(commit.message).splitlines()
         if line.lower().startswith("co-authored-by:")
     )
-    return {author for author in authors if is_valid_author(author)}
+    # Remove extra whitespace
+    authors = [WHITESPACE_RE.sub(" ", author) for author in authors]
+    return {
+        MAP_AUTHORS.get(author, author) for author in authors if is_valid_author(author)
+    }
 
 
 def get_contributors() -> dict[CategoryType, list[str]]:
     contributors: dict[CategoryType, list[str]] = defaultdict(list)
     repo = Repo.init(ROOT_DIR)
-    tags = sorted(repo.tags, key=lambda tag: tag.commit.committed_date)
+    tags = sorted(
+        (tag for tag in repo.tags if tag.name.startswith("weblate-")),
+        key=lambda tag: tag.commit.committed_date,
+    )
     recent_tag = tags[-1]
     commits = list(repo.iter_commits(f"{recent_tag}..HEAD"))
     previous = recent_tag.object.object
@@ -101,7 +147,10 @@ def get_contributors_text() -> str:
         contributors = all_contributors[category]
         if contributors:
             output.append(
-                TEMPLATE.format(label=label, contributors=", ".join(contributors))
+                TEMPLATE.format(
+                    label=label,
+                    contributors=", ".join(map(escape, contributors)),
+                )
             )
 
     return "\n".join(output)

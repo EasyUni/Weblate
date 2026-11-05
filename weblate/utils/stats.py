@@ -5,45 +5,65 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from datetime import datetime, timedelta
-from itertools import chain
-from operator import itemgetter
+from itertools import batched, chain
 from types import GeneratorType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
-import sentry_sdk
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import Count, F, Model, Q
+from django.db.models import Count, Exists, F, OuterRef, Q, Sum
 from django.db.models.functions import Length
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.functional import cached_property
 
-from weblate.checks.models import CHECKS
+from weblate.checks.models import CHECKS, Check
 from weblate.lang.models import Language
 from weblate.trans.checklists import TranslationChecklistMixin
 from weblate.trans.mixins import BaseURLMixin
 from weblate.trans.util import translation_percent
+from weblate.utils.lock import WeblateLock
 from weblate.utils.random import get_random_identifier
 from weblate.utils.site import get_site_url
 from weblate.utils.state import (
+    FUZZY_STATES,
     STATE_APPROVED,
     STATE_EMPTY,
-    STATE_FUZZY,
     STATE_READONLY,
     STATE_TRANSLATED,
 )
+from weblate.utils.tracing import start_span
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
 
-    from weblate.trans.models import Category, Component, Project
+    from django.db.models import Model
+
+    from weblate.auth.models import User
+    from weblate.trans.models import Category, Change, Component, Project, Translation
+    from weblate.trans.models.translation import TranslationQuerySet
+    from weblate.workspaces.models import Workspace
 
 StatItem = int | float | str | datetime | None
 StatDict = dict[str, StatItem]
+
+STATS_PREFETCH_CHUNK_SIZE = 500
+
+
+class UnitSnapshot(TypedDict):
+    state: int
+    num_words: int
+    num_chars: int
+    active_checks_count: int
+    dismissed_checks_count: int
+    suggestion_count: int
+    label_count: int
+    comment_count: int
+
 
 BASICS = {
     "all",
@@ -86,8 +106,9 @@ SOURCE_KEYS = frozenset(
     )
 )
 
-# TODO: Drop in Weblate 6
-LEGACY_KEYS = {
+# TODO: Remove after stats cache versioning prevents pre-5.2 values from
+# surviving supported staged upgrades.
+OUTDATED_STATS_KEYS = {
     "unapproved",
     "unapproved_chars",
     "unapproved_words",
@@ -112,6 +133,16 @@ def zero_stats(keys: Iterable[str]) -> StatDict:
     return stats
 
 
+def yield_stats(queryset) -> Iterable[BaseStats]:
+    """
+    Yield stats attribute from the iterable.
+
+    This is an effective wrapper to use iterator over queryset
+    to generate all stats items.
+    """
+    yield from (item.stats for item in queryset.iterator())
+
+
 def prefetch_stats(queryset):
     """Fetch stats from cache for a queryset."""
     # Force evaluating queryset/iterator, we need all objects
@@ -122,16 +153,25 @@ def prefetch_stats(queryset):
     # is returned.
     # This is needed to allow using such querysets further and to support
     # processing iterator when it is more effective.
-    result = objects if isinstance(queryset, chain | GeneratorType) else queryset
+    result = objects if isinstance(queryset, (chain, GeneratorType)) else queryset
 
     # Bail out in case the query is empty
     if not objects:
         return result
 
-    # Use stats prefetch
-    objects[0].stats.prefetch_many([i.stats for i in objects])
+    # Use bounded stats prefetch to avoid oversized cache multi-get requests.
+    for object_batch in batched(objects, STATS_PREFETCH_CHUNK_SIZE):
+        object_batch[0].stats.prefetch_many([item.stats for item in object_batch])
 
     return result
+
+
+def iter_prefetch_stats(queryset, chunk_size: int = STATS_PREFETCH_CHUNK_SIZE):
+    """Yield objects with statistics prefetched in bounded batches."""
+    iterator = queryset.iterator(chunk_size=chunk_size)
+    for object_batch in batched(iterator, chunk_size):
+        object_batch[0].stats.prefetch_many([item.stats for item in object_batch])
+        yield from object_batch
 
 
 def get_non_glossary_stats(
@@ -145,14 +185,18 @@ def get_non_glossary_stats(
     }
 
     if isinstance(stats_obj, ProjectLanguageStats):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Translation
 
         glossaries = Translation.objects.filter(
-            language=stats_obj.language, component__in=stats_obj.project.glossaries
+            language=stats_obj.language,
+            component__in=stats_obj.project.all_glossaries,
         ).prefetch()
     elif isinstance(stats_obj, ProjectStats):
-        glossaries = stats_obj._object.glossaries  # noqa: SLF001
+        # ruff: ignore[private-member-access]
+        glossaries = stats_obj._object.all_glossaries
     elif isinstance(stats_obj, GlobalStats):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Component
 
         glossaries = Component.objects.filter(is_glossary=True)
@@ -180,8 +224,7 @@ class BaseStats:
         self._object = obj
         self._data: StatDict = {}
         self._loaded: bool = False
-        self._pending_save: bool = False
-        self.last_change_cache = None
+        self.last_change_cache: Change | None = None
         self._collected_update_objects: list[BaseStats] | None = None
 
     def __repr__(self) -> str:
@@ -208,6 +251,12 @@ class BaseStats:
     @property
     def is_loaded(self) -> bool:
         return self._loaded
+
+    @property
+    def has_cached_data(self) -> bool:
+        """Whether basic statistics are available in the cache."""
+        self.ensure_loaded()
+        return "all" in self._data
 
     def set_data(self, data: StatDict) -> None:
         self._loaded = True
@@ -259,6 +308,17 @@ class BaseStats:
     def cache_key(self) -> str:
         return f"stats-{self._object.cache_key}"
 
+    @cached_property
+    def lock(self) -> WeblateLock:
+        return WeblateLock(
+            scope="stats:update",
+            key=self.cache_key,
+            slug=self.cache_key,
+            timeout=5,
+            expiry_timeout=300,
+            origin=self.cache_key,
+        )
+
     def remove_stats(self, *names: str) -> None:
         self.ensure_loaded()
         if not self._data:
@@ -274,8 +334,12 @@ class BaseStats:
     def ensure_loaded(self) -> None:
         """Load from cache if not already done."""
         if not self._loaded:
-            self._data = self.load()
-            self._loaded = True
+            self.force_load()
+
+    def force_load(self) -> None:
+        """Enforced loading of stats."""
+        self.clear()
+        self.set_data(self.load())
 
     def aggregate_get(self, name: str) -> StatItem:
         """
@@ -291,11 +355,9 @@ class BaseStats:
             # Handle source_* keys as virtual on translation level for easier aggregation
             if name.startswith("source_"):
                 return self._data[SOURCE_MAP[name]]
-            # Legacy keys were calculated on demand before and are precalculated
-            # since Weblate 5.2, so they are missing on stats calculated before.
-            # Using zero here is most likely a wrong value, but safe and cheap.
-            # TODO: Drop in Weblate 6
-            if name in LEGACY_KEYS:
+            # These keys used to be calculated on demand and can be missing
+            # from cached stats that survived a staged upgrade.
+            if name in OUTDATED_STATS_KEYS:
                 return 0
             raise
 
@@ -311,8 +373,8 @@ class BaseStats:
             return self.calculate_percent(name)
 
         if name == "stats_timestamp":
-            # TODO: Drop in Weblate 6
-            # Migration path for legacy stat data
+            # Missing timestamp means stale stats; do not rebuild while comparing
+            # child and parent freshness during invalidation.
             return self._data.get(name, 0)
 
         # Virtual fields
@@ -325,20 +387,17 @@ class BaseStats:
 
         # Calculate missing data
         if name not in self._data:
-            was_pending = self._pending_save
-            self._pending_save = True
+            # Calculators persist their results, including any nested calculations.
             self.calculate_by_name(name)
             if name not in self._data:
                 msg = f"Unsupported stats for {self}: {name}"
                 raise AttributeError(msg)
-            if not was_pending:
-                self.save()
-                self._pending_save = False
 
         return self._data[name]
 
     def calculate_by_name(self, name: str) -> None:
         if name in self.basic_keys:
+            self.clear()
             self.calculate_basic()
             self.save()
 
@@ -350,18 +409,30 @@ class BaseStats:
 
     def save(self, update_parents: bool = True) -> None:
         """Save stats to cache."""
-        cache.set(self.cache_key, self._data, 30 * 86400)
+        with self.lock:
+            cache.set(self.cache_key, self._data, 30 * 86400)
 
-    def get_update_objects(self):
+    def get_update_objects(self, *, full: bool = True) -> Generator[BaseStats]:
         yield GlobalStats()
 
-    def collect_update_objects(self) -> None:
+    def collect_update_objects(
+        self, *, extra_objects: Iterable[BaseStats] | None = None
+    ) -> None:
+        """
+        Collect update objects.
+
+        This is used on the pre_delete signal as the objects
+        cannot be collected once the object is deleted.
+        """
         # Use list to force materializing the generator
-        self._collected_update_objects = list(self.get_update_objects())
+        objects: Iterable[BaseStats] = self.get_update_objects()
+        if extra_objects is not None:
+            objects = chain(objects, extra_objects)
+        self._collected_update_objects = list(objects)
 
     def _iterate_update_objects(
         self, *, extra_objects: Iterable[BaseStats] | None = None
-    ):
+    ) -> Generator[BaseStats]:
         """Get list of stats to update."""
         stat_objects: Iterable[BaseStats]
         if self._collected_update_objects is not None:
@@ -372,12 +443,18 @@ class BaseStats:
         if extra_objects:
             stat_objects = chain(stat_objects, extra_objects)
 
-        # Prefetch stats data from cache
-        fetched_stat_objects: list[BaseStats] = prefetch_stats(stat_objects)
+        # Deduplicate overlapping dependency paths while preserving their
+        # child-before-parent order.
+        unique_stat_objects: dict[str, BaseStats] = {}
+        for stat in stat_objects:
+            unique_stat_objects.setdefault(stat.cache_key, stat)
+
+        # Prefetch stats data from cache.
+        fetched_stat_objects = deque(prefetch_stats(unique_stat_objects.values()))
 
         # Discard references to no longer needed objects
         while fetched_stat_objects:
-            yield fetched_stat_objects.pop(0)
+            yield fetched_stat_objects.popleft()
 
     def update_parents(
         self, *, extra_objects: Iterable[BaseStats] | None = None
@@ -410,7 +487,7 @@ class BaseStats:
             self.save(update_parents=update_parents)
 
     def calculate_basic(self) -> None:
-        with sentry_sdk.start_span(op="stats", name=f"CALCULATE {self.cache_key}"):
+        with start_span(op="stats", name=f"CALCULATE {self.cache_key}"):
             self.ensure_loaded()
             self._calculate_basic()
 
@@ -502,12 +579,27 @@ class DummyTranslationStats(BaseStats):
 class TranslationStats(BaseStats):
     """Per translation stats."""
 
+    UNIT_DELTA_KEYS = BASIC_KEYS - frozenset(
+        {
+            "languages",
+            "last_changed",
+            "last_author",
+            "recent_changes",
+            "monthly_changes",
+            "total_changes",
+            "stats_timestamp",
+        }
+    )
+
     @cached_property
     def is_source(self):
         return self._object.is_source
 
     def save(self, update_parents: bool = True) -> None:
-        from weblate.utils.tasks import update_translation_stats_parents
+        # ruff: ignore[import-outside-top-level]
+        from weblate.utils.tasks import (
+            update_translation_stats_parents,
+        )
 
         super().save()
 
@@ -518,7 +610,7 @@ class TranslationStats(BaseStats):
                 pk = self._object.pk
                 update_translation_stats_parents.delay_on_commit(pk)
 
-    def get_update_objects(self, *, full: bool = True):
+    def get_update_objects(self, *, full: bool = True) -> Generator[BaseStats]:
         translation = self._object
         component = translation.component
 
@@ -527,6 +619,15 @@ class TranslationStats(BaseStats):
 
         # Project / language
         yield component.project.stats.get_single_language_stats(translation.language)
+
+        # Linked project and category / language
+        for link in component.componentlink_set.select_related("project", "category"):
+            yield link.project.stats.get_single_language_stats(translation.language)
+            if link.category_id:
+                category = link.category
+                while category:
+                    yield category.stats.get_single_language_stats(translation.language)
+                    category = category.category
 
         # Category / language
         category = component.category
@@ -548,202 +649,216 @@ class TranslationStats(BaseStats):
     def has_review(self):
         return self._object.enable_review
 
-    def _calculate_basic(self) -> None:  # noqa: PLR0914
+    @staticmethod
+    def capture_unit_snapshot(unit) -> UnitSnapshot:
+        if unit.source_unit_id == unit.pk:
+            labels = unit.get_label_count()
+        else:
+            labels = unit.source_unit.get_label_count()
+        return {
+            "state": unit.state,
+            "num_words": unit.num_words,
+            "num_chars": len(unit.effective_source),
+            "active_checks_count": len(unit.active_checks),
+            "dismissed_checks_count": len(unit.dismissed_checks),
+            "suggestion_count": len(unit.suggestions),
+            "label_count": labels,
+            "comment_count": len(unit.unresolved_comments),
+        }
+
+    @staticmethod
+    def _update_bucket(
+        bucket: dict[str, int],
+        prefix: str,
+        num_words: int,
+        num_chars: int,
+        present: bool = True,
+    ) -> None:
+        if not present:
+            return
+        bucket[prefix] = bucket.get(prefix, 0) + 1
+        bucket[f"{prefix}_words"] = bucket.get(f"{prefix}_words", 0) + num_words
+        bucket[f"{prefix}_chars"] = bucket.get(f"{prefix}_chars", 0) + num_chars
+
+    @classmethod
+    def snapshot_to_bucket(
+        cls, snapshot: UnitSnapshot, *, count: int = 1
+    ) -> dict[str, int]:
+        """
+        Classify units with identical state and relation presence into buckets.
+
+        For grouped query results, count is the number of units and the snapshot
+        contains summed word and character counts, not per-unit averages.
+        """
+        bucket: dict[str, int] = {}
+        state = snapshot["state"]
+        num_words = snapshot["num_words"]
+        num_chars = snapshot["num_chars"]
+        has_active_checks = snapshot["active_checks_count"] > 0
+        has_dismissed_checks = snapshot["dismissed_checks_count"] > 0
+        has_suggestions = snapshot["suggestion_count"] > 0
+        has_labels = snapshot["label_count"] > 0
+        has_comments = snapshot["comment_count"] > 0
+
+        cls._update_bucket(bucket, "all", num_words, num_chars)
+        cls._update_bucket(bucket, "fuzzy", num_words, num_chars, state in FUZZY_STATES)
+        cls._update_bucket(
+            bucket, "readonly", num_words, num_chars, state == STATE_READONLY
+        )
+        cls._update_bucket(
+            bucket, "translated", num_words, num_chars, state >= STATE_TRANSLATED
+        )
+        cls._update_bucket(
+            bucket, "todo", num_words, num_chars, state < STATE_TRANSLATED
+        )
+        cls._update_bucket(
+            bucket, "nottranslated", num_words, num_chars, state == STATE_EMPTY
+        )
+        cls._update_bucket(
+            bucket, "approved", num_words, num_chars, state == STATE_APPROVED
+        )
+        cls._update_bucket(
+            bucket, "unapproved", num_words, num_chars, state == STATE_TRANSLATED
+        )
+        cls._update_bucket(bucket, "unlabeled", num_words, num_chars, not has_labels)
+        cls._update_bucket(bucket, "allchecks", num_words, num_chars, has_active_checks)
+        cls._update_bucket(
+            bucket,
+            "translated_checks",
+            num_words,
+            num_chars,
+            has_active_checks and state in {STATE_TRANSLATED, STATE_APPROVED},
+        )
+        cls._update_bucket(
+            bucket, "dismissed_checks", num_words, num_chars, has_dismissed_checks
+        )
+        cls._update_bucket(bucket, "suggestions", num_words, num_chars, has_suggestions)
+        cls._update_bucket(
+            bucket,
+            "nosuggestions",
+            num_words,
+            num_chars,
+            not has_suggestions and state < STATE_TRANSLATED,
+        )
+        cls._update_bucket(
+            bucket,
+            "approved_suggestions",
+            num_words,
+            num_chars,
+            has_suggestions and state == STATE_APPROVED,
+        )
+        cls._update_bucket(bucket, "comments", num_words, num_chars, has_comments)
+        # Grouped snapshots already contain summed words and characters, but
+        # each populated string counter represents all units in the group.
+        if count != 1:
+            for key in BASICS.intersection(bucket):
+                bucket[key] = count
+        return bucket
+
+    def can_apply_delta(self) -> bool:
+        self.ensure_loaded()
+        return bool(self._data) and all(key in self._data for key in self.basic_keys)
+
+    def get_data_copy(self) -> StatDict:
+        self.ensure_loaded()
+        return self._data.copy()
+
+    def apply_source_delta(
+        self, base_stats_timestamp: StatItem, delta: dict[str, int]
+    ) -> bool:
+        with self.lock:
+            self.set_data(self.load())
+            if (
+                not self.can_apply_delta()
+                or self.stats_timestamp != base_stats_timestamp
+            ):
+                return False
+            for key in tuple(self._data):
+                if key.startswith(("check:", "label:")):
+                    del self._data[key]
+            for key, value in delta.items():
+                self.store(key, cast("int", self.aggregate_get(key)) + value)
+            self.last_change_cache = None
+            self.fetch_last_change()
+            self.count_changes()
+            self.save(update_parents=False)
+            return True
+
+    def _calculate_basic(self) -> None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models import Comment, Suggestion, Unit
+
         values = (
             "state",
-            "num_words",
             "active_checks_count",
             "dismissed_checks_count",
             "suggestion_count",
-            "source_label_count",
             "label_count",
             "comment_count",
-            "num_chars",
         )
 
-        # Calculate summary for each unit in the database.
-        # We only need presence check, not actual count, but using Exists(OuterRef())
-        # creates a subquery for each field, while Count() creates a single join
-        # and calculates based on that, what performs better.
-        units = self._object.unit_set.annotate(
-            active_checks_count=Count("check", filter=Q(check__dismissed=False)),
-            dismissed_checks_count=Count("check", filter=Q(check__dismissed=True)),
-            suggestion_count=Count("suggestion"),
-            source_label_count=Count("source_unit__labels"),
-            label_count=Count("source_unit__labels"),
-            comment_count=Count("comment", filter=Q(comment__resolved=False)),
-            num_chars=Length("source"),
-        ).values_list(*values)
+        # Only relation presence affects the buckets. Independent Exists
+        # expressions avoid joins that multiply unit rows and inflate totals.
+        # Clear ordering so it cannot introduce extra grouping columns.
+        units = self._object.unit_set.order_by().annotate(
+            active_checks_count=Exists(
+                Check.objects.filter(unit_id=OuterRef("pk"), dismissed=False)
+            ),
+            dismissed_checks_count=Exists(
+                Check.objects.filter(unit_id=OuterRef("pk"), dismissed=True)
+            ),
+            suggestion_count=Exists(Suggestion.objects.filter(unit_id=OuterRef("pk"))),
+            label_count=Exists(
+                Unit.labels.through.objects.filter(unit_id=OuterRef("source_unit_id"))
+            ),
+            comment_count=Exists(
+                Comment.objects.filter(unit_id=OuterRef("pk"), resolved=False)
+            ),
+        )
+        # Group by state and five presence flags, not by word or character count.
+        # This bounds the rows sent to Python regardless of translation size and
+        # avoids repeating Exists expressions for each conditional bucket sum.
+        source = Unit.objects.effective_source_expression(
+            custom_sources=bool(
+                self._object.component.project.translation_parent_language_ids
+            )
+        )
+        groups = units.values(*values).annotate(
+            num_units=Count("pk"),
+            num_words=Sum("num_words"),
+            num_chars=Sum(Length(source)),
+        )
 
-        (
-            get_state,
-            get_num_words,
-            get_active_checks_count,
-            get_dismissed_checks_count,
-            get_suggestion_count,
-            get_source_label_count,
-            get_label_count,
-            get_comment_count,
-            get_num_chars,
-        ) = (itemgetter(i) for i in range(len(values)))
+        totals = dict.fromkeys(self.UNIT_DELTA_KEYS, 0)
+        for (
+            state,
+            active_checks_count,
+            dismissed_checks_count,
+            suggestion_count,
+            label_count,
+            comment_count,
+            num_units,
+            num_words,
+            num_chars,
+        ) in groups.values_list(*values, "num_units", "num_words", "num_chars"):
+            bucket = self.snapshot_to_bucket(
+                {
+                    "state": state,
+                    "num_words": num_words,
+                    "num_chars": num_chars,
+                    "active_checks_count": active_checks_count,
+                    "dismissed_checks_count": dismissed_checks_count,
+                    "suggestion_count": suggestion_count,
+                    "label_count": label_count,
+                    "comment_count": comment_count,
+                },
+                count=num_units,
+            )
+            for key, value in bucket.items():
+                totals[key] += value
 
-        # Sum stats in Python, this is way faster than conditional sums in the database
-        units_all = units
-        units_fuzzy = [unit for unit in units if get_state(unit) == STATE_FUZZY]
-        units_readonly = [unit for unit in units if get_state(unit) == STATE_READONLY]
-        units_nottranslated = [unit for unit in units if get_state(unit) == STATE_EMPTY]
-        units_unapproved = [
-            unit for unit in units if get_state(unit) == STATE_TRANSLATED
-        ]
-        units_approved = [unit for unit in units if get_state(unit) == STATE_APPROVED]
-        units_translated = [
-            unit for unit in units if get_state(unit) >= STATE_TRANSLATED
-        ]
-        units_todo = [unit for unit in units if get_state(unit) < STATE_TRANSLATED]
-        units_unlabeled = [
-            unit
-            for unit in units
-            if not get_source_label_count(unit) and not get_label_count(unit)
-        ]
-        units_allchecks = [unit for unit in units if get_active_checks_count(unit)]
-        units_translated_checks = [
-            unit
-            for unit in units
-            if get_active_checks_count(unit)
-            and get_state(unit) in {STATE_TRANSLATED, STATE_APPROVED}
-        ]
-        units_dismissed_checks = [
-            unit for unit in units if get_dismissed_checks_count(unit)
-        ]
-        units_suggestions = [unit for unit in units if get_suggestion_count(unit)]
-        units_nosuggestions = [
-            unit
-            for unit in units
-            if not get_suggestion_count(unit) and get_state(unit) < STATE_TRANSLATED
-        ]
-        units_approved_suggestions = [
-            unit
-            for unit in units
-            if get_suggestion_count(unit) and get_state(unit) == STATE_APPROVED
-        ]
-        units_comments = [unit for unit in units if get_comment_count(unit)]
-
-        # Store in a cache
-        self.store("all", len(units_all))
-        self.store("all_words", sum(get_num_words(unit) for unit in units_all))
-        self.store("all_chars", sum(get_num_chars(unit) for unit in units_all))
-        self.store("fuzzy", len(units_fuzzy))
-        self.store("fuzzy_words", sum(get_num_words(unit) for unit in units_fuzzy))
-        self.store("fuzzy_chars", sum(get_num_chars(unit) for unit in units_fuzzy))
-        self.store("readonly", len(units_readonly))
-        self.store(
-            "readonly_words", sum(get_num_words(unit) for unit in units_readonly)
-        )
-        self.store(
-            "readonly_chars", sum(get_num_chars(unit) for unit in units_readonly)
-        )
-        self.store("translated", len(units_translated))
-        self.store(
-            "translated_words", sum(get_num_words(unit) for unit in units_translated)
-        )
-        self.store(
-            "translated_chars", sum(get_num_chars(unit) for unit in units_translated)
-        )
-        self.store("todo", len(units_todo))
-        self.store("todo_words", sum(get_num_words(unit) for unit in units_todo))
-        self.store("todo_chars", sum(get_num_chars(unit) for unit in units_todo))
-        self.store("nottranslated", len(units_nottranslated))
-        self.store(
-            "nottranslated_words",
-            sum(get_num_words(unit) for unit in units_nottranslated),
-        )
-        self.store(
-            "nottranslated_chars",
-            sum(get_num_chars(unit) for unit in units_nottranslated),
-        )
-        # Review workflow
-        self.store("approved", len(units_approved))
-        self.store(
-            "approved_words", sum(get_num_words(unit) for unit in units_approved)
-        )
-        self.store(
-            "approved_chars", sum(get_num_chars(unit) for unit in units_approved)
-        )
-        self.store("unapproved", len(units_unapproved))
-        self.store(
-            "unapproved_words", sum(get_num_words(unit) for unit in units_unapproved)
-        )
-        self.store(
-            "unapproved_chars", sum(get_num_chars(unit) for unit in units_unapproved)
-        )
-        # Labels
-        self.store("unlabeled", len(units_unlabeled))
-        self.store(
-            "unlabeled_words", sum(get_num_words(unit) for unit in units_unlabeled)
-        )
-        self.store(
-            "unlabeled_chars", sum(get_num_chars(unit) for unit in units_unlabeled)
-        )
-        # Checks
-        self.store("allchecks", len(units_allchecks))
-        self.store(
-            "allchecks_words", sum(get_num_words(unit) for unit in units_allchecks)
-        )
-        self.store(
-            "allchecks_chars", sum(get_num_chars(unit) for unit in units_allchecks)
-        )
-        self.store("translated_checks", len(units_translated_checks))
-        self.store(
-            "translated_checks_words",
-            sum(get_num_words(unit) for unit in units_translated_checks),
-        )
-        self.store(
-            "translated_checks_chars",
-            sum(get_num_chars(unit) for unit in units_translated_checks),
-        )
-        self.store("dismissed_checks", len(units_dismissed_checks))
-        self.store(
-            "dismissed_checks_words",
-            sum(get_num_words(unit) for unit in units_dismissed_checks),
-        )
-        self.store(
-            "dismissed_checks_chars",
-            sum(get_num_chars(unit) for unit in units_dismissed_checks),
-        )
-        # Suggestions
-        self.store("suggestions", len(units_suggestions))
-        self.store(
-            "suggestions_words", sum(get_num_words(unit) for unit in units_suggestions)
-        )
-        self.store(
-            "suggestions_chars", sum(get_num_chars(unit) for unit in units_suggestions)
-        )
-        self.store("nosuggestions", len(units_nosuggestions))
-        self.store(
-            "nosuggestions_words",
-            sum(get_num_words(unit) for unit in units_nosuggestions),
-        )
-        self.store(
-            "nosuggestions_chars",
-            sum(get_num_chars(unit) for unit in units_nosuggestions),
-        )
-        self.store("approved_suggestions", len(units_approved_suggestions))
-        self.store(
-            "approved_suggestions_words",
-            sum(get_num_words(unit) for unit in units_approved_suggestions),
-        )
-        self.store(
-            "approved_suggestions_chars",
-            sum(get_num_chars(unit) for unit in units_approved_suggestions),
-        )
-        # Comments
-        self.store("comments", len(units_comments))
-        self.store(
-            "comments_words", sum(get_num_words(unit) for unit in units_comments)
-        )
-        self.store(
-            "comments_chars", sum(get_num_chars(unit) for unit in units_comments)
-        )
+        for key, value in totals.items():
+            self.store(key, value)
 
         # There is single language here, but it is aggregated at higher levels
         self.store("languages", 1)
@@ -757,6 +872,7 @@ class TranslationStats(BaseStats):
         self.store("stats_timestamp", time.time())
 
     def get_last_change_obj(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Change
 
         # This is set in Change.save
@@ -816,18 +932,21 @@ class TranslationStats(BaseStats):
             self.calculate_labels()
 
     def calculate_checks(self) -> None:
-        """Prefetch check stats."""
+        """Calculate and cache all per-check totals for this translation."""
         self.ensure_loaded()
         allchecks = {check.url_id for check in CHECKS.values()}
         stats = (
             self._object.unit_set.filter(check__dismissed=False)
             .values("check__name")
-            .annotate_stats()
+            .annotate_stats(
+                custom_sources=bool(
+                    self._object.component.project.translation_parent_language_ids
+                )
+            )
         )
         for check, strings, words, chars in stats.values_list(
             "check__name", "strings", "words", "chars"
         ):
-            # Filtering here is way more effective than in SQL
             if check is None:
                 continue
             check = f"check:{check}"
@@ -839,30 +958,28 @@ class TranslationStats(BaseStats):
             self.store(check, 0)
             self.store(f"{check}_words", 0)
             self.store(f"{check}_chars", 0)
-        self.save()
+        # Filling missing details does not change totals already held by parents.
+        # Underlying edits, rather than these reads, invalidate parent statistics.
+        self.save(update_parents=False)
 
     def calculate_labels(self) -> None:
-        """Prefetch check stats."""
-        from weblate.trans.models.label import TRANSLATION_LABELS
-
+        """Calculate and cache all per-label totals for this translation."""
         self.ensure_loaded()
         alllabels = set(
             self._object.component.project.label_set.values_list("name", flat=True)
         )
         stats = (
             self._object.unit_set.values("source_unit__labels__name")
-            .annotate_stats()
+            .annotate_stats(
+                custom_sources=bool(
+                    self._object.component.project.translation_parent_language_ids
+                )
+            )
             .values_list("source_unit__labels__name", "strings", "words", "chars")
         )
-        translation_stats = (
-            self._object.unit_set.filter(labels__name__in=TRANSLATION_LABELS)
-            .values("labels__name")
-            .annotate_stats()
-            .values_list("labels__name", "strings", "words", "chars")
-        )
 
-        for label_name, strings, words, chars in chain(stats, translation_stats):
-            # Filtering here is way more effective than in SQL
+        for label_name, strings, words, chars in stats:
+            # The outer join also produces a group for unlabeled units.
             if label_name is None:
                 continue
             label = f"label:{label_name}"
@@ -875,12 +992,16 @@ class TranslationStats(BaseStats):
             self.store(label, 0)
             self.store(f"{label}_words", 0)
             self.store(f"{label}_chars", 0)
-        self.save()
+        self.save(update_parents=False)
 
 
 class AggregatingStats(BaseStats):
     basic_keys = SOURCE_KEYS
     sum_source_keys = True
+
+    def clear(self) -> None:
+        super().clear()
+        self.__dict__.pop("aggregated_stats", None)
 
     def get_child_objects(self) -> Iterable[Model]:
         raise NotImplementedError
@@ -906,7 +1027,8 @@ class AggregatingStats(BaseStats):
 
         # Ensure all objects have data available so that we can use _dict directly
         for stats_obj in all_stats:
-            if "all" not in stats_obj._data:  # noqa: SLF001
+            # ruff: ignore[private-member-access]
+            if "all" not in stats_obj._data:
                 stats_obj.calculate_basic()
                 stats_obj.save()
 
@@ -987,35 +1109,68 @@ class ComponentStats(AggregatingStats):
                 stats["source_strings"] = obj.all
                 break
 
-    def get_update_objects(self) -> Iterable[BaseStats]:
+    def get_update_objects(self, *, full: bool = True) -> Generator[BaseStats]:
         # Component lists
-        for clist in self._object.componentlist_set.all():
-            yield clist.stats
+        yield from yield_stats(self._object.componentlist_set.only("id", "slug"))
+
+        # Projects and categories this component is shared to.
+        linked_projects = []
+        for link in self._object.componentlink_set.select_related(
+            "project__workspace", "category__category__category"
+        ):
+            linked_projects.append(link.project)
+            if link.category_id:
+                category = link.category
+                while category:
+                    yield category.stats
+                    category = category.category
+            yield link.project.stats
 
         if self._object.category:
-            # Category
-            yield self._object.category.stats
-            # Category parents, project and global
-            yield from self._object.category.stats.get_update_objects()
-        else:
-            # Project
-            yield self._object.project.stats
-            # Global
-            yield from self._object.project.stats.get_update_objects()
+            category = self._object.category
+            while category:
+                yield category.stats
+                category = category.category
+        yield self._object.project.stats
 
-    def update_language_stats_parents(self) -> None:
-        # Fetch language stats to update
-        extras: Iterable[Iterable[BaseStats]] = (
-            translation.stats.get_update_objects(full=False)
-            for translation in prefetch_stats(
-                self.get_child_objects().select_related("language")
+        # Workspaces aggregate projects, so update them after every affected
+        # project and before the site-wide aggregate.
+        for project in (*linked_projects, self._object.project):
+            if project.workspace_id:
+                yield project.workspace.stats
+
+        # Every project has to be refreshed before the shared global parent.
+        yield GlobalStats()
+
+    def get_language_update_objects(self) -> Generator[BaseStats]:
+        """Yield language-scoped parents affected by this component."""
+        component = self._object
+        links = list(
+            component.componentlink_set.select_related(
+                "project", "category__category__category"
             )
         )
+        for translation in self.get_child_objects().select_related("language"):
+            language = translation.language
+            yield language.stats
+            yield component.project.stats.get_single_language_stats(language)
+            for link in links:
+                yield link.project.stats.get_single_language_stats(language)
+                category = link.category
+                while category:
+                    yield category.stats.get_single_language_stats(language)
+                    category = category.category
+            category = component.category
+            while category:
+                yield category.stats.get_single_language_stats(language)
+                category = category.category
 
-        # Update all parents
-        self.update_parents(extra_objects=chain.from_iterable(extras))
+    def update_language_stats_parents(self) -> None:
+        """Update all language-scoped and aggregate parents."""
+        self.update_parents(extra_objects=self.get_language_update_objects())
 
     def update_language_stats(self) -> None:
+        # ruff: ignore[import-outside-top-level]
         from weblate.utils.tasks import update_language_stats_parents
 
         # Update languages
@@ -1083,7 +1238,28 @@ class ProjectLanguage(BaseURLMixin, TranslationChecklistMixin):
 
     @property
     def enable_review(self) -> bool:
-        return self.project.enable_review
+        project_review = (
+            self.project.source_review
+            if self.is_source
+            else self.project.translation_review
+        )
+        if not project_review:
+            return False
+        if self.workflow_settings is not None:
+            return self.workflow_settings.translation_review
+        return project_review
+
+    @property
+    def enable_suggestions(self) -> bool:
+        if self.workflow_settings is not None:
+            return self.workflow_settings.enable_suggestions
+        return True
+
+    @property
+    def restrict_direct_editing(self) -> bool:
+        if self.workflow_settings is not None:
+            return self.workflow_settings.restrict_direct_editing
+        return False
 
     @property
     def is_readonly(self) -> bool:
@@ -1097,7 +1273,7 @@ class ProjectLanguage(BaseURLMixin, TranslationChecklistMixin):
     def stats(self):
         return ProjectLanguageStats(self)
 
-    def get_share_url(self):
+    def get_share_url(self) -> str:
         """Return absolute URL usable for sharing."""
         return get_site_url(
             reverse(
@@ -1118,18 +1294,36 @@ class ProjectLanguage(BaseURLMixin, TranslationChecklistMixin):
     def cache_key(self) -> str:
         return f"{self.project.cache_key}-{self.language.pk}"
 
-    def get_url_path(self):
+    def get_url_path(self) -> list[str]:
         return [*self.project.get_url_path(), "-", self.language.code]
 
     def get_absolute_url(self) -> str:
         return reverse("show", kwargs={"path": self.get_url_path()})
 
-    def get_translate_url(self):
+    def get_translate_url(self) -> str:
         return reverse("translate", kwargs={"path": self.get_url_path()})
 
+    @property
+    def action_translation_set(self):
+        return self.language.translation_set.filter(component__project=self.project)
+
     @cached_property
-    def translation_set(self):
-        all_langs = self.language.translation_set.prefetch()
+    def has_action_translations(self) -> bool:
+        return self.action_translation_set.exists()
+
+    @cached_property
+    def has_restricted_action_translations(self) -> bool:
+        return self.action_translation_set.filter(component__restricted=True).exists()
+
+    def get_translation_set_access(self, user: User) -> list[Translation]:
+        """Return translations the user can access."""
+        return self._get_translation_set(user)
+
+    def _get_translation_set(self, user: User | None = None) -> list[Translation]:
+        all_langs = self.language.translation_set
+        if user is not None:
+            all_langs = all_langs.filter_access(user)
+        all_langs = all_langs.prefetch()
         result = all_langs.filter(component__project=self.project)
         if self.project.has_shared_components:
             result |= all_langs.filter(component__links=self.project)
@@ -1146,7 +1340,11 @@ class ProjectLanguage(BaseURLMixin, TranslationChecklistMixin):
         )
 
     @cached_property
-    def is_source(self):
+    def translation_set(self) -> list[Translation]:
+        return self._get_translation_set()
+
+    @cached_property
+    def is_source(self) -> bool:
         return self.language.id in self.project.source_language_ids
 
     @cached_property
@@ -1155,6 +1353,7 @@ class ProjectLanguage(BaseURLMixin, TranslationChecklistMixin):
 
     @cached_property
     def workflow_settings(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models.workflow import WorkflowSetting
 
         workflow_settings = WorkflowSetting.objects.filter(
@@ -1176,22 +1375,26 @@ class ChecklistStats(SingleLanguageStats):
             self.calculate_labels()
 
     def aggregate_stats(self, keys: Iterable[str]) -> None:
+        """Aggregate details, calculating missing child details on demand."""
         self.ensure_loaded()
         all_stats: list[BaseStats] = self.aggregated_stats
         suffixes: tuple[str, ...] = ("", "_words", "_chars")
         for key in keys:
             for suffix in suffixes:
                 name = f"{key}{suffix}"
-                values = (getattr(stats_obj, name) for stats_obj in all_stats)
+                # The attribute might be missing in some corner cases such as
+                # when component is shared in different project and calculating
+                # label stats.
+                values = (getattr(stats_obj, name, 0) for stats_obj in all_stats)
                 self.store(name, sum(values))
         self.save()
 
     def calculate_checks(self) -> None:
-        """Prefetch check stats."""
+        """Aggregate all per-check totals from child statistics."""
         self.aggregate_stats(check.url_id for check in CHECKS.values())
 
     def calculate_labels(self) -> None:
-        """Prefetch check stats."""
+        """Aggregate all per-label totals from child statistics."""
         self.aggregate_stats(
             f"label:{name}"
             for name in self._object.project.label_set.values_list("name", flat=True)
@@ -1207,12 +1410,16 @@ class ProjectLanguageStats(ChecklistStats):
 
     @cached_property
     def has_review(self):
-        return self.project.source_review or self.project.translation_review
+        return self._object.enable_review
 
     def get_child_objects(self):
-        return self.language.translation_set.filter(
-            component__project=self.project
-        ).only("id", "language")
+        return (
+            self.language.translation_set.filter(
+                Q(component__project=self.project) | Q(component__links=self.project)
+            )
+            .distinct()
+            .only("id", "language")
+        )
 
 
 class CategoryLanguage(BaseURLMixin, TranslationChecklistMixin):
@@ -1234,7 +1441,28 @@ class CategoryLanguage(BaseURLMixin, TranslationChecklistMixin):
 
     @property
     def enable_review(self) -> bool:
-        return self.project.enable_review
+        project_review = (
+            self.project.source_review
+            if self.is_source
+            else self.project.translation_review
+        )
+        if not project_review:
+            return False
+        if self.workflow_settings is not None:
+            return self.workflow_settings.translation_review
+        return project_review
+
+    @property
+    def enable_suggestions(self) -> bool:
+        return any(
+            translation.enable_suggestions for translation in self.translation_set
+        )
+
+    @property
+    def restrict_direct_editing(self) -> bool:
+        if self.workflow_settings is not None:
+            return self.workflow_settings.restrict_direct_editing
+        return False
 
     @property
     def is_readonly(self) -> bool:
@@ -1260,19 +1488,43 @@ class CategoryLanguage(BaseURLMixin, TranslationChecklistMixin):
     def cache_key(self) -> str:
         return f"{self.category.cache_key}-{self.language.pk}"
 
-    def get_url_path(self):
+    def get_url_path(self) -> list[str]:
         return [*self.category.get_url_path(), "-", self.language.code]
+
+    def get_widgets_url(self) -> str:
+        """Return the project widgets URL with this language selected."""
+        return f"{self.category.get_widgets_url()}?lang={self.language.code}"
 
     def get_absolute_url(self) -> str:
         return reverse("show", kwargs={"path": self.get_url_path()})
 
-    def get_translate_url(self):
+    def get_translate_url(self) -> str:
         return reverse("translate", kwargs={"path": self.get_url_path()})
 
+    @property
+    def action_translation_set(self):
+        return self.language.translation_set.filter(
+            component_id__in=self.category.all_component_ids
+        )
+
     @cached_property
-    def translation_set(self):
-        result = self.language.translation_set.filter(
-            component__category=self.category
+    def has_action_translations(self) -> bool:
+        return self.action_translation_set.exists()
+
+    @cached_property
+    def has_restricted_action_translations(self) -> bool:
+        return self.action_translation_set.filter(component__restricted=True).exists()
+
+    def get_translation_set_access(self, user: User) -> list[Translation]:
+        """Return translations the user can access."""
+        return self._get_translation_set(user)
+
+    def _get_translation_set(self, user: User | None = None) -> list[Translation]:
+        translations = self.language.translation_set
+        if user is not None:
+            translations = translations.filter_access(user)
+        result = translations.filter(
+            component_id__in=self.category.get_component_ids_with_links()
         ).prefetch()
         for item in result:
             item.is_shared = (
@@ -1286,8 +1538,26 @@ class CategoryLanguage(BaseURLMixin, TranslationChecklistMixin):
         )
 
     @cached_property
-    def is_source(self):
+    def translation_set(self) -> list[Translation]:
+        return self._get_translation_set()
+
+    @cached_property
+    def is_source(self) -> bool:
         return self.language.id in self.category.source_language_ids
+
+    @cached_property
+    def workflow_settings(self):
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models.workflow import WorkflowSetting
+
+        workflow_settings = WorkflowSetting.objects.filter(
+            Q(project=None) | Q(project=self.project),
+            language=self.language,
+        ).order_by(F("project").desc(nulls_last=True))
+        if len(workflow_settings) == 0:
+            return None
+        # Project specific is first, project NULL is last
+        return workflow_settings[0]
 
     @cached_property
     def change_set(self):
@@ -1303,10 +1573,7 @@ class CategoryLanguageStats(ChecklistStats):
 
     @cached_property
     def has_review(self):
-        return (
-            self.category.project.source_review
-            or self.category.project.translation_review
-        )
+        return self._object.enable_review
 
     def get_category_objects(self):
         return [
@@ -1315,25 +1582,44 @@ class CategoryLanguageStats(ChecklistStats):
         ]
 
     def get_child_objects(self):
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models.component import ComponentLink
+
+        shared_component_ids = ComponentLink.objects.filter(
+            category=self.category
+        ).values_list("component_id", flat=True)
         return self.language.translation_set.filter(
-            component__category=self.category
+            Q(component__category=self.category)
+            | Q(component__pk__in=shared_component_ids)
         ).only("id", "language")
 
 
 class CategoryStats(ParentAggregatingStats):
-    def get_update_objects(self):
+    def get_update_objects(self, *, full: bool = True) -> Generator[BaseStats]:
         if self._object.category:
             yield self._object.category.stats
             yield from self._object.category.stats.get_update_objects()
         else:
-            # Global
+            # Project and global
+            yield self._object.project.stats
             yield from self._object.project.stats.get_update_objects()
 
     def get_child_objects(self):
-        return self._object.component_set.only("id", "category", "check_flags")
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models.component import (
+            Component,
+            ComponentLink,
+        )
+
+        shared_ids = ComponentLink.objects.filter(category=self._object).values_list(
+            "component_id", flat=True
+        )
+        return Component.objects.filter(
+            Q(category=self._object) | Q(pk__in=shared_ids)
+        ).only("id", "slug", "category", "check_flags")
 
     def get_category_objects(self):
-        return self._object.category_set.only("id", "category")
+        return self._object.category_set.only("id", "slug", "category")
 
     def get_single_language_stats(self, language):
         return CategoryLanguageStats(CategoryLanguage(self._object, language))
@@ -1351,12 +1637,21 @@ class ProjectStats(ParentAggregatingStats):
         return self._object.enable_review
 
     def get_child_objects(self):
-        return self._object.component_set.only("id", "project", "check_flags")
+        own = self._object.component_set.only("id", "project", "check_flags")
+        shared = self._object.shared_components.only("id", "project", "check_flags")
+        if shared:
+            return (own | shared).distinct()
+        return own
 
-    def get_single_language_stats(self, language):
+    def get_update_objects(self, *, full: bool = True) -> Generator[BaseStats]:
+        if self._object.workspace_id:
+            yield self._object.workspace.stats
+        yield GlobalStats()
+
+    def get_single_language_stats(self, language: Language) -> ProjectLanguageStats:
         return ProjectLanguageStats(ProjectLanguage(self._object, language))
 
-    def get_language_stats(self):
+    def get_language_stats(self) -> list[ProjectLanguageStats]:
         return prefetch_stats(
             self.get_single_language_stats(language)
             for language in self._object.languages
@@ -1364,12 +1659,141 @@ class ProjectStats(ParentAggregatingStats):
 
     def _calculate_basic(self) -> None:
         super()._calculate_basic()
-        self.store("languages", self._object.languages.count())
+        self.store("languages", self._object.get_languages_count())
+
+
+class WorkspaceLanguage(BaseURLMixin, TranslationChecklistMixin):
+    """Workspace language overview and editor scope."""
+
+    def __init__(self, workspace: Workspace, language: Language) -> None:
+        self.workspace = workspace
+        self.language = language
+
+    def __str__(self) -> str:
+        return f"{self.workspace} - {self.language}"
+
+    @cached_property
+    def pk(self) -> str:
+        return f"{self.workspace.pk}-{self.language.pk}"
+
+    @cached_property
+    def cache_key(self) -> str:
+        return f"{self.workspace.cache_key}-{self.language.pk}"
+
+    @cached_property
+    def stats(self) -> WorkspaceLanguageStats:
+        return WorkspaceLanguageStats(self.workspace, self.language)
+
+    @property
+    def enable_review(self) -> bool:
+        return self.workspace.stats.has_review
+
+    is_source = False
+    is_readonly = False
+    project = None
+
+    def get_url_path(self) -> list[str]:
+        return [*self.workspace.get_url_path(), "-", self.language.code]
+
+    def get_absolute_url(self) -> str:
+        return reverse("show", kwargs={"path": self.get_url_path()})
+
+    def get_translate_url(self) -> str:
+        return reverse("translate", kwargs={"path": self.get_url_path()})
+
+    def get_translation_set_access(self, user: User) -> TranslationQuerySet:
+        return (
+            self.language.translation_set.filter_access(user)
+            .filter(
+                Q(component__project__workspace=self.workspace)
+                | Q(component__links__workspace=self.workspace)
+            )
+            .distinct()
+            .order_by(
+                "component__project__name",
+                "component__priority",
+                "component__name",
+                "pk",
+            )
+            .prefetch()
+        )
+
+
+class WorkspaceStats(ParentAggregatingStats):
+    def get_language_stats(self) -> list[WorkspaceLanguageStats]:
+        languages = Language.objects.filter(
+            Q(translation__component__project__workspace=self._object)
+            | Q(translation__component__links__workspace=self._object)
+        ).distinct()
+        return [
+            WorkspaceLanguageStats(self._object, language) for language in languages
+        ]
+
+    @cached_property
+    def has_review(self):
+        if hasattr(self._object, "stats_has_review"):
+            return self._object.stats_has_review
+        return self._object.projects.filter(
+            Q(source_review=True) | Q(translation_review=True)
+        ).exists()
+
+    def get_child_objects(self):
+        if "projects" in getattr(self._object, "_prefetched_objects_cache", {}):
+            return self._object.projects.all()
+        return self._object.projects.only("id", "slug")
+
+    def _calculate_basic(self) -> None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models import Translation
+
+        super()._calculate_basic()
+        if self._object.stats_languages is not None:
+            self.store("languages", self._object.stats_languages)
+            return
+        owned_languages = Translation.objects.filter(
+            component__project__workspace=self._object
+        ).values_list("language_id", flat=True)
+        shared_languages = Translation.objects.filter(
+            component__links__workspace=self._object
+        ).values_list("language_id", flat=True)
+        self.store("languages", owned_languages.union(shared_languages).count())
+
+
+class WorkspaceLanguageStats(ChecklistStats):
+    """Aggregate cached project-language statistics without a separate cache."""
+
+    def __init__(self, workspace: Workspace, language: Language) -> None:
+        self.workspace = workspace
+        self.language = language
+        super().__init__(WorkspaceLanguage(workspace, language))
+        self._object.stats = self
+
+    @cached_property
+    def cache_key(self) -> str:
+        return f"stats-{self.workspace.cache_key}-{self.language.pk}"
+
+    @cached_property
+    def has_review(self):
+        return self.workspace.stats.has_review
+
+    def get_child_objects(self):
+        return [
+            ProjectLanguage(project, self.language)
+            for project in self.workspace.projects.only("id", "slug")
+        ]
+
+    def load(self) -> StatDict:
+        return {}
+
+    def save(self, update_parents: bool = True) -> None:
+        return
 
 
 class ComponentListStats(ParentAggregatingStats):
     def get_child_objects(self):
-        return self._object.components.only("id", "componentlist", "check_flags")
+        return self._object.components.only(
+            "id", "slug", "componentlist", "check_flags"
+        )
 
 
 class GlobalStats(ParentAggregatingStats):
@@ -1377,9 +1801,10 @@ class GlobalStats(ParentAggregatingStats):
         super().__init__(None)
 
     def get_child_objects(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Project
 
-        return Project.objects.only("id", "access_control")
+        return Project.objects.only("id", "slug")
 
     def _calculate_basic(self) -> None:
         super()._calculate_basic()
@@ -1403,47 +1828,103 @@ class GlobalStats(ParentAggregatingStats):
         return Language.objects.count()
 
     def get_users(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.auth.models import User
 
         return User.objects.count()
 
     def get_projects(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Project
 
         return Project.objects.count()
 
     def get_components(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Component
 
         return Component.objects.count()
 
     def get_translations(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Translation
 
         return Translation.objects.count()
 
     def get_checks(self):
-        from weblate.checks.models import Check
-
         return Check.objects.count()
 
     def get_configuration_errors(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.wladmin.models import ConfigurationError
 
         return ConfigurationError.objects.filter(ignored=False).count()
 
     def get_suggestions(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Suggestion
 
         return Suggestion.objects.count()
 
     def get_celery_queues(self):
+        # ruff: ignore[import-outside-top-level]
         from weblate.utils.celery import get_queue_stats
 
         return get_queue_stats()
 
     def get_name(self):
         return settings.SITE_TITLE
+
+
+def _stats_update_priority(stats: BaseStats) -> tuple[int, int]:
+    """Return a stable child-before-parent ordering for topology updates."""
+    if isinstance(stats, GlobalStats):
+        return (100, 0)
+    if isinstance(stats, WorkspaceStats):
+        return (95, 0)
+    if isinstance(stats, ProjectStats):
+        return (90, 0)
+    if isinstance(stats, CategoryStats):
+        depth = 0
+        category = stats.obj.category
+        while category:
+            depth += 1
+            category = category.category
+        return (70, -depth)
+    if isinstance(stats, ProjectLanguageStats):
+        return (60, 0)
+    if isinstance(stats, CategoryLanguageStats):
+        depth = 0
+        category = stats.category.category
+        while category:
+            depth += 1
+            category = category.category
+        return (50, -depth)
+    return (10, 0)
+
+
+def _stats_object_deleted(stats: BaseStats) -> bool:
+    """Whether stats refer to a model instance deleted before recalculation."""
+    if isinstance(stats, CategoryLanguageStats):
+        obj = stats.category
+    elif isinstance(stats, ProjectLanguageStats):
+        obj = stats.project
+    else:
+        obj = stats.obj
+    return (
+        obj is not None and getattr(obj, "_state", None) is not None and obj.pk is None
+    )
+
+
+def update_stats_objects(stats_objects: Iterable[BaseStats]) -> None:
+    """Recalculate a collected dependency graph once per cache key."""
+    unique: dict[str, BaseStats] = {}
+    for stats in stats_objects:
+        if _stats_object_deleted(stats):
+            continue
+        unique.setdefault(stats.cache_key, stats)
+    for stats in sorted(unique.values(), key=_stats_update_priority):
+        stats.update_stats()
 
 
 class GhostStats(BaseStats):

@@ -2,16 +2,17 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-name: Rundev
+name: Development containers
 
 on:
   push:
-    branches-ignore:
-    - renovate/**
-    - weblate
+    branches:
+    - main
+    - stable
   pull_request:
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -19,26 +20,107 @@ permissions:
 
 jobs:
   rundev:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
     name: Test development Docker
     env:
       PYTHONUNBUFFERED: 1
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: /tmp/cache/tesseract
         key: tesseract-data
-    - uses: astral-sh/setup-uv@4959332f0f014c5280e7eac8b70c90cb574c9f9b # v6.6.0
-    - run: ./rundev.sh build
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        enable-cache: false
+        version: 0.13.6
+    - run: ./rundev.sh test weblate/checks/tests/test_chars_checks.py
     - run: ./rundev.sh start
     - run: ./rundev.sh wait
     - run: ./rundev.sh check
     - run: ./rundev.sh compilemessages
-    - run: ./rundev.sh test --exitfirst
+    - name: Test asynchronous application journeys
+      run: ./rundev.sh application-test
+    - name: Run non-browser tests
+      run: ./rundev.sh test --exitfirst --ignore=weblate/trans/tests/test_selenium.py
     - run: ./rundev.sh test weblate/checks/tests/test_chars_checks.py
-    - run: ./rundev.sh logs
+    - run: ./rundev.sh --all logs
       if: always()
-    - run: ./rundev.sh stop
+    - run: ./rundev.sh --all stop
+      if: always()
+
+  smoke:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 26
+        package-manager-cache: false
+    - name: Install Dev Container CLI
+      # Standalone CLI, pinned independently of the application's client dependencies.
+      run: npm install --global @devcontainers/cli@0.89.0 # zizmor: ignore[adhoc-packages]
+    - name: Test host launchers
+      run: |
+        python3 -m unittest discover -s .devcontainer -p test_environment.py
+        python3 -m unittest discover -s .devcontainer -p test_rundev.py
+    - name: Test container bootstrap and isolation
+      env:
+        # The Dev Container CLI generates its Dockerfile outside the build context.
+        BUILDX_BAKE_ENTITLEMENTS_FS: '0'
+      run: python3 .devcontainer/smoke.py
+
+  oss-scanner:
+    name: OSS Scanner offline smoke test
+    runs-on: ubuntu-26.04
+    timeout-minutes: 65
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Build the scanner target from the checkout
+      timeout-minutes: 45
+      run: docker build --progress=plain -f dev-docker/weblate-dev/Dockerfile -t weblate-oss-scanner .
+    - name: Verify the image without network or mounted files
+      timeout-minutes: 15
+      run: >-
+        docker run --name weblate-oss-scanner-smoke --init --network none
+        --cpus 2 --memory 8g --user 0 --workdir /src --entrypoint bash
+        weblate-oss-scanner .oss-scanner/smoke
+    - name: Print scanner smoke logs
+      if: failure()
+      run: docker logs weblate-oss-scanner-smoke
+    - name: Remove the smoke container and its anonymous volumes
+      if: always()
+      run: docker rm --force --volumes weblate-oss-scanner-smoke
+
+  browser:
+    name: Browser tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: ubuntu-24.04-arm
+          selection: ''
+        - runner: ubuntu-24.04
+          selection: test_login_form_accessibility or test_js_unit_tests
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Run Selenium in the development container
+      env:
+        SELECTION: ${{ matrix.selection }}
+      run: ./scripts/devcontainer --backend compose browser-test -k "$SELECTION"
+    - run: ./scripts/devcontainer --backend compose logs
+      if: always()
+    - run: ./scripts/devcontainer --backend compose stop
+      if: always()

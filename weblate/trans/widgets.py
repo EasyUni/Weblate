@@ -5,17 +5,16 @@
 from __future__ import annotations
 
 import os.path
-from io import StringIO
-from typing import TYPE_CHECKING
+from math import ceil
+from typing import TYPE_CHECKING, ClassVar, Literal, NotRequired, TypedDict
 
-import cairo
-import gi
 from django.conf import settings
-from django.http import HttpResponse
 from django.template.loader import render_to_string
-from django.utils.html import format_html
+from django.urls import reverse
+from django.utils.text import capfirst
 from django.utils.translation import (
     get_language,
+    get_language_bidi,
     gettext,
     gettext_lazy,
     ngettext,
@@ -24,16 +23,17 @@ from django.utils.translation import (
     pgettext_lazy,
 )
 
-from weblate.fonts.utils import configure_fontconfig, render_size
+from weblate.fonts.utils import render_size
 from weblate.lang.models import Language
-from weblate.trans.models import Project
-from weblate.trans.templatetags.translations import number_format
+from weblate.trans.models import Category, Component, Project
 from weblate.trans.util import sort_unicode, translation_percent
 from weblate.utils import messages
+from weblate.utils.formatting import number_format
 from weblate.utils.icons import find_static_file
 from weblate.utils.site import get_site_url
 from weblate.utils.stats import (
-    BaseStats,
+    CategoryLanguage,
+    CategoryLanguageStats,
     GlobalStats,
     ProjectLanguage,
     ProjectLanguageStats,
@@ -41,16 +41,16 @@ from weblate.utils.stats import (
     get_non_glossary_stats,
 )
 from weblate.utils.views import get_percent_color
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
     from django.http import HttpRequest, HttpResponse
     from django_stubs_ext import StrOrPromise
+    from matplotlib.font_manager import FontProperties
 
-gi.require_version("PangoCairo", "1.0")
-gi.require_version("Pango", "1.0")
-gi.require_version("Rsvg", "2.0")
-
-from gi.repository import Pango, PangoCairo, Rsvg  # noqa: E402
+    from weblate.utils.stats import (
+        BaseStats,
+    )
 
 COLOR_DATA = {
     "grey": (0, 0, 0),
@@ -61,12 +61,52 @@ COLOR_DATA = {
 
 WIDGETS: dict[str, type[Widget]] = {}
 WIDGET_FONT = "Source Sans 3"
+WIDGET_FONT_SCALE = 4 / 3
+# Pango rounded the Source Sans ascent and descent independently. Preserve
+# those logical line metrics because the bitmap backgrounds were designed for
+# their resulting baselines.
+WIDGET_FONT_ASCENT = 1.02
+WIDGET_FONT_DESCENT = 0.4
+PNG_BADGE_FONT_SIZE = 11
+PNG_BADGE_BASELINE = 14
+
+
+def get_widget_text_metrics(font_properties: FontProperties) -> tuple[int, int]:
+    """Return baseline and line height matching the former Pango layout."""
+    size = font_properties.get_size_in_points()
+    baseline = ceil(size * WIDGET_FONT_ASCENT)
+    return baseline, baseline + ceil(size * WIDGET_FONT_DESCENT)
 
 
 def register_widget(widget):
     """Register widget in dictionary."""
     WIDGETS[widget.name] = widget
     return widget
+
+
+class ExtraParametersDict(TypedDict):
+    name: str
+    label: StrOrPromise
+    type: Literal["number", "boolean"]
+    default: int | bool
+    min: NotRequired[int]
+    max: NotRequired[int]
+    step: NotRequired[int]
+
+
+class MatrixCellDict(TypedDict):
+    name: str
+    percent: int
+    progress_percent: float
+    color: str
+    url: str
+    x: NotRequired[int]
+    y: NotRequired[int]
+    label_x: NotRequired[int]
+    percent_x: NotRequired[int]
+    text_y: NotRequired[int]
+    label: NotRequired[str]
+    progress_width: NotRequired[int]
 
 
 class Widget:
@@ -78,7 +118,7 @@ class Widget:
     extension = "png"
     content_type = "image/png"
     order = 100
-    extra_parameters: list[dict] = []
+    extra_parameters: ClassVar[list[ExtraParametersDict]] = []
 
     def __init__(self, obj, color=None, lang=None) -> None:
         """Create Widget object."""
@@ -120,10 +160,10 @@ class BitmapWidget(Widget):
     extension = "png"
     content_type = "image/png"
     order = 100
-    head_template = '<span letter_spacing="-500"><b>{}</b></span>'
-    foot_template = '<span letter_spacing="1000">{}</span>'
     font_size = 10
     line_spacing = 1.0
+    head_spacing = -0.5
+    foot_spacing = 1
     offset = 0
     column_offset = 0
     lines = True
@@ -164,62 +204,73 @@ class BitmapWidget(Widget):
     def get_columns(self) -> list[list[str]]:
         raise NotImplementedError
 
-    def get_column_width(self, surface, columns):
-        return surface.get_width() // len(columns)
+    def get_column_width(self, width, columns):
+        return width // len(columns)
 
     def get_column_fonts(self):
+        # Importing Matplotlib and NumPy has a significant memory cost, so defer
+        # the rendering stack until a bitmap widget is actually rendered.
+        # ruff: ignore[import-outside-top-level]
+        from weblate.fonts import render
+
         return [
-            Pango.FontDescription(f"{WIDGET_FONT} {self.font_size * 1.5}"),
-            Pango.FontDescription(f"{WIDGET_FONT} {self.font_size}"),
+            render.get_font_properties(
+                WIDGET_FONT,
+                size=self.font_size * 1.5 * WIDGET_FONT_SCALE,
+                weight=700,
+            ),
+            render.get_font_properties(
+                WIDGET_FONT, size=self.font_size * WIDGET_FONT_SCALE, weight=400
+            ),
         ]
 
-    def render_additional(self, ctx) -> None:
+    def render_additional(self, figure) -> None:
         return
 
     def render(self, request: HttpRequest, response: HttpResponse) -> None:
         """Render widget."""
-        configure_fontconfig()
-        surface = cairo.ImageSurface.create_from_png(self.get_filename())
-        height = surface.get_height()
-        ctx = cairo.Context(surface)
+        # ruff: ignore[import-outside-top-level]
+        from weblate.fonts import render
 
-        columns = self.get_columns()
-        column_width = self.get_column_width(surface, columns)
+        with render.rendering_lock():
+            figure = render.create_image_figure(self.get_filename())
+            width, height = figure.canvas.get_width_height()
+            columns = self.get_columns()
+            column_width = self.get_column_width(width, columns)
+            fonts = self.get_column_fonts()
 
-        fonts = self.get_column_fonts()
+            for column_number, column in enumerate(columns):
+                offset = float(self.offset)
+                center = (
+                    self.column_offset + column_width * column_number + column_width / 2
+                )
+                for row, text in enumerate(column):
+                    font_properties = fonts[row]
+                    baseline, line_height = get_widget_text_metrics(font_properties)
+                    render.draw_text(
+                        figure,
+                        center,
+                        offset + baseline,
+                        str(text),
+                        font_properties=font_properties,
+                        color=tuple(value / 255 for value in COLOR_DATA[self.color]),
+                        horizontalalignment="center",
+                        verticalalignment="baseline",
+                        spacing=self.head_spacing if row == 0 else self.foot_spacing,
+                    )
+                    offset += line_height * self.line_spacing
 
-        for i, column in enumerate(columns):
-            offset = self.offset
-            for row, text in enumerate(column):
-                layout = PangoCairo.create_layout(ctx)
-                layout.set_font_description(fonts[row])
+                if self.lines and column_number > 0:
+                    render.draw_line(
+                        figure,
+                        (column_width * column_number, self.offset),
+                        (column_width * column_number, height - self.offset),
+                        color=tuple(value / 255 for value in COLOR_DATA[self.color]),
+                        linewidth=0.5,
+                    )
 
-                # Set color and position
-                ctx.move_to(self.column_offset + column_width * i, offset)
-                ctx.set_source_rgb(*COLOR_DATA[self.color])
-
-                # Add text
-                layout.set_markup(text)
-                layout.set_alignment(Pango.Alignment.CENTER)
-                layout.set_width(column_width * Pango.SCALE)
-
-                offset += layout.get_pixel_size().height * self.line_spacing
-
-                # Render to cairo context
-                PangoCairo.show_layout(ctx, layout)
-
-            # Render column separators
-            if self.lines and i > 0:
-                ctx.new_path()
-                ctx.set_source_rgb(*COLOR_DATA[self.color])
-                ctx.set_line_width(0.5)
-                ctx.move_to(column_width * i, self.offset)
-                ctx.line_to(column_width * i, height - self.offset)
-                ctx.stroke()
-
-        self.render_additional(ctx)
-
-        surface.write_to_png(response)
+            self.render_additional(figure)
+            render.figure_to_png(figure, response)
 
 
 class SVGWidget(Widget):
@@ -233,41 +284,6 @@ class SVGWidget(Widget):
         raise NotImplementedError
 
 
-class PNGWidget(SVGWidget):
-    extension = "png"
-    content_type = "image/png"
-
-    def render(self, request: HttpRequest, response: HttpResponse) -> None:
-        with StringIO() as output:
-            super().render(request, output)
-            svgdata = output.getvalue()
-
-        handle = Rsvg.Handle.new_from_data(svgdata.encode())
-        if hasattr(handle, "get_intrinsic_size_in_pixels"):
-            # librsvg 2.52 and newer
-            out_dimensions = handle.get_intrinsic_size_in_pixels()
-            width = int(out_dimensions.out_width)
-            height = int(out_dimensions.out_height)
-        else:
-            dimensions = handle.get_dimensions()
-            width = int(dimensions.width)
-            height = int(dimensions.height)
-        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
-        context = cairo.Context(surface)
-        if hasattr(Rsvg, "Rectangle"):
-            # librsvg 2.46 and newer
-            viewport = Rsvg.Rectangle()
-            viewport.x = 0
-            viewport.y = 0
-            viewport.width = width
-            viewport.height = height
-            handle.render_document(context, viewport)
-        else:
-            # librsvg before 2.46, this method is now deprecated
-            handle.render_cairo(context)
-        surface.write_to_png(response)
-
-
 @register_widget
 class NormalWidget(BitmapWidget):
     name = "287x66"
@@ -279,26 +295,20 @@ class NormalWidget(BitmapWidget):
     def get_columns(self):
         return [
             [
-                format_html(self.head_template, number_format(self.total)),
-                format_html(
-                    self.foot_template,
-                    npgettext(
-                        "Label on engage page", "String", "Strings", self.total
-                    ).upper(),
-                ),
+                number_format(self.total),
+                npgettext(
+                    "Label on engage page", "String", "Strings", self.total
+                ).upper(),
             ],
             [
-                format_html(self.head_template, number_format(self.languages)),
-                format_html(
-                    self.foot_template,
-                    npgettext(
-                        "Label on engage page", "Language", "Languages", self.languages
-                    ).upper(),
-                ),
+                number_format(self.languages),
+                npgettext(
+                    "Label on engage page", "Language", "Languages", self.languages
+                ).upper(),
             ],
             [
-                format_html(self.head_template, self.get_percent_text()),
-                format_html(self.foot_template, gettext("Translated").upper()),
+                self.get_percent_text(),
+                gettext("Translated").upper(),
             ],
         ]
 
@@ -316,8 +326,8 @@ class SmallWidget(BitmapWidget):
     def get_columns(self):
         return [
             [
-                format_html(self.head_template, self.get_percent_text()),
-                format_html(self.foot_template, gettext("Translated").upper()),
+                self.get_percent_text(),
+                gettext("Translated").upper(),
             ]
         ]
 
@@ -331,17 +341,24 @@ class OpenGraphWidget(NormalWidget):
     offset = 300
     font_size = 20
     column_offset = 265
-    head_template = '<span letter_spacing="-1000">{}</span>'
-    foot_template = '<span letter_spacing="2000">{}</span>'
+    head_spacing = -1
+    foot_spacing = 2
     verbose = pgettext_lazy("Status widget name", "Panel")
 
-    def get_column_width(self, surface, columns) -> int:
+    def get_column_width(self, width, columns) -> int:
         return 230
 
     def get_column_fonts(self):
+        # ruff: ignore[import-outside-top-level]
+        from weblate.fonts import render
+
         return [
-            Pango.FontDescription(f"{WIDGET_FONT} {42}"),
-            Pango.FontDescription(f"{WIDGET_FONT} {18}"),
+            render.get_font_properties(
+                WIDGET_FONT, size=42 * WIDGET_FONT_SCALE, weight=400
+            ),
+            render.get_font_properties(
+                WIDGET_FONT, size=18 * WIDGET_FONT_SCALE, weight=400
+            ),
         ]
 
     def get_name(self) -> str:
@@ -349,27 +366,69 @@ class OpenGraphWidget(NormalWidget):
             return settings.SITE_TITLE
         return str(self.obj)
 
-    def get_title(self, name: str, suffix: str = "") -> str:
+    def get_title_parts(self, name: str, suffix: str = "") -> tuple[str, str, str]:
         if self.obj is None:
             template = "{}"
         elif isinstance(self.obj, Project):
             # Translators: Text on OpenGraph image
             template = gettext("Project {}")
+        elif isinstance(self.obj, Category):
+            # Translators: Text on OpenGraph image
+            template = gettext("Category {}")
+        elif isinstance(self.obj, Workspace):
+            # Translators: Text on OpenGraph image
+            template = gettext("Workspace {}")
         else:
             # Translators: Text on OpenGraph image
             template = gettext("Component {}")
 
-        return format_html(template, format_html("<b>{}</b>{}", name, suffix))
+        prefix, placeholder, postfix = template.partition("{}")
+        if not placeholder:
+            return template, "", ""
+        return prefix, name, f"{suffix}{postfix}"
 
-    def render_additional(self, ctx) -> None:
-        ctx.move_to(280, 170)
-        layout = PangoCairo.create_layout(ctx)
-        layout.set_font_description(Pango.FontDescription(f"{WIDGET_FONT} {52}"))
+    @staticmethod
+    def get_title_runs(
+        title_parts: tuple[str, str, str],
+        regular_font: FontProperties,
+        bold_font: FontProperties,
+    ) -> list[tuple[str, FontProperties]]:
+        """Return styled title runs in visual locale order."""
+        runs = list(
+            zip(
+                title_parts,
+                (regular_font, bold_font, regular_font),
+                strict=True,
+            )
+        )
+        if get_language_bidi():
+            runs.reverse()
+        return runs
+
+    def render_additional(self, figure) -> None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.fonts import render
+
+        font_size = 52 * WIDGET_FONT_SCALE
+        regular_font = render.get_font_properties(
+            WIDGET_FONT, size=font_size, weight=400
+        )
+        bold_font = render.get_font_properties(WIDGET_FONT, size=font_size, weight=700)
         name = self.get_name()
-        layout.set_markup(self.get_title(name))
+        title_parts = self.get_title_parts(name)
 
         max_width = 1200 - 280
-        while layout.get_size().width / Pango.SCALE > max_width:
+        while (
+            sum(
+                render.measure_line(text, font_properties)[0]
+                for text, font_properties in self.get_title_runs(
+                    title_parts,
+                    regular_font,
+                    bold_font,
+                )
+            )
+            > max_width
+        ):
             if " " in name:
                 name = name.rsplit(" ", 1)[0]
             elif "-" in name:
@@ -378,11 +437,29 @@ class OpenGraphWidget(NormalWidget):
                 name = name.rsplit("_", 1)[0]
             else:
                 name = name[:-1]
-            layout.set_markup(self.get_title(f"{name}", "…"))
+            title_parts = self.get_title_parts(name, "…")
             if not name:
                 break
 
-        PangoCairo.show_layout(ctx, layout)
+        x = 280.0
+        baseline = 170 + get_widget_text_metrics(bold_font)[0]
+        for text, font_properties in self.get_title_runs(
+            title_parts,
+            regular_font,
+            bold_font,
+        ):
+            if not text:
+                continue
+            render.draw_text(
+                figure,
+                x,
+                baseline,
+                text,
+                font_properties=font_properties,
+                color=(1, 1, 1),
+                verticalalignment="baseline",
+            )
+            x += render.measure_line(text, font_properties)[0]
 
 
 class BaseSVGBadgeWidget(SVGWidget):
@@ -420,9 +497,19 @@ class SVGBadgeWidget(BaseSVGBadgeWidget):
     order = 80
     # Translators: status widget name
     verbose = gettext_lazy("SVG status badge")
+    extra_parameters: ClassVar[list[ExtraParametersDict]] = [
+        {
+            "name": "capitalize",
+            "label": gettext_lazy("Capitalize"),
+            "type": "boolean",
+            "default": False,
+        }
+    ]
 
-    def render(self, request: HttpRequest, response: HttpResponse) -> None:
-        translated_text = gettext("translated")
+    def get_badge_data(self, request: HttpRequest) -> tuple[str, str, str]:
+        translated_text = str(gettext("translated"))
+        if request.GET.get("capitalize") == "1":
+            translated_text = str(capfirst(translated_text))
         percent_text = self.get_percent_text()
         if self.percent >= 90:
             color = "#4c1"
@@ -430,14 +517,72 @@ class SVGBadgeWidget(BaseSVGBadgeWidget):
             color = "#dfb317"
         else:
             color = "#e05d44"
-        self.render_badge(response, translated_text, percent_text, color)
+        return translated_text, percent_text, color
+
+    def render(self, request: HttpRequest, response: HttpResponse) -> None:
+        self.render_badge(response, *self.get_badge_data(request))
 
 
 @register_widget
-class PNGBadgeWidget(PNGWidget, SVGBadgeWidget):
+class PNGBadgeWidget(SVGBadgeWidget):
     name = "status"
+    extension = "png"
+    content_type = "image/png"
     # Translators: status widget name
     verbose = gettext_lazy("PNG status badge")
+
+    def render(self, request: HttpRequest, response: HttpResponse) -> None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.fonts import render
+
+        label, value, color = self.get_badge_data(request)
+        with render.rendering_lock():
+            font_properties = render.get_font_properties(
+                WIDGET_FONT, size=PNG_BADGE_FONT_SIZE, weight=400
+            )
+            label_width = ceil(
+                render.measure_line(f"   {label}   ", font_properties)[0]
+            )
+            value_width = ceil(render.measure_line(f"  {value}  ", font_properties)[0])
+            width = label_width + value_width
+            figure = render.create_figure(width, 20)
+            render.draw_rectangle(figure, 0, 0, width, 20, color="#555", radius=3)
+            render.draw_rectangle(
+                figure,
+                label_width,
+                0,
+                value_width,
+                20,
+                color=color,
+                radius=3,
+            )
+            # Cover the rounded inner edge so only the outer corners are rounded.
+            render.draw_rectangle(figure, label_width, 0, 4, 20, color=color)
+            for text, center in (
+                (label, label_width / 2),
+                (value, label_width + value_width / 2),
+            ):
+                render.draw_text(
+                    figure,
+                    center,
+                    PNG_BADGE_BASELINE + 1,
+                    text,
+                    font_properties=font_properties,
+                    color=(0.01, 0.01, 0.01, 0.3),
+                    horizontalalignment="center",
+                    verticalalignment="baseline",
+                )
+                render.draw_text(
+                    figure,
+                    center,
+                    PNG_BADGE_BASELINE,
+                    text,
+                    font_properties=font_properties,
+                    color=(1, 1, 1),
+                    horizontalalignment="center",
+                    verticalalignment="baseline",
+                )
+            render.figure_to_png(figure, response)
 
 
 @register_widget
@@ -448,29 +593,59 @@ class MultiLanguageWidget(SVGWidget):
     template_name = "svg/multi-language-badge.svg"
     verbose = pgettext_lazy("Status widget name", "Vertical language bar chart")
 
-    COLOR_MAP = {"red": "#fa3939", "green": "#3fed48", "blue": "#3f85ed", "auto": None}
+    COLOR_MAP: ClassVar[dict[str, str | None]] = {
+        "red": "#fa3939",
+        "green": "#3fed48",
+        "blue": "#3f85ed",
+        "auto": None,
+    }
+
+    def get_language_stats(self) -> list[BaseStats]:
+        if isinstance(
+            self.stats, (CategoryLanguageStats, ProjectLanguageStats, TranslationStats)
+        ):
+            return [self.stats]
+        if isinstance(self.obj, ProjectLanguage):
+            return [self.obj.stats]
+        if isinstance(self.obj, Language):
+            return [self.obj.stats]
+        return self.stats.get_language_stats()
+
+    def get_language_url(self, language: Language) -> str:
+        if isinstance(self.obj, Component):
+            return get_site_url(
+                reverse(
+                    "translate",
+                    kwargs={"path": [*self.obj.get_url_path(), language.code]},
+                )
+            )
+        if self.obj is None:
+            return get_site_url(language.get_absolute_url())
+        if isinstance(self.obj, Category):
+            return get_site_url(CategoryLanguage(self.obj, language).get_absolute_url())
+        if isinstance(self.obj, Workspace):
+            return get_site_url(
+                reverse(
+                    "search",
+                    kwargs={"path": self.obj.get_url_path()},
+                    query={"q": f"language:{language.code}"},
+                )
+            )
+        project_language = ProjectLanguage(self.obj, language)
+        return get_site_url(project_language.get_absolute_url())
 
     def render(self, request: HttpRequest, response: HttpResponse) -> None:
         translations = []
         offset = 20
         color = self.COLOR_MAP[self.color]
         language_width = 190
-        languages: list[BaseStats | ProjectLanguage]
-        if isinstance(self.stats, ProjectLanguageStats | TranslationStats):
-            languages = [self.stats]
-        elif isinstance(self.obj, ProjectLanguage):
-            languages = [self.obj]
-        elif isinstance(self.obj, Language):
-            languages = [self.obj.stats]
-        else:
-            languages = self.stats.get_language_stats()
-        for stats in sort_unicode(languages, lambda x: str(x.language)):
+        for stats in sort_unicode(self.get_language_stats(), lambda x: str(x.language)):
             # Skip empty translations
             if stats.translated == 0:
                 continue
             language = stats.language
             percent = stats.translated_percent
-            if self.color == "auto":
+            if self.color == "auto" or color is None:
                 color = get_percent_color(percent)
             language_name = str(language)
 
@@ -478,10 +653,6 @@ class MultiLanguageWidget(SVGWidget):
                 language_width,
                 (render_size(text=language_name)[0].width + 10),
             )
-            if self.obj is None:
-                project_language = language
-            else:
-                project_language = ProjectLanguage(self.obj, language)
             translations.append(
                 (
                     # Language name
@@ -497,7 +668,7 @@ class MultiLanguageWidget(SVGWidget):
                     # Bar color
                     color,
                     # Row URL
-                    get_site_url(project_language.get_absolute_url()),
+                    self.get_language_url(language),
                     # Top offset for horizontal
                     10 + int((100 - percent) * 1.5),
                 )
@@ -531,12 +702,183 @@ class HorizontalMultiLanguageWidget(MultiLanguageWidget):
 
 
 @register_widget
+class MatrixMultiLanguageWidget(MultiLanguageWidget):
+    name = "matrix"
+    order = 83
+    template_name = "svg/multi-language-matrix.svg"
+    verbose = pgettext_lazy("Status widget name", "Language progress matrix")
+
+    min_cell_width = 100
+    max_cell_width = 130
+    max_width = 820
+    cell_height = 20
+    gap = 3
+    margin = 6
+    text_padding = 8
+    percent_gap = 5
+    text_size = 9
+
+    def get_column_count(self, count: int, cell_width: int) -> int:
+        max_columns = min(
+            count,
+            max(
+                1,
+                (self.max_width - self.margin * 2 + self.gap)
+                // (cell_width + self.gap),
+            ),
+        )
+        if count <= max_columns:
+            return max(1, count)
+
+        if count <= 12:
+            desired = (count + 1) // 2
+        elif count <= 40:
+            desired = 5
+        elif count <= 80:
+            desired = 6
+        else:
+            desired = 8
+
+        desired = min(max(1, desired), max_columns)
+
+        def score(columns: int) -> tuple[int, int, int]:
+            row_count, remainder = divmod(count, columns)
+            if remainder:
+                row_count += 1
+            return (row_count, 1 if remainder == 1 else 0, abs(columns - desired))
+
+        return min(range(1, max_columns + 1), key=score)
+
+    def get_cell_width(self, language_names: list[str]) -> int:
+        widest_language = max(
+            (
+                render_size(
+                    language_name,
+                    font=WIDGET_FONT,
+                    weight=700,
+                    size=self.text_size,
+                )[0].width
+                for language_name in language_names
+            ),
+            default=0,
+        )
+        percent_width = render_size("100%", font=WIDGET_FONT, size=self.text_size)[
+            0
+        ].width
+        return min(
+            self.max_cell_width,
+            max(
+                self.min_cell_width,
+                widest_language + percent_width + self.percent_gap + self.text_padding,
+            ),
+        )
+
+    def fit_text(self, text: str, max_width: int) -> str:
+        if (
+            render_size(text, font=WIDGET_FONT, weight=700, size=self.text_size)[
+                0
+            ].width
+            <= max_width
+        ):
+            return text
+
+        suffix = "..."
+        low = 0
+        high = len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = f"{text[:middle].rstrip()}{suffix}"
+            if (
+                render_size(
+                    candidate,
+                    font=WIDGET_FONT,
+                    weight=700,
+                    size=self.text_size,
+                )[0].width
+                <= max_width
+            ):
+                low = middle
+            else:
+                high = middle - 1
+        if low == 0:
+            return suffix
+        return f"{text[:low].rstrip()}{suffix}"
+
+    def render(self, request: HttpRequest, response: HttpResponse) -> None:
+        cells: list[MatrixCellDict] = []
+        color = self.COLOR_MAP[self.color]
+        for stats in sort_unicode(self.get_language_stats(), lambda x: str(x.language)):
+            # Skip empty translations
+            if stats.translated == 0:
+                continue
+            language = stats.language
+            percent = stats.translated_percent
+            if self.color == "auto" or color is None:
+                cell_color = get_percent_color(percent)
+            else:
+                cell_color = color
+
+            cells.append(
+                {
+                    "name": str(language),
+                    "percent": int(percent),
+                    "progress_percent": min(max(percent, 0), 100),
+                    "color": cell_color,
+                    "url": self.get_language_url(language),
+                }
+            )
+
+        cell_width = self.get_cell_width([cell["name"] for cell in cells])
+        columns = self.get_column_count(len(cells), cell_width)
+        percent_width = render_size("100%", font=WIDGET_FONT, size=self.text_size)[
+            0
+        ].width
+        text_offset = self.text_padding // 2
+        label_width = cell_width - self.text_padding - self.percent_gap - percent_width
+        for index, cell in enumerate(cells):
+            column = index % columns
+            row = index // columns
+            x = self.margin + column * (cell_width + self.gap)
+            y = self.margin + row * (self.cell_height + self.gap)
+            progress_percent = cell["progress_percent"]
+            progress_width = round(cell_width * progress_percent / 100)
+            if progress_percent:
+                progress_width = max(1, progress_width)
+            cell["x"] = x
+            cell["y"] = y
+            cell["label_x"] = x + text_offset
+            cell["percent_x"] = x + cell_width - text_offset
+            cell["text_y"] = y + 14
+            cell["label"] = self.fit_text(cell["name"], label_width)
+            cell["progress_width"] = progress_width
+
+        rows = max(1, (len(cells) + columns - 1) // columns)
+        width = columns * cell_width + (columns - 1) * self.gap + self.margin * 2
+        height = rows * self.cell_height + (rows - 1) * self.gap + self.margin * 2
+
+        response.write(
+            render_to_string(
+                self.template_name,
+                {
+                    "title": gettext("Translation status"),
+                    "width": width,
+                    "height": height,
+                    "cell_width": cell_width,
+                    "cell_height": self.cell_height,
+                    "cells": cells,
+                    "site_url": get_site_url(),
+                },
+            )
+        )
+
+
+@register_widget
 class LanguageBadgeWidget(BaseSVGBadgeWidget):
     name = "language"
-    order = 83
+    order = 84
     # Translators: status widget name
     verbose = gettext_lazy("Language count badge")
-    extra_parameters = [
+    extra_parameters: ClassVar[list[ExtraParametersDict]] = [
         {
             "name": "threshold",
             "label": gettext("Threshold"),
@@ -562,12 +904,12 @@ class LanguageBadgeWidget(BaseSVGBadgeWidget):
             )
             threshold = 0
 
-        languages: list[BaseStats | ProjectLanguage]
-        if isinstance(self.stats, ProjectLanguageStats | TranslationStats):
+        languages: list[BaseStats]
+        if isinstance(
+            self.stats, (CategoryLanguageStats, ProjectLanguageStats, TranslationStats)
+        ):
             languages = [self.stats]
-        elif isinstance(self.obj, ProjectLanguage):
-            languages = [self.obj]
-        elif isinstance(self.obj, Language):
+        elif isinstance(self.obj, (ProjectLanguage, Language)):
             languages = [self.obj.stats]
         else:
             languages = self.stats.get_language_stats()

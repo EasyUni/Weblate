@@ -2,27 +2,42 @@
 # Copyright © Sun Zhigang <hzsunzhigang@corp.netease.com>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
+from typing import TYPE_CHECKING, ClassVar
 
 from .base import (
-    DownloadTranslations,
+    MACHINERY_DEFAULT_THRESHOLD,
     MachineryRateLimitError,
     MachineTranslation,
     MachineTranslationError,
 )
 from .forms import KeySecretMachineryForm
 
-BAIDU_API = "http://api.fanyi.baidu.com/api/trans/vip/translate"
+if TYPE_CHECKING:
+    import httpx2
+
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import (
+        DownloadTranslations,
+    )
+
+BAIDU_API = "https://api.fanyi.baidu.com/api/trans/vip/translate"
 
 
 class BaiduTranslation(MachineTranslation):
     """Baidu API machine translation support."""
 
     name = "Baidu"
+    # Per-second throttling; allow a conservative minute to recover.
+    # https://api.fanyi.baidu.com/api/trans/product/apidoc/
+    rate_limit_window = 60
     max_score = 90
 
     # Map codes used by Baidu to codes used by Weblate
-    language_map = {
+    language_map: ClassVar[dict[str, str]] = {
         "zh_Hans": "zh",
         "ja": "jp",
         "ko": "kor",
@@ -42,7 +57,7 @@ class BaiduTranslation(MachineTranslation):
     }
     settings_form = KeySecretMachineryForm
 
-    def download_languages(self):
+    def download_languages(self) -> list[str]:
         """List of supported languages."""
         return [
             "zh",
@@ -75,7 +90,7 @@ class BaiduTranslation(MachineTranslation):
             "vie",  # codespell:ignore vie
         ]
 
-    def check_failure(self, response) -> None:
+    def check_failure(self, response: httpx2.Response) -> None:
         payload = response.json()
 
         if "error_code" in payload:
@@ -85,19 +100,21 @@ class BaiduTranslation(MachineTranslation):
                 pass
             else:
                 if error_code == 54003:
-                    raise MachineryRateLimitError(payload["error_msg"])
-            msg = "Error {error_code}: {error_msg}".format(**payload)
+                    raise MachineryRateLimitError(
+                        payload["error_msg"], response=response
+                    )
+            msg = f"Error {payload['error_code']}: {payload['error_msg']}"
             raise MachineTranslationError(msg)
         super().check_failure(response)
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
         salt, sign = self.signed_salt(
@@ -112,7 +129,7 @@ class BaiduTranslation(MachineTranslation):
             "sign": sign,
         }
 
-        response = self.request("get", BAIDU_API, params=args)
+        response = self.request("post", BAIDU_API, data=args)
         payload = response.json()
 
         for item in payload["trans_result"]:

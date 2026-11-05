@@ -2,10 +2,17 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from django.utils.translation import pgettext_lazy
 from weblate_language_data import languages
 from weblate_language_data.aliases import ALIASES
 from weblate_language_data.ambiguous import AMBIGUOUS
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 NO_CODE_LANGUAGES = {lang[0] for lang in languages.LANGUAGES}
 
@@ -20,10 +27,10 @@ NO_SPACE_LANGUAGES = {
 }
 
 UNDERSCORE_EXCEPTIONS = {
-    "nb_NO",
     "zh_Hant",
     "zh_Hans",
     "be_Latn",
+    "oc_ES",
     "ro_MD",
     "pt_BR",
     "pa_PK",
@@ -32,14 +39,14 @@ UNDERSCORE_EXCEPTIONS = {
 AT_EXCEPTIONS = {"ca@valencia"}
 
 
-def is_default_variant(code):
+def is_default_variant(code: str) -> bool:
     language = code.partition("_")[0]
     if language not in NO_CODE_LANGUAGES and language in ALIASES:
         return code == ALIASES[language]
     return False
 
 
-def is_basic(code):
+def is_basic(code: str) -> bool:
     if code in AMBIGUOUS:
         return False
     if "_" in code:
@@ -47,7 +54,7 @@ def is_basic(code):
     return "@" not in code or code in AT_EXCEPTIONS
 
 
-BASIC_LANGUAGES = {lang for lang in NO_CODE_LANGUAGES if is_basic(lang)}
+BASIC_LANGUAGES: set[str] = {lang for lang in NO_CODE_LANGUAGES if is_basic(lang)}
 
 # Following variables are used to map Gettext plural formulas
 # to one/few/may/other like rules
@@ -139,6 +146,7 @@ ONE_TWO_FEW_OTHER_PLURALS = (
     "(n == 1) ? 0 : ((n == 2) ? 1 : ((n == 10) ? 2 : 3))",
     "(n==1) ? 0 : (n==2) ? 1 : (n != 8 && n != 11) ? 2 : 3",
     "(n%100==1 ? 0 : n%100==2 ? 1 : n%100==3 || n%100==4 ? 2 : 3)",
+    "(n % 10 == 1 && n % 100 != 11) ? 0 : ((n == 2) ? 1 : ((n != 2 && n % 10 >= 2 && n % 10 <= 9 && (n % 100 < 11 || n % 100 > 19)) ? 2 : 3))",
 )
 ZERO_ONE_TWO_FEW_OTHER_PLURALS = (
     "n==0 ? 0 : (n==1 || n==11) ? 1 : (n==2 || n==12) ? 2 : (n > 2 && n < 20) ? 3 : 4",
@@ -146,6 +154,7 @@ ZERO_ONE_TWO_FEW_OTHER_PLURALS = (
     "n==0 ? 0 : (n % 100 == 1) ? 1 : ((n % 100 == 2) ? 2 : ((n % 100 == 3 || n % 100 == 4) ? 3 : 4))",
     "n==0 ? 0 : n%100==1 ? 1 : n%100==2 ? 2 : n%100==3 || n%100==4 ? 3 : 4",
     "n==0 ? 0 : (n % 10 == 1) ? 1 : ((n % 10 == 2) ? 2 : ((n % 100 == 0 || n % 100 == 20 || n % 100 == 40 || n % 100 == 60 || n % 100 == 80) ? 3 : 4))",
+    "(n == 0) ? 0 : (n % 10 == 1 && n % 100 != 11) ? 1 : ((n == 2) ? 2 : ((n != 2 && n % 10 >= 2 && n % 10 <= 9 && (n % 100 < 11 || n % 100 > 19)) ? 3 : 4))",
 )
 
 OTHER_ONE_TWO_FEW_PLURALS = (
@@ -261,10 +270,11 @@ FORMULA_WITH_ZERO = {
     "(n == 1) ? 0 : ((n != 0 && n % 1000000 == 0) ? 1 : 2)": "(n == 0) ? 0 : (n == 1) ? 1 : ((n != 0 && n % 1000000 == 0) ? 2 : 3)",
     "(n == 0 || n == 1) ? 0 : ((n != 0 && n % 1000000 == 0) ? 1 : 2)": "(n == 0) ? 0 : (n == 1) ? 1 : ((n != 0 && n % 1000000 == 0) ? 2 : 3)",
     "(n == 1) ? 0 : ((n == 2) ? 1 : ((n == 0 || n % 100 >= 3 && n % 100 <= 10) ? 2 : ((n % 100 >= 11 && n % 100 <= 19) ? 3 : 4)))": "(n == 0) ? 0 : (n == 1) ? 1 : ((n == 2) ? 2 : ((n == 0 || n % 100 >= 3 && n % 100 <= 10) ? 3 : ((n % 100 >= 11 && n % 100 <= 19) ? 4 : 5)))",
+    "(n % 10 == 1 && n % 100 != 11) ? 0 : ((n == 2) ? 1 : ((n != 2 && n % 10 >= 2 && n % 10 <= 9 && (n % 100 < 11 || n % 100 > 19)) ? 2 : 3))": "(n == 0) ? 0 : (n % 10 == 1 && n % 100 != 11) ? 1 : ((n == 2) ? 2 : ((n != 2 && n % 10 >= 2 && n % 10 <= 9 && (n % 100 < 11 || n % 100 > 19)) ? 3 : 4))",
 }
 
 
-def nospace_set(source):
+def nospace_set(source: Iterable[str]) -> set[str]:
     return {item.replace(" ", "") for item in source}
 
 

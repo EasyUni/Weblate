@@ -4,16 +4,58 @@
 
 """Test for creating projects and models."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
+
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client
 from django.test.utils import modify_settings, override_settings
 from django.urls import reverse
+from translation_finder import DiscoveryLimit, DiscoveryResult, DiscoveryResults
 
+from weblate.auth.models import UserBlock
 from weblate.lang.models import Language, get_default_lang
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Component
+from weblate.trans.component_creation import get_component_branches
+from weblate.trans.forms import (
+    CategoryRenameForm,
+    ComponentCreateForm,
+    ComponentDiscoverForm,
+    ComponentInitCreateForm,
+    ComponentLinkAddForm,
+    ComponentProjectForm,
+    ComponentRenameForm,
+    get_repository_redirect_change,
+)
+from weblate.trans.models import Category, Component, Project
 from weblate.trans.tests.test_views import ViewTestCase
-from weblate.trans.tests.utils import create_test_billing, get_test_file
+from weblate.trans.tests.utils import (
+    create_another_user,
+    create_test_billing,
+    get_test_file,
+)
+from weblate.trans.views.create import (
+    INTEGRATION_IMPORT_VCS_KEY,
+    SESSION_CREATE_KEY,
+    CreateComponent,
+    CreateProject,
+)
+from weblate.utils.ratelimit import reset_rate_limit
+from weblate.utils.tests.network import mock_dns
+from weblate.utils.views import get_form_data
+from weblate.vcs.base import RepositoryError, RepositoryLock
 from weblate.vcs.git import GitRepository
+from weblate.vcs.github import GitHubAppCredentials, GitHubInstallation
+from weblate.vcs.models import VCS_REGISTRY
+from weblate.vcs.tests.utils import generate_private_key
+from weblate.workspaces.models import WORKSPACE_PROJECT_CREATORS_GROUP, Workspace
+
+if TYPE_CHECKING:
+    from translation_finder.discovery.result import ResultDict
+
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 TEST_ZIP = get_test_file("translations.zip")
 TEST_HTML = get_test_file("cs.html")
@@ -62,13 +104,52 @@ class CreateTest(ViewTestCase):
         self.assert_create_project(True)
 
         # Create one project
-        self.client_create_project(False, billing=0)
-        self.client_create_project(True, billing=billing.pk)
+        self.client_create_project(False, workspace=0)
+        self.client_create_project(True, workspace=billing.workspace_id)
+        billing.workspace.refresh_from_db()
+        self.assertEqual(billing.workspace.name, "Create Project")
 
         # No more billings left
         self.client_create_project(
-            reverse("create-project"), name="p2", slug="p2", billing=billing.pk
+            reverse("create-project"),
+            name="p2",
+            slug="p2",
+            workspace=billing.workspace_id,
         )
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_create_project_rechecks_billing_after_form_validation(self) -> None:
+        billing = create_test_billing(self.user)
+        original_form_valid = CreateProject.form_valid
+
+        def fill_slot(view, form):
+            Project.objects.create(
+                name="Competing browser project",
+                slug="competing-browser-project",
+                workspace_id=billing.workspace_id,
+            )
+            return original_form_valid(view, form)
+
+        with patch.object(CreateProject, "form_valid", fill_slot):
+            response = self.client_create_project(False, workspace=billing.workspace_id)
+        self.assertContains(response, "No valid billing found or limit exceeded.")
+        self.assertFalse(Project.objects.filter(slug="create-project").exists())
+        self.assertEqual(
+            Project.objects.filter(workspace_id=billing.workspace_id).count(), 1
+        )
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_create_project_billing_project_creator(self) -> None:
+        billing = create_test_billing(self.user)
+        project_creator = create_another_user(suffix="-creator")
+        project_creator.add_team(
+            None,
+            billing.workspace.setup_groups()[WORKSPACE_PROJECT_CREATORS_GROUP],
+        )
+        self.client.login(username=project_creator.username, password="testpassword")
+
+        self.assert_create_project(True)
+        self.client_create_project(True, workspace=billing.workspace_id)
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_project_admin(self) -> None:
@@ -84,6 +165,123 @@ class CreateTest(ViewTestCase):
         self.assert_create_project(True)
         self.client_create_project(True)
         self.client_create_project(True, name="p2", slug="p2")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_project_asks_for_license(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        response = self.client.get(reverse("create-project"))
+
+        self.assertContains(response, 'name="license"')
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_project_sets_blank_workspace_license(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        workspace = Workspace.objects.create(name="Blank license workspace")
+
+        self.client_create_project(
+            True,
+            name="Workspace License Project",
+            slug="workspace-license-project",
+            workspace=workspace.pk,
+            license="MIT",
+        )
+
+        project = Project.objects.get(slug="workspace-license-project")
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.license, "MIT")
+        self.assertTrue(project.inherit_license)
+        self.assertEqual(project.license, "MIT")
+        self.assertEqual(project.get_effective_setting("license"), "MIT")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_project_without_workspace_edit_keeps_license_explicit(self) -> None:
+        workspace = Workspace.objects.create(name="Project creator license workspace")
+        project_creator = create_another_user(suffix="-workspace-license")
+        project_creator.add_team(
+            None, workspace.setup_groups()[WORKSPACE_PROJECT_CREATORS_GROUP]
+        )
+        self.client.login(username=project_creator.username, password="testpassword")
+
+        self.client_create_project(
+            True,
+            name="Project Creator License Project",
+            slug="project-creator-license-project",
+            workspace=workspace.pk,
+            license="MIT",
+        )
+
+        project = Project.objects.get(slug="project-creator-license-project")
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.license, "")
+        self.assertFalse(project.inherit_license)
+        self.assertEqual(project.license, "MIT")
+        self.assertEqual(project.get_effective_setting("license"), "MIT")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_project_keeps_different_workspace_license_explicit(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        workspace = Workspace.objects.create(
+            name="Existing license workspace", license="GPL-3.0-or-later"
+        )
+
+        self.client_create_project(
+            True,
+            name="Explicit License Project",
+            slug="explicit-license-project",
+            workspace=workspace.pk,
+            license="MIT",
+        )
+
+        project = Project.objects.get(slug="explicit-license-project")
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.license, "GPL-3.0-or-later")
+        self.assertFalse(project.inherit_license)
+        self.assertEqual(project.license, "MIT")
+        self.assertEqual(project.get_effective_setting("license"), "MIT")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_project_inherits_matching_workspace_license(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        workspace = Workspace.objects.create(
+            name="Matching license workspace", license="MIT"
+        )
+
+        self.client_create_project(
+            True,
+            name="Inherited License Project",
+            slug="inherited-license-project",
+            workspace=workspace.pk,
+            license="MIT",
+        )
+
+        project = Project.objects.get(slug="inherited-license-project")
+        workspace.refresh_from_db()
+        self.assertEqual(workspace.license, "MIT")
+        self.assertTrue(project.inherit_license)
+        self.assertEqual(project.license, "MIT")
+        self.assertEqual(project.get_effective_setting("license"), "MIT")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_standalone_project_keeps_license_explicit(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        self.client_create_project(
+            True,
+            name="Standalone License Project",
+            slug="standalone-license-project",
+            license="MIT",
+        )
+
+        project = Project.objects.get(slug="standalone-license-project")
+        self.assertFalse(project.inherit_license)
+        self.assertEqual(project.license, "MIT")
+        self.assertEqual(project.get_effective_setting("license"), "MIT")
 
     def assert_create_component(self, result) -> None:
         response = self.client.get(reverse("create-component-vcs"))
@@ -116,6 +314,99 @@ class CreateTest(ViewTestCase):
             self.assertEqual(response.status_code, 200)
         return response
 
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_blocked(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        # Keep another eligible destination to exercise project field validation.
+        destination = self.create_project(name="Destination", slug="destination")
+        destination.add_user(self.user, "Administration")
+        params = {
+            "name": "Blocked component",
+            "slug": "blocked-component",
+            "project": self.project.pk,
+            "source_language": get_default_lang(),
+            "file_format": "po-mono",
+            "vcs": "git",
+            "repo": "https://example.com/repository.git",
+        }
+        for view in (
+            "create-component",
+            "create-component-vcs",
+            "create-component-zip",
+            "create-component-doc",
+        ):
+            response = self.client.get(reverse(view))
+            self.assertIn(self.project, response.context["projects"])
+
+        # The block also invalidates destinations from previously opened wizards.
+        UserBlock.objects.create(user=self.user, project=self.project)
+        for view, extra in (
+            ("create-component", {"origin": "scratch"}),
+            ("create-component-vcs", {}),
+            ("create-component-vcs", {"discovery": "manual"}),
+            ("create-component-vcs", {"new_base": "", "filemask": "*.po"}),
+            (
+                "create-component-zip",
+                {"zipfile": SimpleUploadedFile("translations.zip", b"unused")},
+            ),
+            (
+                "create-component-doc",
+                {"docfile": SimpleUploadedFile("document.html", b"<p>Test</p>")},
+            ),
+        ):
+            with (
+                self.subTest(view=view, fields=list(extra)),
+                patch(
+                    "weblate.trans.views.create.create_component_from_zip"
+                ) as zip_create,
+                patch(
+                    "weblate.trans.views.create.create_component_from_doc"
+                ) as doc_create,
+                patch.object(Project, "scratch_create_component") as scratch_create,
+                patch.object(Component, "clean_repo") as prepare,
+            ):
+                response = self.client.get(reverse(view))
+                self.assertNotIn(self.project, response.context["projects"])
+                response = self.client.post(reverse(view), {**params, **extra})
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(
+                    "Select a valid choice.", str(response.context["form"].errors)
+                )
+                zip_create.assert_not_called()
+                doc_create.assert_not_called()
+                scratch_create.assert_not_called()
+                prepare.assert_not_called()
+                self.assertFalse(
+                    Component.objects.filter(slug="blocked-component").exists()
+                )
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_blocked_management_destinations(self) -> None:
+        destination = self.create_project(name="Destination", slug="destination")
+        destination.add_user(self.user, "Administration")
+        self.project.add_user(self.user, "Administration")
+        UserBlock.objects.create(user=self.user, project=destination)
+        self.user.clear_permissions_cache()
+        category = Category.objects.create(
+            name="Category", slug="category", project=self.project
+        )
+        request = cast("AuthenticatedHttpRequest", self.factory.post("/"))
+        request.user = self.user
+        data = {
+            "name": "Moved",
+            "slug": "moved",
+            "project": destination.pk,
+        }
+        forms = (
+            ComponentRenameForm(request, data, instance=self.component),
+            CategoryRenameForm(request, data, instance=category),
+            ComponentLinkAddForm(data, request=request, component=self.component),
+        )
+        for form in forms:
+            with self.subTest(form=type(form).__name__):
+                self.assertFalse(form.is_valid())
+                self.assertIn("project", form.errors)
+
     @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
     def test_create_component_billing(self) -> None:
         # No permissions without billing
@@ -124,7 +415,7 @@ class CreateTest(ViewTestCase):
 
         # Create billing and add permissions
         billing = create_test_billing(self.user)
-        billing.projects.add(self.project)
+        billing.add_project(self.project)
         self.project.add_user(self.user, "Administration")
         self.assert_create_component(True)
 
@@ -154,6 +445,99 @@ class CreateTest(ViewTestCase):
         self.client_create_component(True, name="c2", slug="c2")
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
+    def test_create_linked_component_skips_repository_lock(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        with patch.object(
+            RepositoryLock,
+            "__enter__",
+            autospec=True,
+            side_effect=AssertionError(
+                "Linked component creation should not lock the repository"
+            ),
+        ):
+            self.client_create_component(True)
+
+        component = Component.objects.get(slug="create-component")
+        self.assertTrue(component.is_repo_link)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
+    def test_create_component_does_not_autolink_inaccessible_component(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+
+        self.client_create_component(
+            True,
+            repo=self.component.repo,
+            branch=self.component.branch,
+        )
+
+        component = Component.objects.get(slug="create-component")
+        self.assertFalse(component.is_repo_link)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
+    def test_create_component_ignores_missing_autolink_target(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        link_repo = self.component.get_repo_link_url()
+        original_get_linked = Component.objects.get_linked
+
+        def get_linked(repo):
+            if repo == link_repo:
+                msg = "Component disappeared."
+                raise Component.DoesNotExist(msg)
+            return original_get_linked(repo)
+
+        with patch.object(
+            Component.objects,
+            "get_linked",
+            side_effect=get_linked,
+        ):
+            self.client_create_component(
+                True,
+                repo=self.component.repo,
+                branch=self.component.branch,
+            )
+
+        component = Component.objects.get(slug="create-component")
+        self.assertEqual(component.repo, self.component.repo)
+        self.assertFalse(component.is_repo_link)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
+    def test_create_git_component_keeps_repository_lock(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        project = Project.objects.create(name="Other", slug="other")
+
+        original_lock_enter = RepositoryLock.__enter__
+
+        def record_lock_enter(lock):
+            return original_lock_enter(lock)
+
+        with patch.object(
+            RepositoryLock,
+            "__enter__",
+            autospec=True,
+            side_effect=record_lock_enter,
+        ) as lock_enter:
+            self.client_create_component(
+                True,
+                project=project.pk,
+                repo=self.component.repo,
+                branch=self.component.branch,
+            )
+
+        lock_enter.assert_called()
+        component = Component.objects.get(slug="create-component")
+        self.assertFalse(component.is_repo_link)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_component_wizard(self) -> None:
         # Make superuser
         self.user.is_superuser = True
@@ -181,6 +565,533 @@ class CreateTest(ViewTestCase):
         self.assertContains(response, "po/*.po")
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_does_not_offer_manual_github_app_vcs(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        GitHubAppCredentials.objects.create(
+            hostname="github.com",
+            app_id="99999",
+            app_slug="weblate-app",
+            private_key=generate_private_key(),
+            webhook_secret="secret",
+        )
+
+        # Simulate a worker whose VCS registry was loaded before any App existed.
+        VCS_REGISTRY.clear_cache()
+        try:
+            response = self.client.get(
+                reverse("create-component-vcs"),
+                {
+                    "repo": "https://github.com/test-org/repo1.git",
+                    "branch": "main",
+                    "vcs": "github-app",
+                    "project": self.project.pk,
+                },
+            )
+            form = response.context["form"]
+            self.assertEqual(
+                form["repo"].value(), "https://github.com/test-org/repo1.git"
+            )
+            self.assertEqual(form["branch"].value(), "main")
+            self.assertNotIn("github-app", dict(form.fields["vcs"].choices))
+        finally:
+            VCS_REGISTRY.clear_cache()
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_rejects_manual_github_app_vcs(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        form = ComponentInitCreateForm(
+            self.get_request(),
+            data={
+                "name": "GitHub App Component",
+                "slug": "github-app-component",
+                "project": self.project.pk,
+                "source_language": get_default_lang(),
+                "vcs": "github-app",
+                "repo": "https://github.com/test-org/repo1.git",
+                "branch": "main",
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("vcs", form.errors)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_carries_canonical_repository_url(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        original_url = self.component.repo
+        canonical_url = f"{original_url}-canonical"
+        request = self.get_request()
+
+        def canonicalize(component: Component) -> None:
+            component.repo = canonical_url
+
+        form = ComponentInitCreateForm(
+            request,
+            data={
+                "name": "Redirected Component",
+                "slug": "redirected-component",
+                "project": self.project.pk,
+                "source_language": get_default_lang(),
+                "vcs": "git",
+                "repo": original_url,
+                "branch": "main",
+            },
+        )
+        form.fields["project"].queryset = Project.objects.filter(pk=self.project.pk)
+
+        with patch.object(Component, "clean_repo", autospec=True) as clean_repo:
+            clean_repo.side_effect = canonicalize
+            self.assertTrue(form.is_valid(), form.errors)
+
+        self.assertEqual(form.cleaned_data["repo"], canonical_url)
+        proof = form.cleaned_data["repository_redirect_proof"]
+        self.assertIsInstance(proof, str)
+
+        create_form = ComponentCreateForm(
+            request,
+            data={
+                "name": "Redirected Component",
+                "slug": "redirected-component",
+                "project": self.project.pk,
+                "source_language": get_default_lang(),
+                "vcs": "git",
+                "repo": canonical_url,
+                "branch": "main",
+                "file_format": "po",
+                "filemask": "po/*.po",
+                "new_lang": "add",
+                "language_regex": "^[^.]+$",
+                "repository_redirect_proof": proof,
+            },
+        )
+        with patch.object(Component, "clean"):
+            self.assertTrue(create_form.is_valid(), create_form.errors)
+        self.assertEqual(
+            create_form.instance.repository_redirect_changes,
+            [("repo", original_url, canonical_url)],
+        )
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_rejects_forged_repository_redirect_proof(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        form = ComponentCreateForm(
+            self.get_request(),
+            data={
+                "name": "Redirected Component",
+                "slug": "redirected-component",
+                "project": self.project.pk,
+                "source_language": get_default_lang(),
+                "vcs": "git",
+                "repo": self.component.repo,
+                "branch": "main",
+                "file_format": "po",
+                "filemask": "po/*.po",
+                "new_lang": "add",
+                "language_regex": "^[^.]+$",
+                "repository_redirect_proof": "forged",
+            },
+        )
+        with patch.object(Component, "clean"):
+            self.assertTrue(form.is_valid(), form.errors)
+        self.assertIsNone(form.instance.repository_redirect_changes)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_accepts_github_app_repository_link(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        repo = self.component.get_repo_link_url()
+
+        form = ComponentInitCreateForm(
+            self.get_request(),
+            data={
+                "name": "GitHub App Linked Component",
+                "slug": "github-app-linked-component",
+                "project": self.project.pk,
+                "source_language": get_default_lang(),
+                "vcs": "github-app",
+                "repo": repo,
+                "branch": "",
+            },
+            initial={"vcs": "github-app", "repo": repo, "branch": ""},
+        )
+        form.fields["project"].queryset = Project.objects.filter(pk=self.project.pk)
+        view = CreateComponent()
+        view.initial = {"vcs": "github-app", "repo": repo, "branch": ""}
+        view.integration_import_vcs = "github-app"
+        view.patch_integration_vcs_choice(form)
+
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.cleaned_data["repo"], repo)
+        self.assertEqual(form.cleaned_data["branch"], "")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_hides_github_app_imports_without_credentials(
+        self,
+    ) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.project.workspace = Workspace.objects.create(name="GitHub App workspace")
+        self.project.save(update_fields=["workspace"])
+        GitHubInstallation.objects.create(
+            installation_id="12345",
+            target_type="Organization",
+            target_login="stale-org",
+            hostname="github.example.com",
+            workspace=self.project.workspace,
+            repositories=[
+                {
+                    "name": "repo1",
+                    "full_name": "stale-org/repo1",
+                    "clone_url": "https://github.example.com/stale-org/repo1.git",
+                    "ssh_url": "git@github.example.com:stale-org/repo1.git",
+                    "html_url": "https://github.example.com/stale-org/repo1",
+                    "default_branch": "main",
+                    "private": False,
+                    "description": "",
+                }
+            ],
+        )
+
+        response = self.client.get(
+            reverse("create-component"), {"project": self.project.pk}
+        )
+
+        self.assertEqual(response.context["github_app_repositories"], [])
+        self.assertNotContains(response, "stale-org/repo1")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_hides_github_app_install_link_for_project_admin(
+        self,
+    ) -> None:
+        self.project.workspace = Workspace.objects.create(name="GitHub App workspace")
+        self.project.save(update_fields=["workspace"])
+        self.project.add_user(self.user, "Administration")
+        GitHubAppCredentials.objects.create(
+            hostname="github.com",
+            app_id="99999",
+            app_slug="weblate-app",
+            private_key=generate_private_key(),
+            webhook_secret="secret",
+        )
+
+        response = self.client.get(
+            reverse("create-component"), {"project": self.project.pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["github_app_available"])
+        self.assertNotIn("github_app_install_url", response.context)
+        self.assertNotContains(response, "Add or configure account")
+
+    def test_create_component_locks_github_app_integration_fields(self) -> None:
+        form = ComponentCreateForm(
+            self.get_request(),
+            initial={
+                "vcs": "github-app",
+                "repo": "https://github.com/test-org/repo.git",
+                "push": "https://github.com/test-org/repo.git",
+                "push_branch": "translations",
+            },
+            instance=Component(project=self.project),
+        )
+        view = CreateComponent()
+        view.initial = {"vcs": "github-app"}
+        view.integration_import_vcs = "github-app"
+
+        view.patch_integration_vcs_choice(form)
+
+        for field in ("vcs", "repo", "push", "push_branch"):
+            self.assertTrue(form.fields[field].disabled)
+        self.assertEqual(form.initial["push"], "")
+        self.assertEqual(form.fields["push"].initial, "")
+        self.assertEqual(form.initial["push_branch"], "")
+        self.assertEqual(form.fields["push_branch"].initial, "")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_wizard_discovery_file_format_params(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        source_component = self.create_java(name="source-java", project=self.project)
+
+        discovery = DiscoveryResult(
+            cast(
+                "ResultDict",
+                {
+                    "file_format": "properties",
+                    "filemask": "java/swing_messages_*.properties",
+                    "template": "java/swing_messages.properties",
+                    "file_format_params": {
+                        "properties_encoding": "utf-8",
+                        "strings_encoding": "utf-16",
+                    },
+                    "language_regex": "^(?!en$).+$",
+                },
+            )
+        )
+        discovery.meta = {"priority": 1000, "origin": None}
+        create_url = (
+            f"{reverse('create-component-vcs')}?source_component={source_component.pk}"
+        )
+        params = {
+            "name": "Create Component With Discovery Params",
+            "slug": "create-component-with-discovery-params",
+            "project": self.project.pk,
+            "vcs": "git",
+            "repo": self.component.repo,
+            "source_language": get_default_lang(),
+        }
+
+        with (
+            patch(
+                "weblate.trans.forms.discover",
+                return_value=DiscoveryResults([discovery]),
+            ),
+            override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
+        ):
+            response = self.client.post(create_url, params)
+        self.assertContains(response, "Choose translation files to import")
+        self.assertContains(response, "java/swing_messages_*.properties")
+        self.assertNotContains(response, "properties_encoding")
+        self.assertNotContains(response, "strings_encoding")
+
+        params["discovery"] = "0"
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(create_url, params)
+        self.assertContains(
+            response,
+            "You will be able to edit more options in the component settings after creating it.",
+        )
+        data = get_form_data(response.context["form"].initial)
+        self.assertEqual(data["file_format"], "properties")
+        self.assertEqual(
+            data["file_format_params"],
+            {"properties_encoding": "utf-8"},
+        )
+        self.assertEqual(data["language_regex"], "^(?!en$).+$")
+
+        file_format_params = cast("dict[str, str]", data.pop("file_format_params"))
+        data.update(
+            {
+                f"file_format_params_{key}": value
+                for key, value in file_format_params.items()
+            }
+        )
+        data["project"] = self.project.pk
+        data["source_language"] = get_default_lang()
+        data["new_base"] = ""
+        data["new_lang"] = "contact"
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(create_url, data)
+        self.assertEqual(response.status_code, 302)
+
+        component = Component.objects.get(slug="create-component-with-discovery-params")
+        self.assertEqual(component.file_format_params["properties_encoding"], "utf-8")
+        self.assertNotIn("strings_encoding", component.file_format_params)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_detected_license_disables_inheritance(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.project.license = "GPL-3.0-or-later"
+        self.project.save(update_fields=["license"])
+
+        params = {
+            "name": "Create Component With Detected License",
+            "slug": "create-component-with-detected-license",
+            "project": self.project.pk,
+            "vcs": "git",
+            "repo": self.component.repo,
+            "source_language": get_default_lang(),
+        }
+
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(reverse("create-component-vcs"), params)
+        self.assertContains(response, "Choose translation files to import")
+
+        params["discovery"] = "4"
+        with (
+            patch("weblate.trans.views.create.detect_license", return_value="MIT"),
+            override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
+        ):
+            response = self.client.post(reverse("create-component-vcs"), params)
+        self.assertContains(response, "Detected license as MIT")
+
+        data = get_form_data(response.context["form"].initial)
+        self.assertEqual(data["license"], "MIT")
+        self.assertEqual(data["detected_license"], "MIT")
+        data["project"] = self.project.pk
+        data["source_language"] = get_default_lang()
+        data["new_lang"] = "add"
+        data["new_base"] = "po/project.pot"
+        data["language_regex"] = "^[^.]+$"
+
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(reverse("create-component-vcs"), data)
+        self.assertEqual(response.status_code, 302)
+
+        component = Component.objects.get(slug="create-component-with-detected-license")
+        self.assertEqual(component.license, "MIT")
+        self.assertFalse(component.inherit_license)
+        self.assertEqual(component.effective_license, "MIT")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_detected_license_matching_parent_inherits(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.project.license = "MIT"
+        self.project.save(update_fields=["license"])
+
+        params = {
+            "name": "Create Component With Inherited Detected License",
+            "slug": "create-component-with-inherited-detected-license",
+            "project": self.project.pk,
+            "vcs": "git",
+            "repo": self.component.repo,
+            "source_language": get_default_lang(),
+        }
+
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(reverse("create-component-vcs"), params)
+        self.assertContains(response, "Choose translation files to import")
+
+        params["discovery"] = "4"
+        with (
+            patch("weblate.trans.views.create.detect_license", return_value="MIT"),
+            override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
+        ):
+            response = self.client.post(reverse("create-component-vcs"), params)
+        self.assertContains(response, "Detected license as MIT")
+
+        form = response.context["form"]
+        self.assertTrue(form.fields["license"].disabled)
+        self.assertEqual(
+            form.fields["license"].widget.attrs["data-inherited-value"], "MIT"
+        )
+        self.assertTrue(form["inherit_license"].value())
+
+        data = {field: form[field].value() or "" for field in form.fields}
+        data.pop("license")
+        data["project"] = self.project.pk
+        data["source_language"] = get_default_lang()
+        data["new_lang"] = "add"
+        data["new_base"] = "po/project.pot"
+        data["language_regex"] = "^[^.]+$"
+
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(reverse("create-component-vcs"), data)
+        self.assertEqual(response.status_code, 302)
+
+        component = Component.objects.get(
+            slug="create-component-with-inherited-detected-license"
+        )
+        self.assertTrue(component.inherit_license)
+        self.assertEqual(component.effective_license, "MIT")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_can_inherit_defaults(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.project.license = "GPL-3.0-or-later"
+        self.project.new_lang = "none"
+        self.project.language_code_style = "posix"
+        self.project.save(update_fields=["license", "new_lang", "language_code_style"])
+
+        params = {
+            "name": "Create Component With Inheritance",
+            "slug": "create-component-with-inheritance",
+            "project": self.project.pk,
+            "vcs": "git",
+            "repo": self.component.get_repo_link_url(),
+            "file_format": "po",
+            "filemask": "po/*.po",
+            "new_base": "po/project.pot",
+            "inherit_new_lang": "on",
+            "inherit_license": "on",
+            "inherit_language_code_style": "on",
+            "language_regex": "^[^.]+$",
+            "source_language": get_default_lang(),
+        }
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(reverse("create-component-vcs"), params)
+        self.assertEqual(response.status_code, 302)
+
+        component = Component.objects.get(slug="create-component-with-inheritance")
+        self.assertTrue(component.inherit_new_lang)
+        self.assertEqual(component.effective_new_lang, "none")
+        self.assertTrue(component.inherit_license)
+        self.assertEqual(component.effective_license, "GPL-3.0-or-later")
+        self.assertTrue(component.inherit_language_code_style)
+        self.assertEqual(component.effective_language_code_style, "posix")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_explicit_defaults_disable_inheritance(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.project.new_lang = "none"
+        self.project.license = "GPL-3.0-or-later"
+        self.project.language_code_style = "posix"
+        self.project.save(update_fields=["new_lang", "license", "language_code_style"])
+
+        self.client_create_component(True, license="", language_code_style="")
+
+        component = Component.objects.get(slug="create-component")
+        self.assertFalse(component.inherit_new_lang)
+        self.assertEqual(component.effective_new_lang, "add")
+        self.assertFalse(component.inherit_license)
+        self.assertEqual(component.effective_license, "")
+        self.assertFalse(component.inherit_language_code_style)
+        self.assertEqual(component.effective_language_code_style, "")
+
+    def test_create_component_blank_parent_license_is_editable(self) -> None:
+        form = ComponentCreateForm(
+            self.get_request(), initial={"project": self.project.pk}
+        )
+
+        self.assertFalse(form.fields["license"].disabled)
+        self.assertFalse(form["inherit_license"].value())
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_blank_parent_preserves_selected_license(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        self.project.license = ""
+        self.project.save(update_fields=["license"])
+
+        self.client_create_component(True, license="GPL-3.0-or-later")
+
+        component = Component.objects.get(slug="create-component")
+        self.assertFalse(component.inherit_license)
+        self.assertEqual(component.license, "GPL-3.0-or-later")
+        self.assertEqual(component.effective_license, "GPL-3.0-or-later")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_blank_workspace_preserves_selected_license(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        self.project.workspace = Workspace.objects.create(name="Blank workspace")
+        self.project.inherit_license = True
+        self.project.license = ""
+        self.project.workspace.license = ""
+        self.project.workspace.save(update_fields=["license"])
+        self.project.save(update_fields=["workspace", "inherit_license", "license"])
+
+        self.client_create_component(True, license="GPL-3.0-or-later")
+
+        component = Component.objects.get(slug="create-component")
+        self.assertFalse(component.inherit_license)
+        self.assertEqual(component.license, "GPL-3.0-or-later")
+        self.assertEqual(component.effective_license, "GPL-3.0-or-later")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_component_existing(self) -> None:
         # Make superuser
         self.user.is_superuser = True
@@ -195,9 +1106,23 @@ class CreateTest(ViewTestCase):
         self.component.addon_message = "test addon_message"
         self.component.pull_message = "test pull_message"
         self.component.save()
+        self.project.license = "MIT"
+        self.project.new_lang = "none"
+        self.project.language_code_style = "posix"
+        self.project.save(update_fields=["license", "new_lang", "language_code_style"])
+        Component.objects.filter(pk=self.component.pk).update(
+            license="GPL-3.0-or-later",
+            inherit_license=True,
+            new_lang="add",
+            inherit_new_lang=True,
+            language_code_style="",
+            inherit_language_code_style=False,
+            inherit_agreement=True,
+        )
+        self.component.refresh_from_db()
 
         response = self.client.get(
-            reverse("create-component") + f"?component={self.component.pk}#existing",
+            f"{reverse('create-component')}?component={self.component.pk}#existing",
             follow=True,
         )
         # init step
@@ -220,11 +1145,13 @@ class CreateTest(ViewTestCase):
 
         # discovery step
         self.assertContains(response, "Choose translation files to import")
+        discovery_url = response.request["PATH_INFO"]
+        if query_string := response.request["QUERY_STRING"]:
+            discovery_url = f"{discovery_url}?{query_string}"
 
         with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
             response = self.client.post(
-                reverse("create-component-vcs")
-                + f"?source_component={self.component.pk}#existing,",
+                discovery_url,
                 {
                     "name": "Create Component From Existing",
                     "slug": "create-component-from-existing",
@@ -241,32 +1168,36 @@ class CreateTest(ViewTestCase):
             response,
             "You will be able to edit more options in the component settings after creating it.",
         )
+        form = response.context["form"]
+        self.assertTrue(form.fields["license"].disabled)
+        self.assertEqual(
+            form.fields["license"].widget.attrs["data-override-value"],
+            "GPL-3.0-or-later",
+        )
+        self.assertTrue(form.fields["new_lang"].disabled)
+        self.assertFalse(form.fields["language_code_style"].disabled)
 
-        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
-            response = self.client.post(
-                reverse("create-component-vcs")
-                + f"?source_component={self.component.pk}#existing,",
-                {
-                    "name": "Create Component From Existing",
-                    "slug": "create-component-from-existing",
-                    "is_glossary": self.component.is_glossary,
-                    "project": self.component.project_id,
-                    "vcs": self.component.vcs,
-                    "repo": self.component.repo,
-                    "source_language": self.component.source_language_id,
-                    "file_format": "po",
-                    "filemask": "deep/*/locales/*/LC_MESSAGES/messages.po",
-                    "new_lang": "add",
-                    "new_base": "deep/cs/locales/cs/LC_MESSAGES/messages.po",
-                    "language_regex": "^[^.]+$",
-                    "source_component": self.component.pk,
-                },
+        data = {field: form[field].value() or "" for field in form.fields}
+        data.pop("inherit_license")
+        data["license"] = "LGPL-3.0-or-later"
+        data.pop("new_lang")
+        create_url = response.request["PATH_INFO"]
+        if query_string := response.request["QUERY_STRING"]:
+            create_url = f"{create_url}?{query_string}"
+        with (
+            override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.client.post(
+                create_url,
+                data,
                 follow=True,
             )
-        self.assertContains(response, "Community localization checklist")
+        new_component = Component.objects.get(name="Create Component From Existing")
+        response = self.client.get(new_component.get_absolute_url(), follow=True)
+        self.assertContains(response, "Diagnostics")
         self.assertContains(response, "Test/Create Component From Existing @ Weblate")
 
-        new_component = Component.objects.get(name="Create Component From Existing")
         cloned_fields = [
             "agreement",
             "merge_style",
@@ -281,9 +1212,448 @@ class CreateTest(ViewTestCase):
             self.assertEqual(
                 getattr(new_component, field), getattr(self.component, field)
             )
+        self.assertEqual(
+            new_component.inherit_agreement, self.component.inherit_agreement
+        )
+        self.assertFalse(new_component.inherit_license)
+        self.assertEqual(new_component.license, "LGPL-3.0-or-later")
+        self.assertEqual(new_component.effective_license, "LGPL-3.0-or-later")
+        self.assertTrue(new_component.inherit_new_lang)
+        self.assertEqual(new_component.new_lang, "add")
+        self.assertEqual(new_component.effective_new_lang, "none")
+        self.assertFalse(new_component.inherit_language_code_style)
+        self.assertEqual(new_component.effective_language_code_style, "")
 
         change = new_component.change_set.get(action=ActionEvents.CREATE_COMPONENT)
         self.assertEqual(change.details["origin"], "vcs")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_existing_requires_edit_permission(self) -> None:
+        self.user.groups.clear()
+        destination = self.create_project(name="Destination", slug="destination")
+        destination.add_user(self.user, "Administration")
+        self.user.clear_permissions_cache()
+        destination_component = self.create_po(
+            project=destination, name="Destination source"
+        )
+        credentialed_repo = "https://user:password@example.com/repository.git"
+        Component.objects.filter(pk=self.component.pk).update(repo=credentialed_repo)
+        self.component.refresh_from_db()
+
+        self.assertTrue(
+            Component.objects.filter_access(self.user).contains(self.component)
+        )
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+        self.assertFalse(self.user.has_perm("vcs.view", self.component))
+
+        url = f"{reverse('create-component')}?component={self.component.pk}"
+        response = self.client.post(
+            url,
+            {
+                "origin": "existing",
+                "name": "Unauthorized duplicate",
+                "slug": "unauthorized-duplicate",
+                "component": self.component.pk,
+                "is_glossary": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("component", response.context["form"].errors)
+        self.assertNotContains(response, credentialed_repo)
+        self.assertNotIn(SESSION_CREATE_KEY, self.client.session)
+
+        response = self.client_create_component(
+            False,
+            project=destination.pk,
+            repo=destination_component.get_repo_link_url(),
+            branch="",
+            source_component=self.component.pk,
+        )
+        form = response.context["form"]
+        self.assertNotIn("source_component", form.errors)
+        self.assertIn("Select a valid choice.", " ".join(form.non_field_errors()))
+        self.assertFalse(Component.objects.filter(slug="create-component").exists())
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_existing_preserves_repository_owner_link(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        linked_component = self.create_link_existing()
+
+        response = self.client.post(
+            f"{reverse('create-component')}?component={linked_component.pk}",
+            {
+                "origin": "existing",
+                "name": "Duplicate linked component",
+                "slug": "duplicate-linked-component",
+                "component": linked_component.pk,
+                "is_glossary": False,
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            f"{reverse('create-component-vcs')}?{SESSION_CREATE_KEY}=1",
+            fetch_redirect_response=False,
+        )
+        session_data = self.client.session[SESSION_CREATE_KEY]
+        self.assertEqual(session_data["repo"], self.component.get_repo_link_url())
+        self.assertEqual(session_data["branch"], "")
+
+        url = f"{reverse('create-component-vcs')}?{SESSION_CREATE_KEY}=1"
+        with patch("weblate.trans.forms.discover", return_value=DiscoveryResults()):
+            response = self.client.get(url)
+
+        form = response.context["form"]
+        self.assertEqual(form.errors, {})
+        self.assertEqual(response.context["stage"], "discover")
+        self.assertEqual(form.initial["repo"], self.component.get_repo_link_url())
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_existing_preserves_github_app_vcs(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.component.vcs = "github-app"
+        self.component.repo = "https://github.com/test-org/repo.git"
+        self.component.save(update_fields=["vcs", "repo"])
+
+        response = self.client.post(
+            reverse("create-component"),
+            {
+                "origin": "existing",
+                "name": "Create Component From GitHub App",
+                "slug": "create-component-from-github-app",
+                "component": self.component.pk,
+                "is_glossary": self.component.is_glossary,
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            f"{reverse('create-component-vcs')}?{SESSION_CREATE_KEY}=1",
+            fetch_redirect_response=False,
+        )
+        session_data = self.client.session[SESSION_CREATE_KEY]
+        self.assertEqual(session_data["vcs"], "github-app")
+        self.assertEqual(session_data["repo"], self.component.get_repo_link_url())
+        self.assertEqual(session_data["branch"], "")
+        self.assertEqual(session_data[INTEGRATION_IMPORT_VCS_KEY], "github-app")
+
+    def make_github_app_component(self) -> str:
+        """Turn the test component into a GitHub App one and return its repo."""
+        self.enterContext(mock_dns("github.com"))
+        self.user.is_superuser = True
+        self.user.save()
+        self.project.workspace = Workspace.objects.create(name="GitHub App workspace")
+        self.project.save(update_fields=["workspace"])
+        self.component.vcs = "github-app"
+        self.component.repo = "https://github.com/test-org/repo.git"
+        self.component.branch = "main"
+        self.component.save(update_fields=["vcs", "repo", "branch"])
+        return self.component.repo
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_existing_github_app_links_repository(self) -> None:
+        self.make_github_app_component()
+
+        self.client.post(
+            reverse("create-component"),
+            {
+                "origin": "existing",
+                "name": "Second GitHub App Component",
+                "slug": "second-github-app-component",
+                "component": self.component.pk,
+                "is_glossary": False,
+            },
+        )
+
+        url = f"{reverse('create-component-vcs')}?{SESSION_CREATE_KEY}=1"
+        with (
+            patch.object(Component, "clean_repo"),
+            patch("weblate.trans.forms.discover", return_value=DiscoveryResults()),
+        ):
+            response = self.client.get(url)
+
+        form = response.context["form"]
+        self.assertEqual(form.errors, {})
+        self.assertEqual(response.context["stage"], "discover")
+        self.assertEqual(form.initial["repo"], self.component.get_repo_link_url())
+        self.assertEqual(form.initial["branch"], "")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_github_app_link_survives_discovery(self) -> None:
+        repo = self.make_github_app_component()
+        session = self.client.session
+        session[SESSION_CREATE_KEY] = {
+            "repo": repo,
+            "branch": "main",
+            "vcs": "github-app",
+            "name": "Second GitHub App Component",
+            "slug": "second-github-app-component",
+            "project": self.project.pk,
+            INTEGRATION_IMPORT_VCS_KEY: "github-app",
+        }
+        session.save()
+
+        url = f"{reverse('create-component-vcs')}?{SESSION_CREATE_KEY}=1"
+        with (
+            patch.object(Component, "clean_repo"),
+            patch("weblate.trans.forms.discover", return_value=DiscoveryResults()),
+        ):
+            response = self.client.get(url)
+            self.assertEqual(response.context["stage"], "init")
+
+            data = get_form_data(response.context["form"].initial)
+            data["project"] = self.project.pk
+            data["source_language"] = self.component.source_language.pk
+            response = self.client.post(url, data, follow=True)
+            self.assertEqual(response.context["form"].errors, {})
+            self.assertEqual(response.context["stage"], "discover")
+
+            # The disabled field is not posted back, keep it in the session.
+            self.assertEqual(
+                self.client.session[SESSION_CREATE_KEY]["repo"],
+                self.component.get_repo_link_url(),
+            )
+
+            data = get_form_data(response.context["form"].initial)
+            data["project"] = self.project.pk
+            data["source_language"] = self.component.source_language.pk
+            data["discovery"] = "manual"
+            response = self.client.post(url, data, follow=True)
+
+        self.assertEqual(response.context["form"].errors, {})
+        self.assertEqual(response.context["stage"], "create")
+
+    def test_component_discover_form_truncation(self) -> None:
+        discovery = DiscoveryResult({"file_format": "po", "filemask": "po/*.po"})
+        truncated = (DiscoveryLimit.RESULTS,)
+        for scans in (
+            [DiscoveryResults([discovery])],
+            [DiscoveryResults(), DiscoveryResults()],
+            [DiscoveryResults([discovery], limit_reasons=truncated)],
+            [DiscoveryResults(limit_reasons=truncated), DiscoveryResults([discovery])],
+            [
+                DiscoveryResults(),
+                DiscoveryResults([discovery], limit_reasons=truncated),
+            ],
+            [DiscoveryResults(limit_reasons=truncated), DiscoveryResults()],
+        ):
+            with (
+                self.subTest(scans=scans),
+                patch.object(ComponentDiscoverForm, "clean_instance"),
+                patch.object(
+                    ComponentDiscoverForm, "discover", side_effect=scans
+                ) as mocked,
+            ):
+                request = self.get_request()
+                # A fresh scan must replace the previous run's truncation status.
+                request.session = {"create_discovery_truncated": True}
+                form = ComponentDiscoverForm(request, initial={})
+                expected = any(scan.truncated for scan in scans)
+                self.assertEqual(form.discovery_truncated, expected)
+                self.assertEqual(
+                    request.session["create_discovery_truncated"], expected
+                )
+                self.assertEqual(mocked.call_count, len(scans))
+
+                restored = ComponentDiscoverForm(request, initial={}, data={})
+                self.assertEqual(restored.discovery_truncated, expected)
+                self.assertEqual(restored.discovered, form.discovered)
+                self.assertEqual(mocked.call_count, len(scans))
+
+                del request.session["create_discovery_truncated"]
+                restored = ComponentDiscoverForm(request, initial={}, data={})
+                self.assertFalse(restored.discovery_truncated)
+
+    def test_create_component_wizard_warns_about_incomplete_discovery(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        url = reverse("create-component-vcs")
+        params = {
+            "name": "Incomplete discovery",
+            "slug": "incomplete-discovery",
+            "project": self.project.pk,
+            "vcs": "git",
+            "repo": self.component.repo,
+            "source_language": get_default_lang(),
+        }
+        discovery = DiscoveryResult({"file_format": "po", "filemask": "po/*.po"})
+        warning = "Translation discovery reached a resource limit."
+        for results in ([], [discovery]):
+            with (
+                self.subTest(results=results),
+                patch(
+                    "weblate.trans.forms.discover",
+                    return_value=DiscoveryResults(
+                        results, limit_reasons=[DiscoveryLimit.RESULTS]
+                    ),
+                ),
+            ):
+                response = self.client.post(url, params)
+                self.assertContains(response, warning, count=1)
+                self.assertContains(response, "Specify configuration manually")
+
+            with patch("weblate.trans.forms.discover") as mocked:
+                response = self.client.post(url, {**params, "discovery": "invalid"})
+                self.assertContains(response, warning, count=1)
+                self.assertIn("discovery", response.context["form"].errors)
+                mocked.assert_not_called()
+
+            response = self.client.post(
+                url, {**params, "discovery": "0" if results else "manual"}
+            )
+            self.assertEqual(response.context["stage"], "create")
+            self.assertNotContains(response, warning)
+
+        with patch("weblate.trans.forms.discover", return_value=DiscoveryResults()):
+            response = self.client.post(url, params)
+        self.assertNotContains(response, warning)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_discover_form_shows_hidden_field_errors(self) -> None:
+        repo = self.make_github_app_component()
+        initial = {
+            "project": self.project,
+            "name": "Second GitHub App Component",
+            "slug": "second-github-app-component",
+            "source_language": self.component.source_language,
+            "vcs": "github-app",
+            "repo": repo,
+            "branch": "main",
+        }
+        data = get_form_data(initial)
+        # Missing branch is rejected by the GitHub App integration
+        data["branch"] = ""
+
+        request = self.get_request()
+        request.session = {}
+        with patch("weblate.trans.forms.discover", return_value=DiscoveryResults()):
+            form = ComponentDiscoverForm(request, initial=initial, data=data)
+
+        self.assertFalse(form.is_valid())
+        self.assertNotIn("branch", form.errors)
+        self.assertIn(
+            "Repository branch is required for this integration.",
+            " ".join(form.non_field_errors()),
+        )
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_project_form_shows_hidden_field_errors(self) -> None:
+        other_project = Project.objects.create(name="Other", slug="other")
+        other_category = Category.objects.create(
+            name="Other category", slug="other-category", project=other_project
+        )
+
+        form = ComponentProjectForm(
+            self.get_request(),
+            data={
+                "name": "Hidden Category Component",
+                "slug": "hidden-category-component",
+                "project": self.project.pk,
+                "category": other_category.pk,
+                "source_language": get_default_lang(),
+            },
+        )
+        form.fields["project"].queryset = Project.objects.all()
+
+        self.assertFalse(form.is_valid())
+        # The category field is hidden, show the error on the form level
+        self.assertNotIn("category", form.errors)
+        self.assertIn(
+            "Category does not belong to this project.",
+            " ".join(form.non_field_errors()),
+        )
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_session_keeps_redirect_proof(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        original_url = self.component.repo
+        canonical_url = f"{original_url}-canonical"
+
+        def canonicalize(component: Component) -> None:
+            component.repo = canonical_url
+
+        session = self.client.session
+        session[SESSION_CREATE_KEY] = {
+            "repo": original_url,
+            "branch": "main",
+            "vcs": "git",
+            "name": "Redirected Component",
+            "slug": "redirected-component",
+            "project": self.project.pk,
+        }
+        session.save()
+
+        url = f"{reverse('create-component-vcs')}?{SESSION_CREATE_KEY}=1"
+        with (
+            patch.object(Component, "clean_repo", autospec=True) as clean_repo,
+            patch("weblate.trans.forms.discover", return_value=DiscoveryResults()),
+        ):
+            clean_repo.side_effect = canonicalize
+            response = self.client.get(url)
+            self.assertEqual(response.context["stage"], "init")
+
+            data = get_form_data(response.context["form"].initial)
+            data["project"] = self.project.pk
+            data["source_language"] = self.component.source_language.pk
+            response = self.client.post(url, data, follow=True)
+
+        self.assertEqual(response.context["form"].errors, {})
+        self.assertEqual(response.context["stage"], "discover")
+
+        # The redirect is not detected again, keep the proof for it
+        session_data = self.client.session[SESSION_CREATE_KEY]
+        self.assertEqual(session_data["repo"], canonical_url)
+        self.assertTrue(session_data["repository_redirect_proof"])
+        self.assertEqual(
+            get_repository_redirect_change(self.get_request(), session_data),
+            ("repo", original_url, canonical_url),
+        )
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_create_component_rejects_inaccessible_source_component(self) -> None:
+        billing = create_test_billing(self.user)
+        billing.add_project(self.project)
+        self.project.add_user(self.user, "Administration")
+
+        private_project = self.create_project(
+            name="Private source",
+            slug="private-source",
+            access_control=Project.ACCESS_PRIVATE,
+        )
+        private_component = self.create_po(
+            project=private_project, name="Private source"
+        )
+        private_component.file_format_params = {"po_line_wrap": "-1"}
+        private_component.save(update_fields=["file_format_params"])
+
+        request = self.factory.get("/", {"source_component": str(private_component.pk)})
+        request.user = self.user
+        form = ComponentCreateForm(
+            request,
+            initial={"project": self.project.pk, "file_format": "po"},
+        )
+        self.assertNotEqual(
+            form.initial.get("file_format_params", {}).get("po_line_wrap"), "-1"
+        )
+
+        response = self.client.get(
+            f"{reverse('create-component')}?component={private_component.pk}#existing"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, private_component.name)
+
+        response = self.client_create_component(
+            False, source_component=private_component.pk
+        )
+        form = response.context["form"]
+        # The field is hidden, so the error is shown on the form level
+        self.assertNotIn("source_component", form.errors)
+        self.assertIn("Select a valid choice.", " ".join(form.non_field_errors()))
+        self.assertFalse(Component.objects.filter(slug="create-component").exists())
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_component_branch_fail(self) -> None:
@@ -325,13 +1695,301 @@ class CreateTest(ViewTestCase):
                     "component": component.pk,
                     "branch": "translations",
                 },
-                follow=True,
             )
-        self.assertContains(response, "Return to the component")
 
         component = Component.objects.get(slug="create-component")
+        self.assertRedirects(
+            response,
+            reverse("show_progress", kwargs={"path": component.get_url_path()}),
+            fetch_redirect_response=False,
+        )
         change = component.change_set.get(action=ActionEvents.CREATE_COMPONENT)
         self.assertEqual(change.details["origin"], "branch")
+
+    def test_component_branches_filters_existing_branches(self) -> None:
+        repo = "https://example.com/repo-a.git"
+        Component.objects.filter(pk=self.component.pk).update(repo=repo)
+        self.component.refresh_from_db()
+        second = self.create_po(project=self.project, name="Second")
+        Component.objects.filter(pk=second.pk).update(repo=repo, branch="stable")
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches",
+            return_value=[self.component.branch, "stable", "feature"],
+        ) as discover:
+            self.assertEqual(get_component_branches(self.component), ["feature"])
+        discover.assert_called_once_with(timeout=15)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_creation_does_not_discover_branches(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        self.create_android(project=self.project, name="Another repository")
+        with patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover:
+            response = self.client.get(reverse("create-component"))
+        self.assertContains(response, reverse("component_branches"))
+        self.assertContains(response, "Additional branch")
+        discover.assert_not_called()
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_branches_endpoint(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.create_android(project=self.project, name="Another repository")
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches",
+            return_value=[self.component.branch, "new"],
+        ) as discover:
+            response = self.client.post(
+                reverse("component_branches"), {"component": self.component.pk}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"branches": ["new"]})
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        discover.assert_called_once_with(timeout=15)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(RATELIMIT_ATTEMPTS=1)
+    def test_component_branches_default_rate_limit_allows_browsing(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.assertFalse(self.user.is_superuser)
+        reset_rate_limit("component_branches", self.get_request())
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches", return_value=[]
+        ) as discover:
+            for _index in range(6):
+                response = self.client.post(
+                    reverse("component_branches"), {"component": self.component.pk}
+                )
+                self.assertEqual(response.status_code, 200)
+            self.assertEqual(discover.call_count, 6)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(
+        RATELIMIT_COMPONENT_BRANCHES_ATTEMPTS=3,
+        RATELIMIT_COMPONENT_BRANCHES_WINDOW=60,
+        RATELIMIT_COMPONENT_BRANCHES_LOCKOUT=60,
+    )
+    def test_component_branches_configured_rate_limit(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        reset_rate_limit("component_branches", self.get_request())
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches", return_value=[]
+        ) as discover:
+            for _index in range(3):
+                response = self.client.post(
+                    reverse("component_branches"), {"component": self.component.pk}
+                )
+                self.assertEqual(response.status_code, 200)
+            response = self.client.post(
+                reverse("component_branches"), {"component": self.component.pk}
+            )
+            self.assertEqual(response.status_code, 429)
+            self.assertEqual(discover.call_count, 3)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_branches_endpoint_errors(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        url = reverse("component_branches")
+        with patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover:
+            self.assertEqual(self.client.get(url).status_code, 405)
+            self.assertEqual(self.client.post(url, {}).status_code, 400)
+            self.assertEqual(
+                self.client.post(url, {"component": "bad"}).status_code, 400
+            )
+            self.assertEqual(
+                self.client.post(
+                    url, {"component": self.component.pk, "project": "bad"}
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.client.post(
+                    url, {"component": self.component.pk, "project": -1}
+                ).status_code,
+                404,
+            )
+            discover.assert_not_called()
+            discover.return_value = []
+            self.assertEqual(
+                self.client.post(url, {"component": self.component.pk}).json(),
+                {"branches": []},
+            )
+            discover.side_effect = RepositoryError(1, "secret repository credentials")
+            response = self.client.post(url, {"component": self.component.pk})
+            self.assertEqual(response.status_code, 502)
+            self.assertNotContains(response, "secret", status_code=502)
+        with (
+            patch("weblate.trans.views.js.check_rate_limit", return_value=False),
+            patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover,
+        ):
+            self.assertEqual(
+                self.client.post(url, {"component": self.component.pk}).status_code, 429
+            )
+            discover.assert_not_called()
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_branches_endpoint_permissions(self) -> None:
+        url = reverse("component_branches")
+        with patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover:
+            # Read access alone does not permit component creation.
+            self.assertEqual(
+                self.client.post(url, {"component": self.component.pk}).status_code, 404
+            )
+            private_project = self.create_project(
+                name="Private source",
+                slug="private-source",
+                access_control=Project.ACCESS_PRIVATE,
+            )
+            private_component = self.create_po(
+                project=private_project, name="Private source"
+            )
+            self.assertEqual(
+                self.client.post(url, {"component": private_component.pk}).status_code,
+                404,
+            )
+            self.client.logout()
+            self.assertEqual(
+                self.client.post(url, {"component": self.component.pk}).status_code, 302
+            )
+            discover.assert_not_called()
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_branch_shortcut_does_not_bypass_creation_permissions(
+        self,
+    ) -> None:
+        params = {
+            "origin": "branch",
+            "name": "New branch",
+            "slug": "new-branch",
+            "component": self.component.pk,
+            "branch": "new",
+        }
+        with patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover:
+            response = self.client.post(
+                f"{reverse('create-component')}?component={self.component.pk}", params
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("component", response.context["form"].errors)
+            discover.assert_not_called()
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_branches_unsupported_backend(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        Component.objects.filter(pk=self.component.pk).update(
+            vcs="local", repo="local:"
+        )
+        with patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover:
+            response = self.client.post(
+                reverse("component_branches"), {"component": self.component.pk}
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"branches": []})
+            discover.assert_not_called()
+
+    def test_component_branches_endpoint_csrf(self) -> None:
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        with patch("weblate.vcs.git.GitRepository.list_remote_branches") as discover:
+            self.assertEqual(
+                client.post(
+                    reverse("component_branches"), {"component": self.component.pk}
+                ).status_code,
+                403,
+            )
+            discover.assert_not_called()
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_component_branches_endpoint_billing(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        url = reverse("component_branches")
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches", return_value=[]
+        ) as discover:
+            self.assertEqual(
+                self.client.post(url, {"component": self.component.pk}).status_code, 404
+            )
+            discover.assert_not_called()
+            billing = create_test_billing(self.user)
+            billing.add_project(self.project)
+            self.assertEqual(
+                self.client.post(url, {"component": self.component.pk}).status_code, 200
+            )
+            discover.assert_called_once_with(timeout=15)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(
+        RATELIMIT_COMPONENT_BRANCHES_ATTEMPTS=3,
+        RATELIMIT_COMPONENT_BRANCHES_WINDOW=60,
+        RATELIMIT_COMPONENT_BRANCHES_LOCKOUT=60,
+    )
+    def test_component_branch_submissions_share_lookup_rate_limit(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.assertFalse(self.user.is_superuser)
+        reset_rate_limit("component_branches", self.get_request())
+        params = {
+            "origin": "branch",
+            "slug": "new-branch",
+            "component": self.component.pk,
+            "branch": "new",
+        }
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches", return_value=["new"]
+        ) as discover:
+            # Ineligible components must not consume a lookup attempt.
+            response = self.client.post(
+                reverse("create-component"), {**params, "component": -1}
+            )
+            self.assertIn("component", response.context["form"].errors)
+            discover.assert_not_called()
+            response = self.client.post(
+                reverse("component_branches"), {"component": self.component.pk}
+            )
+            self.assertEqual(response.status_code, 200)
+            # Missing names make the forms invalid but still trigger remote lookups.
+            for _index in range(2):
+                response = self.client.post(reverse("create-component"), params)
+                self.assertIn("name", response.context["form"].errors)
+                self.assertNotIn("component", response.context["form"].errors)
+            self.assertEqual(discover.call_count, 3)
+            response = self.client.post(
+                reverse("create-component"), {**params, "name": "New branch"}
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.context["form"].errors["component"],
+                ["Too many branch requests. Please try again later."],
+            )
+            response = self.client.post(
+                reverse("component_branches"), {"component": self.component.pk}
+            )
+            self.assertEqual(response.status_code, 429)
+            self.assertEqual(discover.call_count, 3)
+        self.assertFalse(Component.objects.filter(slug="new-branch").exists())
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_component_branch_submission_validates_selected_repository(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.create_android(project=self.project, name="Another repository")
+        params = {
+            "origin": "branch",
+            "name": "New branch",
+            "slug": "new-branch",
+            "component": self.component.pk,
+            "branch": "invalid",
+        }
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches", return_value=["new"]
+        ) as discover:
+            response = self.client.post(reverse("create-component"), params)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("branch", response.context["form"].errors)
+            discover.assert_called_once_with(timeout=15)
+        with patch(
+            "weblate.vcs.git.GitRepository.list_remote_branches",
+            side_effect=RepositoryError(1, "secret"),
+        ) as discover:
+            response = self.client.post(reverse("create-component"), params)
+            self.assertIn("component", response.context["form"].errors)
+            discover.assert_called_once_with(timeout=15)
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_invalid_zip(self) -> None:
@@ -351,6 +2009,26 @@ class CreateTest(ViewTestCase):
                 },
             )
         self.assertContains(response, "Could not parse uploaded ZIP file.")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(COMPONENT_ZIP_UPLOAD_MAX_SIZE=1)
+    def test_create_zip_too_big(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            response = self.client.post(
+                reverse("create-component-zip"),
+                {
+                    "zipfile": SimpleUploadedFile(
+                        "translations.zip", b"xx", content_type="application/zip"
+                    ),
+                    "name": "Create Component",
+                    "slug": "create-component",
+                    "project": self.project.pk,
+                    "source_language": get_default_lang(),
+                },
+            )
+        self.assertContains(response, "Uploaded ZIP file is too big.")
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_zip(self) -> None:
@@ -389,6 +2067,7 @@ class CreateTest(ViewTestCase):
 
             form = response.context["form"]
             params = {field: form[field].value() or "" for field in form.fields}
+            params.pop("inherit_new_lang")
             params["new_lang"] = "none"
             response = self.client.post(
                 reverse("create-component-zip"), params, follow=True
@@ -446,6 +2125,25 @@ class CreateTest(ViewTestCase):
             self.assertEqual(change.details["origin"], "document")
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    @override_settings(TRANSLATION_UPLOAD_MAX_SIZE=1)
+    def test_create_doc_too_big(self) -> None:
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            self.user.is_superuser = True
+            self.user.save()
+            response = self.client.post(
+                reverse("create-component-doc"),
+                {
+                    "docfile": SimpleUploadedFile("cs.html", b"xx"),
+                    "name": "Create Component",
+                    "slug": "create-component",
+                    "project": self.project.pk,
+                    "source_language": get_default_lang(),
+                },
+            )
+
+        self.assertContains(response, "Uploaded translation file is too big.")
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_doc_category(self) -> None:
         self.user.is_superuser = True
         self.user.save()
@@ -489,7 +2187,10 @@ class CreateTest(ViewTestCase):
         self.user.is_superuser = True
         self.user.save()
 
-        with open(TEST_PO) as handle, override_settings(CREATE_GLOSSARIES=False):
+        with (
+            open(TEST_PO, encoding="utf-8") as handle,
+            override_settings(CREATE_GLOSSARIES=False),
+        ):
             response = self.client.post(
                 reverse("create-component-doc"),
                 {

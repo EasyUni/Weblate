@@ -5,14 +5,20 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from collections import defaultdict
 from datetime import date, timedelta
+from itertools import starmap
+from typing import TYPE_CHECKING
 
 from django.core.cache import cache
 from django.utils import timezone
-from django.utils.functional import Promise, cached_property
+from django.utils.functional import cached_property
 from django.utils.translation import pgettext_lazy
 
 from weblate.metrics.models import Metric
+
+if TYPE_CHECKING:
+    from django.utils.functional import Promise
 
 MONTH_NAMES = [
     pgettext_lazy("Short name of month", "Jan"),
@@ -42,23 +48,26 @@ class MetricsWrapper:
         today = timezone.now().date()
         dates = [today - timedelta(days=days) for days in [0, 1, 30, 31, 60, 61]]
 
-        # Use use range as it is more likely to use index than
+        # Use range as it is more likely to use index than
         # the IN operator with six values.
         metrics = Metric.objects.filter_metric(
             self.scope, self.relation, self.secondary
         ).filter(date__range=(dates[-1], dates[0]))
 
-        # Fetch the most recent metric for each date
-        current = past_30 = past_60 = Metric()
-        for metric in metrics:
-            if metric.date in dates[0:2] and current.pk is None:
-                current = metric
-            if metric.date in dates[2:4] and past_30.pk is None:
-                past_30 = metric
-            if metric.date in dates[4:6] and past_60.pk is None:
-                past_30 = metric
+        metrics_by_date = {metric.date: metric for metric in metrics}
 
-        return (current, past_30, past_60)
+        def get_metric(candidates: list[date]) -> Metric:
+            for metric_date in candidates:
+                metric = metrics_by_date.get(metric_date)
+                if metric is not None:
+                    return metric
+            return Metric()
+
+        return (
+            get_metric(dates[0:2]),
+            get_metric(dates[2:4]),
+            get_metric(dates[4:6]),
+        )
 
     @property
     def current(self) -> Metric:
@@ -258,40 +267,71 @@ class MetricsWrapper:
     def get_month_cache_key(self, year, month) -> str:
         return f"{self.cache_key_prefix}:month:{year}:{month}"
 
-    def get_month_activity(
-        self, year: int, month: int, cached_results: dict[str, int]
-    ) -> int:
-        cache_key = self.get_month_cache_key(year, month)
-        if cache_key in cached_results:
-            return cached_results[cache_key]
-        numdays = monthrange(year, month)[1]
-        daily = self.get_daily_activity(date(year, month, numdays), numdays - 1)
-        result = sum(daily.values())
+    def get_month_date_range(self, year: int, month: int) -> tuple[date, date]:
+        """Return collection dates for a monthly activity trend summary."""
+        return (
+            date(year, month, 1),
+            date(year, month, monthrange(year, month)[1]),
+        )
+
+    def populate_month_activity_cache(
+        self, months: list[tuple[int, int]], cached_results: dict[str, int]
+    ) -> None:
+        missing = [
+            (year, month)
+            for year, month in months
+            if self.get_month_cache_key(year, month) not in cached_results
+        ]
+        if not missing:
+            return
+
+        starts, ends = zip(*starmap(self.get_month_date_range, missing), strict=True)
+        totals: defaultdict[tuple[int, int], int] = defaultdict(int)
+        for metric_date, changes in (
+            Metric.objects.filter_metric(self.scope, self.relation, self.secondary)
+            .filter(date__range=(min(starts), max(ends)))
+            .values_list("date", "changes")
+        ):
+            # Each metric counts the preceding day's changes. Keep grouping by
+            # collection month for trend summaries, so a completed month does
+            # not depend on the first collection job of the following month.
+            totals[metric_date.year, metric_date.month] += changes
+
+        cache_updates = {}
+        for year, month in missing:
+            cache_key = self.get_month_cache_key(year, month)
+            cached_results[cache_key] = totals[year, month]
+            cache_updates[cache_key] = cached_results[cache_key]
+
         # Cache for one year
-        cache.set(cache_key, result, 365 * 24 * 3600)
-        return result
+        cache.set_many(cache_updates, 365 * 24 * 3600)
 
     @cached_property
-    def monthly_activity(self) -> list[dict[str, int | date | str | Promise]]:
+    def monthly_activity_totals(self) -> dict[tuple[int, int], int]:
+        """Return 24 completed collection months, oldest first, zero-filled."""
         months: list[tuple[int, int]] = []
-        prefetch: list[str] = []
         last_month_date = timezone.now().date().replace(day=1) - timedelta(days=1)
         month = last_month_date.month
         year = last_month_date.year
-        for _dummy in range(12):
+        for _dummy in range(24):
             months.append((year, month))
-            prefetch.extend(
-                (
-                    self.get_month_cache_key(year, month),
-                    self.get_month_cache_key(year - 1, month),
-                )
-            )
             month -= 1
             if month < 1:
                 month = 12
                 year -= 1
 
-        cached_results: dict[str, int] = cache.get_many(prefetch)
+        cached_results: dict[str, int] = cache.get_many(
+            list(starmap(self.get_month_cache_key, months))
+        )
+        self.populate_month_activity_cache(months, cached_results)
+        return {
+            (year, month): cached_results[self.get_month_cache_key(year, month)]
+            for year, month in reversed(months)
+        }
+
+    @cached_property
+    def monthly_activity(self) -> list[dict[str, int | date | str | Promise]]:
+        totals = self.monthly_activity_totals
         result: list[dict[str, int | date | str | Promise]] = [
             {
                 "month": month,
@@ -304,10 +344,10 @@ class MetricsWrapper:
                 "previous_end_date": date(
                     year - 1, month, monthrange(year - 1, month)[1]
                 ),
-                "current": self.get_month_activity(year, month, cached_results),
-                "previous": self.get_month_activity(year - 1, month, cached_results),
+                "current": totals[year, month],
+                "previous": totals[year - 1, month],
             }
-            for year, month in reversed(months)
+            for year, month in list(totals)[-12:]
         ]
 
         maximum = max(1, *(max(item["current"], item["previous"]) for item in result))  # type: ignore[call-overload]

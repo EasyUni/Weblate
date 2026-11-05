@@ -24,8 +24,18 @@ and the up-to-date file is yield without any conversions.
 
 You can also download the translation converted into one of the widely used
 localization formats. The converted files will be enriched with data provided
-in Weblate; such as additional context, comments or flags. Several file formats
-are available via the :guilabel:`Files` ↓ :guilabel:`Customize download` menu:
+in Weblate; such as additional context, comments or flags.
+
+.. note::
+
+   Format conversion changes the localization file representation, but does
+   not translate between runtime message syntaxes such as ICU MessageFormat
+   and C ``printf`` formatting. Use application-specific tooling when consumers
+   need different placeholder syntaxes or a compiled resource format not
+   offered by Weblate.
+
+Several file formats are available via the :guilabel:`Files` ↓
+:guilabel:`Customize download` menu:
 
 * gettext PO (``po``)
 * XLIFF 1.1 with gettext extensions (``xliff``)
@@ -90,12 +100,31 @@ features might not be translated properly.
    * :ref:`formats`
    * :doc:`/user/files`
 
+.. _upload-ignore_language:
+
+Language checking
++++++++++++++++++
+
+Weblate checks language metadata declared in uploaded files when the format
+provides it, including PO, XLIFF, Qt Linguist, and ARB files. Uploads declaring
+a different language are rejected. Known language aliases and variants sharing
+a base language are accepted, for example Portuguese and Brazilian Portuguese.
+Files without recognized language metadata can still be uploaded. Weblate does
+not infer the language from the filename or translated text.
+
+Select :guilabel:`Ignore language mismatch` to upload a file despite a language
+mismatch. This does not bypass other upload checks or permissions. When updating
+source strings, Weblate checks the declared source language instead of the target
+language.
+
 .. _upload-method:
 
 Import methods
 ++++++++++++++
 
 These are the choices presented when uploading translation files:
+
+.. image:: /screenshots/file-import-methods.webp
 
 Add as translation (``translate``)
     Imported strings are added as translations to existing strings. This is the most common usecase, and
@@ -131,6 +160,8 @@ Replace existing translation file (``replace``)
 
     This option is available only if the user has the
     :ref:`"Edit component settings" permission or "Add new string", "Remove a string" and "Edit strings" permissions <privileges>`.
+    When reviews are enabled, the :ref:`"Review strings" permission <privileges>`
+    is also required because the file can contain approved strings.
 Update source strings (``source``)
     Updates source strings in bilingual translation file. This is similar to
     what :ref:`addon-weblate.gettext.msgmerge` does.
@@ -138,7 +169,7 @@ Update source strings (``source``)
     This option is available only for some file formats and only if the user has the
     :ref:`"Upload translations" permission <privileges>`.
 Add new strings (``add``)
-    Adds new strings to the translation. It skips the one which already exist.
+    Adds new strings to the translation. It skips the ones which already exist.
 
     In case you want to both add new strings and update existing translations,
     upload the file second time with :guilabel:`Add as translation`.

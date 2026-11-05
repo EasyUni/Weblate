@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
-from weakref import WeakValueDictionary
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypeVar, runtime_checkable
+from weakref import WeakSet
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+from django.dispatch import receiver
+from django.test.signals import setting_changed
 from django.utils.functional import cached_property
 
 if TYPE_CHECKING:
@@ -38,18 +40,19 @@ def load_class(name, setting):
         raise ImproperlyConfigured(msg) from error
 
 
+@runtime_checkable
 class ClassLoaderProtocol(Protocol):
     @property
     def name(self) -> StrOrPromise: ...
 
 
-T = TypeVar("T", bound=ClassLoaderProtocol)
+T = TypeVar("T")
 
 
-class ClassLoader(Generic[T]):
+class ClassLoader[T]:
     """Dict like object to lazy load list of classes."""
 
-    instances: WeakValueDictionary[str, ClassLoader] = WeakValueDictionary()
+    instances: ClassVar[WeakSet[ClassLoader]] = WeakSet()
 
     def __init__(
         self,
@@ -58,22 +61,22 @@ class ClassLoader(Generic[T]):
         base_class: type[T],
         construct: bool = True,
         collect_errors: bool = False,
+        dependent_settings: tuple[str, ...] = (),
     ) -> None:
         self.name = name
+        self.setting_names = frozenset((name, *dependent_settings))
         self.construct = construct
         self.collect_errors = collect_errors
         self.errors: dict[str, str | Exception] = {}
         self.base_class: type = base_class
-        obj = self.instances.get(name)
-        if obj is None:
-            self.instances[name] = self
+        self.instances.add(self)
 
     def get_settings(self):
         result = getattr(settings, self.name)
         if result is None:
             # Special case to disable all checks/...
             result = []
-        elif not isinstance(result, list | tuple):
+        elif not isinstance(result, (list, tuple)):
             msg = f"Setting {self.name} must be list or tuple!"
             raise ImproperlyConfigured(msg)
         return result
@@ -104,6 +107,14 @@ class ClassLoader(Generic[T]):
     @cached_property
     def data(self) -> dict[str, T]:
         return self.load_data()
+
+    def clear_cache(self) -> None:
+        """Clear cached data loaded from settings."""
+        self.errors.clear()
+        for cls in type(self).mro():
+            for name, attr in vars(cls).items():
+                if isinstance(attr, cached_property):
+                    self.__dict__.pop(name, None)
 
     def __getitem__(self, key: str) -> T:
         return self.data.__getitem__(key)
@@ -146,11 +157,44 @@ class ClassLoader(Generic[T]):
             def cond(x: T) -> bool:
                 return True
 
-        result = [
-            (x, self[x].name)
-            for x in sorted(self.keys())
-            if x not in exclude and cond(self[x])
-        ]
+        result = []
+        for key in sorted(self.keys()):
+            value = self[key]
+            if key in exclude or not cond(value):
+                continue
+            if not isinstance(value, ClassLoaderProtocol):
+                msg = f"Loaded object {value!r} does not provide a name"
+                raise TypeError(msg)
+            result.append((key, value.name))
         if empty:
             result.insert(0, ("", ""))
         return result
+
+
+class ClassRegistry[T: ClassLoaderProtocol](ClassLoader[type[T]]):
+    """Class loader variant which retains classes instead of constructing them."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        base_class: type[T],
+        collect_errors: bool = False,
+        dependent_settings: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(
+            name,
+            base_class=base_class,  # type: ignore[arg-type]
+            construct=False,
+            collect_errors=collect_errors,
+            dependent_settings=dependent_settings,
+        )
+
+
+@receiver(setting_changed)
+def reset_class_loader_cache(sender, setting: str, **_kwargs) -> None:
+    """Invalidate class loader data after setting overrides."""
+    del sender
+    for instance in list(ClassLoader.instances):
+        if setting in instance.setting_names:
+            instance.clear_cache()

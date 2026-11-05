@@ -1,12 +1,26 @@
 # Copyright © AlexEbenrode <alexebenrode@gmail.com>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 from urllib.parse import unquote_plus
 
-from .base import DownloadTranslations, MachineTranslation, MachineTranslationError
+import httpx2
+
+from .base import (
+    MACHINERY_DEFAULT_THRESHOLD,
+    MachineTranslation,
+    MachineTranslationError,
+)
 from .forms import KeyMachineryForm
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import DownloadTranslations
 
 
 class YandexV2Translation(MachineTranslation):
@@ -15,17 +29,18 @@ class YandexV2Translation(MachineTranslation):
     name = "Yandex v2"
     max_score = 90
     settings_form = KeyMachineryForm
+    version_added = "5.1"
 
-    def check_failure(self, response) -> None:
+    def check_failure(self, response: httpx2.Response) -> None:
         super().check_failure(response)
         payload = response.json()
         if "message" in payload:
             raise MachineTranslationError(payload["message"])
         if "code" in payload and payload["code"] != 200:
-            msg = "Error: {}".format(payload["code"])
+            msg = f"Error: {payload['code']}"
             raise MachineTranslationError(msg)
 
-    def download_languages(self):
+    def download_languages(self) -> list[str]:
         """Download list of supported languages from a service."""
         key = self.settings["key"]
         response = self.request(
@@ -39,20 +54,20 @@ class YandexV2Translation(MachineTranslation):
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
         key = self.settings["key"]
         response = self.request(
             "post",
             "https://translate.api.cloud.yandex.net/translate/v2/translate",
-            params={
-                "texts": text,
+            json={
+                "texts": [text],
                 "sourceLanguageCode": source_language,
                 "targetLanguageCode": target_language,
             },
@@ -68,8 +83,12 @@ class YandexV2Translation(MachineTranslation):
                 "source": text,
             }
 
-    def get_error_message(self, exc):
-        try:
-            return exc.response.json()["message"]
-        except Exception:
-            return super().get_error_message(exc)
+    def get_error_message(self, exc: Exception) -> str:
+        response = getattr(exc, "response", None)
+        if isinstance(exc, httpx2.HTTPError) and response is not None:
+            try:
+                return response.json()["message"]
+            # ruff: ignore[try-except-pass]
+            except Exception:
+                pass
+        return super().get_error_message(exc)

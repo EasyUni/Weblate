@@ -16,6 +16,41 @@ correctly in these browsers as well.
 
 Older browsers might work, but some features might be limited.
 
+Accessibility
+-------------
+
+Weblate targets WCAG 2.2 Level AA for new and changed user-facing
+functionality where practical. Use semantic HTML and Bootstrap components
+before adding custom interaction code.
+
+When changing the frontend:
+
+- Make all interactive controls reachable and usable with a keyboard.
+- Keep focus order logical and preserve visible focus styling.
+- Prefer native buttons, links, inputs, selects, and tables over custom widgets.
+- Associate every form control with a label, help text, and validation errors
+  where applicable.
+- Do not use color, icon shape, or position as the only way to convey state.
+- Announce dynamic status changes that are not otherwise visible to assistive
+  technology.
+- Respect reduced-motion preferences for animation or scrolling behavior.
+- Test changed workflows with keyboard-only navigation and, when practical, a
+  screen reader spot check.
+
+User interface conventions
+--------------------------
+
+Documentation links
++++++++++++++++++++
+
+Use the information icon for contextual links to the Weblate documentation
+instead of a textual :guilabel:`Documentation` button. In Django templates,
+use the ``documentation_icon`` template tag so that the link has consistent
+styling, labeling, and external-link behavior. Documentation icons are
+interactive links and have to remain keyboard-focusable. Keep textual
+documentation links when they are part of explanatory prose rather than a
+contextual action.
+
 Dependency management
 ---------------------
 
@@ -28,10 +63,10 @@ Prerequisites
 
 Before proceeding with an installation, make sure you have the following prerequisites:
 
-- ``Nodejs`` version 14 or higher.
+- A supported ``Node.js`` release.
 - The ``yarn`` package manager is installed on your system.
 - Run ``cd client``.
-- Run ``yarn install``.
+- Run ``yarn install --check-files``.
 
 Installation
 ++++++++++++
@@ -88,7 +123,9 @@ Now the library is built and ready for use. To include it follow these steps:
 Coding style
 ------------
 
-Weblate relies on `Biome`_ for formatting and linting the JavaScript and CSS code.
+Weblate relies on `Biome`_ for formatting and linting the JavaScript and CSS
+code. Django templates are formatted and linted separately by :program:`djade`
+and :program:`djlint`.
 
 .. _Biome: https://biomejs.dev/
 
@@ -102,16 +139,16 @@ function, but there are more complex features available:
 
 .. code-block:: javascript
 
-    document.write(gettext('this is to be translated'));
+    document.write(gettext("this is to be translated"));
 
     var object_count = 1 // or 0, or 2, or 3, ...
-    s = ngettext('literal for the singular case',
-            'literal for the plural case', object_count);
+    s = ngettext("literal for the singular case",
+            "literal for the plural case", object_count);
 
-    fmts = ngettext('There is %s object. Remaining: %s',
-            'There are %s objects. Remaining: %s', 11);
+    fmts = ngettext("There is %s object. Remaining: %s",
+            "There are %s objects. Remaining: %s", 11);
     s = interpolate(fmts, [11, 20]);
-    // s is 'There are 11 objects. Remaining: 20'
+    // s is "There are 11 objects. Remaining: 20"
 
 .. seealso::
 

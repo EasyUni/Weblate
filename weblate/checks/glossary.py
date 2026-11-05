@@ -18,6 +18,7 @@ from weblate.utils.csv import (
 from weblate.utils.html import format_html_join_comma
 
 if TYPE_CHECKING:
+    from weblate.checks.models import Check
     from weblate.trans.models import Unit
 
 
@@ -28,39 +29,49 @@ class GlossaryCheck(TargetCheck):
     description = gettext_lazy(
         "The translation does not follow terms defined in a glossary."
     )
+    version_added = "4.5"
 
     def check_single(self, source: str, target: str, unit: Unit):
-        from weblate.glossary.models import get_glossary_terms
+        # ruff: ignore[import-outside-top-level]
+        from weblate.glossary.models import (
+            get_glossary_terms,
+            iter_glossary_alternatives,
+        )
 
         forbidden = set()
         mismatched = set()
         matched = set()
+        permitted = set()
         boundary = r"\b" if unit.translation.language.uses_whitespace() else ""
-        for term in get_glossary_terms(unit, include_variants=False):
+        for term in iter_glossary_alternatives(
+            get_glossary_terms(unit, include_variants=False),
+            allow_readonly_aliases=True,
+            effective_source=True,
+        ):
             term_source = term.source
             flags = term.all_flags
-            expected = term_source if "read-only" in flags else term.target
-            if "forbidden" in flags:
-                if re.search(
-                    rf"{boundary}{re.escape(expected)}{boundary}", target, re.IGNORECASE
-                ):
-                    forbidden.add(term_source)
-            else:
-                if term_source in matched:
-                    continue
-                if re.search(
-                    rf"{boundary}{re.escape(expected)}{boundary}", target, re.IGNORECASE
-                ):
-                    mismatched.discard(term_source)
-                    matched.add(term_source)
+            expected = term.target
+            if not expected:
+                continue
+            pair = (term.pk, term_source, expected.lower())
+            if re.search(
+                rf"{boundary}{re.escape(expected)}{boundary}", target, re.IGNORECASE
+            ):
+                if "forbidden" in flags:
+                    forbidden.add(pair)
                 else:
-                    mismatched.add(term_source)
+                    permitted.add(pair)
+                    matched.add(term_source)
+            elif "forbidden" not in flags:
+                mismatched.add(term_source)
 
-        return forbidden | mismatched
+        return {source for _, source, _ in forbidden - permitted} | (
+            mismatched - matched
+        )
 
-    def get_description(self, check_obj):
+    def get_description(self, check_obj: Check):
         unit = check_obj.unit
-        sources = unit.get_source_plurals()
+        sources = unit.get_effective_source_plurals()
         targets = unit.get_target_plurals()
         source = sources[0]
         results = set()
@@ -95,6 +106,7 @@ class ProhibitedInitialCharacterCheck(TargetCheck):
     # Process readonly (source) strings
     ignore_readonly = False
     glossary = True
+    version_added = "5.9"
 
     def should_skip(self, unit: Unit) -> bool:
         if not unit.translation.component.is_glossary:
@@ -107,7 +119,7 @@ class ProhibitedInitialCharacterCheck(TargetCheck):
             source and source[0] in PROHIBITED_INITIAL_CHARS
         )
 
-    def get_description(self, check_obj) -> str:
+    def get_description(self, check_obj: Check) -> str:
         """Return description of the check."""
         return format_html(
             escape(

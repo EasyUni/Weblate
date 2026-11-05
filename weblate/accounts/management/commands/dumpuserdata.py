@@ -1,35 +1,63 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
-import argparse
 import json
+from pathlib import Path
+from typing import TYPE_CHECKING
 
+from django.core.management.base import CommandError
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db.models import Prefetch
 
-from weblate.accounts.models import Profile
+from weblate.accounts.models import Profile, Subscription, load_subscription_categories
 from weblate.utils.management.base import BaseCommand
+
+if TYPE_CHECKING:
+    from django.core.management.base import CommandParser
 
 
 class Command(BaseCommand):
     help = "dumps user data to JSON file"
 
-    def add_arguments(self, parser) -> None:
-        parser.add_argument(
-            "json-file", type=argparse.FileType("w"), help="File where to export"
-        )
+    def add_arguments(self, parser: CommandParser) -> None:
+        parser.add_argument("json-file", type=Path, help="File where to export")
 
     def handle(self, *args, **options) -> None:
-        data = []
-
-        profiles = Profile.objects.select_related("user").prefetch_related(
-            "watched", "languages", "secondary_languages"
+        profiles = list(
+            Profile.objects.filter(user__is_active=True, user__is_bot=False)
+            .select_related("user")
+            .prefetch_related(
+                "watched",
+                "languages",
+                "secondary_languages",
+                "user__savedsearch_set",
+                Prefetch(
+                    "user__subscription_set",
+                    queryset=Subscription.objects.select_related(
+                        "project", "component", "component__project"
+                    ),
+                ),
+            )
+        )
+        categories = load_subscription_categories(
+            subscription
+            for profile in profiles
+            for subscription in profile.user.subscription_set.all()
         )
 
-        for profile in profiles:
-            if not profile.user.is_active or profile.user.is_bot:
-                continue
-            data.append(profile.dump_data())
+        data = [
+            profile.dump_data(
+                subscriptions=profile.user.subscription_set.all(),
+                categories=categories,
+            )
+            for profile in profiles
+        ]
 
-        json.dump(data, options["json-file"], indent=2, cls=DjangoJSONEncoder)
-        options["json-file"].close()
+        try:
+            with options["json-file"].open("w") as handle:
+                json.dump(data, handle, indent=2, cls=DjangoJSONEncoder)
+        except OSError as error:
+            msg = f"Could not open file: {error}"
+            raise CommandError(msg) from error

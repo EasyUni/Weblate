@@ -28,6 +28,10 @@ else:
 class WeblateLegalConf(AppConf):
     # Current TOS date
     LEGAL_TOS_DATE = DEFAULT_TOS_DATE
+    # CSS class for styling legal document templates
+    LEGAL_DOCUMENT_CSS_CLASS = "tos"
+    # Legal documents to hide from the UI
+    LEGAL_HIDDEN_DOCUMENTS = ()
 
     class Meta:
         prefix = ""
@@ -43,6 +47,7 @@ class Agreement(models.Model):
     timestamp = models.DateTimeField(auto_now=True)
 
     class Meta:
+        required_db_vendor = "postgresql"
         verbose_name = "TOS agreement"
         verbose_name_plural = "TOS agreements"
 
@@ -56,7 +61,7 @@ class Agreement(models.Model):
             settings.LEGAL_TOS_DATE,  # type: ignore[misc]
         )
 
-    def is_current(self):
+    def is_current(self) -> bool:
         return self.tos == self.current_tos_date()
 
     def make_current(self, request: HttpRequest) -> None:

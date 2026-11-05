@@ -7,6 +7,10 @@ Hosting subscribers receive priority support at no extra charge.
 Prepaid help packages are available for everyone, including self-hosting users.
 Find info about current support offerings at https://weblate.org/support.
 
+The :ref:`cloudbackup` service is also available separately for self-hosted
+installations. It does not require a hosting or separate support subscription.
+You can purchase it from the :guilabel:`Backups` page in the management interface.
+
 .. _activate-support:
 
 Integrating support
@@ -28,10 +32,20 @@ Info sent to the Weblate
 * The version you are running
 * Tallies of projects, components, languages, source strings, and users
 * The public SSH key of your instance
+* Monthly activity summaries from the instance statistics for the last 24 completed
+  months, used to monitor subscription activity and rank
+  servers in Discover Weblate. Months without stored metrics are reported as zero.
+
+Monthly activity uses the same cached summaries as the instance statistics page
+at :file:`/stats/`. These are trend indicators grouped by metric collection
+month. Each daily metric counts the preceding day's changes, so the September
+summary covers changes from August 31 through September 29. This keeps completed
+monthly summaries independent of the collection job on the first day of the
+following month. Use :doc:`/devel/reporting` for reports over exact date ranges.
 
 Additionally, if you turn on :ref:`discover-weblate`:
 
-* List of public projects (name, URL, and website).
+* List of public and protected projects (name, URL, and website).
 
 .. hint::
    Check what *Discover* shows publicly in the :ref:`discover-weblate` description.
@@ -44,10 +58,53 @@ Integration services
 * See if your support package is still valid
 * :ref:`cloudbackup`
 * :ref:`discover-weblate`
+* :ref:`support-contact`
 
 .. hint::
 
    Purchased support packages are already activated upon purchase and can be used without integrating them.
+
+For installations without integrated support, the management page offers
+professional support for setup, maintenance, and troubleshooting. If you have
+already purchased support, link your package there so the installation can
+recognize it.
+
+Superusers also receive a support reminder after login, at most once every
+180 days per account. Use :guilabel:`Continue to Weblate` to return to the page
+you were opening. The reminder does not apply to ordinary translators. Set
+:setting:`SUPPORT_STATUS_CHECK` to ``False`` to disable this redirect, including
+on community installations that do not need professional support. Docker
+installations can use :envvar:`WEBLATE_SUPPORT_STATUS_CHECK`.
+
+.. _support-contact:
+
+Contacting customer care
+------------------------
+
+.. hint::
+
+   If you do not have a support package yet, please refer to the
+   :doc:`/contributing/issues` section for available community resources.
+
+Subscribers can reach Weblate Care directly through the following channels:
+
+* Email support at care@weblate.org.
+* The `customer care portal <https://care.weblate.org/>`_
+* The support form is available in the Weblate management interface after :ref:`activate-support`.
+
+A subscription ensures timely and reliable help with setup, maintenance, and troubleshooting.
+
+.. note::
+
+   **Sending encrypted content**
+
+   If you want to send an encrypted content, please use the public key for
+   care@weblate.org with ID ``0961 62CE 141D 7FE4 B15D A9FA 73D9 298A CB26
+   03F0``.
+
+   This public key is available on the most commonly used key servers, using
+   WKD or `directly from weblate.org
+   <https://weblate.org/.well-known/openpgpkey/hu/7oq6zfqsndhzsmw94xm1e5yu8me8sjsx?l=care>`_.
 
 .. _discover-weblate:
 
@@ -64,22 +121,41 @@ https://weblate.org/discover/.
 Getting listed
 ++++++++++++++
 
+.. versionchanged:: 2026.7.1
+
+   Discover Weblate registration can be started directly from the management
+   interface without manually copying the activation token.
+
 .. note::
 
    Make sure you are OK with publishing your instance name, URL, tally of projects, components, and users,
-   together with names of public projects and components for use on *Discover*.
+   together with names of public and protected projects for use on *Discover*.
 
 
-List your server directly from the management panel if you have an active
-support subscription (:ref:`activate-support`):
+Use the :guilabel:`Discover Weblate` panel in the management interface to
+manage the listing.
+If you have an activated support package, list your server by clicking
+:guilabel:`Enable discovery`.
+If the instance is not connected to weblate.org yet, start the registration by
+clicking :guilabel:`Enable Discover Weblate`:
 
 .. image:: /screenshots/support-discovery.webp
 
-All steps for listing a server without a support contract:
+This opens the registration form on weblate.org and returns to your Weblate
+management interface to complete activation with discovery already enabled.
+The registration flow can be used from an account that has a support
+subscription, but it registers the Discover Weblate listing; activating a
+purchased support package is handled by :ref:`activate-support`.
+Unlinking the support package disables the Discover Weblate listing.
+
+All steps for listing a server manually, for example from older Weblate
+versions:
 
 1. Register yourself at https://weblate.org/user/
 2. Register your Weblate site at https://weblate.org/subscription/discovery/
-3. Confirm you want your Weblate listed by clicking :guilabel:`Enable discovery` from its management page :
+3. Copy the activation token into your Weblate management interface.
+4. Confirm you want your Weblate listed by clicking
+   :guilabel:`Enable discovery` from the :guilabel:`Discover Weblate` panel:
 
 .. image:: /screenshots/support-discovery.webp
 

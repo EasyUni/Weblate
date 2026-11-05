@@ -2,15 +2,21 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import requests
+from __future__ import annotations
+
+from urllib.parse import urlsplit
+
+import httpx2
 from django.core.cache import cache
 from django.db.models import Sum
+from django.urls import reverse
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.translation import gettext, gettext_lazy
 from django.views.generic import TemplateView
 
 from weblate.accounts.models import Profile
 from weblate.metrics.models import Metric
-from weblate.utils.requests import request
+from weblate.utils.requests import JSON_RESPONSE_ERRORS, fetch_url
 from weblate.utils.requirements import get_versions_list
 from weblate.utils.stats import GlobalStats
 from weblate.vcs.gpg import get_gpg_public_key, get_gpg_sign_key
@@ -26,9 +32,9 @@ MENU = (
 REPO_URL = "https://api.github.com/repos/WeblateOrg/weblate"
 ACTIVITY_URL = "https://api.github.com/repos/WeblateOrg/weblate/stats/commit_activity"
 FALLBACK_STATS = {
-    "stars": 4082,
-    "issues": 447,
-    "commits": 663,
+    "stars": 6159,
+    "issues": 433,
+    "commits": 1283,
 }
 
 
@@ -54,7 +60,7 @@ class AboutView(TemplateView):
 
         return context
 
-    def get_template_names(self):
+    def get_template_names(self) -> list[str]:
         return [f"about/{self.page}.html"]
 
 
@@ -78,7 +84,7 @@ class StatsView(AboutView):
             .filter(user__is_bot=False, user__is_active=True)[:10]
             .select_related("user")
         )
-        translated_max = max(user.translated for user in top_users)
+        translated_max = max((user.translated for user in top_users), default=0)
         for user in top_users:
             if translated_max:
                 user.translated_width = 100 * user.translated // translated_max
@@ -106,7 +112,7 @@ class DonateView(AboutView):
     cache_key = "weblate-repo-stats"
 
     def fetch_url(self, url: str):
-        response = request("get", url)
+        response = fetch_url("get", url)
         return response.json()
 
     def get_stats(self) -> dict[str, int]:
@@ -115,7 +121,7 @@ class DonateView(AboutView):
             try:
                 repo = self.fetch_url(REPO_URL)
                 activity = self.fetch_url(ACTIVITY_URL)
-            except requests.exceptions.RequestException:
+            except (httpx2.HTTPError, *JSON_RESPONSE_ERRORS):
                 return FALLBACK_STATS
             activity = sorted(activity, key=lambda item: -item["week"])
             result = {
@@ -128,4 +134,13 @@ class DonateView(AboutView):
 
     def page_context(self, context) -> None:
         context["title"] = gettext("Support Weblate")
+        return_url = self.request.session.pop("support_return_url", "")
+        if (
+            not return_url.startswith("/")
+            or return_url.startswith("//")
+            or not url_has_allowed_host_and_scheme(return_url, allowed_hosts=set())
+            or urlsplit(return_url).path == reverse("donate")
+        ):
+            return_url = reverse("home")
+        context["support_return_url"] = return_url
         context.update(self.get_stats())

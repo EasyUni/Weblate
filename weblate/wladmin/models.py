@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import json
-from typing import TypedDict
+import uuid
+from typing import TYPE_CHECKING, ClassVar, TypedDict
+from urllib.parse import urlencode, urljoin
 
 import dateutil.parser
 from appconf import AppConf
@@ -14,11 +16,14 @@ from django.contrib.admin import ModelAdmin
 from django.core.cache import cache
 from django.core.checks import run_checks
 from django.db import models
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext, gettext_lazy
 
-from weblate.auth.models import AuthenticatedHttpRequest, User
+from weblate.auth.models import User
+from weblate.metrics.models import Metric
+from weblate.metrics.wrapper import MetricsWrapper
 from weblate.trans.models import Component, Project
 from weblate.utils.backup import (
     BackupError,
@@ -30,11 +35,149 @@ from weblate.utils.backup import (
     prune,
 )
 from weblate.utils.const import SUPPORT_STATUS_CACHE_KEY
-from weblate.utils.requests import request
+from weblate.utils.requests import fetch_url
 from weblate.utils.site import get_site_url
 from weblate.utils.stats import GlobalStats
 from weblate.utils.validators import validate_backup_path
 from weblate.vcs.ssh import ensure_ssh_key
+
+if TYPE_CHECKING:
+    from weblate.auth.models import AuthenticatedHttpRequest
+    from weblate.utils.backup import (
+        BorgResult,
+    )
+
+
+class SecurityScan(models.Model):
+    """Credential-free state of an account security operation."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actor = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+    filename = models.CharField(max_length=255, blank=True, default="")
+    operation = models.CharField(max_length=20, default="validate")
+    finding_type = models.CharField(max_length=50, default="leaked-password")
+    state = models.CharField(max_length=20, default="pending", db_index=True)
+    created = models.DateTimeField(default=timezone.now)
+    completed = models.DateTimeField(null=True)
+    processed = models.PositiveIntegerField(default=0)
+    total = models.PositiveIntegerField(default=0)
+    summary = models.JSONField(default=dict)
+    error = models.TextField(default="")
+
+    def __str__(self) -> str:
+        return f"{self.operation}: {self.pk}"
+
+    def get_absolute_url(self) -> str:
+        parameter = (
+            "scan"
+            if self.operation in {"validate", "legacy-email-check"}
+            else "operation"
+        )
+        return f"{reverse('manage-security')}?{urlencode({parameter: self.pk})}"
+
+    def get_state_display(self) -> str:
+        return str(
+            {
+                "configuring": gettext_lazy("Configuring"),
+                "pending": gettext_lazy("Pending"),
+                "running": gettext_lazy("Running"),
+                "completed": gettext_lazy("Completed"),
+                "failed": gettext_lazy("Failed"),
+            }.get(self.state, self.state)
+        )
+
+    @property
+    def matching_rows(self) -> int | None:
+        return self.summary.get("matched", 0 if self.state == "completed" else None)
+
+    @property
+    def affected_accounts(self) -> int | None:
+        return self.summary.get("accounts", 0 if self.state == "completed" else None)
+
+    @property
+    def progress(self) -> int:
+        if self.state == "completed":
+            return 100
+        return min(99, self.processed * 100 // self.total) if self.total else 0
+
+
+class SecurityFinding(models.Model):
+    """A typed account security issue, without authentication secrets."""
+
+    if TYPE_CHECKING:
+        type_label: object
+        display_matches: list[dict]
+        match_count: int
+
+    class Status(models.TextChoices):
+        OPEN = "open", gettext_lazy("Open")
+        RESOLVED = "resolved", gettext_lazy("Resolved")
+        DISMISSED = "dismissed", gettext_lazy("Dismissed")
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    finding_type = models.CharField(max_length=50)
+    key = models.CharField(max_length=64)
+    evidence = models.JSONField(default=dict)
+    status = models.CharField(max_length=10, choices=Status, default=Status.OPEN)
+    first_seen = models.DateTimeField(default=timezone.now)
+    last_seen = models.DateTimeField(default=timezone.now)
+    handled_at = models.DateTimeField(null=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["user", "finding_type", "key"], name="security_finding_identity"
+            ),
+        ]
+        indexes: ClassVar = [models.Index(fields=["status", "finding_type"])]
+
+    def __str__(self) -> str:
+        return f"{self.finding_type}: {self.user_id}"
+
+
+class SecurityFindingEvent(models.Model):
+    finding = models.ForeignKey(
+        SecurityFinding, on_delete=models.CASCADE, related_name="events"
+    )
+    scan = models.ForeignKey(SecurityScan, on_delete=models.CASCADE)
+    actor = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+    action = models.CharField(max_length=20)
+    timestamp = models.DateTimeField(default=timezone.now)
+    reason = models.CharField(max_length=50, default="")
+    evidence = models.JSONField(default=dict)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["finding", "scan", "action"],
+                name="security_finding_event_identity",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.action}: {self.finding_id}"
+
+    def get_action_display(self) -> str:
+        return str(
+            {
+                "detected": gettext_lazy("Detected"),
+                "resolved": gettext_lazy("Resolved"),
+                "dismissed": gettext_lazy("Dismissed"),
+            }.get(self.action, self.action)
+        )
+
+    def get_reason_display(self) -> str:
+        return str(
+            {
+                "dismissed": gettext_lazy("Dismissed by administrator"),
+                "email-cleanup": gettext_lazy("Lookalike e-mail identity removed"),
+                "email-already-changed": gettext_lazy(
+                    "E-mail identity already changed"
+                ),
+                "password-reset": gettext_lazy("Password reset"),
+                "password-changed": gettext_lazy("Password already changed"),
+            }.get(self.reason, self.reason)
+        )
 
 
 class WeblateConf(AppConf):
@@ -42,6 +185,10 @@ class WeblateConf(AppConf):
 
     class Meta:
         prefix = ""
+
+
+def get_support_url(path: str = "api/support/") -> str:
+    return urljoin(f"{settings.SUPPORT_API_URL.rstrip('/')}/", path.lstrip("/"))
 
 
 class WeblateModelAdmin(ModelAdmin):
@@ -57,7 +204,7 @@ class ConfigurationErrorManager(models.Manager["ConfigurationError"]):
         if checks is None:
             checks = run_checks(include_deployment_checks=True)
         checks_dict = {check.id: check for check in checks}
-        criticals = {
+        critical_checks = {
             "weblate.E002",
             "weblate.E003",
             "weblate.E007",
@@ -81,11 +228,20 @@ class ConfigurationErrorManager(models.Manager["ConfigurationError"]):
             "weblate.C038",
             "weblate.C040",
             "weblate.C041",
+            "weblate.E006",
+            "weblate.C044",
+            "weblate.C045",
+            "weblate.C047",
+            "weblate.C051",
+            "weblate.W052",
+        }
+        retired_checks = {
+            "weblate.C046",
         }
         removals = []
         existing = {error.name: error for error in self.all()}
 
-        for check_id in criticals:
+        for check_id in critical_checks:
             if check_id in checks_dict:
                 check = checks_dict[check_id]
                 if check_id in existing:
@@ -97,6 +253,8 @@ class ConfigurationErrorManager(models.Manager["ConfigurationError"]):
                     self.create(name=check_id, message=check.msg)
             elif check_id in existing:
                 removals.append(check_id)
+
+        removals.extend(retired_checks.intersection(existing))
 
         if removals:
             self.filter(name__in=removals).delete()
@@ -111,7 +269,8 @@ class ConfigurationError(models.Model):
     objects = ConfigurationErrorManager()
 
     class Meta:
-        indexes = [
+        required_db_vendor = "postgresql"
+        indexes: ClassVar = [
             models.Index(fields=["ignored", "timestamp"]),
         ]
         verbose_name = "Configuration error"
@@ -160,6 +319,7 @@ class SupportStatus(models.Model):
     objects = SupportStatusManager()
 
     class Meta:
+        required_db_vendor = "postgresql"
         verbose_name = "Support status"
         verbose_name_plural = "Support statuses"
 
@@ -171,11 +331,12 @@ class SupportStatus(models.Model):
             return gettext("Unpaid subscription")
         return SUPPORT_NAMES.get(self.name, self.name)
 
-    def refresh(self) -> None:
+    def refresh(self, *, site_url: str | None = None) -> None:
         stats = GlobalStats()
+        metrics = MetricsWrapper(None, Metric.SCOPE_GLOBAL, 0)
         data = {
             "secret": self.secret,
-            "site_url": get_site_url(),
+            "site_url": site_url or get_site_url(),
             "site_title": settings.SITE_TITLE,
             "users": User.objects.count(),
             "projects": Project.objects.count(),
@@ -184,6 +345,19 @@ class SupportStatus(models.Model):
             "source_strings": stats.source_strings,
             "strings": stats.all,
             "words": stats.all_words,
+            "activity": json.dumps(
+                [
+                    {
+                        "year": year,
+                        "month": month,
+                        "changes": changes,
+                    }
+                    for (
+                        year,
+                        month,
+                    ), changes in metrics.monthly_activity_totals.items()
+                ]
+            ),
         }
         if self.discoverable:
             data["discoverable"] = 1
@@ -195,15 +369,17 @@ class SupportStatus(models.Model):
                         "web": project.web,
                     }
                     for project in Project.objects.filter(
-                        access_control=Project.ACCESS_PUBLIC
+                        access_control__in={
+                            Project.ACCESS_PUBLIC,
+                            Project.ACCESS_PROTECTED,
+                        }
                     ).iterator()
                 ]
             )
         ssh_key = ensure_ssh_key()
         if ssh_key:
             data["ssh_key"] = ssh_key["key"]
-        response = request("post", settings.SUPPORT_API_URL, data=data, timeout=360)
-        response.raise_for_status()
+        response = fetch_url("post", get_support_url(), data=data, timeout=360)
         payload = response.json()
         self.name = payload["name"]
         self.expiry = dateutil.parser.parse(payload["expiry"])
@@ -276,6 +452,7 @@ class BackupService(models.Model):
     paperkey = models.TextField()
 
     class Meta:
+        required_db_vendor = "postgresql"
         verbose_name = "Support service"
         verbose_name_plural = "Support services"
 
@@ -284,50 +461,127 @@ class BackupService(models.Model):
 
     @cached_property
     def last_logs(self) -> models.QuerySet[BackupLog]:
-        return self.backuplog_set.order_by("-timestamp")[:10]
+        return self.backuplog_set.order_by("-timestamp", "-pk")[:10]
+
+    @cached_property
+    def latest_status_logs(self) -> dict[str, BackupLog]:
+        events = ("backup", "error", "database", "database-error")
+        return {
+            log.event: log
+            for log in self.backuplog_set.filter(event__in=events)
+            .order_by("event", "-timestamp", "-pk")
+            .distinct("event")
+        }
+
+    @cached_property
+    def display_logs(self) -> list[BackupLog]:
+        logs = list(self.last_logs)
+        for current_log in (self.current_error, self.current_warning):
+            if current_log is not None and all(
+                log.pk != current_log.pk for log in logs
+            ):
+                logs.append(current_log)
+        return logs
+
+    @cached_property
+    def has_repository_logs(self) -> bool:
+        return self.backuplog_set.exclude(
+            event__in=("database", "database-error")
+        ).exists()
 
     @cached_property
     def has_errors(self) -> bool:
-        for log in self.last_logs:
-            if log.event == "error":
-                return True
-            if log.event == "backup":
-                return False
-        return False
+        return self.current_error is not None
 
-    def ensure_init(self) -> None:
-        if not self.paperkey:
+    @cached_property
+    def has_warnings(self) -> bool:
+        return self.current_warning is not None
+
+    @cached_property
+    def current_error(self) -> BackupLog | None:
+        logs = self.latest_status_logs
+        unresolved = []
+        for error_event, success_event in (
+            ("error", "backup"),
+            ("database-error", "database"),
+        ):
+            if error_event == "database-error" and settings.DATABASE_BACKUP == "none":
+                continue
+            error = logs.get(error_event)
+            success = logs.get(success_event)
+            if error is not None and (
+                success is None
+                or (error.timestamp, error.pk or 0)
+                > (success.timestamp, success.pk or 0)
+            ):
+                unresolved.append(error)
+        if not unresolved:
+            return None
+        return max(unresolved, key=lambda log: (log.timestamp, log.pk or 0))
+
+    @cached_property
+    def current_warning(self) -> BackupLog | None:
+        if self.current_error is not None:
+            return None
+        warning_log = (
+            self.backuplog_set.filter(warning=True)
+            .order_by("-timestamp", "-pk")
+            .first()
+        )
+        if warning_log is None:
+            return None
+        backup_log = self.latest_status_logs.get("backup")
+        if backup_log is None or (warning_log.timestamp, warning_log.pk or 0) >= (
+            backup_log.timestamp,
+            backup_log.pk or 0,
+        ):
+            return warning_log
+        return None
+
+    def create_backup_log(self, event: str, result: BorgResult) -> None:
+        self.backuplog_set.create(
+            event=event,
+            log=result.output,
+            warning=result.has_warnings,
+        )
+
+    def ensure_init(self) -> bool:
+        if self.paperkey:
+            return True
+
+        try:
+            self.paperkey = get_paper_key(self.repository)
+            self.save(update_fields=["paperkey"])
+        except BackupError:
             try:
+                result = initialize(self.repository, self.passphrase)
+                self.create_backup_log("init", result)
                 self.paperkey = get_paper_key(self.repository)
                 self.save(update_fields=["paperkey"])
-            except BackupError:
-                try:
-                    log = initialize(self.repository, self.passphrase)
-                    self.backuplog_set.create(event="init", log=log)
-                    self.paperkey = get_paper_key(self.repository)
-                    self.save()
-                except BackupError as error:
-                    self.backuplog_set.create(event="error", log=str(error))
+            except BackupError as error:
+                self.backuplog_set.create(event="error", log=str(error))
+                return False
+        return True
 
     def backup(self) -> None:
         try:
-            log = backup(self.repository, self.passphrase)
-            self.backuplog_set.create(event="backup", log=log)
+            result = backup(self.repository, self.passphrase)
+            self.create_backup_log("backup", result)
         except BackupError as error:
             self.backuplog_set.create(event="error", log=str(error))
 
     def prune(self) -> None:
         try:
-            log = prune(self.repository, self.passphrase)
-            self.backuplog_set.create(event="prune", log=log)
+            result = prune(self.repository, self.passphrase)
+            self.create_backup_log("prune", result)
         except BackupError as error:
             self.backuplog_set.create(event="error", log=str(error))
 
     def cleanup(self) -> None:
         initial = self.backuplog_set.filter(event="cleanup").exists()
         try:
-            log = cleanup(self.repository, self.passphrase, initial=initial)
-            self.backuplog_set.create(event="cleanup", log=log)
+            result = cleanup(self.repository, self.passphrase, initial=initial)
+            self.create_backup_log("cleanup", result)
         except BackupError as error:
             self.backuplog_set.create(event="error", log=str(error))
 
@@ -343,6 +597,10 @@ class BackupLog(models.Model):
             # Translators: Backup repository operation
             ("error", gettext_lazy("Backup failed")),
             # Translators: Backup repository operation
+            ("database", gettext_lazy("Database backup performed")),
+            # Translators: Backup repository operation
+            ("database-error", gettext_lazy("Database backup failed")),
+            # Translators: Backup repository operation
             ("prune", gettext_lazy("Deleted the oldest backups")),
             # Translators: Backup repository operation
             ("cleanup", gettext_lazy("Cleaned up backup storage")),
@@ -351,9 +609,11 @@ class BackupLog(models.Model):
         ),
         db_index=True,
     )
+    warning = models.BooleanField(default=False)
     log = models.TextField()
 
     class Meta:
+        required_db_vendor = "postgresql"
         verbose_name = "Backup log"
         verbose_name_plural = "Backup logs"
 

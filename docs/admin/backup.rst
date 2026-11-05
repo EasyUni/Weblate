@@ -10,27 +10,78 @@ Project level backups
 
 .. versionadded:: 4.14
 
-.. warning::
-
-   Restoring backups is only supported when using PostgreSQL or MariaDB 10.5+ as a database.
-
 The project backups all translation content from Weblate (project, components,
 translations, string comments, suggestions or checks). It is suitable for
 transferring a project to another Weblate instance.
+
+The backup includes every component in the project, including restricted
+components which the administrator can not open directly. Creating, listing,
+and downloading these backups requires :guilabel:`Edit project settings`.
+Grant that permission only to users trusted with the complete project contents.
 
 You can perform a project backup in :guilabel:`Operations` ↓ :guilabel:`Backups`.
 The backup can be restored when creating a project (see
 :ref:`adding-projects`).
 
-The backups currently do not include access control information and history.
+.. note::
 
-The comments and suggestions are backed up with an username of user who did
+   Project backups can also be created, listed, and downloaded through the
+   :ref:`api` since version 2026.7;
+
+The backups include project-scoped teams and their memberships, and project
+:ref:`saved-searches`, but do not include history. Restored
+:ref:`automatic team assignment rules <autoteam>` invite matching new users
+to project teams and require acceptance before granting membership.
+
+When restoring backups with duplicate team names, all teams are preserved.
+Additional teams with the same name receive a numeric suffix, and the import
+reports the renamed teams in its warnings. Built-in teams are restored separately
+from custom teams. Older backups do not record team type, so duplicate entries
+are restored as editable custom teams with numeric suffixes alongside the
+generated built-in team.
+
+Missing repository directories are skipped while component and translation
+data are still backed up. Repository maintenance failures are logged, and the
+backup continues with the available repository files.
+Filesystem access and I/O errors cause the backup to fail, and incomplete
+archives are removed. Restoring a backup with missing or invalid repository
+metadata preserves the available files, components, and translation data,
+but the repository must be recovered separately.
+
+The comments and suggestions are backed up with the username of the user who did
 create them. Upon import it is assigned to a matching user. If there is no user
 with such username, it is assigned to anonymous user.
 
 The generated backups are kept on the server as configured by
 :setting:`PROJECT_BACKUP_KEEP_DAYS` and :setting:`PROJECT_BACKUP_KEEP_COUNT`
 (it defaults to keep at most 3 backups for 30 days).
+
+Import validation of uploaded project backups can be tuned using
+:setting:`PROJECT_BACKUP_IMPORT_MAX_MEMBERS`,
+:setting:`PROJECT_BACKUP_IMPORT_MAX_TOTAL_UNCOMPRESSED_SIZE`,
+:setting:`PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE`,
+:setting:`PROJECT_BACKUP_IMPORT_MIN_RATIO_SIZE`, and
+:setting:`PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_RATIO`.
+
+The complete backup is validated before restoring any data. Invalid object
+fields, references, repository paths, URLs, regular expressions, or screenshot
+files cause the import to be rejected without creating a partial project.
+
+Screenshot filename extensions are corrected to match their validated image
+contents during import. This also repairs older backups containing filenames
+such as :file:`screenshot.pngrawtrue`. Invalid images are still rejected.
+
+Upgrading to Weblate 2026.11 applies the same repair to stored screenshots.
+Missing or invalid images are left unchanged and reported in the migration log.
+Original files are retained until scheduled screenshot cleanup removes them.
+
+Version control and file format parameters are migrated from older backup
+formats before their values are validated. Unknown parameters and parameters
+that do not apply to the component's version control system or file format are
+skipped and reported in the import warnings. Invalid values for supported
+parameters cause the import to be rejected. Values must use the types stored
+by Weblate; for example, boolean parameters require JSON booleans rather than
+strings.
 
 Use the generated file to import project when :ref:`adding-projects` or in :wladmin:`import_projectbackup`.
 
@@ -54,7 +105,7 @@ the cloud. The backups can be controlled in the management interface from the
 
 .. versionchanged:: 4.4.1
 
-   Both PostgreSQL and MySQL/MariaDB databases are included in the automated backups.
+   PostgreSQL databases are included in the automated backups.
 
 The backups using Borg are incremental and Weblate is configured to keep following backups:
 
@@ -92,14 +143,20 @@ Weblate provisioned backup storage
 ----------------------------------
 
 The easiest way of backing up your Weblate instance is purchasing the `backup
-service at weblate.org <https://weblate.org/support/#backup>`_. This
-is how you get it running:
+service at weblate.org <https://weblate.org/support/#backup>`_. It is available
+for Weblate running in your own environment and does not require a hosting or
+separate support subscription.
 
-1. Purchase the `Backup service` on https://weblate.org/support/#backup.
-2. Enter the obtained key in the management interface, see :ref:`activate-support`.
+This is how you get it running:
+
+1. In the management interface, open :guilabel:`Backups` and select
+   :guilabel:`Buy backup service`, or `purchase the backup service directly
+   <https://weblate.org/subscription/new/?plan=backup>`_.
+2. Enter the obtained activation token in :guilabel:`Activate support package`
+   on the :guilabel:`Backups` page, see :ref:`activate-support`.
 3. Weblate connects to the cloud service and obtains access info for the backups.
 4. Turn on the new backup configuration from the :guilabel:`Backups` tab.
-5. Backup your Borg credentials to be able to restore the backups, see :ref:`borg-keys`.
+5. Back up your Borg credentials to be able to restore the backups, see :ref:`borg-keys`.
 
 .. hint::
 
@@ -148,7 +205,7 @@ to create it but needs the appropriate permissions to do so.
               - /home/weblate/data:/app/data
               - /home/weblate/borgbackup:/borgbackup
 
-    The directory where backups will be stored have to be owned by UID 1000,
+    The directory where backups will be stored has to be owned by UID 1000,
     otherwise Weblate won’t be able to write the backups there.
 
 Remote backups
@@ -162,8 +219,10 @@ via SSH using the Weblate SSH key:
 2. Install the SSH server on it (you will get it by default with most Linux distributions).
 3. Install `BorgBackup`_ on that server; most Linux distributions have packages available (see :doc:`borg:installation`).
 4. Choose an existing user or create a new user that will be used for backing up.
-5. Add Weblate SSH key to the user so that Weblate can SSH to the server without a password (see :ref:`weblate-ssh-key`).
-6. Configure the backup location in Weblate as ``user@host:/path/to/backups`` or ``ssh://user@host:port/path/to/backups``.
+5. Add Weblate SSH key to the user's `.ssh/authorized_keys` file, so that Weblate can SSH to the server without a password (see :ref:`weblate-ssh-key`).
+6. Create a user-writable directory where Weblate can remotely set up the Borg backup repository, for example in the home directory (i.e. ``/home/borg/backups``).
+7. Configure the backup location in Weblate as ``user@host:/home/borg/backups`` or ``ssh://user@host:port/home/borg/backups``.
+8. Once enabled, the backups will be triggered automatically daily. You can also manually trigger a backup from the Weblate UI or using :ref:`backup-management-command`.
 
 .. hint::
 
@@ -218,6 +277,85 @@ The Borg session might look like this:
    * :doc:`borg:usage/extract`
 
 
+.. _restore-docker:
+
+Restoring Docker based setup
+----------------------------
+
+The following steps assume the official Docker Compose setup using the bundled
+PostgreSQL and Valkey services, see :doc:`install/docker`. If your deployment
+uses an external database or a customized Compose file, adapt the database and
+volume steps to that environment.
+
+Start with a Docker Compose checkout matching the restored deployment. Restore
+your original Compose overrides, secrets, and environment variables. The
+:file:`environment.yml` file from :ref:`backup-dumps` can help with this, but
+it is not imported automatically.
+
+1. Restore the backup archive using :ref:`restore-borg` or unpack your manual
+   backup so that the Weblate data directory and
+   :file:`backups/database.sql` are available.
+
+2. Stop the services which can write to the database or data volume:
+
+   .. code-block:: shell
+
+      docker compose stop weblate cache
+
+3. Recreate the PostgreSQL volume.
+
+   .. code-block:: shell
+
+      docker compose stop database
+      docker compose rm -v database
+      docker volume remove weblate-docker_postgres-data
+
+   The volume name depends on the Compose project name and can differ from
+   :file:`weblate-docker_postgres-data`. Check your setup before removing any
+   volume.
+
+4. Start the database service:
+
+   .. code-block:: shell
+
+      docker compose up -d database
+
+5. Restore the database dump:
+
+   .. code-block:: shell
+
+      cat backups/database.sql | docker compose exec -T database psql --username weblate --dbname weblate
+
+   Check that the database name matches :envvar:`POSTGRES_DB` and the user
+   matches :envvar:`POSTGRES_USER` in your Compose configuration.
+
+6. Restore the Weblate data directory to the Docker data volume mounted as
+   :file:`/app/data`, see :ref:`docker-volume`. Files in this volume have to be
+   owned by UID 1000, see :ref:`file-permissions`.
+
+7. Start the remaining services and follow the logs:
+
+   .. code-block:: shell
+
+      docker compose up -d
+      docker compose logs -f
+
+   The Weblate container performs database migrations on startup. If you are
+   also upgrading Weblate, follow :ref:`upgrading-docker`.
+
+8. Refresh the repositories after the restore:
+
+   .. code-block:: shell
+
+      docker compose exec --user weblate weblate weblate updategit --all
+
+.. seealso::
+
+   * :ref:`backup-dumps`
+   * :ref:`docker-postgres-upgrade`
+   * :ref:`docker-volume`
+
+
 .. _BorgBackup: https://www.borgbackup.org/
 
 
@@ -251,8 +389,8 @@ Native database backup
 ++++++++++++++++++++++
 
 The recommended approach is to save a dump of the database using database-native
-tools such as :program:`pg_dump` or :program:`mysqldump`. It usually performs
-better than Django backup, and it restores complete tables with all their data.
+tools such as :program:`pg_dump`. It usually performs better than Django backup,
+and it restores complete tables with all their data.
 
 You can restore this backup in a newer Weblate release, it will perform all the
 necessary migrations when running in :wladmin:`migrate`. Please consult
@@ -338,6 +476,9 @@ If you are using SSH or GPG keys generated by Weblate, you should back up these
 locations. Otherwise you will lose the private keys and you will have to
 regenerate new ones.
 
+Generated SSH wrapper scripts are stored in :setting:`CACHE_DIR` and do not
+need to be backed up.
+
 User uploaded files
 +++++++++++++++++++
 
@@ -384,7 +525,7 @@ Restoring manual backup
          weblate updategit --all
 
 Moving a Weblate installation
-------------------------------
+-----------------------------
 
 Relocate your installation to a different system
 by following the backing up and restoration instructions above.

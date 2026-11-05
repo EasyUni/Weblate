@@ -1,3 +1,4 @@
+.. _laravel:
 .. _laravel-php:
 
 Laravel PHP strings
@@ -7,6 +8,10 @@ Laravel PHP strings
 
 The Laravel PHP localization files are supported as well with plurals:
 
+.. versionchanged:: 5.15
+
+   The translation keys no longer include PHP structure and only contain the actual key.
+
 .. literalinclude:: ../../weblate/trans/tests/data/laravel.php
     :language: php
 
@@ -15,7 +20,9 @@ The Laravel PHP localization files are supported as well with plurals:
     * :doc:`tt:formats/php`
     * `Localization in Laravel`_
 
-.. _Localization in Laravel: https://laravel.com/docs/localization
+.. _Localization in Laravel: https://laravel.com/framework/docs/localization
+
+.. include:: /snippets/format-features/laravel-features.rst
 
 Weblate configuration
 +++++++++++++++++++++

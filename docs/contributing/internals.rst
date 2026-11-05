@@ -105,6 +105,105 @@ Weblate consists of several Django applications (some optional, see
 .. _Django: https://www.djangoproject.com/
 .. _Django REST framework: https://www.django-rest-framework.org/
 
+Translation sources
+-------------------
+
+A unit has a canonical file source and may have a translation from another
+language as its effective source. Keep ``Unit.source`` and ``Unit.source_unit``
+canonical: repository synchronization and file formats depend on this. Use
+``effective_source`` and its language and plural accessors for content shown to
+translators. Do not replace ``source`` on a copied unit to simulate an effective
+source; other fields and related objects still describe the canonical source.
+
+Use ``Unit.source_snapshot`` when an operation needs to preserve the source text,
+language, plural rules, and terminology metadata together. Its ``identity`` defines source changes for
+dependency reconciliation, editor conflict detection, and AI diagnostics. For
+historical rendering and reports, read the snapshot recorded on the change,
+rather than reconstructing it from the current unit.
+
+A missing configured parent remains a custom source: its text is empty, its
+language is retained, and its child is blocked. ``effective_source_unit`` is
+then ``None``. Only removing the workflow or selecting the canonical language
+restores the canonical source.
+
+Pending source snapshots retain the first source change until acceptance, including
+for targets already needing editing. Their ``previous_state`` metadata prevents
+source reversion from accepting a target that already needed editing. Without a
+previous snapshot, custom sources do not use the canonical ``previous_source``.
+
+Text-only accessors do not load language or plural metadata. For batch consumers
+that need the complete effective source, use
+``UnitQuerySet.prefetch_translation_parent()`` alongside their existing unit
+prefetches. ``prefetch_source()`` already includes this. Ordinary searches keep
+the canonical query path and ordinary units retain their existing content hashes.
+
+Source-dependent writes enter ``source_operation()`` before locking unit rows.
+The outer operation takes a shared project gate and reads its workflow mapping
+in one database round trip, including for projects without custom workflows.
+Workflow changes take ``source_project_gate(..., exclusive=True)`` before
+validation or persistence. Configuration changes affecting several projects
+acquire their gates in ascending project ID order. Never upgrade a shared gate
+to an exclusive one inside an operation.
+
+The database gate function locks first and reads workflows in a separate
+statement, so a waiter sees configuration committed while it waited. Write paths
+use this transaction-scoped view rather than cached model settings. Nested
+operations reuse it; rolled-back savepoints discard their dependency work.
+Queued dependencies are reconciled before commit and external memory updates
+are scheduled after commit. Source-change history is written in bulk, preserving
+individual records while batching their notification dispatch.
+
+Workflow saves and deletions compare the old and new source mappings under the
+exclusive gate. Reconciliation visits changed languages and their transitive
+dependants in either mapping, skipping components without affected translations.
+It loads supporting parent units without rebuilding unrelated languages. Callers
+that need a complete rebuild, such as restoration and language maintenance, omit
+the language restriction.
+
+Within each component, reconciliation updates relationships before running
+checks. Workflow changes run local checks with the existing component batching
+enabled, then schedule expensive checks through the component check finalizer
+after commit. Boundary-wide batches also clear stale warnings on old-source
+peers. Successful child batches are combined at the exclusive project gate,
+deduplicating shared project and workspace checks while preserving rollback
+boundaries and actor attribution. Eager tasks and automation contexts finalize
+their batches synchronously after commit, retaining the initiating actor and
+change origin. A finalization failure does not roll back the committed edit.
+Finalization holds the project or workspace checks lock before acquiring the
+component checks lock and keeps it until the checks transaction commits.
+Ordinary dependency reconciliation retains its synchronous
+unit and previous-source peer checks.
+
+Translation-memory payloads use bounded batches scheduled after commit. Nested
+operations merge dependency work, while rolled-back savepoints discard their
+work and commit callbacks.
+
+Automatic translation uses a nonblocking PostgreSQL session advisory lock per
+translation, acquired before selecting units and fetching provider results.
+Calls inside an editing transaction also retain a transaction advisory lock
+until commit or rollback. Provider results are discarded if the owning database
+session is lost. Background translation tasks carry completed target IDs and
+accumulated results through retries, deferring busy targets for 30–60 seconds.
+These deferrals do not consume the retry budget for other lock failures.
+Synchronous callers report busy translations immediately. Worker queues and
+concurrency are unchanged.
+
+Acquire any required repository locks before project gates, then component and
+unit row locks. Reconciliation itself only changes database state and does not
+acquire repository locks. Apply this boundary to bulk imports, automatic
+translation, file-save failures, deletion, and restoration as well as editor
+writes. Language and plural-rule changes require exclusive gates before their
+updates. Historical migrations use historical models without these runtime
+helpers.
+
+Machinery source selection happens before mapping language codes to a provider.
+Use ``get_unit_source_language()`` for translation and ``uses_custom_source()``
+for workflow-specific glossary handling. Provider codes can merge distinct
+language variants, so code equality cannot determine whether a workflow source
+was selected. Explicit component or secondary source selection takes precedence
+over the workflow source.
+
+
 .. _background-tasks-internals:
 
 Background tasks internals
@@ -135,3 +234,30 @@ workload:
    The backup tasks cannot be executed in parallel, and a single dedicated worker makes this easier.
 ``translate``
    Automatic translation tasks are known to take long because they hit external services.
+
+
+Built-in role defaults
+----------------------
+
+Changes to built-in roles in :file:`weblate/auth/data.py` require a data migration.
+Run the following after changing the definitions, then review and format the
+resulting migration::
+
+    ./manage.py generate_role_migration
+    ./manage.py generate_role_migration --check
+
+Each generated migration freezes the old and new permission codenames and merges
+them with assigned permissions using historical models. Keep these snapshots
+independent of runtime definitions so upgrades through skipped releases apply each
+change in order. The consistency test rejects definitions without a matching
+migration. Role-update migrations are irreversible because merging can discard
+information. The post-migration hook only creates missing roles.
+
+
+Built-in role names are persistent identifiers, not freely changeable labels.
+An upstream rename requires an explicit data migration that preserves the role's
+primary key, team assignments, and local permission differences. Rename the
+existing role and map its old upstream baseline to the new name before merging.
+Freeze the renamed upstream defaults in that migration so subsequent generation
+uses the correct baseline. A generated remove/add migration would create a new
+role and leave teams assigned to the old one.

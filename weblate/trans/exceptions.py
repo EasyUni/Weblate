@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from translate.storage.base import ParseError as TranslateParseError
+
 
 class WeblateError(Exception):
     """Base class for Weblate errors."""
@@ -13,6 +15,10 @@ class WeblateError(Exception):
 
 class FileParseError(WeblateError):
     """File parse error."""
+
+
+class LanguageMismatchError(FileParseError):
+    """The uploaded file declares a different language."""
 
 
 class PluralFormsMismatchError(WeblateError):
@@ -32,3 +38,17 @@ class FailedCommitError(WeblateError):
 
 class SuggestionSimilarToTranslationError(WeblateError):
     """Target of the Suggestion is similar to source."""
+
+
+class SuggestionTooLongError(WeblateError):
+    """Target of the Suggestion is too long."""
+
+
+EXPECTED_PARSE_ERRORS = (FileNotFoundError, TranslateParseError)
+
+
+def is_expected_parse_error(error: BaseException | None) -> bool:
+    """Check whether an exception is an expected file parsing failure."""
+    return isinstance(error, EXPECTED_PARSE_ERRORS) or isinstance(
+        getattr(error, "__cause__", None), EXPECTED_PARSE_ERRORS
+    )

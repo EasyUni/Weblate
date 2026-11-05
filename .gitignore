@@ -40,6 +40,13 @@ weblate-*.tar.*
 /weblate-openapi.yaml
 /memray*
 /mypy.log
+/.codex
+/.mypy_cache
+/.devcontainer/compose.local.json
+/.devcontainer/compose.local.*.tmp
+
+# doccmd temporary files
+doccmd_*
 
 # Ignore dynaconf secret files
 .secrets.*

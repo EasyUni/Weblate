@@ -22,7 +22,7 @@ Weblate Cloudron Package
 
 `Cloudron <https://www.cloudron.io/>`_ is a platform for self-hosting web applications.
 Weblate installed with Cloudron will be automatically kept up-to-date.
-The package is maintained by the Cloudron team at their `Weblate package repo <https://git.cloudron.io/cloudron/weblate-app>`_.
+The package is maintained by the Cloudron team; see the `Weblate package documentation <https://docs.cloudron.io/packages/weblate/>`_.
 
 .. image:: /images/cloudron.png
    :alt: Install Weblate with Cloudron
@@ -47,4 +47,14 @@ It also is possible to use the command-line interface:
 
 .. code-block:: sh
 
-    yunohost app install https://github.com/YunoHost-Apps/weblate_ynh
+    yunohost app install weblate
+
+Weblate with MASH
+-----------------
+
+The `MASH <https://github.com/mother-of-all-self-hosting/mash-playbook>`_ Ansible
+playbook can install Weblate as a Docker container, together with the
+PostgreSQL, Valkey, and Traefik services it depends on. See the
+`Weblate page in the MASH documentation
+<https://github.com/mother-of-all-self-hosting/mash-playbook/blob/main/components/weblate/README.md>`_
+for the configuration to add to your inventory.

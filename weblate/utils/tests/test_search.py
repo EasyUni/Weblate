@@ -3,23 +3,51 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, ClassVar, Literal
+from unittest.mock import patch
 
-from django.db.models import Count, Expression, F, Q
+from django.db import connection
+from django.db.models import Count, Exists, F, OuterRef, Q, Sum
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
+from django.utils.timezone import get_current_timezone
+from pyparsing import ParserElement
 
 from weblate.auth.models import User
+from weblate.checks.models import Check
+from weblate.lang.models import Language
+from weblate.screenshots.models import Screenshot
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Change, Project, Unit
+from weblate.trans.models import (
+    Change,
+    Comment,
+    PendingUnitChange,
+    Project,
+    Suggestion,
+    Unit,
+)
+from weblate.trans.models.variant import Variant
 from weblate.trans.tests.test_views import ViewTestCase
+from weblate.trans.tests.utils import get_test_actor
 from weblate.trans.util import PLURAL_SEPARATOR
-from weblate.utils.db import using_postgresql
-from weblate.utils.search import parse_query
+from weblate.utils.search import (
+    MAX_SEARCH_QUERY_LENGTH,
+    MAX_SEARCH_QUERY_TERMS,
+    SearchQueryError,
+    UnitTermExpr,
+    build_parser,
+    parse_query,
+    parse_string,
+    parser_to_query,
+)
 from weblate.utils.state import (
+    FUZZY_STATES,
     STATE_APPROVED,
     STATE_EMPTY,
     STATE_FUZZY,
+    STATE_NEEDS_CHECKING,
+    STATE_NEEDS_REWRITING,
     STATE_READONLY,
     STATE_TRANSLATED,
 )
@@ -27,10 +55,24 @@ from weblate.utils.state import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from django.db.models import Expression
+
 
 class SearchTestCase(TestCase):
-    object_class: ClassVar[type[Unit | User]] = Unit
-    parser: ClassVar[Literal["unit", "user", "superuser"]] = "unit"
+    object_class: ClassVar[type[Unit | User | Screenshot]] = Unit
+    parser: ClassVar[Literal["unit", "user", "superuser", "screenshot"]] = "unit"
+
+    def assert_related_query(self, string: str, expected: Q) -> None:
+        # These comparisons test parser structure; scoped authorization has its
+        # own behavioral tests in test_contributor_visibility.
+        filters, annotations = parse_query(string, user=User(is_superuser=True))
+        self.assertEqual(annotations, {})
+        expected_filter = Q(Exists(Unit.objects.filter(expected, pk=OuterRef("pk"))))
+        self.assertEqual(
+            Unit.objects.filter(filters).query.sql_with_params(),
+            Unit.objects.filter(expected_filter).query.sql_with_params(),
+        )
+        self.assertFalse(Unit.objects.filter(filters).exists())
 
     def assert_query(
         self,
@@ -53,18 +95,134 @@ class SearchTestCase(TestCase):
             exists,
         )
 
+    def assert_query_sql(
+        self,
+        string: str,
+        *,
+        sql_contains: tuple[str, ...] = (),
+        sql_not_contains: tuple[str, ...] = (),
+        params_contains: tuple[object, ...] = (),
+        exists: bool = False,
+        **context,
+    ) -> tuple[str, tuple[object, ...]]:
+        context.setdefault("user", User(is_superuser=True))
+        filters, annotations = parse_query(string, parser=self.parser, **context)
+        self.assertEqual(annotations, {})
+        query = self.object_class.objects.annotate(**annotations).filter(filters)
+        sql, params = query.query.sql_with_params()
+        for fragment in sql_contains:
+            self.assertIn(fragment, sql)
+        for fragment in sql_not_contains:
+            self.assertNotIn(fragment, sql)
+        for param in params_contains:
+            self.assertIn(param, params)
+        self.assertEqual(query.exists(), exists)
+        return sql, params
+
+
+class BooleanOperatorParserTest(TestCase):
+    def test_query_length_limit_precedes_parser(self) -> None:
+        parse_string("x" * MAX_SEARCH_QUERY_LENGTH, "unit")
+        with (
+            patch("weblate.utils.search.PARSER_LOCK") as lock,
+            self.assertRaisesMessage(SearchQueryError, "Search query is too long"),
+        ):
+            parse_string("x" * (MAX_SEARCH_QUERY_LENGTH + 1), "unit")
+        lock.__enter__.assert_not_called()
+
+    def test_term_limit_counts_quoted_text_once(self) -> None:
+        terms = [f"word{index}" for index in range(MAX_SEARCH_QUERY_TERMS)]
+        parse_query(" ".join(terms))
+        parse_query('"' + " ".join(terms) + '"')
+        with self.assertRaisesMessage(SearchQueryError, "Search query is too complex"):
+            parse_query(" ".join([*terms, "extra"]))
+
+    def test_parsed_queries_are_not_retained(self) -> None:
+        first = parse_string("state:translated", "unit")
+        second = parse_string("state:translated", "unit")
+        self.assertIsNot(first, second)
+
+    def test_packrat_is_enabled(self) -> None:
+        with patch.object(ParserElement, "enable_packrat") as enable_packrat:
+            build_parser(UnitTermExpr)
+
+        enable_packrat.assert_called_once_with()
+
+    def test_boolean_operators_are_case_insensitive(self) -> None:
+        parsers: tuple[Literal["unit", "screenshot", "user", "superuser"], ...] = (
+            "unit",
+            "screenshot",
+            "user",
+            "superuser",
+        )
+        for parser in parsers:
+            with self.subTest(parser=parser):
+                self.assertEqual(
+                    parse_query("alpha and not beta", parser=parser),
+                    parse_query("alpha AND NOT beta", parser=parser),
+                )
+                self.assertEqual(
+                    parse_query("alpha Or beta", parser=parser),
+                    parse_query("alpha OR beta", parser=parser),
+                )
+
+    def test_nested_parentheses(self) -> None:
+        self.assertEqual(
+            parse_query("((((((((alpha))))))))"),
+            parse_query("alpha"),
+        )
+
+    def test_unbalanced_parentheses(self) -> None:
+        with self.assertRaises(SearchQueryError):
+            parse_query("((((((((alpha")
+
+    def test_nested_implicit_operators(self) -> None:
+        self.assertEqual(
+            parse_query("(alpha (alpha (alpha (alpha alpha))))"),
+            parse_query("alpha AND alpha AND alpha AND alpha AND alpha"),
+        )
+
+    def test_not_chain(self) -> None:
+        self.assertEqual(
+            parse_query(f"{'NOT ' * 16}alpha"),
+            parse_query("alpha"),
+        )
+
+
+def source_query(**lookup: str | int | datetime) -> Q:
+    """Build the expected lookup against the effective source."""
+    return (
+        Q(
+            translation_parent__isnull=True,
+            details__translation_parent__missing__isnull=True,
+        )
+        & Q(**lookup)
+    ) | (
+        Q(translation_parent__isnull=False)
+        & Q(
+            **{
+                key.replace("source__", "translation_parent__target__")
+                .replace("source_unit__state", "translation_parent__state")
+                .replace(
+                    "source_unit__last_updated", "translation_parent__last_updated"
+                ): value
+                for key, value in lookup.items()
+            }
+        )
+    )
+
 
 class UnitQueryParserTest(SearchTestCase):
     def test_simple(self) -> None:
         self.assert_query(
             "hello world",
             (
-                Q(source__substring="hello")
+                source_query(source__substring="hello")
                 | Q(target__substring="hello")
                 | Q(context__substring="hello")
             )
             & (
-                Q(source__substring="world")
+                source_query(source__substring="world")
                 | Q(target__substring="world")
                 | Q(context__substring="world")
             ),
@@ -72,7 +230,7 @@ class UnitQueryParserTest(SearchTestCase):
 
     def test_quote(self) -> None:
         expected = (
-            Q(source__substring="hello world")
+            source_query(source__substring="hello world")
             | Q(target__substring="hello world")
             | Q(context__substring="hello world")
         )
@@ -95,131 +253,171 @@ class UnitQueryParserTest(SearchTestCase):
         self.assert_query("location:'TEXT'\r\n", Q(location__substring="TEXT"))
 
     def test_comment(self) -> None:
-        self.assert_query(
+        self.assert_related_query(
             "comment:TEXT",
             Q(comment__comment__substring="TEXT") & Q(comment__resolved=False),
         )
-        self.assert_query(
+        self.assert_related_query(
             "resolved_comment:TEXT",
             Q(comment__comment__substring="TEXT") & Q(comment__resolved=True),
         )
-        self.assert_query(
+        self.assert_related_query(
             "comment_author:nijel", Q(comment__user__username__iexact="nijel")
+        )
+        self.assert_related_query(
+            "source_comment:TEXT",
+            (
+                Q(source_unit__comment__comment__substring="TEXT")
+                & Q(source_unit__comment__resolved=False)
+            )
+            | (
+                Q(translation_parent__comment__comment__substring="TEXT")
+                & Q(translation_parent__comment__resolved=False)
+            ),
+        )
+        self.assert_related_query(
+            "resolved_source_comment:TEXT",
+            (
+                Q(source_unit__comment__comment__substring="TEXT")
+                & Q(source_unit__comment__resolved=True)
+            )
+            | (
+                Q(translation_parent__comment__comment__substring="TEXT")
+                & Q(translation_parent__comment__resolved=True)
+            ),
+        )
+        self.assert_related_query(
+            "source_comment_author:nijel",
+            Q(source_unit__comment__user__username__iexact="nijel")
+            | Q(translation_parent__comment__user__username__iexact="nijel"),
         )
 
     def test_field(self) -> None:
         self.assert_query(
             "source:hello target:world",
-            Q(source__substring="hello") & Q(target__substring="world"),
+            source_query(source__substring="hello") & Q(target__substring="world"),
         )
         self.assert_query("location:hello.c", Q(location__substring="hello.c"))
 
     def test_exact(self) -> None:
-        self.assert_query("source:='hello'", Q(source__exact="hello"))
-        self.assert_query('source:="hello world"', Q(source__exact="hello world"))
-        self.assert_query("source:='hello world'", Q(source__exact="hello world"))
-        self.assert_query("source:=hello", Q(source__exact="hello"))
+        self.assert_query("source:='hello'", source_query(source__exact="hello"))
+        self.assert_query(
+            'source:="hello world"', source_query(source__exact="hello world")
+        )
+        self.assert_query(
+            "source:='hello world'", source_query(source__exact="hello world")
+        )
+        self.assert_query("source:=hello", source_query(source__exact="hello"))
 
     def test_regex(self) -> None:
-        self.assert_query('source:r"^hello"', Q(source__trgm_regex="^hello"))
+        self.assert_query('source:r"^hello"', source_query(source__trgm_regex="^hello"))
+        with self.assertRaisesRegex(
+            SearchQueryError, "Regular expression is too complex"
+        ):
+            parse_query('source:r"(a){30000000}"')
         # Invalid regex
-        with self.assertRaises(ValueError):
-            self.assert_query('source:r"^(hello"', Q(source__trgm_regex="^(hello"))
+        with self.assertRaises(SearchQueryError):
+            self.assert_query(
+                'source:r"^(hello"', source_query(source__trgm_regex="^(hello")
+            )
         # Not supported regex on PostgreSQL
-        if using_postgresql():
-            with self.assertRaises(ValueError):
-                self.assert_query(
-                    'source:r"^(?i)hello"', Q(source__trgm_regex="^(?i)hello")
-                )
-        self.assert_query('source:r"(?i)^hello"', Q(source__trgm_regex="(?i)^hello"))
+        with self.assertRaises(SearchQueryError):
+            self.assert_query(
+                'source:r"^(?i)hello"', source_query(source__trgm_regex="^(?i)hello")
+            )
+        self.assert_query(
+            'source:r"(?i)^hello"', source_query(source__trgm_regex="(?i)^hello")
+        )
 
     def test_logic(self) -> None:
         self.assert_query(
             "source:hello AND NOT target:world",
-            Q(source__substring="hello") & ~Q(target__substring="world"),
+            source_query(source__substring="hello") & ~Q(target__substring="world"),
         )
         self.assert_query(
             "source:hello OR target:world",
-            Q(source__substring="hello") | Q(target__substring="world"),
+            source_query(source__substring="hello") | Q(target__substring="world"),
         )
 
     def test_empty(self) -> None:
         self.assert_query("", Q())
 
     def test_invalid(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query(
                 "changed:inval AND target:world", Q(target__substring="world")
             )
 
     def test_year(self) -> None:
-        self.assert_query(
+        self.assert_query_sql(
             "changed:2018",
-            Q(
-                change__timestamp__range=(
-                    datetime(2018, 1, 1, 0, 0, tzinfo=UTC),
-                    datetime(2018, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
-                )
-            )
-            & Q(change__action__in=Change.ACTIONS_CONTENT),
+            sql_contains=('"timestamp" BETWEEN', '"action" IN', "EXISTS"),
+            params_contains=(
+                datetime(2018, 1, 1, 0, 0, tzinfo=UTC),
+                datetime(2018, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+            ),
         )
 
     def test_change_action(self) -> None:
-        expected = Q(
-            change__timestamp__range=(
+        self.assert_query_sql(
+            "change_time:2018 AND change_action:marked-for-edit",
+            sql_contains=('"timestamp" BETWEEN', '"action" =', "EXISTS"),
+            params_contains=(
                 datetime(2018, 1, 1, 0, 0, tzinfo=UTC),
                 datetime(2018, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
-            )
-        ) & Q(change__action=ActionEvents.MARKED_EDIT)
-        self.assert_query(
-            "change_time:2018 AND change_action:marked-for-edit", expected
+                ActionEvents.MARKED_EDIT,
+            ),
         )
-        self.assert_query(
-            "change_time:2018 AND change_action:'Marked for edit'", expected
+        sql, _params = self.assert_query_sql(
+            "change_time:2018 AND change_action:'Marked for edit'",
+            sql_contains=('"timestamp" BETWEEN', '"action" =', "EXISTS"),
+            params_contains=(
+                datetime(2018, 1, 1, 0, 0, tzinfo=UTC),
+                datetime(2018, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+                ActionEvents.MARKED_EDIT,
+            ),
         )
+        self.assertEqual(sql.count("EXISTS"), 1)
+        with self.assertRaises(SearchQueryError):
+            self.assert_query("NOT change_action:new-string", Q())
 
     def test_dates(self) -> None:
-        action_change = Q(change__action__in=Change.ACTIONS_CONTENT)
-        self.assert_query(
+        self.assert_query_sql(
             "changed:>20190301",
-            Q(change__timestamp__gte=datetime(2019, 3, 1, 0, 0, tzinfo=UTC))
-            & action_change,
+            sql_contains=('"timestamp" >=', '"action" IN', "EXISTS"),
+            params_contains=(datetime(2019, 3, 1, 0, 0, tzinfo=UTC),),
         )
-        self.assert_query(
+        self.assert_query_sql(
             "changed:>2019-03-01",
-            Q(change__timestamp__gte=datetime(2019, 3, 1, 0, 0, tzinfo=UTC))
-            & action_change,
+            sql_contains=('"timestamp" >=', '"action" IN', "EXISTS"),
+            params_contains=(datetime(2019, 3, 1, 0, 0, tzinfo=UTC),),
         )
-        self.assert_query(
+        self.assert_query_sql(
             "changed:2019-03-01",
-            Q(
-                change__timestamp__range=(
-                    datetime(2019, 3, 1, 0, 0, tzinfo=UTC),
-                    datetime(2019, 3, 1, 23, 59, 59, 999999, tzinfo=UTC),
-                )
-            )
-            & action_change,
+            sql_contains=('"timestamp" BETWEEN', '"action" IN', "EXISTS"),
+            params_contains=(
+                datetime(2019, 3, 1, 0, 0, tzinfo=UTC),
+                datetime(2019, 3, 1, 23, 59, 59, 999999, tzinfo=UTC),
+            ),
         )
-        self.assert_query(
+        self.assert_query_sql(
             "changed:>'March 1, 2019'",
-            Q(change__timestamp__gte=datetime(2019, 3, 1, 0, 0, tzinfo=UTC))
-            & action_change,
+            sql_contains=('"timestamp" >=', '"action" IN', "EXISTS"),
+            params_contains=(datetime(2019, 3, 1, 0, 0, tzinfo=UTC),),
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("changed:>'Not a date'", Q())
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("changed:>'Invalid 1, 2019'", Q())
 
     def test_date_range(self) -> None:
-        self.assert_query(
+        self.assert_query_sql(
             "changed:[2019-03-01 to 2019-04-01]",
-            Q(
-                change__timestamp__range=(
-                    datetime(2019, 3, 1, 0, 0, tzinfo=UTC),
-                    datetime(2019, 4, 1, 23, 59, 59, 999999, tzinfo=UTC),
-                )
-            )
-            & Q(change__action__in=Change.ACTIONS_CONTENT),
+            sql_contains=('"timestamp" BETWEEN', '"action" IN', "EXISTS"),
+            params_contains=(
+                datetime(2019, 3, 1, 0, 0, tzinfo=UTC),
+                datetime(2019, 4, 1, 23, 59, 59, 999999, tzinfo=UTC),
+            ),
         )
 
     def test_date_added(self) -> None:
@@ -231,14 +429,22 @@ class UnitQueryParserTest(SearchTestCase):
     def test_source_changed(self) -> None:
         self.assert_query(
             "source_changed:>20190301",
-            Q(source_unit__last_updated__gte=datetime(2019, 3, 1, 0, 0, tzinfo=UTC)),
+            source_query(
+                source_unit__last_updated__gte=datetime(2019, 3, 1, 0, 0, tzinfo=UTC)
+            ),
+        )
+
+    def test_last_updated(self) -> None:
+        self.assert_query(
+            "last_changed:>20190301",
+            Q(last_updated__gte=datetime(2019, 3, 1, 0, 0, tzinfo=UTC)),
         )
 
     def test_bool(self) -> None:
-        self.assert_query("pending:true", Q(pending_changes__isnull=False))
+        self.assert_related_query("pending:true", Q(pending_changes__isnull=False))
 
     def test_nonexisting(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("nonexisting:true", Q())
 
     def test_state(self) -> None:
@@ -250,19 +456,21 @@ class UnitQueryParserTest(SearchTestCase):
 
     def test_source_state(self) -> None:
         self.assert_query(
-            "source_state:>=empty", Q(source_unit__state__gte=STATE_EMPTY)
+            "source_state:>=empty", source_query(source_unit__state__gte=STATE_EMPTY)
         )
         self.assert_query(
-            "source_state:>=translated", Q(source_unit__state__gte=STATE_TRANSLATED)
+            "source_state:>=translated",
+            source_query(source_unit__state__gte=STATE_TRANSLATED),
         )
         self.assert_query(
-            "source_state:<translated", Q(source_unit__state__lt=STATE_TRANSLATED)
+            "source_state:<translated",
+            source_query(source_unit__state__lt=STATE_TRANSLATED),
         )
         self.assert_query(
-            "source_state:translated", Q(source_unit__state=STATE_TRANSLATED)
+            "source_state:translated", source_query(source_unit__state=STATE_TRANSLATED)
         )
         self.assert_query(
-            "source_state:needs-editing", Q(source_unit__state=STATE_FUZZY)
+            "source_state:needs-editing", source_query(source_unit__state=STATE_FUZZY)
         )
 
     def test_position(self) -> None:
@@ -271,19 +479,25 @@ class UnitQueryParserTest(SearchTestCase):
         self.assert_query("position:[1 to 10]", Q(position__range=(1, 10)))
 
     def test_invalid_state(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("state:invalid", Q())
 
     def test_parenthesis(self) -> None:
         self.assert_query(
             "state:translated AND ( source:hello OR source:bar )",
             Q(state=STATE_TRANSLATED)
-            & (Q(source__substring="hello") | Q(source__substring="bar")),
+            & (
+                source_query(source__substring="hello")
+                | source_query(source__substring="bar")
+            ),
         )
         self.assert_query(
             "state:translated AND (source:hello OR source:bar)",
             Q(state=STATE_TRANSLATED)
-            & (Q(source__substring="hello") | Q(source__substring="bar")),
+            & (
+                source_query(source__substring="hello")
+                | source_query(source__substring="bar")
+            ),
         )
 
     def test_priorities(self) -> None:
@@ -318,17 +532,72 @@ class UnitQueryParserTest(SearchTestCase):
             parse_query("(source:c OR target:c OR context:c) AND is:translated"),
         )
         self.assertEqual(
-            parse_query("c is:translated OR has:dismissed-check"),
-            parse_query(
+            Unit.objects.search(
+                "c is:translated OR has:dismissed-check"
+            ).query.sql_with_params(),
+            Unit.objects.search(
                 "((source:c OR target:c OR context:c) AND is:translated) OR has:dismissed-check"
-            ),
+            ).query.sql_with_params(),
         )
 
     def test_language(self) -> None:
-        self.assert_query("language:cs", Q(translation__language__code__iexact="cs"))
+        language = Language.objects.get(code="cs")
+        for query in ("language:cs", "language:CS", 'language:"cs"', "language:=cs"):
+            with self.subTest(query=query):
+                self.assert_query(query, Q(translation__language_id__in=[language.pk]))
+        for query in (
+            "language:=CS",
+            "language:unknown-search-code",
+            'language:"Czech"',
+        ):
+            with self.subTest(query=query):
+                self.assert_query(query, Q(translation__language_id__in=[]))
+
+    def test_language_case_collisions(self) -> None:
+        # Cached language objects can outlive a fixture reload and its IDs.
+        lower = Language.objects.get(code="cs", skip_cache=True)
+        upper = Language.objects.get(code="en", skip_cache=True)
+        Language.objects.filter(pk=lower.pk).update(code="qaa_search")
+        Language.objects.filter(pk=upper.pk).update(code="QAA_SEARCH")
+        self.assert_query_sql(
+            "language:qaa_search",
+            sql_contains=('"trans_translation"."language_id" IN',),
+            sql_not_contains=('"lang_language"',),
+            params_contains=(lower.pk, upper.pk),
+        )
+        self.assert_query(
+            "language:=qaa_search", Q(translation__language_id__in=[lower.pk])
+        )
+        self.assert_query(
+            "language:=QAA_SEARCH", Q(translation__language_id__in=[upper.pk])
+        )
+
+    def test_language_cached_parse_resolves_current_ids(self) -> None:
+        query = "language:qaa_search"
+        self.assert_query(query, Q(translation__language_id__in=[]))
+        language = Language.objects.get(code="cs")
+        Language.objects.filter(pk=language.pk).update(code="qaa_search")
+        self.assert_query(query, Q(translation__language_id__in=[language.pk]))
+        Language.objects.filter(pk=language.pk).update(code="qaa_search_renamed")
+        self.assert_query(query, Q(translation__language_id__in=[]))
+
+    def test_language_nonliteral_lookups(self) -> None:
         self.assert_query(
             'language:r".*"', Q(translation__language__code__trgm_regex=".*")
         )
+        with self.assertRaises(SearchQueryError):
+            parse_query('language:r"["')
+        for operator, lookup in (
+            (":<", "lt"),
+            (":<=", "lte"),
+            (":>", "gt"),
+            (":>=", "gte"),
+        ):
+            with self.subTest(operator=operator):
+                self.assert_query(
+                    f"language{operator}cs",
+                    Q(**{f"translation__language__code__{lookup}": "cs"}),
+                )
 
     def test_component(self) -> None:
         self.assert_query(
@@ -359,22 +628,34 @@ class UnitQueryParserTest(SearchTestCase):
     def test_html(self) -> None:
         self.assert_query(
             "<b>bold</b>",
-            Q(source__substring="<b>bold</b>")
+            source_query(source__substring="<b>bold</b>")
             | Q(target__substring="<b>bold</b>")
             | Q(context__substring="<b>bold</b>"),
         )
 
     def test_has(self) -> None:
-        self.assert_query("has:plural", Q(source__search=PLURAL_SEPARATOR))
-        self.assert_query("has:suggestion", Q(suggestion__isnull=False))
-        self.assert_query("has:check", Q(check__dismissed=False))
-        self.assert_query("has:comment", Q(comment__resolved=False))
+        self.assert_query(
+            "has:plural", source_query(source__trgm_search=PLURAL_SEPARATOR)
+        )
+        self.assert_related_query("has:suggestion", Q(suggestion__isnull=False))
+        self.assert_related_query("has:check", Q(check__dismissed=False))
+        self.assert_related_query("has:comment", Q(comment__resolved=False))
         self.assert_query("has:note", ~Q(note=""))
         self.assert_query("has:location", ~Q(location=""))
-        self.assert_query("has:resolved-comment", Q(comment__resolved=True))
-        self.assert_query("has:dismissed-check", Q(check__dismissed=True))
+        self.assert_related_query("has:resolved-comment", Q(comment__resolved=True))
+        source_comment = Q(source_unit__comment__resolved=False) | Q(
+            translation_parent__comment__resolved=False
+        )
+        self.assert_related_query("has:source-comment", source_comment)
+        self.assert_related_query("has:source_comment", source_comment)
+        self.assert_related_query(
+            "has:resolved-source-comment",
+            Q(source_unit__comment__resolved=True)
+            | Q(translation_parent__comment__resolved=True),
+        )
+        self.assert_related_query("has:dismissed-check", Q(check__dismissed=True))
         self.assert_query("has:translation", Q(state__gte=STATE_TRANSLATED))
-        self.assert_query(
+        self.assert_related_query(
             "has:variant",
             Q(defined_variants__isnull=False)
             | (
@@ -382,11 +663,9 @@ class UnitQueryParserTest(SearchTestCase):
                 & Q(context__regex=F("variant__variant_regex"))
             ),
         )
-        self.assert_query(
-            "has:label", Q(source_unit__labels__isnull=False) | Q(labels__isnull=False)
-        )
+        self.assert_related_query("has:label", Q(source_unit__labels__isnull=False))
         self.assert_query("has:context", ~Q(context=""))
-        self.assert_query(
+        self.assert_related_query(
             "has:screenshot",
             Q(screenshots__isnull=False) | Q(source_unit__screenshots__isnull=False),
         )
@@ -395,19 +674,92 @@ class UnitQueryParserTest(SearchTestCase):
         self.assert_query("has:glossary", Q(source__isnull=True))
 
     def test_is(self) -> None:
-        self.assert_query("is:pending", Q(pending_changes__isnull=False))
+        self.assert_related_query("is:pending", Q(pending_changes__isnull=False))
         self.assert_query("is:translated", Q(state__gte=STATE_TRANSLATED))
         self.assert_query("is:untranslated", Q(state__lt=STATE_TRANSLATED))
         self.assert_query("is:approved", Q(state=STATE_APPROVED))
         self.assert_query("is:read-only", Q(state=STATE_READONLY))
-        self.assert_query("is:fuzzy", Q(state=STATE_FUZZY))
+        self.assert_query("is:fuzzy", Q(state__in=FUZZY_STATES))
+        self.assert_query("is:needs-editing", Q(state__in=FUZZY_STATES))
+
+    def test_fuzzy_state_aliases(self) -> None:
+        self.assert_query("state:needs-editing", Q(state=STATE_FUZZY))
+        self.assert_query("state:needs-rewriting", Q(state=STATE_NEEDS_REWRITING))
+        self.assert_query("state:needs-checking", Q(state=STATE_NEEDS_CHECKING))
 
     def test_changed_by(self) -> None:
-        self.assert_query(
+        self.assert_query_sql(
             "changed_by:nijel",
-            Q(change__author__username__iexact="nijel")
-            & Q(change__action__in=Change.ACTIONS_CONTENT),
+            sql_contains=('"username"', '"action" IN', "EXISTS"),
+            params_contains=("nijel",),
         )
+        self.assert_query_sql(
+            "changed_by:none",
+            sql_contains=('"username"', '"action" IN', "EXISTS"),
+            params_contains=("none",),
+        )
+
+        sql, _params = self.assert_query_sql(
+            'changed_by:""',
+            sql_contains=('"action" IN', '"author_id" IS NULL', "EXISTS"),
+            sql_not_contains=('"weblate_auth_user"',),
+        )
+        self.assertEqual(sql.count("EXISTS"), 1)
+
+        sql, _params = self.assert_query_sql(
+            'NOT changed_by:""',
+            sql_contains=(
+                "NOT (EXISTS",
+                '"action" IN',
+                '"author_id" IS NULL',
+                "EXISTS",
+            ),
+        )
+        self.assertEqual(sql.count("EXISTS"), 1)
+
+        sql, _params = self.assert_query_sql(
+            'changed_by:"" AND changed:2026',
+            sql_contains=(
+                '"timestamp" BETWEEN',
+                '"action" IN',
+                '"author_id" IS NULL',
+                "EXISTS",
+            ),
+            params_contains=(
+                datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+                datetime(2026, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+            ),
+        )
+        self.assertEqual(sql.count("EXISTS"), 1)
+
+        sql, _params = self.assert_query_sql(
+            'changed_by:"" OR change_action:marked-for-edit',
+            sql_contains=('"author_id" IS NULL', '"action" =', "EXISTS"),
+            params_contains=(ActionEvents.MARKED_EDIT,),
+        )
+        self.assertEqual(sql.count("EXISTS"), 2)
+
+        start_2026 = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+        end_2026 = datetime(2026, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+        sql, params = self.assert_query_sql(
+            '(changed_by:"" OR changed_by:nijel) AND changed:2026',
+            sql_contains=(
+                '"timestamp" BETWEEN',
+                '"action" IN',
+                '"author_id" IS NULL',
+                '"username"',
+                "EXISTS",
+            ),
+            params_contains=("nijel", start_2026, end_2026),
+        )
+        self.assertEqual(sql.count("EXISTS"), 2)
+        self.assertEqual(params.count(start_2026), 2)
+        self.assertEqual(params.count(end_2026), 2)
+
+    def test_changed_query_complexity_limit(self) -> None:
+        query = " AND ".join("(changed_by:nijel OR changed_by:none)" for _ in range(13))
+        with self.assertRaises(SearchQueryError):
+            parse_query(query)
 
     def test_explanation(self) -> None:
         self.assert_query(
@@ -415,33 +767,11 @@ class UnitQueryParserTest(SearchTestCase):
         )
 
     def test_suggestions(self) -> None:
-        self.assert_query("suggestion:text", Q(suggestion__target__substring="text"))
-        self.assert_query(
+        self.assert_related_query(
+            "suggestion:text", Q(suggestion__target__substring="text")
+        )
+        self.assert_related_query(
             "suggestion_author:nijel", Q(suggestion__user__username__iexact="nijel")
-        )
-
-    def test_checks(self) -> None:
-        self.assert_query(
-            "check:ellipsis",
-            Q(check__name__iexact="ellipsis") & Q(check__dismissed=False),
-        )
-        self.assert_query(
-            "dismissed_check:ellipsis",
-            Q(check__name__iexact="ellipsis") & Q(check__dismissed=True),
-        )
-
-    def test_labels(self) -> None:
-        self.assert_query(
-            "label:'test label'",
-            Q(source_unit__labels__name__iexact="test label")
-            | Q(labels__name__iexact="test label"),
-        )
-
-    def test_screenshot(self) -> None:
-        self.assert_query(
-            "screenshot:'test screenshot'",
-            Q(source_unit__screenshots__name__iexact="test screenshot")
-            | Q(screenshots__name__iexact="test screenshot"),
         )
 
     def test_priority(self) -> None:
@@ -459,17 +789,17 @@ class UnitQueryParserTest(SearchTestCase):
         self.assert_query(
             "[one to other]",
             (
-                Q(source__substring="[one")
+                source_query(source__substring="[one")
                 | Q(target__substring="[one")
                 | Q(context__substring="[one")
             )
             & (
-                Q(source__substring="to")
+                source_query(source__substring="to")
                 | Q(target__substring="to")
                 | Q(context__substring="to")
             )
             & (
-                Q(source__substring="other]")
+                source_query(source__substring="other]")
                 | Q(target__substring="other]")
                 | Q(context__substring="other]")
             ),
@@ -482,22 +812,72 @@ class UnitQueryParserTest(SearchTestCase):
         )
 
     def test_timestamp_format(self) -> None:
-        self.assert_query(
+        self.assert_query_sql(
             "changed:>=01/20/2020",
-            Q(change__timestamp__gte=datetime(2020, 1, 20, 0, 0, tzinfo=UTC))
-            & Q(change__action__in=Change.ACTIONS_CONTENT),
+            sql_contains=('"timestamp" >=', '"action" IN', "EXISTS"),
+            params_contains=(datetime(2020, 1, 20, 0, 0, tzinfo=UTC),),
+        )
+
+    def test_timestamp_exact_iso(self) -> None:
+        timestamp = datetime.now(tz=timezone(timedelta(hours=3)))
+        self.assert_query_sql(
+            f"changed:{timestamp.isoformat()}",
+            sql_contains=('"timestamp" =', '"action" IN', "EXISTS"),
+            params_contains=(timestamp,),
+        )
+        self.assert_query_sql(
+            f"changed:={timestamp.isoformat()}",
+            sql_contains=('"timestamp" =', '"action" IN', "EXISTS"),
+            params_contains=(timestamp,),
+        )
+
+    def test_timestamp_exact_date(self) -> None:
+        # The microsecond = 5 is relict from the parser, it should be avoided if possible
+        timestamp = datetime(
+            2013, 7, 21, 22, 15, 20, tzinfo=timezone(timedelta(hours=5))
+        )
+        self.assert_query_sql(
+            "changed:='21 July 2013 10:15:20 pm +0500'",
+            sql_contains=('"timestamp" =', '"action" IN', "EXISTS"),
+            params_contains=(timestamp,),
+        )
+
+    def test_timestamp_exact_human(self) -> None:
+        timestamp = datetime(2013, 7, 21, 22, 15, 20, tzinfo=get_current_timezone())
+        self.assert_query_sql(
+            "changed:='21 July year 2013 10:15:20 pm'",
+            sql_contains=('"timestamp" =', '"action" IN', "EXISTS"),
+            params_contains=(timestamp,),
         )
 
     def test_timestamp_interval(self) -> None:
-        self.assert_query(
+        self.assert_query_sql(
             "changed:2020-03-27",
-            Q(
-                change__timestamp__range=(
-                    datetime(2020, 3, 27, 0, 0, tzinfo=UTC),
-                    datetime(2020, 3, 27, 23, 59, 59, 999999, tzinfo=UTC),
-                )
-            )
-            & Q(change__action__in=Change.ACTIONS_CONTENT),
+            sql_contains=('"timestamp" BETWEEN', '"action" IN', "EXISTS"),
+            params_contains=(
+                datetime(2020, 3, 27, 0, 0, tzinfo=UTC),
+                datetime(2020, 3, 27, 23, 59, 59, 999999, tzinfo=UTC),
+            ),
+        )
+
+    def test_timestamp_interval_human(self) -> None:
+        today = datetime.now(tz=get_current_timezone())
+        timestamp = today - timedelta(days=20)
+        self.assert_query_sql(
+            "changed:'20 days ago'",
+            sql_contains=('"timestamp" BETWEEN', '"action" IN', "EXISTS"),
+            params_contains=(
+                timestamp.replace(hour=0, minute=0, second=0, microsecond=0),
+                timestamp.replace(hour=23, minute=59, second=59, microsecond=999999),
+            ),
+        )
+        self.assert_query_sql(
+            "changed:[20_days_ago to today]",
+            sql_contains=('"timestamp" BETWEEN', '"action" IN', "EXISTS"),
+            params_contains=(
+                timestamp.replace(hour=0, minute=0, second=0, microsecond=0),
+                today.replace(hour=23, minute=59, second=59, microsecond=999999),
+            ),
         )
 
     def test_non_quoted_strings(self) -> None:
@@ -511,12 +891,12 @@ class UnitQueryParserTest(SearchTestCase):
         self.assert_query(
             "to %{_topdir}",
             (
-                Q(source__substring="to")
+                source_query(source__substring="to")
                 | Q(target__substring="to")
                 | Q(context__substring="to")
             )
             & (
-                Q(source__substring="%{_topdir}")
+                source_query(source__substring="%{_topdir}")
                 | Q(target__substring="%{_topdir}")
                 | Q(context__substring="%{_topdir}")
             ),
@@ -532,27 +912,100 @@ class UnitQueryParserTest(SearchTestCase):
         self.assert_query('source:"', parse_query("""source:'"'"""))
 
     def test_labels_count(self) -> None:
-        annotation = {"labels_count": Count("source_unit__labels") + Count("labels")}
+        for query, expected in (
+            ("labels_count:2", Q(labels_count=2)),
+            ("labels_count:=2", Q(labels_count__exact=2)),
+            ("labels_count:>3", Q(labels_count__gt=3)),
+            ("labels_count:<=1", Q(labels_count__lte=1)),
+        ):
+            with self.subTest(query=query):
+                filters, annotations = parse_query(query)
+                self.assertEqual(filters, expected)
+                queryset = Unit.objects.annotate(**annotations).filter(filters)
+                sql = str(queryset.query)
+                self.assertIn("COALESCE", sql)
+                self.assertIn("COUNT(", sql)
+                self.assertIsNone(queryset.query.group_by)
+                self.assertFalse(queryset.exists())
+
+        with self.assertRaises(SearchQueryError):
+            parse_query("labels_count:invalid")
+
+
+class ScreenshotQueryParserTest(SearchTestCase):
+    object_class: ClassVar[type[Unit | User | Screenshot]] = Screenshot
+    parser: ClassVar[Literal["unit", "user", "superuser", "screenshot"]] = "screenshot"
+
+    def test_simple(self) -> None:
+        self.assert_query("login", Q(name__icontains="login"))
+
+    def test_fields(self) -> None:
+        self.assert_query("id:100", Q(id=100))
+        self.assert_query("name:login", Q(name__icontains="login"))
+        self.assert_query("name:=login", Q(name__exact="login"))
+        self.assert_query("path:fastlane", Q(repository_filename__icontains="fastlane"))
         self.assert_query(
-            "labels_count:2", Q(labels_count=2), expected_annotations=annotation
+            "repository:fastlane", Q(repository_filename__icontains="fastlane")
+        )
+        self.assert_query("string:Save", Q(units__source__icontains="Save"))
+        self.assert_query("context:menu", Q(units__context__icontains="menu"))
+        self.assert_query("location:main", Q(units__location__icontains="main"))
+
+    def test_language(self) -> None:
+        self.assert_query(
+            "language:cs",
+            Q(translation__language__code__icontains="cs")
+            | Q(translation__language__name__icontains="cs"),
         )
         self.assert_query(
-            "labels_count:=2", Q(labels_count__exact=2), expected_annotations=annotation
+            "language:=Czech",
+            Q(translation__language__code__iexact="Czech")
+            | Q(translation__language__name__iexact="Czech"),
         )
         self.assert_query(
-            "labels_count:>3", Q(labels_count__gt=3), expected_annotations=annotation
+            'language:r".*"',
+            Q(translation__language__code__trgm_regex=".*")
+            | Q(translation__language__name__trgm_regex=".*"),
         )
+        with self.assertRaises(SearchQueryError):
+            self.assert_query('language:r"["', Q())
+
+    def test_has(self) -> None:
+        self.assert_query("has:string", Q(units__isnull=False))
+        self.assert_query("NOT has:string", ~Q(units__isnull=False))
+        self.assert_query("has:repository", ~Q(repository_filename=""))
+        self.assert_query("has:path", ~Q(repository_filename=""))
+
+    def test_strings_count(self) -> None:
+        annotation = {"strings": Count("units", distinct=True)}
+        self.assert_query("strings:2", Q(strings=2), expected_annotations=annotation)
         self.assert_query(
-            "labels_count:<=1", Q(labels_count__lte=1), expected_annotations=annotation
+            "strings:>2", Q(strings__gt=2), expected_annotations=annotation
         )
 
-        with self.assertRaises(ValueError):
-            self.assert_query("labels_count:invalid", Q())
+    def test_timestamp(self) -> None:
+        self.assert_query(
+            "timestamp:2018",
+            Q(
+                timestamp__range=(
+                    datetime(2018, 1, 1, 0, 0, tzinfo=UTC),
+                    datetime(2018, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+                )
+            ),
+        )
+
+    def test_invalid(self) -> None:
+        with self.assertRaises(SearchQueryError):
+            self.assert_query("state:translated", Q())
+        with self.assertRaises(SearchQueryError):
+            self.assert_query("has:translation", Q())
+        with self.assertRaises(SearchQueryError):
+            self.assert_query("strings:invalid", Q())
 
 
 class UserQueryParserTest(SearchTestCase):
-    object_class: ClassVar[type[Unit | User]] = User
-    parser: ClassVar[Literal["unit", "user", "superuser"]] = "user"
+    object_class: ClassVar[type[Unit | User | Screenshot]] = User
+    parser: ClassVar[Literal["unit", "user", "superuser", "screenshot"]] = "user"
 
     def test_simple(self) -> None:
         self.assert_query(
@@ -571,22 +1024,26 @@ class UserQueryParserTest(SearchTestCase):
         )
 
     def test_is(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("is:bot", Q(is_bot=True))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("is:superuser", Q(is_superuser=True))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query("is:active", Q(is_active=True))
 
     def test_language(self) -> None:
         self.assert_query("language:cs", (Q(profile__languages__code__iexact="cs")))
 
     def test_email(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(SearchQueryError):
             self.assert_query(
                 "email:hello",
                 Q(social_auth__verifiedemail__email__icontains="hello"),
             )
+
+    def test_ip(self) -> None:
+        with self.assertRaises(SearchQueryError):
+            self.assert_query("ip:192.0.2.1", Q(auditlog__address="192.0.2.1"))
 
     def test_joined(self) -> None:
         self.assert_query(
@@ -616,29 +1073,36 @@ class UserQueryParserTest(SearchTestCase):
         )
 
     def test_contributes(self) -> None:
+        user = User.objects.create(is_superuser=True)
         self.assert_query(
             "contributes:test",
-            Q(change__project__slug__iexact="test"),
+            Q(change__project__slug__iexact="test")
+            & Q(change__project__in=user.allowed_projects),
+            user=user,
         )
         self.assert_query(
             "contributes:test/test",
-            Q(change__component_id__in=[]),
+            Q(change__component_id__in=[])
+            & Q(change__project__in=user.allowed_projects),
+            user=user,
         )
         self.assert_query(
             "contributes:test change_time:>'90 days ago'",
             Q(change__project__slug__iexact="test")
+            & Q(change__project__in=user.allowed_projects)
             & Q(
                 change__timestamp__gte=datetime.now(tz=UTC).replace(
                     hour=0, minute=0, second=0, microsecond=0
                 )
                 - timedelta(days=90)
             ),
+            user=user,
         )
 
 
 class SuperuserQueryParserTest(UserQueryParserTest):
-    object_class: ClassVar[type[Unit | User]] = User
-    parser: ClassVar[Literal["unit", "user", "superuser"]] = "superuser"
+    object_class: ClassVar[type[Unit | User | Screenshot]] = User
+    parser: ClassVar[Literal["unit", "user", "superuser", "screenshot"]] = "superuser"
 
     def test_simple(self) -> None:
         self.assert_query(
@@ -655,6 +1119,21 @@ class SuperuserQueryParserTest(UserQueryParserTest):
             "email:hello", Q(social_auth__verifiedemail__email__icontains="hello")
         )
 
+    def test_ip(self) -> None:
+        self.assert_query("ip:192.0.2.1", Q(auditlog__address="192.0.2.1"))
+        self.assert_query("ip:2001:0db8::1", Q(auditlog__address="2001:db8::1"))
+        with self.assertRaises(SearchQueryError):
+            self.assert_query("ip:not-an-ip", Q(auditlog__address="not-an-ip"))
+
+    def test_plain_ip(self) -> None:
+        self.assert_query(
+            "192.0.2.1",
+            Q(username__icontains="192.0.2.1")
+            | Q(full_name__icontains="192.0.2.1")
+            | Q(social_auth__verifiedemail__email__iexact="192.0.2.1")
+            | Q(auditlog__address="192.0.2.1"),
+        )
+
     def test_is(self) -> None:
         self.assert_query("is:bot", Q(is_bot=True))
         self.assert_query("is:superuser", Q(is_superuser=True))
@@ -666,6 +1145,267 @@ class SearchTest(ViewTestCase, SearchTestCase):
 
     CREATE_GLOSSARIES: bool = True
 
+    def search_matches_unit(self, query: str, unit: Unit) -> bool:
+        filters, annotations = parse_query(query, parser=self.parser)
+        return Unit.objects.annotate(**annotations).filter(filters, pk=unit.pk).exists()
+
+    def test_language_boolean_filters(self) -> None:
+        unit = self.get_unit()
+        units = Unit.objects.filter(pk__in=(unit.pk, unit.source_unit.pk))
+        czech = Q(translation__language__code__iexact="cs")
+        english = Q(translation__language__code__iexact="en")
+        unknown = Q(translation__language__code__iexact="unknown-search-code")
+        for query, original in (
+            ("language:CS", czech),
+            ('language:"cs"', czech),
+            ("language:=cs", Q(translation__language__code__exact="cs")),
+            ("language:=CS", Q(translation__language__code__exact="CS")),
+            ("language:unknown-search-code", unknown),
+            ("NOT language:unknown-search-code", ~unknown),
+            ("NOT language:cs", ~czech),
+            ("language:cs OR language:en", czech | english),
+            ("language:cs AND language:en", czech & english),
+            ("language:cs AND NOT language:unknown-search-code", czech & ~unknown),
+            ("NOT (language:cs OR language:unknown-search-code)", ~(czech | unknown)),
+            (
+                "(language:unknown-search-code OR language:cs) AND NOT language:en",
+                (unknown | czech) & ~english,
+            ),
+            (f"language:unknown-search-code OR id:{unit.pk}", unknown | Q(pk=unit.pk)),
+            (f"language:unknown-search-code AND id:{unit.pk}", unknown & Q(pk=unit.pk)),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(
+                    list(
+                        units.search(query).order_by("pk").values_list("pk", flat=True)
+                    ),
+                    list(
+                        units.filter(original)
+                        .order_by("pk")
+                        .values_list("pk", flat=True)
+                    ),
+                )
+
+    def test_language_lookup_is_reused_for_search_operations(self) -> None:
+        unit = self.get_unit()
+        base = Unit.objects.filter(pk__in=(unit.pk, unit.source_unit.pk))
+        with self.assertNumQueries(1):
+            units = base.search("language:cs")
+        with CaptureQueriesContext(connection) as queries:
+            count = units.count()
+            words = units.aggregate(words=Sum("num_words"))["words"]
+            page = list(units.order_by("-priority", "position", "pk")[:22])
+        self.assertEqual(count, 1)
+        self.assertEqual(words, unit.num_words)
+        self.assertEqual([result.pk for result in page], [unit.pk])
+        self.assertEqual(len(queries), 3)
+        for query in queries:
+            self.assertNotIn('"lang_language"', query["sql"])
+            self.assertIn('"trans_translation"."language_id"', query["sql"])
+        with self.assertNumQueries(2):
+            parse_query("language:cs OR language:en")
+
+    def test_related_search_preserves_matching_without_duplicates(self) -> None:
+        unit = self.get_unit()
+        other = User.objects.create(username="search-other")
+        Comment.objects.bulk_create(
+            [
+                Comment(unit=unit, user=self.user, comment="alpha"),
+                Comment(unit=unit, user=other, comment="beta"),
+                Comment(unit=unit, user=self.user, comment="alpha", resolved=True),
+                Comment(unit=unit.source_unit, user=other, comment="alpha"),
+                Comment(unit=unit.source_unit, user=self.user, comment="beta"),
+            ]
+        )
+        Suggestion.objects.bulk_create(
+            [
+                Suggestion(unit=unit, user=self.user, target="alpha"),
+                Suggestion(unit=unit, user=other, target="beta"),
+            ]
+        )
+        PendingUnitChange.objects.bulk_create(
+            [PendingUnitChange(unit=unit, author=self.user) for _ in range(2)]
+        )
+        for name in ("php_format", "bbcode"):
+            Check.objects.get_or_create(unit=unit, name=name)
+        for name in ("first", "second"):
+            label = self.project.label_set.create(name=name, color="black")
+            unit.source_unit.labels.add(label)
+            screenshot = Screenshot.objects.create(
+                name=name, translation=unit.translation, user=self.user
+            )
+            screenshot.units.add(unit, unit.source_unit)
+            variant = Variant.objects.create(component=self.component, key=name)
+            variant.defining_units.add(unit)
+
+        units = Unit.objects.filter(pk__in=(unit.pk, unit.source_unit.pk))
+        queries = (
+            "hello",
+            "has:comment",
+            "has:resolved-comment",
+            "has:source-comment",
+            "has:resolved-source-comment",
+            "has:suggestion",
+            "has:check",
+            "has:dismissed-check",
+            "has:label",
+            "has:screenshot",
+            "has:variant",
+            "has:shaping",
+            "pending:true",
+            "pending:false",
+            "is:pending",
+            "NOT has:comment",
+            "NOT pending:true",
+            "comment:alpha AND comment:beta",
+            "comment:alpha comment:beta",
+            "comment:alpha OR comment:beta",
+            f"comment:alpha AND comment_author:={other.username}",
+            f"(comment:alpha OR comment:beta) AND comment_author:={other.username}",
+            f"NOT (comment:alpha AND comment_author:={other.username})",
+            f"comment:alpha AND NOT comment_author:={other.username}",
+            "comment:alpha AND resolved_comment:alpha",
+            "NOT (comment:alpha OR resolved_comment:alpha)",
+            "source_comment:alpha AND source_comment:beta",
+            f"source_comment:alpha AND source_comment_author:={self.user.username}",
+            "source_comment:alpha AND comment:beta",
+            f"suggestion:alpha AND suggestion_author:={other.username}",
+            "comment:alpha AND suggestion:beta",
+            f"suggestion:alpha OR id:{unit.source_unit_id}",
+            f"(comment:alpha OR id:{unit.source_unit_id}) AND comment:beta",
+            f"(comment:alpha AND suggestion:beta) OR id:{unit.source_unit_id}",
+            "NOT (comment:alpha AND suggestion:beta)",
+            "comment:alpha AND has:check AND has:label",
+            "label:first AND label:second",
+            "screenshot:first AND screenshot:second",
+            "check:php_format AND check:bbcode",
+        )
+        for query in queries:
+            with self.subTest(query=query):
+                # Compare with the original join-based predicate, including its
+                # shared-row and negation semantics, rather than a new oracle.
+                original = parser_to_query(
+                    parse_string(query, "unit"), {"project": self.project}
+                )
+                expected = sorted(
+                    set(units.filter(original).values_list("pk", flat=True))
+                )
+                matching = units.search(query, project=self.project).order_by("pk")
+                self.assertEqual(list(matching.values_list("pk", flat=True)), expected)
+                self.assertEqual(matching.count(), len(expected))
+                self.assertEqual(
+                    matching.aggregate(words=Sum("num_words"))["words"],
+                    units.filter(pk__in=expected).aggregate(words=Sum("num_words"))[
+                        "words"
+                    ],
+                )
+                self.assertFalse(matching.query.distinct)
+                sql = str(matching.values("pk").query)
+                outer = sql.split(" WHERE ", 1)[0]
+                for table in (
+                    "trans_comment",
+                    "trans_suggestion",
+                    "trans_pendingunitchange",
+                    "trans_unit_labels",
+                    "trans_variant_defining_units",
+                    "checks_check",
+                    "screenshots_screenshot_units",
+                ):
+                    self.assertNotIn(f'JOIN "{table}"', outer)
+
+        self.assertFalse(
+            units.filter(pk=unit.pk)
+            .search(f"comment:alpha AND comment_author:={other.username}")
+            .exists()
+        )
+        self.assertFalse(
+            units.filter(pk=unit.pk)
+            .search(f"suggestion:alpha AND suggestion_author:={other.username}")
+            .exists()
+        )
+        self.assertTrue(units.distinct().search("has:comment").query.distinct)
+        self.assertEqual(
+            units.distinct("target").search("has:comment").query.distinct_fields,
+            ("target",),
+        )
+
+    def test_label_count_is_independent_of_related_matches(self) -> None:
+        unit = self.get_unit()
+        units = Unit.objects.filter(pk=unit.pk)
+        Comment.objects.bulk_create(
+            [Comment(unit=unit, user=self.user, comment="alpha") for _ in range(3)]
+        )
+        self.assertEqual(units.search("labels_count:0").count(), 1)
+        self.assertEqual(units.search("labels_count:>0").count(), 0)
+        for name in ("first", "second"):
+            label = self.project.label_set.create(name=name, color="black")
+            unit.source_unit.labels.add(label)
+
+        for query in (
+            "labels_count:2",
+            "labels_count:=2 AND comment:alpha",
+            "labels_count:>=2 AND label:first",
+            "labels_count:<=2 AND NOT comment:beta",
+            "(labels_count:2 OR comment:beta) AND has:comment",
+        ):
+            with self.subTest(query=query):
+                matching = units.search(query)
+                self.assertEqual(list(matching.values_list("pk", flat=True)), [unit.pk])
+                for sort_by in ("num_comments", "num_failing_checks", "labels"):
+                    ordered = matching.order_by_request({"sort_by": sort_by}, None)
+                    self.assertEqual(
+                        list(ordered.values_list("pk", flat=True)), [unit.pk]
+                    )
+                self.assertEqual(
+                    matching.order_by_request({"sort_by": "num_comments"}, None)
+                    .values_list("comment__count", flat=True)
+                    .get(),
+                    3,
+                )
+
+    def test_change_search_same_event_semantics(self) -> None:
+        unit = self.get_unit()
+        Change.objects.filter(unit=unit).delete()
+        other_user = User.objects.create(username="other-user")
+
+        authorless_change = Change.objects.create(
+            user=get_test_actor(self),
+            unit=unit,
+            action=ActionEvents.CHANGE,
+            author=None,
+        )
+        Change.objects.filter(pk=authorless_change.pk).update(
+            timestamp=datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
+        )
+        authored_change = Change.objects.create(
+            user=get_test_actor(self),
+            unit=unit,
+            action=ActionEvents.CHANGE,
+            author=other_user,
+        )
+        Change.objects.filter(pk=authored_change.pk).update(
+            timestamp=datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+        )
+
+        query = 'changed_by:"" AND changed:2026'
+        self.assertFalse(self.search_matches_unit(query, unit))
+        grouped_query = (
+            f'(changed_by:"" OR changed_by:{self.user.username}) AND changed:2026'
+        )
+        self.assertFalse(self.search_matches_unit(grouped_query, unit))
+
+        authorless_2026_change = Change.objects.create(
+            user=get_test_actor(self),
+            unit=unit,
+            action=ActionEvents.CHANGE,
+            author=None,
+        )
+        Change.objects.filter(pk=authorless_2026_change.pk).update(
+            timestamp=datetime(2026, 6, 1, 0, 0, tzinfo=UTC)
+        )
+        self.assertTrue(self.search_matches_unit(query, unit))
+        self.assertTrue(self.search_matches_unit(grouped_query, unit))
+
     def test_glossary_empty(self) -> None:
         self.assert_query("has:glossary", Q(source__isnull=True), project=self.project)
 
@@ -673,10 +1413,7 @@ class SearchTest(ViewTestCase, SearchTestCase):
         glossary = self.project.glossaries[0].translation_set.get(language_code="cs")
         glossary.add_unit(None, "", "hello", "ahoj", author=self.user)
 
-        if using_postgresql():
-            expected = "[[:<:]](hello)[[:>:]]"
-        else:
-            expected = r"(^|[ \t\n\r\f\v])(hello)($|[ \t\n\r\f\v])"
+        expected = "[[:<:]](hello)[[:>:]]"
         self.assert_query(
             "has:glossary",
             Q(source__iregex=expected),

@@ -4,16 +4,24 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from django.core.checks import (
-    CheckMessage,
     Critical,
-    Debug,
-    Error,
-    Info,
-    Warning,  # noqa: A004
 )
 
 from weblate.utils.docs import get_doc_url
+
+if TYPE_CHECKING:
+    from django.core.checks import (
+        CheckMessage,
+        Debug,
+        Error,
+        Info,
+    )
+    from django.core.checks import (
+        Warning as DjangoWarning,
+    )
 
 DOC_LINKS: dict[str, str | tuple[str] | tuple[str, str]] = {
     "security.W001": ("admin/upgdade", "up-3-1"),
@@ -51,7 +59,7 @@ DOC_LINKS: dict[str, str | tuple[str] | tuple[str, str]] = {
     "weblate.I021": ("admin/install", "collecting-errors"),
     "weblate.E022": ("admin/optionals", "git-exporter"),
     "weblate.C023": ("admin/install", "production-encoding"),
-    "weblate.C024": ("admin/install", "pangocairo"),
+    "weblate.C024": ("admin/install", "python-deps"),
     "weblate.W025": ("admin/install", "optional-deps"),
     "weblate.E026": ("admin/install", "celery"),
     "weblate.E027": ("admin/install", "file-permissions"),
@@ -61,7 +69,7 @@ DOC_LINKS: dict[str, str | tuple[str] | tuple[str, str]] = {
     "weblate.C030": ("admin/install", "celery"),
     "weblate.I031": ("admin/upgrade",),
     "weblate.C031": ("admin/upgrade",),
-    "weblate.C032": ("admin/install",),
+    "weblate.C032": ("admin/install", "hardware"),
     "weblate.W033": ("vcs",),
     "weblate.E034": ("admin/install", "celery"),
     "weblate.C035": ("vcs",),
@@ -72,6 +80,15 @@ DOC_LINKS: dict[str, str | tuple[str] | tuple[str, str]] = {
     "weblate.C040": ("vcs",),
     "weblate.C041": "https://weblate.org/user/",
     "weblate.C042": ("admin/config", "std-setting-REGISTRATION_ALLOW_BACKENDS"),
+    "weblate.E043": ("admin/install", "hardware"),
+    "weblate.C044": ("admin/config", "std-setting-CACHE_DIR"),
+    "weblate.C045": ("admin/install", "production-database"),
+    "weblate.C047": ("admin/install", "production-database"),
+    "weblate.W048": ("admin/install", "hardware"),
+    "weblate.W049": ("admin/install/docker", "docker-startup-warnings"),
+    "weblate.E050": ("api", "api-rate"),
+    "weblate.W052": ("admin/access", "account-security-findings"),
+    "weblate.C051": ("admin/config", "default-notifications"),
 }
 
 
@@ -92,7 +109,7 @@ def check_doc_link(docid: str, strict: bool = False) -> str | None:
 def weblate_check(
     check_id: str,
     message: str,
-    cls: type[Critical | Debug | Error | Info | Warning] = Critical,
+    cls: type[Critical | Debug | Error | Info | DjangoWarning] = Critical,
 ) -> CheckMessage:
     """Return Django check instance."""
     return cls(message, hint=check_doc_link(check_id), id=check_id)

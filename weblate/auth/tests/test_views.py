@@ -2,20 +2,63 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-from weblate.auth.models import Group
-from weblate.trans.tests.test_views import ViewTestCase
+from django.conf import settings
+from django.template.loader import render_to_string
+from django.urls import reverse
+
+from weblate.auth.data import (
+    SELECTION_ALL,
+    SELECTION_ALL_PUBLIC,
+    SELECTION_COMPONENT_LIST,
+    SELECTION_MANUAL,
+)
+from weblate.auth.forms import ProjectTeamForm, SitewideTeamForm, WorkspaceTeamForm
+from weblate.auth.models import Group, Permission, Role, TeamMembership, User, UserBlock
+from weblate.lang.models import Language
+from weblate.trans.models import Component, ComponentList, Project
+from weblate.trans.tests.test_views import FixtureTestCase
+from weblate.workspaces.models import Workspace
 
 
-class TeamsTest(ViewTestCase):
+class TeamsTest(FixtureTestCase):
     def make_superuser(self, superuser: bool = True) -> None:
         self.user.is_superuser = superuser
         self.user.save()
+
+    def test_restricted_team_admin_cannot_add_user(self) -> None:
+        for restriction in ("block", "team_2fa", "project_2fa"):
+            with self.subTest(restriction=restriction):
+                group = Group.objects.create(
+                    name=f"Restricted {restriction}",
+                    defining_project=self.project,
+                    enforced_2fa=restriction == "team_2fa",
+                )
+                group.admins.add(self.user)
+                self.user.groups.add(group)
+                if restriction == "block":
+                    UserBlock.objects.create(user=self.user, project=self.project)
+                if restriction == "project_2fa":
+                    self.project.enforced_2fa = True
+                    self.project.save(update_fields=["enforced_2fa"])
+
+                self.user.clear_permissions_cache()
+                response = self.client.post(
+                    group.get_absolute_url(),
+                    {"add_user": "1", "user": self.anotheruser.username},
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertFalse(group.user_set.filter(pk=self.anotheruser.pk).exists())
+
+                group.delete()
+                UserBlock.objects.filter(user=self.user, project=self.project).delete()
+                self.project.enforced_2fa = False
+                self.project.save(update_fields=["enforced_2fa"])
 
     def test_sitewide(self) -> None:
         group = Group.objects.create(name="Test group")
         edit_payload = {
             "name": "Other",
-            "language_selection": "1",
+            "all_languages": "on",
             "project_selection": "1",
             "autogroup_set-TOTAL_FORMS": "0",
             "autogroup_set-INITIAL_FORMS": "0",
@@ -31,6 +74,10 @@ class TeamsTest(ViewTestCase):
         self.make_superuser()
         response = self.client.get(group.get_absolute_url())
         self.assertContains(response, "id_autogroup_set-TOTAL_FORMS")
+        self.assertContains(
+            response,
+            "This is checked for every new user on the site, regardless of which project they use.",
+        )
 
         response = self.client.post(group.get_absolute_url(), edit_payload)
         self.assertRedirects(response, group.get_absolute_url())
@@ -42,7 +89,7 @@ class TeamsTest(ViewTestCase):
 
         edit_payload = {
             "name": "Other",
-            "language_selection": "1",
+            "all_languages": "on",
             "autogroup_set-TOTAL_FORMS": "0",
             "autogroup_set-INITIAL_FORMS": "0",
         }
@@ -62,6 +109,216 @@ class TeamsTest(ViewTestCase):
         self.assertRedirects(response, group.get_absolute_url())
         group.refresh_from_db()
         self.assertEqual(group.name, "Other")
+
+    def test_edit_project_team_preserves_stale_component_scope(self) -> None:
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.save(update_fields=["access_control"])
+        destination = Project.objects.create(
+            name="Destination",
+            slug="destination",
+            access_control=Project.ACCESS_PRIVATE,
+        )
+        group = Group.objects.create(name="Scoped team", defining_project=self.project)
+        group.projects.add(self.project)
+        group.roles.add(Role.objects.get(name="Administration"))
+        group.components.add(self.component)
+        self.anotheruser.groups.add(group)
+        Component.objects.filter(pk=self.component.pk).update(project=destination)
+        components_html = render_to_string(
+            "auth/teams-components.html", {"group": group}
+        )
+        self.assertIn(f"Moved component #{self.component.pk}", components_html)
+        self.assertNotIn(destination.name, components_html)
+        self.make_superuser()
+
+        response = self.client.post(
+            group.get_absolute_url(),
+            {
+                "name": "Renamed scoped team",
+                "all_languages": "on",
+                "roles": [Role.objects.get(name="Administration").pk],
+                "autogroup_set-TOTAL_FORMS": "0",
+                "autogroup_set-INITIAL_FORMS": "0",
+            },
+        )
+
+        self.assertRedirects(response, group.get_absolute_url())
+        group.refresh_from_db()
+        self.assertEqual(group.name, "Renamed scoped team")
+        self.assertTrue(group.components.filter(pk=self.component.pk).exists())
+        self.anotheruser.clear_permissions_cache()
+        self.assertFalse(self.anotheruser.can_access_project(self.project))
+        self.assertFalse(self.anotheruser.can_access_project(destination))
+
+    def test_project_team_form_roles(self) -> None:
+        global_role = Role.objects.create(name="Global project")
+        global_role.permissions.add(
+            Permission.objects.get(codename="project.add"),
+            Permission.objects.get(codename="translation.add"),
+        )
+        workspace_role = Role.objects.create(name="Workspace project")
+        workspace_role.permissions.add(
+            Permission.objects.get(codename="workspace.edit"),
+            Permission.objects.get(codename="translation.add"),
+        )
+
+        form = ProjectTeamForm(self.project)
+        roles = set(form.fields["roles"].queryset)
+
+        self.assertIn(Role.objects.get(name="Administration"), roles)
+        self.assertNotIn(global_role, roles)
+        self.assertNotIn(workspace_role, roles)
+        self.assertNotIn(Role.objects.get(name="Workspace administration"), roles)
+
+    def test_workspace_team_form_roles(self) -> None:
+        workspace = Workspace.objects.create(name="Workspace")
+        workspace_role = Role.objects.create(name="Custom workspace")
+        workspace_role.permissions.add(
+            Permission.objects.get(codename="workspace.edit")
+        )
+        global_role = Role.objects.create(name="Global workspace")
+        global_role.permissions.add(
+            Permission.objects.get(codename="workspace.edit"),
+            Permission.objects.get(codename="project.add"),
+        )
+        project_role = Role.objects.create(name="Project")
+        project_role.permissions.add(Permission.objects.get(codename="project.edit"))
+
+        form = WorkspaceTeamForm(workspace)
+        roles = set(form.fields["roles"].queryset)
+
+        self.assertIn(workspace_role, roles)
+        self.assertNotIn(global_role, roles)
+        self.assertNotIn(project_role, roles)
+
+    def test_workspace_team_form_uses_all_languages(self) -> None:
+        workspace = Workspace.objects.create(name="Workspace")
+        group = Group.objects.create(name="Test group", defining_workspace=workspace)
+
+        form = WorkspaceTeamForm(
+            workspace,
+            {
+                "name": group.name,
+                "roles": [],
+                "autogroup_set-TOTAL_FORMS": "0",
+                "autogroup_set-INITIAL_FORMS": "0",
+            },
+            instance=group,
+        )
+
+        self.assertTrue(form.is_valid())
+        form.save()
+        group.refresh_from_db()
+        self.assertEqual(group.language_selection, SELECTION_ALL)
+
+    def test_sitewide_team_form_all_languages_mapping(self) -> None:
+        group = Group.objects.create(name="Test group")
+        czech = Language.objects.get(code="cs")
+        group.languages.add(czech)
+
+        form = SitewideTeamForm(
+            {
+                "name": group.name,
+                "project_selection": str(group.project_selection),
+                "all_languages": "on",
+            },
+            instance=group,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        group.refresh_from_db()
+        self.assertEqual(group.language_selection, SELECTION_ALL)
+        # The manual selection is preserved when switching to all languages
+        self.assertEqual(list(group.languages.values_list("code", flat=True)), ["cs"])
+
+        # Initial state of the checkbox reflects the stored selection
+        form = SitewideTeamForm(instance=group)
+        self.assertTrue(form["all_languages"].initial)
+
+        # Unchecked checkbox maps back to manual selection
+        form = SitewideTeamForm(
+            {
+                "name": group.name,
+                "project_selection": str(group.project_selection),
+                "languages": [str(czech.pk)],
+            },
+            instance=group,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        group.refresh_from_db()
+        self.assertEqual(group.language_selection, SELECTION_MANUAL)
+        self.assertEqual(list(group.languages.values_list("code", flat=True)), ["cs"])
+
+    def test_sitewide_team_form_componentlists(self) -> None:
+        componentlist = ComponentList.objects.create(name="List", slug="list")
+        componentlist.components.add(self.component)
+        group = Group.objects.create(name="Test group")
+
+        # Selecting a component list stores it and derives the projects from it
+        form = SitewideTeamForm(
+            {
+                "name": group.name,
+                "project_selection": str(SELECTION_COMPONENT_LIST),
+                "componentlists": [str(componentlist.pk)],
+                "all_languages": "on",
+            },
+            instance=group,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        group.refresh_from_db()
+        self.assertEqual(
+            list(group.componentlists.values_list("slug", flat=True)), ["list"]
+        )
+        # The projects have to reflect the component list saved in this request
+        self.assertEqual(
+            list(group.projects.values_list("slug", flat=True)), [self.project.slug]
+        )
+
+        form = SitewideTeamForm(
+            {
+                "name": group.name,
+                "project_selection": str(SELECTION_ALL_PUBLIC),
+                "all_languages": "on",
+            },
+            instance=group,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        group.refresh_from_db()
+        self.assertEqual(list(group.componentlists.all()), [])
+        self.assertEqual(list(group.projects.all()), [])
+
+    def test_internal_team_all_languages_guard(self) -> None:
+        group = Group.objects.get(name="Users", internal=True, defining_project=None)
+        form = SitewideTeamForm(
+            {
+                "name": group.name,
+                "project_selection": str(group.project_selection),
+            },
+            instance=group,
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            "Cannot change this on a built-in team.", form.errors["all_languages"]
+        )
+        # The rejected value must not leak to the instance shared with the view
+        self.assertEqual(form.instance.language_selection, SELECTION_ALL)
+
+    def test_workspace_internal_team_delete(self) -> None:
+        workspace = Workspace.objects.create(name="Workspace")
+        workspace.add_owner(self.user)
+        group = workspace.get_owners_group()
+
+        response = self.client.post(group.get_absolute_url(), {"delete": "1"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response["Location"],
+            reverse("workspace-access", kwargs={"pk": workspace.pk}),
+        )
+        self.assertTrue(Group.objects.filter(pk=group.pk).exists())
 
     def test_add_users(self) -> None:
         group = Group.objects.create(name="Test group", defining_project=self.project)
@@ -85,6 +342,28 @@ class TeamsTest(ViewTestCase):
         )
         self.assertEqual(group.user_set.count(), 1)
         self.assertEqual(group.admins.count(), 0)
+        self.assertFalse(
+            TeamMembership.objects.get(
+                user=self.user, group=group
+            ).limit_languages.exists()
+        )
+
+        self.client.post(
+            group.get_absolute_url(),
+            {
+                "add_user": "add",
+                "user": self.user.username,
+                "limit_languages": ["cs"],
+            },
+        )
+        self.assertEqual(
+            list(
+                TeamMembership.objects.get(
+                    user=self.user, group=group
+                ).limit_languages.values_list("code", flat=True)
+            ),
+            ["cs"],
+        )
 
         self.client.post(
             group.get_absolute_url(),
@@ -92,6 +371,28 @@ class TeamsTest(ViewTestCase):
         )
         self.assertEqual(group.user_set.count(), 1)
         self.assertEqual(group.admins.count(), 1)
+        self.assertEqual(
+            list(
+                TeamMembership.objects.get(
+                    user=self.user, group=group
+                ).limit_languages.values_list("code", flat=True)
+            ),
+            ["cs"],
+        )
+
+        self.client.post(
+            group.get_absolute_url(),
+            {
+                "add_user": "add",
+                "user": self.user.username,
+            },
+        )
+        self.assertFalse(
+            TeamMembership.objects.get(
+                user=self.user, group=group
+            ).limit_languages.exists()
+        )
+        group.admins.add(self.user)
 
         # Team admin
         self.make_superuser(False)
@@ -115,3 +416,99 @@ class TeamsTest(ViewTestCase):
         )
         self.assertEqual(group.user_set.count(), 2)
         self.assertEqual(group.admins.count(), 1)
+
+    def test_user_list_orders_limit_languages(self) -> None:
+        group = Group.objects.create(name="Test group", defining_project=self.project)
+        membership = TeamMembership.objects.create(user=self.user, group=group)
+        membership.limit_languages.add(Language.objects.get(code="de"))
+        membership.limit_languages.add(Language.objects.get(code="cs"))
+        self.make_superuser()
+
+        response = self.client.get(group.get_absolute_url())
+
+        listed_user = next(iter(response.context["users"]))
+        with self.assertNumQueries(0):
+            limit_languages = list(listed_user.team_membership.limit_languages.all())
+        self.assertEqual(
+            [language.code for language in limit_languages],
+            ["cs", "de"],
+        )
+
+    def test_add_special_users_denied(self) -> None:
+        group = Group.objects.create(name="Test group", defining_project=self.project)
+        self.user.groups.add(group)
+        group.admins.add(self.user)
+        inactive = User.objects.create_user(
+            "inactive-user", "inactive-user@example.org", "testpassword"
+        )
+        inactive.is_active = False
+        inactive.save()
+        bot = User.objects.create(
+            username="bot-user",
+            full_name="Bot user",
+            email="bot-user@example.org",
+            is_bot=True,
+        )
+        users = [
+            User.objects.get(username=settings.ANONYMOUS_USER_NAME),
+            inactive,
+            bot,
+        ]
+
+        for user in users:
+            for payload in (
+                {"add_user": "1", "user": user.username},
+                {"add_user": "1", "user": user.username, "make_admin": "1"},
+            ):
+                self.client.post(group.get_absolute_url(), payload)
+                self.assertFalse(group.user_set.filter(pk=user.pk).exists())
+                self.assertFalse(group.admins.filter(pk=user.pk).exists())
+
+    def test_anonymous_team_admin_denied(self) -> None:
+        group = Group.objects.create(name="Test group", defining_project=self.project)
+        anonymous = User.objects.get(username=settings.ANONYMOUS_USER_NAME)
+        anonymous.groups.add(group)
+        group.admins.add(anonymous)
+        self.client.logout()
+
+        response = self.client.post(
+            group.get_absolute_url(),
+            {"add_user": "1", "user": self.anotheruser.username},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(group.user_set.filter(pk=self.anotheruser.pk).exists())
+
+    def test_admin_access(self) -> None:
+        group = Group.objects.create(name="Test group", defining_project=self.project)
+        self.user.groups.add(group)
+        group.admins.add(self.user)
+
+        response = self.client.get(group.get_absolute_url())
+
+        self.assertNotContains(response, "Enforced two-factor authentication")
+        self.assertContains(response, "Add a user")
+
+        # Add user should work
+        self.client.post(
+            group.get_absolute_url(),
+            {"add_user": "1", "user": self.anotheruser.username},
+        )
+        self.assertEqual(group.user_set.count(), 2)
+        self.assertEqual(group.admins.count(), 1)
+
+        # Edit should not work
+        edit_payload = {
+            "name": "Other",
+            "all_languages": "on",
+            "autogroup_set-TOTAL_FORMS": "0",
+            "autogroup_set-INITIAL_FORMS": "0",
+        }
+
+        # Edit not allowed
+        response = self.client.post(group.get_absolute_url(), edit_payload)
+        self.assertEqual(response.status_code, 403)
+
+        # Verify no changes were done
+        group.refresh_from_db()
+        self.assertEqual(group.name, "Test group")

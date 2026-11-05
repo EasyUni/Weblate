@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import re
 from itertools import chain
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from django.utils.translation import gettext_lazy
+from lxml import etree
 from lxml.etree import XMLSyntaxError
 from translate.misc.multistring import multistring
 from translate.storage.aresource import AndroidResourceFile
-from translate.storage.csvl10n import csvfile
 from translate.storage.jsonl10n import JsonFile, JsonNestedFile
 from translate.storage.mo import mofile
 from translate.storage.poxliff import PoXliffFile
@@ -25,15 +25,33 @@ from translate.storage.tmx import tmxfile
 from translate.storage.xliff import xlifffile
 
 import weblate.utils.version
+from weblate.checks.flags import Flags
 from weblate.formats.external import XlsxFormat
-from weblate.trans.util import xliff_string_to_rich
-from weblate.utils.csv import PROHIBITED_INITIAL_CHARS
+from weblate.formats.helpers import (
+    CSV_ID_HASH,
+    CSV_PLURAL_FIELDNAMES,
+    CSV_SOURCE_PLURAL_FORM,
+    CSV_TARGET_PLURAL_FORM,
+    format_csv_id_hash,
+)
+from weblate.formats.ttkit import TBXUnit, WeblateCSVFile
+from weblate.lang.models import PluralMapper
+from weblate.trans.file_format_params import (
+    GettextSetLanguageTeamHeader,
+    GettextXGenerator,
+)
+from weblate.trans.util import split_plural, xliff_string_to_rich
+from weblate.utils.csv import escape_csv_formula
 
 from .base import BaseExporter
 
 if TYPE_CHECKING:
     from translate.storage.base import TranslationStore
     from translate.storage.lisa import LISAfile
+    from translate.storage.poxliff import PoXliffUnit
+    from translate.storage.tbx import tbxunit
+
+    from weblate.trans.models import Translation
 
 # Map to remove control characters except newlines and tabs
 # Based on lxml - src/lxml/apihelpers.pxi _is_valid_xml_utf8
@@ -49,9 +67,11 @@ DASHES = re.compile(r"--+")
 
 
 class PoExporter(BaseExporter):
+    identity_safe = True
     name = "po"
     content_type = "text/x-po"
     extension = "po"
+    file_format = "po"
     verbose = gettext_lazy("gettext PO")
     storage_class: ClassVar[type[TranslationStore]] = pofile
 
@@ -63,14 +83,20 @@ class PoExporter(BaseExporter):
         store = super().get_storage()
         plural = self.plural
 
+        headers_kwargs = {}
+        if GettextSetLanguageTeamHeader.get_value(self.file_format_params):
+            headers_kwargs["language_team"] = f"{self.language.name} <{self.url}>"
+
+        if GettextXGenerator.get_value(self.file_format_params):
+            headers_kwargs["x_generator"] = f"Weblate {weblate.utils.version.VERSION}"
+
         # Set po file header
         store.updateheader(
             add=True,
             language=self.language.code,
-            x_generator=f"Weblate {weblate.utils.version.VERSION}",
             project_id_version=f"{self.language.name} ({self.project.name})",
             plural_forms=plural.plural_form,
-            language_team=f"{self.language.name} <{self.url}>",
+            **headers_kwargs,
         )
         return store
 
@@ -96,6 +122,7 @@ class XMLExporter(XMLFilterMixin, BaseExporter):
 
 
 class PoXliffExporter(XMLExporter):
+    identity_safe = True
     name = "xliff"
     content_type = "application/x-xliff+xml"
     extension = "xlf"
@@ -115,7 +142,7 @@ class PoXliffExporter(XMLExporter):
         return multistring([self.string_filter(plural) for plural in plurals])
 
     def build_unit(self, unit):
-        output = super().build_unit(unit)
+        output = cast("PoXliffUnit", super().build_unit(unit))
         try:
             converted_source = xliff_string_to_rich(unit.get_source_plurals())
             converted_target = xliff_string_to_rich(unit.get_target_plurals())
@@ -127,6 +154,7 @@ class PoXliffExporter(XMLExporter):
 
 
 class XliffExporter(PoXliffExporter):
+    identity_safe = True
     name = "xliff11"
     content_type = "application/x-xliff+xml"
     extension = "xlf"
@@ -136,14 +164,168 @@ class XliffExporter(PoXliffExporter):
 
 
 class TBXExporter(XMLExporter):
+    identity_safe = True
     name = "tbx"
     content_type = "application/x-tbx"
     extension = "tbx"
     verbose = gettext_lazy("TBX")
     storage_class = tbxfile
 
+    @staticmethod
+    # ruff: ignore[unused-static-method-argument]
+    def supports(translation: Translation) -> bool:
+        return True
+
+    def build_unit(self, unit):
+        output = cast("tbxunit", super().build_unit(unit))
+        if unit.translation.component.is_multivalue:
+            source_unit = unit.source_unit if unit.details.get("tbx_terms") else unit
+            output.set_source_terms(
+                [self.string_filter(text) for text in source_unit.get_source_plurals()],
+                self.source_language.code,
+            )
+            if self.source_language != self.language:
+                targets = unit.get_target_plurals()
+                output.set_target_terms(
+                    [self.string_filter(text) for text in targets]
+                    if any(targets)
+                    else [],
+                    self.language.code,
+                )
+        return output
+
+    def store_flags(self, output, flags) -> None:
+        output.xmlelement.set("weblate-flags", flags.format())
+
+    def _export_term_metadata(
+        self, output, records, language_code, shared_notes
+    ) -> None:
+        language = output.getlanguageNode(language_code)
+        if language is None:
+            return
+        for tig, record in zip(
+            language.findall(output.namespaced("tig")), records, strict=False
+        ):
+            if record.get("id"):
+                tig.set("id", self.string_filter(record["id"]))
+            if record.get("administrative_status"):
+                node = etree.SubElement(
+                    tig, output.namespaced("termNote"), type="administrativeStatus"
+                )
+                node.text = self.string_filter(record["administrative_status"])
+            for note in record.get("notes", []):
+                scope = note.get("scope", "term")
+                parent = (
+                    output.xmlelement
+                    if scope == "concept"
+                    else language
+                    if scope == "language"
+                    else tig
+                )
+                key = (parent, note.get("origin"), note.get("category"), note["text"])
+                if scope != "term" and key in shared_notes:
+                    continue
+                shared_notes.add(key)
+                self._export_note(output, parent, note)
+
+    def _export_note(self, output, parent, note) -> None:
+        origin = note.get("origin")
+        tag = (
+            "descrip"
+            if origin == "definition"
+            else "termNote"
+            if origin == "pos"
+            else "note"
+        )
+        node = etree.SubElement(parent, output.namespaced(tag))
+        if note.get("category"):
+            node.set("type", self.string_filter(note["category"]))
+        if tag == "note" and origin:
+            node.set("from", self.string_filter(origin))
+        node.text = self.string_filter(note["text"])
+
+    def store_unit_metadata(self, output, unit) -> None:
+        if unit.context:
+            output.setid(self.string_filter(unit.context))
+        metadata = unit.tbx_terms
+        source_metadata = unit.source_unit.tbx_terms if metadata else metadata
+        shared_notes: set[tuple] = set()
+        self._export_term_metadata(
+            output,
+            source_metadata.get("source", []),
+            self.source_language.code,
+            shared_notes,
+        )
+        if self.source_language != self.language:
+            self._export_term_metadata(
+                output, metadata.get("target", []), self.language.code, shared_notes
+            )
+        # Compare with the imported explanations so term-scoped definitions are
+        # not duplicated at concept scope merely by exporting them.
+        adapter: TBXUnit = TBXUnit(None, output)  # type: ignore[call-overload]
+        adapter.set_source_explanation(self.string_filter(unit.source_unit.explanation))
+        if self.source_language != self.language:
+            adapter.set_explanation(self.string_filter(unit.explanation))
+        if unit.note and unit.note != adapter.notes:
+            output.addnote(self.string_filter(unit.note), origin="developer")
+        for comment in unit.unresolved_comments:
+            self._export_note(
+                output,
+                output.target_dom
+                if output.target_dom is not None
+                else output.xmlelement,
+                {"origin": "translator", "text": comment.comment},
+            )
+        for suggestion in unit.suggestions:
+            suggestions = ", ".join(split_plural(suggestion.target))
+            self._export_note(
+                output,
+                output.target_dom
+                if output.target_dom is not None
+                else output.xmlelement,
+                {
+                    "origin": "translator",
+                    "text": f"Suggested in Weblate: {suggestions}",
+                },
+            )
+        # TBX requires concept/language metadata before language sets/terms.
+        # Common explanations and developer notes can also append metadata, so
+        # restore ordering after all writers have finished.
+        for parent, child_tag in [
+            (output.xmlelement, "langSet"),
+            *((language, "tig") for language in output.getlanguageNodes()),
+        ]:
+            for child in list(parent):
+                if child.tag == output.namespaced(child_tag):
+                    parent.append(child)
+        native_flags = unit.details.get("tbx_flags")
+        flags = unit.all_flags
+        if native_flags is not None:
+            flags = Flags(
+                unit.translation.all_flags,
+                native_flags["explicit"],
+                unit.source_unit.extra_flags,
+                unit.extra_flags,
+            )
+        if (native_flags and native_flags["read_only"]) or "read-only" in flags:
+            node = etree.Element(
+                output.namespaced("descrip"), type="Translation needed"
+            )
+            node.text = "No"
+            output.xmlelement.insert(0, node)
+        self.store_flags(output, flags)
+        self.store_unit_state(output, unit)
+
+    def add(self, unit, word) -> None:
+        if self.source_language.code.replace("_", "-").lower() == (
+            self.language.code.replace("_", "-").lower()
+        ):
+            return
+        super().add(unit, word)
+
 
 class TMXExporter(XMLExporter):
+    identity_safe = True
     name = "tmx"
     content_type = "application/x-tmx"
     extension = "tmx"
@@ -152,6 +334,7 @@ class TMXExporter(XMLExporter):
 
 
 class MoExporter(PoExporter):
+    identity_safe = True
     name = "mo"
     content_type = "application/x-gettext-catalog"
     extension = "mo"
@@ -183,11 +366,15 @@ class MoExporter(PoExporter):
             if self.monolingual:
                 try:
                     unit = translation.store.content_units[0]
-                    self.use_context = not unit.template.source
                 except IndexError:
-                    pass
+                    self.use_context = False
+                else:
+                    self.use_context = not unit.template.source
 
     def store_flags(self, output, flags) -> None:
+        return
+
+    def setup_storage(self, storage) -> None:
         return
 
     def add_unit(self, unit) -> None:
@@ -211,12 +398,12 @@ class MoExporter(PoExporter):
         self.storage.addunit(output)
 
     @staticmethod
-    def supports(translation):
+    def supports(translation: Translation) -> bool:
         return translation.component.file_format in {"po", "po-mono"}
 
 
 class CVSBaseExporter(BaseExporter):
-    storage_class = csvfile
+    storage_class = WeblateCSVFile
 
     def get_storage(self):
         storage = self.storage_class(fieldnames=self.fieldnames)
@@ -227,29 +414,125 @@ class CVSBaseExporter(BaseExporter):
         return storage
 
 
-class CSVExporter(CVSBaseExporter):
+class PluralCSVExportMixin(BaseExporter):
+    def add_unit(self, unit) -> None:
+        if unit.is_plural and not unit.translation.component.is_multivalue:
+            self.add_plural_unit(unit)
+            return
+        super().add_unit(unit)
+
+    def add_plural_fieldnames(self) -> None:
+        for field in CSV_PLURAL_FIELDNAMES:
+            if field not in self.storage.fieldnames:
+                self.storage.fieldnames.append(field)
+
+    def get_source_plural_index(
+        self, unit, target_index: int, sources: list[str]
+    ) -> int:
+        if not sources:
+            return 0
+
+        source_plural = unit.translation.component.source_language.plural
+        target_plural = unit.translation.plural
+        if len(sources) == source_plural.number and target_index < target_plural.number:
+            mapper = PluralMapper(source_plural, target_plural)
+            if mapper.same_plurals and target_index < len(sources):
+                return target_index
+            if target_plural.number == 1:
+                return len(sources) - 1
+            source_index = mapper.target_map[target_index][0]
+            if source_index is not None and 0 <= source_index < len(sources):
+                return source_index
+            return len(sources) - 1
+
+        return min(target_index, len(sources) - 1)
+
+    def add_plural_unit(self, unit) -> None:
+        self.add_plural_fieldnames()
+        sources = unit.get_source_plurals()
+
+        for target_index, target in enumerate(unit.get_target_plurals()):
+            source_index = self.get_source_plural_index(unit, target_index, sources)
+            output = self.create_unit(self.string_filter(sources[source_index]))
+            self.add(output, self.string_filter(target))
+            setattr(output, CSV_SOURCE_PLURAL_FORM, str(source_index))
+            setattr(output, CSV_TARGET_PLURAL_FORM, str(target_index))
+            setattr(output, CSV_ID_HASH, format_csv_id_hash(unit.id_hash))
+            self.store_unit_metadata(output, unit)
+            self.storage.addunit(output)
+
+
+class CSVExporter(PluralCSVExportMixin, CVSBaseExporter):
+    identity_safe = True
     name = "csv"
     content_type = "text/csv"
     extension = "csv"
+    file_format = "csv"
     verbose = gettext_lazy("CSV")
 
     def string_filter(self, text):
-        """
-        Avoid Excel interpreting text as formula.
-
-        This is really bad idea, implemented in Excel, as this change leads to
-        displaying additional ' in all other tools, but this seems to be what most
-        people have gotten used to. Hopefully these characters are not widely used at
-        first position of translatable strings, so that harm is reduced.
-
-        Reverse for this is in weblate.formats.ttkit.CSVUnit.unescape_csv
-        """
-        if text and text[0] in PROHIBITED_INITIAL_CHARS:
-            return "'{}'".format(text.replace("|", "\\|"))
-        return text
+        return escape_csv_formula(text)
 
 
-class XlsxExporter(XMLFilterMixin, CVSBaseExporter):
+class MultiCSVExporter(CVSBaseExporter):
+    identity_safe = True
+    name = "csv-multi"
+    content_type = "text/csv"
+    extension = "csv"
+    file_format = "csv-multi"
+    verbose = gettext_lazy("Multivalue CSV")
+
+    @staticmethod
+    def supports(translation: Translation) -> bool:
+        return translation.component.file_format == "csv-multi"
+
+    def string_filter(self, text):
+        return escape_csv_formula(text)
+
+    def add_units(self, units) -> None:
+        # Override add_units to handle multivalue units by adding each translation
+        # as a separate row in the CSV export.
+
+        for unit in units:
+            if not unit.target:
+                continue
+
+            # Split the target into plural forms
+            targets = split_plural(unit.target)
+
+            if len(targets) > 1:
+                # Multiple translations for this unit - add each one separately
+                for target in targets:
+                    if target.strip():  # Only add non-empty targets
+                        # Create a temporary unit with this specific target
+                        temp_unit = type(unit)(
+                            translation=unit.translation,
+                            source=unit.source,
+                            target=target,
+                            context=unit.context,
+                            location=unit.location,
+                            note=unit.note,
+                            flags=unit.flags,
+                            explanation=unit.explanation,
+                            state=unit.state,
+                            position=unit.position,
+                            id_hash=unit.id_hash,
+                        )
+                        # Set source_unit to the original unit's source_unit to avoid None issues
+                        temp_unit.source_unit = unit.source_unit
+                        # Set unresolved_comments to empty list to avoid query issues
+                        temp_unit.__dict__["unresolved_comments"] = []
+                        # Set suggestions to empty list to avoid database query issues
+                        temp_unit.__dict__["suggestions"] = []
+
+                        self.add_unit(temp_unit)
+            else:
+                # Single translation - add normally
+                self.add_unit(unit)
+
+
+class XlsxExporter(PluralCSVExportMixin, XMLFilterMixin, CVSBaseExporter):
+    identity_safe = True
     name = "xlsx"
     content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     extension = "xlsx"
@@ -264,8 +547,10 @@ class MonolingualExporter(BaseExporter):
     """Base class for monolingual exports."""
 
     @staticmethod
-    def supports(translation):
-        return translation.component.has_template()
+    def supports(translation: Translation) -> bool:
+        return (
+            BaseExporter.supports(translation) and translation.component.has_template()
+        )
 
     def build_unit(self, unit):
         output = self.create_unit(unit.context)
@@ -275,20 +560,25 @@ class MonolingualExporter(BaseExporter):
 
 
 class JSONExporter(MonolingualExporter):
+    identity_safe = True
     storage_class = JsonFile
     name = "json"
     content_type = "application/json"
     extension = "json"
+    file_format = "json"
     verbose = gettext_lazy("JSON")
 
 
 class JSONNestedExporter(JSONExporter):
+    identity_safe = True
     name = "json-nested"
+    file_format = "json-nested"
     verbose = gettext_lazy("JSON nested structure file")
     storage_class = JsonNestedFile
 
 
 class AndroidResourceExporter(XMLFilterMixin, MonolingualExporter):
+    identity_safe = True
     storage_class = AndroidResourceFile
     name = "aresource"
     content_type = "application/xml"
@@ -297,7 +587,8 @@ class AndroidResourceExporter(XMLFilterMixin, MonolingualExporter):
 
     def add(self, unit, word) -> None:
         # Need to have storage to handle plurals
-        unit._store = self.storage  # noqa: SLF001
+        # ruff: ignore[private-member-access]
+        unit._store = self.storage
         super().add(unit, word)
 
     def add_note(self, output, note: str, origin: str) -> None:
@@ -310,10 +601,12 @@ class AndroidResourceExporter(XMLFilterMixin, MonolingualExporter):
 
 
 class StringsExporter(MonolingualExporter):
+    identity_safe = True
     storage_class = stringsutf8file
     name = "strings"
     content_type = "text/plain"
     extension = "strings"
+    file_format = "strings"
     verbose = gettext_lazy("iOS strings")
 
     def create_unit(self, source):

@@ -1,8 +1,17 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
-from .base import DownloadTranslations, MachineTranslation
+from typing import TYPE_CHECKING
+
+from .base import MACHINERY_DEFAULT_THRESHOLD, MachineTranslation
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import DownloadTranslations
 
 
 class GlosbeTranslation(MachineTranslation):
@@ -12,22 +21,22 @@ class GlosbeTranslation(MachineTranslation):
     max_score = 90
     do_cleanup = False
 
-    def map_code_code(self, code):
+    def map_code_code(self, code: str) -> str:
         """Convert language to service specific code."""
         return code.replace("_", "-").split("-")[0].lower()
 
-    def is_supported(self, source_language, target_language) -> bool:
+    def is_supported(self, source_language: str, target_language: str) -> bool:
         """Any language is supported."""
         return True
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
         params = {

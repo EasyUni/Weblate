@@ -4,6 +4,12 @@
 
 """Test for legal stuff."""
 
+from __future__ import annotations
+
+from itertools import product
+from unittest.mock import patch
+
+from django.conf import settings
 from django.http import HttpRequest
 from django.test import TestCase
 from django.test.utils import modify_settings, override_settings
@@ -13,43 +19,411 @@ from weblate.accounts.tests.test_registration import (
     REGISTRATION_DATA,
     REGISTRATION_SUCCESS,
 )
+from weblate.api.spectacular import get_spectacular_settings
+from weblate.legal.utils import get_hidden_documents
 from weblate.trans.tests.test_views import RegistrationTestMixin
 from weblate.trans.tests.utils import create_test_user
 
 
 class LegalTest(TestCase, RegistrationTestMixin):
+    @override_settings(LEGAL_HIDDEN_DOCUMENTS=("", "contracts", " privacy "))
+    def test_hidden_documents_normalized(self) -> None:
+        self.assertEqual(get_hidden_documents(), {"contracts", "privacy"})
+
     def test_index(self) -> None:
         response = self.client.get(reverse("legal:index"))
         self.assertContains(response, "Legal Terms Overview")
 
+    def test_styles_template(self) -> None:
+        for page in ("index", "terms", "cookies", "privacy", "contracts"):
+            with self.subTest(page=page):
+                response = self.client.get(reverse(f"legal:{page}"))
+                self.assertTemplateUsed(response, "legal/base.html")
+                self.assertTemplateUsed(response, "legal/styles.html")
+
     def test_terms(self) -> None:
         response = self.client.get(reverse("legal:terms"))
         self.assertContains(response, "General Terms and Conditions")
+        self.assertContains(response, 'class="card-body tos"')
+        self.assertContains(response, "This site has not defined any terms")
+
+    def test_privacy_without_external_url(self) -> None:
+        response = self.client.get(reverse("legal:privacy"))
+        self.assertContains(response, "This site has not defined a privacy policy")
+
+    @override_settings(
+        LEGAL_URL="https://example.com/terms/",
+        PRIVACY_URL="https://example.com/privacy/",
+    )
+    def test_external_documents_take_priority(self) -> None:
+        for page, url, placeholder in (
+            ("terms", "https://example.com/terms/", "has not defined any terms"),
+            ("privacy", "https://example.com/privacy/", "has not defined a privacy"),
+        ):
+            with self.subTest(page=page):
+                response = self.client.get(reverse(f"legal:{page}"))
+                self.assertContains(response, f'href="{url}"')
+                self.assertNotContains(response, placeholder)
+                self.assertEqual(response.context[f"{page}_url"], url)
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("terms", "privacy"),
+        LEGAL_URL="https://example.com/terms/",
+        PRIVACY_URL="https://example.com/privacy/",
+    )
+    def test_hidden_documents_keep_external_links(self) -> None:
+        response = self.client.get(reverse("legal:index"))
+        self.assertContains(response, 'href="https://example.com/terms/"')
+        self.assertContains(response, 'href="https://example.com/privacy/"')
+        for page in ("terms", "privacy"):
+            with self.subTest(page=page):
+                response = self.client.get(reverse(f"legal:{page}"))
+                self.assertEqual(response.status_code, 404)
+
+    @override_settings(LEGAL_DOCUMENT_CSS_CLASS="")
+    def test_terms_without_document_css_class(self) -> None:
+        response = self.client.get(reverse("legal:terms"))
+        self.assertContains(response, 'class="card-body"')
+        self.assertNotContains(response, 'class="card-body tos"')
+
+    @override_settings(LEGAL_DOCUMENT_CSS_CLASS="custom-legal")
+    def test_terms_with_custom_document_css_class(self) -> None:
+        response = self.client.get(reverse("legal:terms"))
+        self.assertContains(response, 'class="card-body custom-legal"')
+        self.assertNotContains(response, 'class="card-body tos"')
 
     def test_cookies(self) -> None:
         response = self.client.get(reverse("legal:cookies"))
         self.assertContains(response, "Cookies Policy")
 
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("terms", "privacy"),
+        LEGAL_URL="https://example.com/terms/",
+        PRIVACY_URL="https://example.com/privacy/",
+    )
+    def test_cookies_hidden_document_links(self) -> None:
+        response = self.client.get(reverse("legal:cookies"))
+        self.assertContains(response, "https://example.com/terms/")
+        self.assertContains(response, "https://example.com/privacy/")
+        self.assertNotContains(response, reverse("legal:terms"))
+        self.assertNotContains(response, reverse("legal:privacy"))
+
+    def test_document_introduction(self) -> None:
+        cases = (
+            (
+                ("terms", "privacy"),
+                (
+                    "This page is based on the General Terms and Conditions and the "
+                    "Privacy Policy, you should still read the original documents "
+                    "to fully understand them:"
+                ),
+            ),
+            (
+                ("terms",),
+                (
+                    "This page is based on the General Terms and Conditions, you "
+                    "should still read the original document to fully understand it:"
+                ),
+            ),
+            (
+                ("privacy",),
+                (
+                    "This page is based on the Privacy Policy, you should still read "
+                    "the original document to fully understand it:"
+                ),
+            ),
+            ((), None),
+        )
+        for page, external, (documents, introduction) in product(
+            ("index", "cookies"), (False, True), cases
+        ):
+            with (
+                self.subTest(page=page, external=external, documents=documents),
+                override_settings(
+                    LEGAL_HIDDEN_DOCUMENTS=tuple(
+                        document
+                        for document in ("terms", "privacy")
+                        if external or document not in documents
+                    ),
+                    LEGAL_URL=(
+                        "https://example.com/terms/"
+                        if external and "terms" in documents
+                        else None
+                    ),
+                    PRIVACY_URL=(
+                        "https://example.com/privacy/"
+                        if external and "privacy" in documents
+                        else None
+                    ),
+                ),
+            ):
+                response = self.client.get(reverse(f"legal:{page}"))
+                if introduction:
+                    self.assertContains(
+                        response, f"<p>{introduction}</p>", count=1, html=True
+                    )
+                else:
+                    self.assertNotContains(response, "This page is based on")
+                for document in ("terms", "privacy"):
+                    internal_url = reverse(f"legal:{document}")
+                    external_url = f"https://example.com/{document}/"
+                    if document in documents:
+                        self.assertContains(
+                            response,
+                            f'href="{external_url if external else internal_url}"',
+                        )
+                    if external or document not in documents:
+                        self.assertNotContains(response, f'href="{internal_url}"')
+                    if not external or document not in documents:
+                        self.assertNotContains(response, f'href="{external_url}"')
+
     def test_contracts(self) -> None:
         response = self.client.get(reverse("legal:contracts"))
         self.assertContains(response, "Subcontractors")
 
-    @modify_settings(
-        SOCIAL_AUTH_PIPELINE={"append": "weblate.legal.pipeline.tos_confirm"}
+    @override_settings(LEGAL_HIDDEN_DOCUMENTS=("contracts",))
+    def test_hidden_contracts(self) -> None:
+        response = self.client.get(reverse("legal:terms"))
+        self.assertContains(response, "General Terms and Conditions")
+        self.assertNotContains(response, reverse("legal:contracts"))
+
+        response = self.client.get(reverse("legal:contracts"))
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(
+        LEGAL_DOCUMENT_CSS_CLASS="",
+        LEGAL_HIDDEN_DOCUMENTS=("terms",),
+        LEGAL_URL=None,
     )
+    def test_confirm_without_document_css_class(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertTemplateUsed(response, "legal/base.html")
+        self.assertTemplateUsed(response, "legal/styles.html")
+        self.assertContains(response, 'class="list-group-item pre-scrollable"')
+        self.assertNotContains(response, 'class="list-group-item pre-scrollable tos"')
+        self.assertContains(
+            response,
+            "I agree with the General Terms and Conditions and the Privacy Policy",
+        )
+        self.assertContains(
+            response,
+            "You have to agree to the General Terms and Conditions and the Privacy Policy",
+            count=1,
+        )
+        self.assertContains(
+            response,
+            f'<a href="{reverse("legal:privacy")}">Privacy Policy</a>',
+        )
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("terms", "privacy"),
+        LEGAL_URL="https://example.com/terms/",
+        PRIVACY_URL="https://example.com/privacy/",
+    )
+    def test_confirm_external_documents(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(response, "https://example.com/terms/")
+        self.assertContains(response, "https://example.com/privacy/")
+        self.assertNotContains(response, reverse("legal:terms"))
+        self.assertNotContains(response, reverse("legal:privacy"))
+        self.assertNotContains(response, "no defined privacy terms of service")
+        self.assertContains(
+            response,
+            "I agree with the General Terms and Conditions and the Privacy Policy",
+        )
+        self.assertContains(
+            response,
+            "You have to agree to the General Terms and Conditions and the Privacy Policy",
+            count=1,
+        )
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=(),
+        LEGAL_URL="https://example.com/terms/",
+        PRIVACY_URL="https://example.com/privacy/",
+    )
+    def test_confirm_prefers_external_documents_without_hiding_pages(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(response, 'href="https://example.com/terms/"')
+        self.assertContains(response, 'href="https://example.com/privacy/"')
+        self.assertNotContains(response, 'href="/legal/terms/"')
+        self.assertNotContains(response, 'href="/legal/privacy/"')
+        self.assertNotContains(response, "has not defined")
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("privacy",),
+        LEGAL_URL="https://example.com/terms/",
+        PRIVACY_URL=None,
+    )
+    def test_confirm_external_terms_without_privacy(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(response, 'href="https://example.com/terms/"')
+        self.assertNotContains(response, "has not defined any terms")
+        self.assertContains(
+            response, "I agree with the General Terms and Conditions document"
+        )
+        self.assertNotContains(response, "Privacy Policy")
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("terms",),
+        LEGAL_URL=None,
+        PRIVACY_URL="https://example.com/privacy/",
+    )
+    def test_confirm_external_privacy_with_embedded_terms(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(response, 'href="https://example.com/privacy/"')
+        self.assertContains(response, "has not defined any terms")
+        self.assertContains(
+            response,
+            "I agree with the General Terms and Conditions and the Privacy Policy",
+        )
+        self.assertNotContains(response, "has not defined a privacy policy")
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("privacy",),
+        PRIVACY_URL=None,
+    )
+    def test_confirm_without_privacy_policy(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(
+            response,
+            "I agree with the General Terms and Conditions document",
+        )
+        self.assertContains(
+            response,
+            "You have to agree to the General Terms and Conditions",
+            count=1,
+        )
+        self.assertNotContains(
+            response,
+            "I agree with the General Terms and Conditions and the Privacy Policy",
+        )
+        self.assertNotContains(response, "Please also read the")
+        self.assertNotContains(response, "has not defined a privacy policy")
+        self.assertNotContains(response, 'href="/legal/privacy/"')
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("terms",),
+        LEGAL_URL=None,
+        PRIVACY_URL=None,
+    )
+    def test_confirm_without_external_terms(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(response, "has not defined any terms and conditions")
+        self.assertContains(
+            response,
+            "Please read the General Terms and Conditions below",
+        )
+        self.assertContains(response, 'href="/legal/privacy/"')
+
+    @override_settings(
+        LEGAL_HIDDEN_DOCUMENTS=("terms", "privacy"),
+        LEGAL_URL=None,
+        PRIVACY_URL=None,
+    )
+    def test_confirm_without_document_links(self) -> None:
+        create_test_user()
+        self.client.login(username="testuser", password="testpassword")
+
+        response = self.client.get(reverse("legal:confirm"))
+        self.assertContains(response, "has not defined any terms and conditions")
+        self.assertContains(
+            response, "Please read the General Terms and Conditions below"
+        )
+        self.assertContains(
+            response, "I agree with the General Terms and Conditions document"
+        )
+        self.assertNotContains(response, "Privacy Policy")
+
+    def test_spectacular_tos_url(self) -> None:
+        apps = ["weblate.legal"]
+        spectacular_settings = get_spectacular_settings(
+            apps, "https://example.com", "Weblate"
+        )
+        self.assertEqual(spectacular_settings["TOS"], "/legal/terms/")
+
+        spectacular_settings = get_spectacular_settings(
+            apps,
+            "https://example.com",
+            "Weblate",
+            legal_hidden_documents=("terms",),
+            legal_url="https://example.com/terms/",
+        )
+        self.assertEqual(spectacular_settings["TOS"], "https://example.com/terms/")
+
+        spectacular_settings = get_spectacular_settings(
+            apps,
+            "https://example.com",
+            "Weblate",
+            legal_url="https://example.com/terms/",
+        )
+        self.assertEqual(spectacular_settings["TOS"], "https://example.com/terms/")
+
+        spectacular_settings = get_spectacular_settings(
+            apps,
+            "https://example.com",
+            "Weblate",
+            legal_hidden_documents=("terms",),
+        )
+        self.assertNotIn("TOS", spectacular_settings)
+
+    def test_spectacular_logo_uses_stable_url(self) -> None:
+        spectacular_settings = get_spectacular_settings(
+            [],
+            "https://example.com",
+            "Weblate",
+            static_url="https://cdn.example.com/static/",
+        )
+        logo_url = spectacular_settings["EXTENSIONS_INFO"]["x-logo"]["url"]
+        self.assertIs(type(logo_url), str)
+        self.assertEqual(logo_url, "https://cdn.example.com/static/weblate.svg")
+
     @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
     def test_confirm(self) -> None:
         """TOS confirmation on social auth."""
-        response = self.client.post(reverse("register"), REGISTRATION_DATA, follow=True)
+        pipeline = list(settings.SOCIAL_AUTH_PIPELINE)
+        pipeline.insert(
+            pipeline.index("weblate.accounts.pipeline.second_factor") + 1,
+            "weblate.legal.pipeline.tos_confirm",
+        )
+        self.enterContext(self.settings(SOCIAL_AUTH_PIPELINE=pipeline))
+        sync_groups = self.enterContext(
+            patch("weblate.accounts.strategy.WeblateStrategy.sync_user_groups")
+        )
+        registration_response = self.client.post(
+            reverse("register"), REGISTRATION_DATA, follow=True
+        )
         # Check we did succeed
-        self.assertContains(response, REGISTRATION_SUCCESS)
+        self.assertContains(registration_response, REGISTRATION_SUCCESS)
 
         # Follow link
         url = self.assert_registration_mailbox()
-        response = self.client.get(url, follow=True)
+        response = self.confirm_registration_url(url, follow=True)
         self.assertTrue(
             response.redirect_chain[-1][0].startswith(reverse("legal:confirm"))
         )
+        sync_groups.assert_not_called()
 
         # Extract next URL
         url = response.context["form"].initial["next"]
@@ -57,12 +431,14 @@ class LegalTest(TestCase, RegistrationTestMixin):
         # Try invalid form (not checked)
         response = self.client.post(reverse("legal:confirm"), {"next": url})
         self.assertContains(response, "This field is required")
+        sync_groups.assert_not_called()
 
         # Actually confirm the TOS
         response = self.client.post(
             reverse("legal:confirm"), {"next": url, "confirm": 1}, follow=True
         )
         self.assertContains(response, "Your profile")
+        sync_groups.assert_called_once()
 
     @modify_settings(
         MIDDLEWARE={"append": "weblate.legal.middleware.RequireTOSMiddleware"}
@@ -79,9 +455,10 @@ class LegalTest(TestCase, RegistrationTestMixin):
         self.assertTrue(
             response.redirect_chain[-1][0].startswith(reverse("legal:confirm"))
         )
+        self.assertContains(response, "We have updated our legal documents")
         # Check that contact works even without TOS
         response = self.client.get(reverse("contact"), follow=True)
-        self.assertContains(response, "You can only contact administrators")
+        self.assertContains(response, "How can we help?")
         # Confirm current TOS
         request = HttpRequest()
         request.META["REMOTE_ADDR"] = "127.0.0.1"

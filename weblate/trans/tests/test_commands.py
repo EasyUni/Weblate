@@ -4,22 +4,46 @@
 
 """Test for management commands."""
 
+import json
 import sys
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import cast
+from unittest.mock import patch
 
-import requests
 from django.core.management import call_command
 from django.core.management.base import CommandError, SystemCheckError
 from django.test import SimpleTestCase, TestCase
 from django.test.utils import override_settings
+from django.utils import timezone
 
 from weblate.accounts.models import Profile
 from weblate.runner import main
-from weblate.trans.models import Component, Translation
+from weblate.trans.actions import ActionEvents
+from weblate.trans.file_format_params import (
+    FILE_FORMATS_PARAMS,
+    BaseFileFormatParam,
+    register_file_format_param,
+)
+from weblate.trans.models import Change, Component, Project, Suggestion, Translation
+from weblate.trans.tests.github import github_fixture_repositories
 from weblate.trans.tests.test_models import RepoTestCase
-from weblate.trans.tests.test_views import FixtureTestCase, ViewTestCase
-from weblate.trans.tests.utils import create_test_user, get_test_file
+from weblate.trans.tests.test_views import (
+    ComponentTestCase,
+    FixtureComponentTestCase,
+    ViewTestCase,
+)
+from weblate.trans.tests.utils import (
+    TEST_VCS_ALLOW_SCHEMES,
+    create_another_user,
+    create_test_user,
+    get_test_actor,
+    get_test_file,
+)
+from weblate.vcs.git import GitRepository
 from weblate.vcs.mercurial import HgRepository
+from weblate.vcs.params import VCS_PARAMS, BaseVCSParam, register_vcs_param
 
 TEST_PO = get_test_file("cs.po")
 TEST_COMPONENTS = get_test_file("components.json")
@@ -37,13 +61,69 @@ class RunnerTest(SimpleTestCase):
             sys.stdout = restore
 
 
+class AnalyzeTranslatorWorkTest(ComponentTestCase):
+    def create_change(self, author, user) -> None:
+        unit = self.get_unit()
+        Change.objects.create(
+            action=ActionEvents.ACCEPT,
+            author=author,
+            user=user,
+            unit=unit,
+            translation=self.translation,
+            component=self.component,
+            project=self.project,
+            language=self.translation.language,
+        )
+
+    def test_accepted_suggestions_are_grouped_by_author(self) -> None:
+        reviewer = self.user
+        first_author = create_another_user("-first")
+        second_author = create_another_user("-second")
+        for _unused in range(3):
+            self.create_change(first_author, reviewer)
+            self.create_change(second_author, reviewer)
+
+        output = StringIO()
+        call_command(
+            "analyze_translator_work",
+            days=1,
+            min_changes=1,
+            stdout=output,
+        )
+
+        result = output.getvalue()
+        self.assertIn("User days: 2 included, 0 excluded", result)
+        self.assertIn("  median: 3", result)
+
+    def test_component_filter_uses_full_path(self) -> None:
+        category = self.create_category(self.project)
+        self.component.category = category
+        self.component.save(update_fields=["category"])
+        for _unused in range(3):
+            self.create_change(self.user, self.user)
+
+        output = StringIO()
+        call_command(
+            "analyze_translator_work",
+            component="/".join(self.component.get_url_path()),
+            days=1,
+            min_changes=1,
+            stdout=output,
+        )
+
+        result = output.getvalue()
+        self.assertIn("User days: 1 included, 0 excluded", result)
+        self.assertIn("  median: 3", result)
+
+
 class ImportProjectTest(RepoTestCase):
     def do_import(self, path=None, **kwargs) -> None:
+        kwargs.setdefault("user", get_test_actor(self).username)
         with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path if path is None else path,
+                self.format_test_repo_url(self.git_repo_path) if path is None else path,
                 "main",
                 "**/*.po",
                 **kwargs,
@@ -52,7 +132,39 @@ class ImportProjectTest(RepoTestCase):
     def test_import(self) -> None:
         project = self.create_project()
         self.do_import()
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
+        history = Change.objects.filter(
+            project=project,
+            action__in=(ActionEvents.CREATE_COMPONENT, ActionEvents.ADDON_CREATE),
+        )
+        self.assertTrue(history.exists())
+        self.assertFalse(history.exclude(user=get_test_actor(self)).exists())
+
+    def test_import_requires_user(self) -> None:
+        with (
+            patch(
+                "weblate.trans.management.commands.import_project.Command.checkout_tmp"
+            ) as checkout,
+            self.assertRaisesRegex(CommandError, "--user"),
+        ):
+            call_command(
+                "import_project", "test", "https://example.com/repo", "main", "**/*.po"
+            )
+        checkout.assert_not_called()
+
+    def test_import_rejects_unknown_user_before_checkout(self) -> None:
+        with (
+            patch(
+                "weblate.trans.management.commands.import_project.Command.checkout_tmp"
+            ) as checkout,
+            self.assertRaisesRegex(CommandError, "User does not exist"),
+        ):
+            self.do_import(user="missing-import-user")
+        checkout.assert_not_called()
+
+    def test_import_rejects_anonymous_user(self) -> None:
+        with self.assertRaisesRegex(CommandError, "anonymous user"):
+            self.do_import(user="anonymous")
 
     def test_import_deep(self) -> None:
         project = self.create_project()
@@ -60,9 +172,10 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "deep/*/locales/*/LC_MESSAGES/**.po",
+                user=get_test_actor(self).username,
             )
         self.assertEqual(project.component_set.count(), 1)
 
@@ -70,13 +183,13 @@ class ImportProjectTest(RepoTestCase):
         project = self.create_project()
         self.do_import()
         self.do_import()
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
 
     def test_import_duplicate(self) -> None:
         project = self.create_project()
         self.do_import()
         self.do_import(path="weblate://test/po")
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
 
     def test_import_main_1(self, name="po-mono") -> None:
         project = self.create_project()
@@ -84,10 +197,11 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/*.po",
                 main_component=name,
+                user=get_test_actor(self).username,
             )
         non_linked = project.component_set.with_repo()
         self.assertEqual(non_linked.count(), 1)
@@ -106,12 +220,13 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/*.po",
                 language_regex="cs",
+                user=get_test_actor(self).username,
             )
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
         for component in project.component_set.filter(is_glossary=False).iterator():
             self.assertEqual(component.translation_set.count(), 2)
 
@@ -121,9 +236,10 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 r"(?P<component>[^/-]*)/(?P<language>[^/]*)\.po",
+                user=get_test_actor(self).username,
             )
         self.assertEqual(project.component_set.count(), 1)
 
@@ -133,10 +249,11 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 r"(?P<component>[^/-]*)/(?P<language>[^/]*)\.po",
                 name_template="Test name",
+                user=get_test_actor(self).username,
             )
         self.assertEqual(project.component_set.count(), 1)
         self.assertTrue(project.component_set.filter(name="Test name").exists())
@@ -149,9 +266,10 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 r"(?P<name>[^/-]*)/.*\.po",
+                user=get_test_actor(self).username,
             )
 
     def test_import_re_wrong(self) -> None:
@@ -162,9 +280,10 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 r"(?P<name>[^/-]*",
+                user=get_test_actor(self).username,
             )
 
     def test_import_po(self) -> None:
@@ -173,12 +292,13 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/*.po",
                 file_format="po",
+                user=get_test_actor(self).username,
             )
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
 
     def test_import_invalid(self) -> None:
         project = self.create_project()
@@ -189,10 +309,11 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/*.po",
                 file_format="INVALID",
+                user=get_test_actor(self).username,
             )
         self.assertEqual(project.component_set.count(), 0)
 
@@ -202,11 +323,12 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/values-*/strings.xml",
                 file_format="aresource",
                 base_file_template="android/values/strings.xml",
+                user=get_test_actor(self).username,
             )
         self.assertEqual(project.component_set.count(), 2)
 
@@ -216,11 +338,12 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/values-*/strings.xml",
                 file_format="aresource",
                 base_file_template="%s/values/strings.xml",
+                user=get_test_actor(self).username,
             )
         self.assertEqual(project.component_set.count(), 2)
 
@@ -228,15 +351,51 @@ class ImportProjectTest(RepoTestCase):
         project = self.create_project()
         with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
             call_command(
-                "import_project", "test", self.git_repo_path, "main", "**/*.po"
+                "import_project",
+                "test",
+                self.format_test_repo_url(self.git_repo_path),
+                "main",
+                "**/*.po",
+                user=get_test_actor(self).username,
             )
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
 
         with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
             call_command(
-                "import_project", "test", self.git_repo_path, "main", "**/*.po"
+                "import_project",
+                "test",
+                self.format_test_repo_url(self.git_repo_path),
+                "main",
+                "**/*.po",
+                user=get_test_actor(self).username,
             )
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
+
+    def test_re_import_uses_fresh_checkout_discovery(self) -> None:
+        project = self.create_project()
+        self.do_import()
+        self.assertEqual(project.component_set.count(), 5)
+
+        with TemporaryDirectory() as workdir:
+            repository = GitRepository.clone(
+                self.format_test_repo_url(self.git_repo_path), workdir, "main"
+            )
+            translation = Path(workdir, "new-component", "cs.po")
+            translation.parent.mkdir()
+            translation.write_text('msgid ""\nmsgstr ""\n', encoding="utf-8")
+            with repository.lock:
+                repository.set_committer("Test", "test@example.com")
+                repository.commit(
+                    "Add component",
+                    "Test <test@example.com>",
+                    timezone.now(),
+                    ["new-component/cs.po"],
+                )
+                repository.push("")
+
+        self.do_import()
+
+        self.assertEqual(project.component_set.count(), 6)
 
     def test_import_against_existing(self) -> None:
         """Test importing with a weblate:// URL."""
@@ -250,8 +409,9 @@ class ImportProjectTest(RepoTestCase):
                 f"weblate://{project.slug!s}/{android.slug!s}",
                 "main",
                 "**/*.po",
+                user=get_test_actor(self).username,
             )
-        self.assertEqual(project.component_set.count(), 5)
+        self.assertEqual(project.component_set.count(), 6)
 
     def test_import_missing_project(self) -> None:
         """Test of correct handling of missing project."""
@@ -260,14 +420,26 @@ class ImportProjectTest(RepoTestCase):
             override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
         ):
             call_command(
-                "import_project", "test", self.git_repo_path, "main", "**/*.po"
+                "import_project",
+                "test",
+                self.format_test_repo_url(self.git_repo_path),
+                "main",
+                "**/*.po",
+                user=get_test_actor(self).username,
             )
 
     def test_import_missing_wildcard(self) -> None:
         """Test of correct handling of missing wildcard."""
         self.create_project()
         with self.assertRaises(CommandError):
-            call_command("import_project", "test", self.git_repo_path, "main", "*/*.po")
+            call_command(
+                "import_project",
+                "test",
+                self.format_test_repo_url(self.git_repo_path),
+                "main",
+                "*/*.po",
+                user=get_test_actor(self).username,
+            )
 
     def test_import_wrong_vcs(self) -> None:
         """Test of correct handling of wrong vcs."""
@@ -279,12 +451,14 @@ class ImportProjectTest(RepoTestCase):
             call_command(
                 "import_project",
                 "test",
-                self.git_repo_path,
+                self.format_test_repo_url(self.git_repo_path),
                 "main",
                 "**/*.po",
                 vcs="nonexisting",
+                user=get_test_actor(self).username,
             )
 
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
     def test_import_mercurial(self) -> None:
         """Test importing Mercurial project."""
         if not HgRepository.is_supported():
@@ -298,9 +472,11 @@ class ImportProjectTest(RepoTestCase):
                 "default",
                 "**/*.po",
                 vcs="mercurial",
+                user=get_test_actor(self).username,
             )
-        self.assertEqual(project.component_set.count(), 4)
+        self.assertEqual(project.component_set.count(), 5)
 
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
     def test_import_mercurial_mixed(self) -> None:
         """Test importing Mercurial project with mixed component/lang."""
         if not HgRepository.is_supported():
@@ -317,10 +493,11 @@ class ImportProjectTest(RepoTestCase):
                 "default",
                 "*/**.po",
                 vcs="mercurial",
+                user=get_test_actor(self).username,
             )
 
 
-class BasicCommandTest(FixtureTestCase):
+class BasicCommandTest(FixtureComponentTestCase):
     def test_versions(self) -> None:
         output = StringIO()
         call_command("list_versions", stdout=output)
@@ -331,19 +508,20 @@ class BasicCommandTest(FixtureTestCase):
             call_command("check", "--deploy")
 
 
-class WeblateComponentCommandTestCase(ViewTestCase):
+class WeblateComponentCommandMixin:
     """Base class for handling tests of WeblateComponentCommand based commands."""
 
     command_name = "checkgit"
     expected_string = "On branch main"
 
     def do_test(self, *args, **kwargs) -> None:
+        test_case = cast("TestCase", self)
         output = StringIO()
         call_command(self.command_name, *args, stdout=output, **kwargs)
         if self.expected_string:
-            self.assertIn(self.expected_string, output.getvalue())
+            test_case.assertIn(self.expected_string, output.getvalue())
         else:
-            self.assertEqual("", output.getvalue())
+            test_case.assertEqual("", output.getvalue())
 
     def test_all(self) -> None:
         self.do_test(all=True)
@@ -355,15 +533,21 @@ class WeblateComponentCommandTestCase(ViewTestCase):
         self.do_test("test/test")
 
     def test_nonexisting_project(self) -> None:
-        with self.assertRaises(CommandError):
+        test_case = cast("TestCase", self)
+        with test_case.assertRaises(CommandError):
             self.do_test("notest")
 
     def test_nonexisting_component(self) -> None:
-        with self.assertRaises(CommandError):
+        test_case = cast("TestCase", self)
+        with test_case.assertRaises(CommandError):
             self.do_test("test/notest")
 
 
-class CommitPendingTest(WeblateComponentCommandTestCase):
+class WeblateComponentCommandTestCase(ComponentTestCase, WeblateComponentCommandMixin):
+    pass
+
+
+class CommitPendingCommandMixin(WeblateComponentCommandMixin):
     command_name = "commit_pending"
     expected_string = ""
 
@@ -371,7 +555,11 @@ class CommitPendingTest(WeblateComponentCommandTestCase):
         self.do_test("test", "--age", "1")
 
 
-class CommitPendingChangesTest(CommitPendingTest):
+class CommitPendingTest(ComponentTestCase, CommitPendingCommandMixin):
+    pass
+
+
+class CommitPendingChangesTest(ViewTestCase, CommitPendingCommandMixin):
     def setUp(self) -> None:
         super().setUp()
         self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
@@ -413,15 +601,25 @@ class UnLockTranslationTest(WeblateComponentCommandTestCase):
 
 
 class ImportDemoTestCase(TestCase):
+    def test_import_requires_actor(self) -> None:
+        for options in ({}, {"user": "missing-actor"}):
+            with self.subTest(options=options), self.assertRaises(CommandError):
+                call_command("import_demo", **options)
+        self.assertFalse(Project.objects.filter(slug="demo").exists())
+
     def test_import(self) -> None:
-        try:
-            requests.get("https://github.com/", timeout=1)
-        except requests.exceptions.ConnectionError as error:
-            self.skipTest(f"GitHub not reachable: {error}")
+        self.enterContext(github_fixture_repositories())
         output = StringIO()
-        call_command("import_demo", stdout=output)
+        for delete in (False, True):
+            with self.subTest(delete=delete):
+                call_command(
+                    "import_demo",
+                    stdout=output,
+                    user=get_test_actor(self).username,
+                    delete=delete,
+                )
+                self.assertEqual(Component.objects.count(), 5)
         self.assertEqual(output.getvalue(), "")
-        self.assertEqual(Component.objects.count(), 5)
 
 
 class CleanupTestCase(TestCase):
@@ -501,28 +699,87 @@ class SuggestionCommandTest(RepoTestCase):
     def test_add_suggestions(self) -> None:
         user = create_test_user()
         call_command(
-            "add_suggestions", "test", "test", "cs", TEST_PO, author=user.email
+            "add_suggestions",
+            "test",
+            "test",
+            "cs",
+            TEST_PO,
+            user=get_test_actor(self).username,
+            author=user.email,
         )
         translation = self.component.translation_set.get(language_code="cs")
         self.assertEqual(translation.stats.suggestions, 1)
         profile = Profile.objects.get(user__email=user.email)
         self.assertEqual(profile.suggested, 1)
+        change = self.component.change_set.get(action=ActionEvents.FILE_UPLOAD)
+        self.assertEqual(change.user, get_test_actor(self))
+        self.assertEqual(change.author, profile.user)
+        self.assertEqual(
+            Suggestion.objects.get(unit__translation__component=self.component).user,
+            profile.user,
+        )
+
+    def test_import_requires_actor(self) -> None:
+        for options in ({}, {"user": "missing-import-user"}, {"user": "anonymous"}):
+            with (
+                self.subTest(options=options),
+                patch.object(Path, "open") as open_file,
+                self.assertRaises(CommandError),
+            ):
+                call_command(
+                    "add_suggestions", "test", "test", "cs", TEST_PO, **options
+                )
+            open_file.assert_not_called()
 
     def test_default_user(self) -> None:
-        call_command("add_suggestions", "test", "test", "cs", TEST_PO)
+        call_command(
+            "add_suggestions",
+            "test",
+            "test",
+            "cs",
+            TEST_PO,
+            user=get_test_actor(self).username,
+        )
         profile = Profile.objects.get(user__email="noreply@weblate.org")
         self.assertEqual(profile.suggested, 1)
+        change = self.component.change_set.get(action=ActionEvents.FILE_UPLOAD)
+        self.assertEqual(change.user, get_test_actor(self))
+        self.assertEqual(change.author, profile.user)
+        self.assertEqual(
+            Suggestion.objects.get(unit__translation__component=self.component).user,
+            profile.user,
+        )
 
     def test_missing_user(self) -> None:
         call_command(
-            "add_suggestions", "test", "test", "cs", TEST_PO, author="foo@example.org"
+            "add_suggestions",
+            "test",
+            "test",
+            "cs",
+            TEST_PO,
+            user=get_test_actor(self).username,
+            author="foo@example.org",
         )
         profile = Profile.objects.get(user__email="foo@example.org")
         self.assertEqual(profile.suggested, 1)
+        change = self.component.change_set.get(action=ActionEvents.FILE_UPLOAD)
+        self.assertEqual(change.user, get_test_actor(self))
+        self.assertEqual(change.author, profile.user)
+        self.assertEqual(
+            Suggestion.objects.get(unit__translation__component=self.component).user,
+            profile.user,
+        )
 
     def test_missing_project(self) -> None:
         with self.assertRaises(CommandError):
-            call_command("add_suggestions", "test", "xxx", "cs", TEST_PO)
+            call_command(
+                "add_suggestions",
+                "test",
+                "xxx",
+                "cs",
+                TEST_PO,
+                user=get_test_actor(self).username,
+            )
 
 
 class ImportCommandTest(RepoTestCase):
@@ -543,17 +800,117 @@ class ImportCommandTest(RepoTestCase):
                 "test",
                 TEST_COMPONENTS,
                 stdout=output,
+                user=get_test_actor(self).username,
             )
         self.assertEqual(self.component.project.component_set.count(), 3)
         self.assertEqual(Translation.objects.count(), 10)
         self.assertIn("Imported Test/Gettext PO with 4 translations", output.getvalue())
+
+    def test_import_requires_actor(self) -> None:
+        for options in ({}, {"user": "missing-import-user"}, {"user": "anonymous"}):
+            with (
+                self.subTest(options=options),
+                patch.object(Path, "open") as open_file,
+                self.assertRaises(CommandError),
+            ):
+                call_command("import_json", TEST_COMPONENTS, project="test", **options)
+            open_file.assert_not_called()
+
+    @override_settings(DEFAULT_ADDONS={"weblate.gettext.msgmerge": {}})
+    def test_import_default_addon_keeps_actor(self) -> None:
+        with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+            call_command(
+                "import_json",
+                TEST_COMPONENTS,
+                project="test",
+                main_component="test",
+                user=get_test_actor(self).username,
+            )
+        change = Change.objects.get(
+            component__slug="po", action=ActionEvents.ADDON_CREATE
+        )
+        self.assertEqual(change.user, get_test_actor(self))
+
+    def test_import_source_language(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            filename = Path(tempdir) / "components.json"
+            filename.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "Android",
+                            "filemask": "android/values-*/strings.xml",
+                            "template": "android/values/strings.xml",
+                            "repo": "weblate://test/test",
+                            "file_format": "aresource",
+                            "source_language": {
+                                "code": "ru",
+                                "name": "Russian",
+                                "direction": "ltr",
+                            },
+                        }
+                    ]
+                )
+            )
+
+            with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+                call_command(
+                    "import_json",
+                    "--main-component",
+                    "test",
+                    "--project",
+                    "test",
+                    filename,
+                    user=get_test_actor(self).username,
+                )
+
+        component = Component.objects.get(slug="android")
+        self.assertEqual(component.source_language.code, "ru")
+
+    def test_import_source_language_string(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            filename = Path(tempdir) / "components.json"
+            filename.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": "Android",
+                            "filemask": "android/values-*/strings.xml",
+                            "template": "android/values/strings.xml",
+                            "repo": "weblate://test/test",
+                            "file_format": "aresource",
+                            "source_language": "ru",
+                        }
+                    ]
+                )
+            )
+
+            with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+                call_command(
+                    "import_json",
+                    "--main-component",
+                    "test",
+                    "--project",
+                    "test",
+                    filename,
+                    user=get_test_actor(self).username,
+                )
+
+        component = Component.objects.get(slug="android")
+        self.assertEqual(component.source_language.code, "ru")
 
     def test_import_invalid(self) -> None:
         with (
             self.assertRaises(CommandError),
             override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
         ):
-            call_command("import_json", "--project", "test", TEST_COMPONENTS_INVALID)
+            call_command(
+                "import_json",
+                "--project",
+                "test",
+                TEST_COMPONENTS_INVALID,
+                user=get_test_actor(self).username,
+            )
 
     def test_import_twice(self) -> None:
         with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
@@ -564,6 +921,7 @@ class ImportCommandTest(RepoTestCase):
                 "--project",
                 "test",
                 TEST_COMPONENTS,
+                user=get_test_actor(self).username,
             )
         with (
             self.assertRaises(CommandError),
@@ -576,6 +934,7 @@ class ImportCommandTest(RepoTestCase):
                 "--project",
                 "test",
                 TEST_COMPONENTS,
+                user=get_test_actor(self).username,
             )
 
     def test_import_ignore(self) -> None:
@@ -589,6 +948,7 @@ class ImportCommandTest(RepoTestCase):
                 "test",
                 TEST_COMPONENTS,
                 stdout=output,
+                user=get_test_actor(self).username,
             )
         self.assertIn("Imported Test/Gettext PO with 4 translations", output.getvalue())
         output.truncate()
@@ -602,6 +962,7 @@ class ImportCommandTest(RepoTestCase):
                 "--ignore",
                 TEST_COMPONENTS,
                 stderr=output,
+                user=get_test_actor(self).username,
             )
         self.assertIn("Component Test/Gettext PO already exists", output.getvalue())
 
@@ -614,6 +975,7 @@ class ImportCommandTest(RepoTestCase):
                 "--project",
                 "test",
                 TEST_COMPONENTS,
+                user=get_test_actor(self).username,
             )
         with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
             call_command(
@@ -624,7 +986,46 @@ class ImportCommandTest(RepoTestCase):
                 "test",
                 "--update",
                 TEST_COMPONENTS,
+                user=get_test_actor(self).username,
             )
+
+    def test_import_update_ignores_source_language(self) -> None:
+        with TemporaryDirectory() as tempdir:
+            filename = Path(tempdir) / "components.json"
+            with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+                call_command(
+                    "import_json",
+                    "--main-component",
+                    "test",
+                    "--project",
+                    "test",
+                    TEST_COMPONENTS,
+                    user=get_test_actor(self).username,
+                )
+
+            components = json.loads(Path(TEST_COMPONENTS).read_text(encoding="utf-8"))
+            components[0]["source_language"] = "ru"
+            components[0]["name"] = "Updated Gettext PO"
+            components[0]["license"] = "WTFPL"
+            filename.write_text(json.dumps(components))
+
+            with override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES):
+                call_command(
+                    "import_json",
+                    "--main-component",
+                    "test",
+                    "--project",
+                    "test",
+                    "--update",
+                    filename,
+                    user=get_test_actor(self).username,
+                )
+
+        component = Component.objects.get(slug="po")
+        self.assertEqual(component.name, "Updated Gettext PO")
+        self.assertEqual(component.source_language.code, "en")
+        change = component.change_set.get(action=ActionEvents.LICENSE_CHANGE)
+        self.assertEqual(change.user, get_test_actor(self))
 
     def test_invalid_file(self) -> None:
         with (
@@ -638,6 +1039,7 @@ class ImportCommandTest(RepoTestCase):
                 "--project",
                 "test",
                 TEST_PO,
+                user=get_test_actor(self).username,
             )
 
     def test_nonexisting_project(self) -> None:
@@ -652,6 +1054,7 @@ class ImportCommandTest(RepoTestCase):
                 "--project",
                 "test2",
                 "/nonexisting/dfile",
+                user=get_test_actor(self).username,
             )
 
     def test_nonexisting_component(self) -> None:
@@ -666,6 +1069,7 @@ class ImportCommandTest(RepoTestCase):
                 "--project",
                 "test",
                 "/nonexisting/dfile",
+                user=get_test_actor(self).username,
             )
 
     def test_missing_component(self) -> None:
@@ -673,4 +1077,70 @@ class ImportCommandTest(RepoTestCase):
             self.assertRaises(CommandError),
             override_settings(CREATE_GLOSSARIES=self.CREATE_GLOSSARIES),
         ):
-            call_command("import_json", "--project", "test", "/nonexisting/dfile")
+            call_command(
+                "import_json",
+                "--project",
+                "test",
+                "/nonexisting/dfile",
+                user=get_test_actor(self).username,
+            )
+
+
+class DocumentationCommandTest(TestCase):
+    def test_change_event_metadata(self) -> None:
+        self.assertEqual(ActionEvents.UPDATE.value, 0)
+        self.assertEqual(ActionEvents.UPDATE.label, "Resource updated")
+        self.assertEqual(
+            ActionEvents.UPDATE.description,
+            "A translation file was synchronized with its repository.",
+        )
+        self.assertEqual(ActionEvents.choices[0], (0, "Resource updated"))
+        self.assertTrue(all(str(event.description) for event in ActionEvents))
+
+    def test_list_file_format_params(self) -> None:
+        class TestJSONFileFormatParam(BaseFileFormatParam):
+            name = "json-test"
+            label = "JSONTest"
+            file_formats = ("test", "json")
+            help_text = "Test JSON file format parameter"
+
+        register_file_format_param(TestJSONFileFormatParam)
+
+        output = StringIO()
+        call_command("list_file_format_params", stdout=output)
+        self.assertIn("JSONTest", output.getvalue())
+        self.assertIn("Test JSON file format parameter", output.getvalue())
+        self.assertIn("json-test", output.getvalue())
+
+        FILE_FORMATS_PARAMS.remove(TestJSONFileFormatParam)
+
+    def test_list_vcs_params(self) -> None:
+        class TestVCSParam(BaseVCSParam):
+            name = "vcs-test"  # type: ignore[assignment]
+            label = "VCSTest"
+            vcs_backends = ("test", "git")
+            help_text = "Test version control parameter"
+
+        register_vcs_param(TestVCSParam)
+
+        output = StringIO()
+        call_command("list_vcs_params", stdout=output)
+        self.assertIn("VCSTest", output.getvalue())
+        self.assertIn("Test version control parameter", output.getvalue())
+        self.assertIn("vcs-test", output.getvalue())
+        # Shipped parameters are listed as well
+        self.assertIn("git_force_push", output.getvalue())
+
+        VCS_PARAMS.remove(TestVCSParam)
+
+    def test_list_change_events(self) -> None:
+        output = StringIO()
+        call_command("list_change_events", stdout=output)
+        result = output.getvalue()
+        self.assertIn("``83``", result)
+        self.assertIn("``forced_synchronization_of_translations``", result)
+        self.assertIn("Forced synchronization of translations", result)
+        self.assertIn("Description", result)
+        self.assertIn(
+            "Translation files were forcibly synchronized with the repository.", result
+        )

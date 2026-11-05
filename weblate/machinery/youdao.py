@@ -2,10 +2,24 @@
 # Copyright © Sun Zhigang <hzsunzhigang@corp.netease.com>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
+from typing import TYPE_CHECKING, ClassVar
 
-from .base import DownloadTranslations, MachineTranslation, MachineTranslationError
+from .base import (
+    MACHINERY_DEFAULT_THRESHOLD,
+    MachineTranslation,
+    MachineTranslationError,
+)
 from .forms import KeySecretMachineryForm
+
+if TYPE_CHECKING:
+    from httpx2 import Response
+
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import DownloadTranslations
 
 YOUDAO_API_ROOT = "https://openapi.youdao.com/api"
 
@@ -17,10 +31,14 @@ class YoudaoTranslation(MachineTranslation):
     max_score = 90
 
     # Map codes used by Youdao to codes used by Weblate
-    language_map = {"zh_Hans": "zh-CHS", "zh": "zh-CHS", "en": "EN"}
+    language_map: ClassVar[dict[str, str]] = {
+        "zh_Hans": "zh-CHS",
+        "zh": "zh-CHS",
+        "en": "EN",
+    }
     settings_form = KeySecretMachineryForm
 
-    def download_languages(self):
+    def download_languages(self) -> list[str]:
         """List of supported languages."""
         return [
             "zh-CHS",
@@ -37,21 +55,21 @@ class YoudaoTranslation(MachineTranslation):
             "id",
         ]
 
-    def check_failure(self, response) -> None:
+    def check_failure(self, response: Response) -> None:
         super().check_failure(response)
         payload = response.json()
         if int(payload["errorCode"]) != 0:
-            msg = "Error code: {}".format(payload["errorCode"])
+            msg = f"Error code: {payload['errorCode']}"
             raise MachineTranslationError(msg)
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
         salt, sign = self.signed_salt(
@@ -59,9 +77,9 @@ class YoudaoTranslation(MachineTranslation):
         )
 
         response = self.request(
-            "get",
+            "post",
             YOUDAO_API_ROOT,
-            params={
+            data={
                 "q": text,
                 "_from": source_language,
                 "to": target_language,

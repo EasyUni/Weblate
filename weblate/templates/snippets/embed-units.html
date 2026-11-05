@@ -1,10 +1,20 @@
 {% load i18n icons translations %}
 
 {% any_unit_has_context units as any_unit_has_context %}
+{% get_embed_unit_query as embed_query %}
 
-<table class="table table-condensed table-embed-units">
+<table class="table table-sm table-embed-units">
   <thead>
     <tr>
+      {% if selection_template %}
+        <th class="unit-selection-cell">
+          {% if selection_header_template %}
+            {% include selection_header_template %}
+          {% else %}
+            <span class="visually-hidden">{% translate "Select" %}</span>
+          {% endif %}
+        </th>
+      {% endif %}
       <th class="unit-state-cell"></th>
       {% if show_translation %}
         <th>{% translate "Translation" %}</th>
@@ -13,13 +23,13 @@
         <th>{% translate "Language" %}</th>
       {% endif %}
       {% if not hide_context and any_unit_has_context %}
-        <th {% if include_search %}class="sort-cell"{% endif %}>
+        <th class="unit-context-cell{% if include_search %} sort-cell{% endif %}">
           {% if include_search %}
             <a href="?q={{ search_query|urlencode }}&amp;sort_by={% if sort_query == "context" %}-{% endif %}context">
-            {% endif %}
-            {{ units.0.translation.component.context_label }}
-            {% if include_search %}
-              <span class="sort-icon {% if sort_query == "context" %}sort-down{% elif sort_query == "-context" %}sort-up{% endif %}" />
+          {% endif %}
+          {{ units.0.translation.component.context_label }}
+          {% if include_search %}
+            <span class="sort-icon {% if sort_query == "context" %}sort-down{% elif sort_query == "-context" %}sort-up{% endif %}" />
             </a>
           {% endif %}
         </th>
@@ -31,10 +41,10 @@
         <th {% if include_search %}class="sort-cell"{% endif %}>
           {% if include_search %}
             <a href="?q={{ search_query|urlencode }}&amp;sort_by={% if sort_query == "source" %}-{% endif %}source">
-            {% endif %}
-            {{ translation.component.source_language }}
-            {% if include_search %}
-              <span class="sort-icon {% if sort_query == "source" %}sort-down{% elif sort_query == "-source" %}sort-up{% endif %}" />
+          {% endif %}
+          {{ translation.effective_source_language }}
+          {% if include_search %}
+            <span class="sort-icon {% if sort_query == "source" %}sort-down{% elif sort_query == "-source" %}sort-up{% endif %}" />
             </a>
           {% endif %}
         </th>
@@ -45,10 +55,10 @@
         <th {% if include_search %}class="sort-cell"{% endif %}>
           {% if include_search %}
             <a href="?q={{ search_query|urlencode }}&amp;sort_by={% if sort_query == "target" %}-{% endif %}target">
-            {% endif %}
-            {{ translation.language }}
-            {% if include_search %}
-              <span class="sort-icon {% if sort_query == "target" %}sort-down{% elif sort_query == "-target" %}sort-up{% endif %}" />
+          {% endif %}
+          {{ translation.language }}
+          {% if include_search %}
+            <span class="sort-icon {% if sort_query == "target" %}sort-down{% elif sort_query == "-target" %}sort-up{% endif %}" />
             </a>
           {% endif %}
         </th>
@@ -77,7 +87,12 @@
   <tbody class="unit-listing-body">
 
     {% for unit in units %}
-      <tr class="{% if current_unit.id == unit.id %}current_translation{% endif %}">
+      {% querystring embed_query checksum=unit.checksum as unit_query %}
+      <tr class="{% if current_unit.id == unit.id %}current_translation{% endif %}"
+          data-unit-id="{{ unit.pk }}">
+        {% if selection_template %}
+          <td class="unit-selection-cell">{% include selection_template %}</td>
+        {% endif %}
         <td class="unit-state-cell {% unit_state_class unit %}"
             title="{% unit_state_title unit %}"></td>
         {% if show_translation %}
@@ -92,9 +107,9 @@
           </td>
         {% endif %}
         {% if not hide_context and any_unit_has_context %}
-          <td>
+          <td class="unit-context-cell">
             {% if unit.context %}
-              <a href="{{ unit.get_absolute_url }}{% if include_search and search_url %}&amp;{{ search_url }}{% elif sort_query %}&amp;sort_by={{ sort_query }}{% endif %}">
+              <a href="{{ unit.translation.get_translate_url }}{{ unit_query }}">
                 {% format_source_string unit.context unit wrap=True search_match=search_query %}
               </a>
             {% endif %}
@@ -102,18 +117,22 @@
         {% endif %}
         {% if force_source or not hide_source and not unit.is_source %}
           <td>
-            <a href="{{ unit.get_absolute_url }}{% if include_search and search_url %}&amp;{{ search_url }}{% elif sort_query %}&amp;sort_by={{ sort_query }}{% endif %}">
+            <a href="{{ unit.translation.get_translate_url }}{{ unit_query }}">
               {% format_unit_source unit search_match=search_query %}
             </a>
           </td>
         {% endif %}
         <td>
-          <a href="{{ unit.get_absolute_url }}{% if include_search and search_url %}&amp;{{ search_url }}{% elif sort_query %}&amp;sort_by={{ sort_query }}{% endif %}">
+          <a href="{{ unit.translation.get_translate_url }}{{ unit_query }}">
             {% format_unit_target unit search_match=search_query %}
           </a>
         </td>
-        {% if show_location %}<td>{{ unit.location }}</td>{% endif %}
-        {% if show_screenshots %}<td>{{ unit.screenshots__count }}</td>{% endif %}
+        {% if show_location %}
+          <td>{{ unit.location }}</td>
+        {% endif %}
+        {% if show_screenshots %}
+          <td>{{ unit.screenshots__count }}</td>
+        {% endif %}
         {% if actions_template %}
           <td>{% include actions_template %}</td>
         {% endif %}

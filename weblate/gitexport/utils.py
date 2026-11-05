@@ -2,7 +2,11 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
+# ruff: ignore[suspicious-subprocess-import]
 import subprocess
+from contextlib import suppress
 from functools import cache as functools_cache
 
 from django.core.management.utils import find_command
@@ -16,10 +20,11 @@ GIT_PATHS = [
 
 
 @functools_cache
-def find_git_http_backend():
+def find_git_http_backend() -> str | None:
     """Find Git HTTP back-end."""
-    try:
+    with suppress(OSError):
         path = subprocess.run(
+            # ruff: ignore[start-process-with-partial-path]
             ["git", "--exec-path"],
             text=True,
             check=True,
@@ -27,7 +32,5 @@ def find_git_http_backend():
         ).stdout.strip()
         if path:
             GIT_PATHS.insert(0, path)
-    except OSError:
-        pass
 
     return find_command("git-http-backend", path=GIT_PATHS)

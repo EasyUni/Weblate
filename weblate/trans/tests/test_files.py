@@ -4,22 +4,78 @@
 
 """Test for import and export."""
 
-from io import BytesIO
+from __future__ import annotations
 
+import csv
+import os
+import tempfile
+from io import BytesIO, StringIO
+from itertools import count
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+from unittest.mock import ANY, patch
+from zipfile import ZipFile
+
+from django.conf import settings
 from django.contrib.messages import ERROR
-from django.test import SimpleTestCase
+from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import DatabaseError
+from django.http import StreamingHttpResponse
+from django.test import RequestFactory, SimpleTestCase, override_settings
 from django.urls import reverse
 from openpyxl import load_workbook
 
-from weblate.formats.helpers import NamedBytesIO
+from weblate.auth.data import SELECTION_ALL, SELECTION_MANUAL
+from weblate.auth.models import Group, Permission, Role, TeamMembership
+from weblate.auth.results import Denied
+from weblate.formats.helpers import NamedBytesIO, format_csv_id_hash
+from weblate.formats.ttkit import CSVFormat, PoFormat, XliffFormat
+from weblate.lang.models import Language, Plural
 from weblate.trans.actions import ActionEvents
-from weblate.trans.forms import SimpleUploadForm
-from weblate.trans.models import ComponentList
+from weblate.trans.exceptions import (
+    FailedCommitError,
+    FileParseError,
+    LanguageMismatchError,
+    PluralFormsMismatchError,
+)
+from weblate.trans.forms import SimpleUploadForm, UploadForm, get_upload_form
+from weblate.trans.models import (
+    Category,
+    Change,
+    Component,
+    ComponentList,
+    PendingUnitChange,
+    Project,
+    Translation,
+    WorkflowSetting,
+)
 from weblate.trans.tests.test_views import ViewTestCase
-from weblate.trans.tests.utils import get_test_file
-from weblate.utils.state import STATE_READONLY
+from weblate.trans.tests.utils import get_optional_path, get_test_file
+from weblate.trans.util import check_upload_method_permissions, join_plural
+from weblate.trans.views.files import (
+    _get_download_commit_repositories,
+    can_download_workspace,
+    download_multi,
+    get_download_components,
+)
+from weblate.utils.change_origin import change_origin_context, get_change_origin
+from weblate.utils.data import data_dir
+from weblate.utils.lock import WeblateLockTimeoutError
+from weblate.utils.state import STATE_READONLY, STATE_TRANSLATED
+from weblate.utils.views import download_translation_file, write_zip_files
+from weblate.workspaces.models import Workspace
+
+if TYPE_CHECKING:
+    from typing import ClassVar
+
+    from django.http import FileResponse
+    from django.test.client import _MonkeyPatchedWSGIResponse as ClientResponse
+
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 TEST_PO = get_test_file("cs.po")
+TEST_PO_PLURAL = get_test_file("cs-plural.po")
 TEST_CSV = get_test_file("cs.csv")
 TEST_CSV_QUOTES = get_test_file("cs-quotes.csv")
 TEST_CSV_QUOTES_ESCAPED = get_test_file("cs-quotes-escaped.csv")
@@ -30,6 +86,7 @@ TEST_POT = get_test_file("hello.pot")
 TEST_POT_CHARSET = get_test_file("hello-charset.pot")
 TEST_MO = get_test_file("cs.mo")
 TEST_XLIFF = get_test_file("cs.poxliff")
+TEST_RUBY = get_test_file("cs.ryml")
 TEST_ANDROID = get_test_file("strings-cs.xml")
 TEST_ANDROID_READONLY = get_test_file("strings-with-readonly.xml")
 TEST_XLSX = get_test_file("cs.xlsx")
@@ -37,6 +94,155 @@ TEST_TBX = get_test_file("terms.tbx")
 
 TRANSLATION_OURS = "Nazdar světe!\n"
 TRANSLATION_PO = "Ahoj světe!\n"
+
+
+class UploadFormTest(SimpleTestCase):
+    def test_upload_form_rejects_approved_conflicts_without_review(self) -> None:
+        form = UploadForm(
+            data={
+                "method": "translate",
+                "fuzzy": "",
+                "conflicts": "replace-approved",
+            },
+            files={"file": SimpleUploadedFile("test.po", b'msgid ""\n')},
+            review_permission=Denied("Translation reviews are turned off."),
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertEqual(
+            form.errors["conflicts"],
+            ["Translation reviews are turned off."],
+        )
+
+
+class UploadFormPermissionTest(ViewTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.project.add_user(self.user, "Administration")
+        self.user.clear_permissions_cache()
+
+    def test_upload_form_hides_approved_conflicts_without_review(self) -> None:
+        form = get_upload_form(self.user, self.translation)
+
+        choices = [choice[0] for choice in form.fields["conflicts"].choices]
+        self.assertIn("replace-translated", choices)
+        self.assertNotIn("replace-approved", choices)
+
+    def test_upload_form_keeps_approved_conflicts_with_review(self) -> None:
+        self.project.translation_review = True
+        self.project.save()
+        self.user.clear_permissions_cache()
+
+        form = get_upload_form(self.user, self.translation)
+
+        choices = [choice[0] for choice in form.fields["conflicts"].choices]
+        self.assertIn("replace-approved", choices)
+
+
+class ReplaceUploadReviewPermissionTest(ViewTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        self.component.create_glossary()
+        glossary = Component.objects.get(project=self.project, is_glossary=True)
+        self.translation = glossary.translation_set.get(language__code="cs")
+
+    def test_glossary_replace_requires_review(self) -> None:
+        self.assertTrue(self.user.has_perm("upload.perform", self.translation))
+        self.assertTrue(self.user.has_perm("unit.add", self.translation))
+        self.assertTrue(self.user.has_perm("unit.delete", self.translation))
+        self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+        self.assertFalse(self.user.has_perm("unit.review", self.translation))
+        self.assertFalse(
+            check_upload_method_permissions(self.user, self.translation, "replace")
+        )
+
+        form = get_upload_form(self.user, self.translation)
+        self.assertNotIn("replace", dict(form.fields["method"].choices))
+
+        with open(TEST_TBX, "rb") as handle:
+            response = self.client.post(
+                reverse("upload", kwargs={"path": self.translation.get_url_path()}),
+                {"file": handle, "method": "replace"},
+                follow=True,
+            )
+        self.assertContains(response, "Please fix errors in the form.")
+        self.assertFalse(
+            self.translation.change_set.filter(
+                action=ActionEvents.REPLACE_UPLOAD
+            ).exists()
+        )
+
+    def test_glossary_replace_allowed_for_reviewer(self) -> None:
+        self.project.add_user(self.user, "Review")
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.review", self.translation))
+        self.assertTrue(
+            check_upload_method_permissions(self.user, self.translation, "replace")
+        )
+
+    def test_glossary_replace_allowed_without_reviews(self) -> None:
+        self.project.translation_review = False
+        self.project.save(update_fields=["translation_review"])
+        self.translation = Translation.objects.get(pk=self.translation.pk)
+        self.assertTrue(
+            check_upload_method_permissions(self.user, self.translation, "replace")
+        )
+
+
+class RestrictedDirectEditingUploadTest(ViewTestCase):
+    def add_project_role(self, role: Role) -> None:
+        group = Group.objects.create(
+            name=f"Restricted upload {role.name}",
+            language_selection=SELECTION_ALL,
+        )
+        group.projects.add(self.project)
+        group.roles.add(role)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+    def restrict_language(self, translation: Translation) -> Translation:
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=translation.language,
+            restrict_direct_editing=True,
+        )
+        return Translation.objects.get(pk=translation.pk)
+
+    def test_direct_and_suggestion_upload(self) -> None:
+        translation = self.restrict_language(self.translation)
+
+        self.assertTrue(self.user.has_perm("upload.perform", translation))
+        self.assertFalse(
+            check_upload_method_permissions(self.user, translation, "translate")
+        )
+        self.assertTrue(
+            check_upload_method_permissions(self.user, translation, "suggest")
+        )
+
+    def test_replace_upload(self) -> None:
+        role = Role.objects.create(name="Replace upload")
+        role.permissions.add(Permission.objects.get(codename="component.edit"))
+        self.add_project_role(role)
+        self.assertTrue(
+            check_upload_method_permissions(self.user, self.translation, "replace")
+        )
+
+        translation = self.restrict_language(self.translation)
+
+        self.assertFalse(
+            check_upload_method_permissions(self.user, translation, "replace")
+        )
+
+    def test_source_upload(self) -> None:
+        self.add_project_role(Role.objects.get(name="Edit source"))
+        source = self.get_translation("en")
+        self.assertTrue(check_upload_method_permissions(self.user, source, "source"))
+
+        source = self.restrict_language(source)
+
+        self.assertFalse(check_upload_method_permissions(self.user, source, "source"))
 
 
 class ImportBaseTest(ViewTestCase):
@@ -50,7 +256,9 @@ class ImportBaseTest(ViewTestCase):
         self.user.is_superuser = True
         self.user.save()
 
-    def do_import(self, test_file=None, follow=False, **kwargs):
+    def do_import(
+        self, *, test_file: str | None = None, follow: bool = False, **kwargs
+    ) -> ClientResponse:
         """Perform file import."""
         if test_file is None:
             test_file = self.test_file
@@ -63,11 +271,12 @@ class ImportBaseTest(ViewTestCase):
                 "author_email": self.user.email,
             }
             params.update(kwargs)
-            return self.client.post(
-                reverse("upload", kwargs=self.kw_translation),
-                params,
-                follow=follow,
-            )
+            with self.captureOnCommitCallbacks(execute=True):
+                return self.client.post(
+                    reverse("upload", kwargs=self.kw_translation),
+                    params,
+                    follow=follow,
+                )
 
 
 class ImportTest(ImportBaseTest):
@@ -78,6 +287,15 @@ class ImportTest(ImportBaseTest):
 
     def test_import_normal(self) -> None:
         """Test importing normally."""
+        translation = self.get_translation()
+
+        initial_change_count = Change.objects.filter(
+            action=ActionEvents.UPLOAD, translation=translation
+        ).count()
+        initial_pending_count = PendingUnitChange.objects.filter(
+            unit__translation=translation
+        ).count()
+
         response = self.do_import()
         self.assertRedirects(response, self.translation_url)
 
@@ -87,9 +305,41 @@ class ImportTest(ImportBaseTest):
         self.assertEqual(translation.stats.fuzzy, 0)
         self.assertEqual(translation.stats.all, 4)
 
+        self.assertGreater(
+            Change.objects.filter(
+                action=ActionEvents.UPLOAD, translation=translation
+            ).count(),
+            initial_change_count,
+        )
+        self.assertGreater(
+            PendingUnitChange.objects.filter(unit__translation=translation).count(),
+            initial_pending_count,
+        )
+
         # Verify unit
         unit = self.get_unit()
         self.assertEqual(unit.target, TRANSLATION_PO)
+        self.assertTrue(PendingUnitChange.objects.filter(unit=unit).exists())
+        change = unit.change_set.filter(action=ActionEvents.UPLOAD).latest("pk")
+        self.assertEqual(change.details["change_origin"], {"scope": "ui"})
+
+    @override_settings(TRANSLATION_UPLOAD_MAX_SIZE=1)
+    def test_import_too_big(self) -> None:
+        response = self.do_import(follow=True)
+
+        self.assertRedirects(response, self.translation_url)
+        self.assertContains(response, "Uploaded translation file is too big.")
+
+    @override_settings(TRANSLATION_UPLOAD_MAX_SIZE=1)
+    def test_direct_upload_too_big_without_size(self) -> None:
+        translation = self.get_translation()
+        request = self.get_request()
+        handle = NamedBytesIO("test.po", Path(TEST_PO).read_bytes())
+
+        with self.assertRaisesMessage(
+            ValidationError, "Uploaded translation file is too big."
+        ):
+            translation.handle_upload(request, handle, "")
 
     def test_import_author(self) -> None:
         """Test importing normally."""
@@ -107,6 +357,74 @@ class ImportTest(ImportBaseTest):
         # Verify unit
         unit = self.get_unit()
         self.assertEqual(unit.target, TRANSLATION_PO)
+
+    def test_import_commit_error_is_sanitized(self) -> None:
+        with patch.object(
+            Translation,
+            "handle_upload",
+            side_effect=FailedCommitError(
+                "Commit failed via "
+                "ssh://git@internal.example.net/private/repo.git "
+                f"in {self.component.full_path}/secret"
+            ),
+        ):
+            response = self.do_import(follow=True)
+
+        self.assertRedirects(response, self.translation_url)
+        messages = [message.message for message in response.context["messages"]]
+        self.assertIn("Commit failed", messages[0])
+        self.assertNotIn("internal.example.net", messages[0])
+        self.assertNotIn("ssh://", messages[0])
+        self.assertNotIn(self.component.full_path, messages[0])
+        self.assertIn(".../secret", messages[0])
+
+    def test_import_database_error_is_hidden(self) -> None:
+        with (
+            patch.object(
+                Translation,
+                "handle_upload",
+                side_effect=DatabaseError(
+                    "invalid page in block 876338 of relation base/16386/17990"
+                ),
+            ),
+            patch("weblate.trans.views.files.report_error") as mocked_report_error,
+        ):
+            response = self.do_import(follow=True)
+
+        self.assertRedirects(response, self.translation_url)
+        messages = [message.message for message in response.context["messages"]]
+        self.assertIn("File upload has failed", messages[0])
+        self.assertIn("Please try again later.", messages[0])
+        self.assertNotIn("invalid page", messages[0])
+        self.assertNotIn("base/16386/17990", messages[0])
+        mocked_report_error.assert_called_once_with(
+            "Upload error", project=self.component.project
+        )
+
+    def test_direct_import_commit_database_error_is_hidden(self) -> None:
+        translation = self.get_translation()
+        request = self.get_request()
+        filename = translation.get_filename()
+        assert filename is not None
+        handle = NamedBytesIO(filename, Path(filename).read_bytes())
+
+        with (
+            patch.object(
+                Translation,
+                "commit_pending",
+                side_effect=DatabaseError(
+                    "invalid page in block 876338 of relation base/16386/17990"
+                ),
+            ),
+            self.assertRaises(FailedCommitError) as context,
+        ):
+            translation.handle_upload(request, handle, "", method="replace")
+
+        message = str(context.exception)
+        self.assertIn("Could not commit pending changes", message)
+        self.assertIn("Please try again later.", message)
+        self.assertNotIn("invalid page", message)
+        self.assertNotIn("base/16386/17990", message)
 
     def test_import_overwrite(self) -> None:
         """Test importing with overwriting."""
@@ -172,8 +490,80 @@ class ImportTest(ImportBaseTest):
         self.assertEqual(translation.stats.translated, 1)
 
 
+class PluralSuggestionImportTest(ImportBaseTest):
+    test_file = get_test_file("cs-suggestions-plural.po")
+    source: ClassVar[list[str]] = [
+        "Orangutan has %d banana.\n",
+        "Orangutan has %d bananas.\n",
+    ]
+    target: ClassVar[list[str]] = [
+        "Orangutan má %d banán.\n",
+        "Orangutan má %d banány.\n",
+        "Orangutan má %d banánů.\n",
+    ]
+
+    def test_import_suggest_plural(self) -> None:
+        unit = self.get_translation().unit_set.get(source=join_plural(self.source))
+        original_target = unit.target
+        original_state = unit.state
+
+        response = self.do_import(method="suggest")
+        self.assertRedirects(response, self.translation_url)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, original_target)
+        self.assertEqual(unit.state, original_state)
+        suggestion = unit.suggestion_set.get()
+        self.assertEqual(suggestion.target_list, self.target)
+        self.assertEqual(suggestion.user, self.user)
+
+        response = self.do_import(method="suggest")
+        self.assertRedirects(response, self.translation_url)
+        self.assertEqual(unit.suggestion_set.get().pk, suggestion.pk)
+
+        suggestion.accept(self.get_request())
+        unit.refresh_from_db()
+        self.assertEqual(unit.get_target_plurals(), self.target)
+        self.assertTrue(unit.translated)
+        self.assertFalse(unit.suggestion_set.exists())
+
+    def test_import_suggest_plural_unchanged(self) -> None:
+        unit = self.get_translation().unit_set.get(source=join_plural(self.source))
+        unit.translate(self.user, self.target, STATE_TRANSLATED)
+
+        response = self.do_import(method="suggest")
+        self.assertRedirects(response, self.translation_url)
+        self.assertFalse(unit.suggestion_set.exists())
+
+
+class AndroidPluralSuggestionImportTest(PluralSuggestionImportTest):
+    test_file = get_test_file("strings-cs-suggestions-plural.xml")
+
+    def create_component(self) -> Component:
+        return self.create_android()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.component.source_translation.add_unit(
+            None, "suggestion_plural", self.source, author=self.user
+        )
+        self.component.commit_pending("test", self.user)
+
+
 class ImportErrorTest(ImportBaseTest):
     """Testing import of broken files."""
+
+    def test_invalid_toml_is_reported(self) -> None:
+        fd, filename = tempfile.mkstemp(suffix=".toml")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(b"=broken")
+
+            response = self.do_import(test_file=filename, follow=True)
+        finally:
+            os.unlink(filename)
+
+        self.assertRedirects(response, self.translation_url)
+        self.assertContains(response, "Could not parse uploaded file")
 
     def test_mismatched_plurals(self) -> None:
         """
@@ -189,6 +579,448 @@ class ImportErrorTest(ImportBaseTest):
         self.assertIn(
             "Plural forms in the uploaded file do not match", messages[0].message
         )
+
+
+class LanguageUploadValidationTest(ImportBaseTest):
+    def mismatched_file(self) -> SimpleUploadedFile:
+        return SimpleUploadedFile(
+            "test.po",
+            Path(TEST_PO).read_bytes().replace(b"Language: cs", b"Language: de"),
+        )
+
+    def test_mismatch_does_not_change_translation(self) -> None:
+        translation = self.get_translation()
+        path = translation.get_filename()
+        assert path is not None
+        filename = Path(path)
+        content = filename.read_bytes()
+        targets = list(translation.unit_set.values_list("target", flat=True))
+        changes = translation.change_set.count()
+        for method in ("translate", "approve", "fuzzy", "suggest", "add", "replace"):
+            with (
+                self.subTest(method=method),
+                patch.object(translation, "commit_pending") as commit,
+                patch.object(
+                    translation.component, "commit_pending"
+                ) as component_commit,
+                self.assertRaises(LanguageMismatchError),
+            ):
+                translation.handle_upload(
+                    self.get_request(),
+                    NamedBytesIO("test.po", self.mismatched_file().read()),
+                    "",
+                    method=method,
+                )
+            commit.assert_not_called()
+            component_commit.assert_not_called()
+            self.assertEqual(filename.read_bytes(), content)
+            self.assertEqual(
+                list(translation.unit_set.values_list("target", flat=True)), targets
+            )
+            self.assertEqual(translation.change_set.count(), changes)
+
+    def test_ui_mismatch_and_override(self) -> None:
+        for ignore_language in (False, True):
+            with self.subTest(ignore_language=ignore_language):
+                response = self.client.post(
+                    reverse("upload", kwargs=self.kw_translation),
+                    {
+                        "file": self.mismatched_file(),
+                        "method": "translate",
+                        "author_name": self.user.full_name,
+                        "author_email": self.user.email,
+                        "ignore_language": ignore_language,
+                    },
+                    follow=True,
+                )
+                messages = list(response.context["messages"])
+                if ignore_language:
+                    self.assertNotEqual(messages[0].level, ERROR)
+                    self.assertEqual(self.get_unit().target, TRANSLATION_PO)
+                else:
+                    self.assertEqual(messages[0].level, ERROR)
+                    self.assertIn("uploaded file language (de)", messages[0].message)
+                    self.assertIn("Ignore language mismatch", messages[0].message)
+
+    def test_language_codes(self) -> None:
+        translation = self.get_translation()
+        for code in ("cs", "CS", "cs-CZ", "ces", "cs_XX", "", "unknown", "de-invalid!"):
+            with self.subTest(code=code):
+                store = PoFormat(
+                    NamedBytesIO(
+                        "test.po", f'msgid ""\nmsgstr "Language: {code}\\n"\n'.encode()
+                    )
+                )
+                translation.validate_upload_language(store)
+
+        for expected, actual in (
+            ("pt_BR", "pt-PT"),
+            ("zh_Hans", "zh-Hant"),
+            ("sr_Latn", "sr@cyrillic"),
+            ("he", "iw"),
+        ):
+            with self.subTest(expected=expected, actual=actual):
+                translation.language = Language.objects.get(code=expected)
+                store = PoFormat(
+                    NamedBytesIO(
+                        "test.po",
+                        f'msgid ""\nmsgstr "Language: {actual}\\n"\n'.encode(),
+                    )
+                )
+                translation.validate_upload_language(store)
+
+    def test_no_declared_language_skips_cache(self) -> None:
+        store = PoFormat(NamedBytesIO("test.po", b'msgid ""\nmsgstr ""\n'))
+
+        with patch.object(Language.objects, "build_fuzzy_get_cache") as build_cache:
+            self.get_translation().validate_upload_language(store)
+
+        build_cache.assert_not_called()
+
+    def test_xliff_language_mismatch(self) -> None:
+        content = b'<xliff version="1.2"><file source-language="en" target-language="de"><body><trans-unit id="hello"><source>Hello, world!\n</source><target>Hallo Welt!\n</target></trans-unit></body></file></xliff>'
+        with self.assertRaises(LanguageMismatchError):
+            self.get_translation().handle_upload(
+                self.get_request(), NamedBytesIO("test.xlf", content), ""
+            )
+
+    def test_xliff_language_declarations_limit(self) -> None:
+        files = b"".join(
+            f'<file target-language="x-{index}"><body/></file>'.encode()
+            for index in range(101)
+        )
+        store = XliffFormat(
+            NamedBytesIO("test.xlf", b'<xliff version="1.2">' + files + b"</xliff>")
+        )
+
+        with self.assertRaisesMessage(
+            FileParseError, "contains too many language declarations"
+        ):
+            self.get_translation().validate_upload_language(store)
+
+    def test_override_keeps_parse_validation(self) -> None:
+        with self.assertRaises(FileParseError):
+            self.get_translation().handle_upload(
+                self.get_request(),
+                NamedBytesIO("test.po", b"not a PO file"),
+                "",
+                method="replace",
+                ignore_language=True,
+            )
+
+    def test_override_replace(self) -> None:
+        translation = self.get_translation()
+        result = translation.handle_upload(
+            self.get_request(),
+            NamedBytesIO("test.po", self.mismatched_file().read()),
+            "",
+            method="replace",
+            ignore_language=True,
+        )
+        self.assertGreater(result[2], 0)
+        self.assertEqual(self.get_unit().target, TRANSLATION_PO)
+
+    def test_override_suggest(self) -> None:
+        translation = self.get_translation()
+        result = translation.handle_upload(
+            self.get_request(),
+            NamedBytesIO("test.po", self.mismatched_file().read()),
+            "",
+            method="suggest",
+            ignore_language=True,
+        )
+        self.assertEqual(result[2], 1)
+        self.assertEqual(self.get_unit().suggestion_set.get().target, TRANSLATION_PO)
+
+    def test_project_language_alias(self) -> None:
+        translation = self.get_translation()
+        translation.component.project.language_aliases = "de:cs"
+        translation.component.project.__dict__.pop("language_aliases_dict", None)
+        store = PoFormat(NamedBytesIO("test.po", self.mismatched_file().read()))
+        translation.validate_upload_language(store)
+
+    def test_override_keeps_plural_validation(self) -> None:
+        with self.assertRaises(PluralFormsMismatchError):
+            self.get_translation().handle_upload(
+                self.get_request(),
+                NamedBytesIO("test.po", Path(TEST_BADPLURALS).read_bytes()),
+                "",
+                ignore_language=True,
+            )
+
+    def test_source_language(self) -> None:
+        source = self.component.source_translation
+        content = b'<xliff version="1.2"><file source-language="de" target-language="en"><body/></file></xliff>'
+        store = XliffFormat(NamedBytesIO("test.xlf", content))
+        with self.assertRaises(LanguageMismatchError):
+            source.validate_upload_language(store, source=True)
+        # A foreign target language does not make a source upload invalid.
+        store = XliffFormat(
+            NamedBytesIO(
+                "test.xlf",
+                content.replace(
+                    b'source-language="de" target-language="en"',
+                    b'source-language="en" target-language="de"',
+                ),
+            )
+        )
+        source.validate_upload_language(store, source=True)
+
+
+class PluralMetadataUploadValidationTest(ImportBaseTest):
+    @staticmethod
+    def get_csv_id_hash(id_hash: int) -> str:
+        return format_csv_id_hash(id_hash)
+
+    @staticmethod
+    def get_csv_content(rows: list[dict[str, str]]) -> bytes:
+        output = StringIO()
+        fieldnames = [
+            "source",
+            "target",
+            "id_hash",
+            "source_plural_form",
+            "target_plural_form",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        return output.getvalue().encode()
+
+    @classmethod
+    def get_csv_store(cls, rows: list[dict[str, str]]) -> CSVFormat:
+        return CSVFormat(NamedBytesIO("plural.csv", cls.get_csv_content(rows)))
+
+    def test_merge_plural_metadata_out_of_range_is_not_partially_applied(
+        self,
+    ) -> None:
+        translation = self.get_translation()
+        request = self.get_request()
+        hello_unit = self.get_unit()
+        plural_unit = self.get_unit("Orangutan has %d banana.\n")
+        original_hello_target = hello_unit.target
+        original_plural_target = plural_unit.target
+        source_plurals = plural_unit.get_source_plurals()
+
+        store = self.get_csv_store(
+            [
+                {
+                    "source": hello_unit.source,
+                    "target": "This should not be imported.\n",
+                    "id_hash": str(hello_unit.id_hash),
+                    "source_plural_form": "",
+                    "target_plural_form": "",
+                },
+                *(
+                    {
+                        "source": source_plurals[min(form, len(source_plurals) - 1)],
+                        "target": f"Plural form {form}.\n",
+                        "id_hash": self.get_csv_id_hash(plural_unit.id_hash),
+                        "source_plural_form": str(min(form, len(source_plurals) - 1)),
+                        "target_plural_form": str(form),
+                    }
+                    for form in range(translation.plural.number + 1)
+                ),
+            ]
+        )
+
+        with self.assertRaisesMessage(
+            FileParseError,
+            f"Plural form {translation.plural.number} in the uploaded file is out of range.",
+        ):
+            translation.merge_translations(
+                request, self.user, store, "", "translate", ""
+            )
+
+        hello_unit.refresh_from_db()
+        plural_unit.refresh_from_db()
+        self.assertEqual(hello_unit.target, original_hello_target)
+        self.assertEqual(plural_unit.target, original_plural_target)
+
+    def test_merge_incomplete_plural_metadata_is_not_partially_applied(self) -> None:
+        translation = self.get_translation()
+        request = self.get_request()
+        hello_unit = self.get_unit()
+        plural_unit = self.get_unit("Orangutan has %d banana.\n")
+        original_hello_target = hello_unit.target
+        original_plural_target = plural_unit.target
+        self.assertGreater(translation.plural.number, 1)
+        missing_form = translation.plural.number - 1
+        source_plurals = plural_unit.get_source_plurals()
+        plural_rows = [
+            {
+                "source": source_plurals[min(form, len(source_plurals) - 1)],
+                "target": f"Incomplete plural form {form}.\n",
+                "id_hash": self.get_csv_id_hash(plural_unit.id_hash),
+                "source_plural_form": str(min(form, len(source_plurals) - 1)),
+                "target_plural_form": str(form),
+            }
+            for form in range(missing_form)
+        ]
+        store = self.get_csv_store(
+            [
+                {
+                    "source": hello_unit.source,
+                    "target": "This should not be imported.\n",
+                    "id_hash": str(hello_unit.id_hash),
+                    "source_plural_form": "",
+                    "target_plural_form": "",
+                },
+                *plural_rows,
+            ]
+        )
+
+        with self.assertRaisesMessage(
+            FileParseError,
+            f"Plural form {missing_form} in the uploaded file is missing.",
+        ):
+            translation.merge_translations(
+                request, self.user, store, "", "translate", ""
+            )
+
+        hello_unit.refresh_from_db()
+        plural_unit.refresh_from_db()
+        self.assertEqual(hello_unit.target, original_hello_target)
+        self.assertEqual(plural_unit.target, original_plural_target)
+
+    def test_merge_malformed_id_hash_is_not_partially_applied(self) -> None:
+        translation = self.get_translation()
+        request = self.get_request()
+        hello_unit = self.get_unit()
+        plural_unit = self.get_unit("Orangutan has %d banana.\n")
+        original_target = hello_unit.target
+
+        store = self.get_csv_store(
+            [
+                {
+                    "source": hello_unit.source,
+                    "target": "This should not be imported.\n",
+                    "id_hash": str(hello_unit.id_hash),
+                    "source_plural_form": "",
+                    "target_plural_form": "",
+                },
+                {
+                    "source": plural_unit.get_source_plurals()[0],
+                    "target": "Invalid id hash.\n",
+                    "id_hash": "invalid",
+                    "source_plural_form": "0",
+                    "target_plural_form": "0",
+                },
+            ]
+        )
+
+        with self.assertRaisesMessage(
+            FileParseError, "Invalid id_hash metadata in CSV file: invalid"
+        ):
+            translation.merge_translations(
+                request, self.user, store, "", "translate", ""
+            )
+
+        hello_unit.refresh_from_db()
+        self.assertEqual(hello_unit.target, original_target)
+
+    def test_merge_non_plural_id_hash_column_is_ignored(self) -> None:
+        translation = self.get_translation()
+        hello_unit = self.get_unit()
+        target = "Imported despite external id_hash.\n"
+        store = self.get_csv_store(
+            [
+                {
+                    "source": hello_unit.source,
+                    "target": target,
+                    "id_hash": "external-id",
+                    "source_plural_form": "",
+                    "target_plural_form": "",
+                },
+            ]
+        )
+
+        result = translation.merge_translations(
+            self.get_request(), self.user, store, "replace-translated", "translate", ""
+        )
+
+        self.assertEqual(result, (0, 0, 1, 1))
+        hello_unit.refresh_from_db()
+        self.assertEqual(hello_unit.target, target)
+
+    def test_upload_plural_metadata_without_id_hash_is_rejected(self) -> None:
+        translation = self.get_translation()
+        translation.plural = Plural.objects.create(
+            language=translation.language, number=1, formula="0"
+        )
+        translation.save(update_fields=["plural"])
+
+        plural_unit = self.get_unit("Orangutan has %d banana.\n")
+        original_target = plural_unit.target
+
+        with self.assertRaisesMessage(
+            FileParseError, "Plural form metadata in CSV file requires id_hash."
+        ):
+            translation.handle_upload(
+                self.get_request(),
+                NamedBytesIO(
+                    "plural.csv",
+                    self.get_csv_content(
+                        [
+                            {
+                                "source": plural_unit.get_source_plurals()[1],
+                                "target": "Imported one plural form.\n",
+                                "id_hash": "",
+                                "source_plural_form": "1",
+                                "target_plural_form": "0",
+                            },
+                        ]
+                    ),
+                ),
+                "replace-translated",
+                method="translate",
+            )
+
+        plural_unit.refresh_from_db()
+        self.assertEqual(plural_unit.target, original_target)
+
+    def test_add_plural_metadata_with_id_hash_sparse_source_form_skips_existing(
+        self,
+    ) -> None:
+        translation = self.get_translation()
+        translation.plural = Plural.objects.create(
+            language=translation.language, number=1, formula="0"
+        )
+        translation.save(update_fields=["plural"])
+        plural_unit = self.get_unit("Orangutan has %d banana.\n")
+        translation.add_unit(
+            self.get_request(),
+            plural_unit.context,
+            [
+                "Ambiguous singular source.\n",
+                plural_unit.get_source_plurals()[1],
+            ],
+            ["Ambiguous one plural form.\n"],
+        )
+        initial_count = translation.unit_set.count()
+
+        result = translation.handle_upload(
+            self.get_request(),
+            NamedBytesIO(
+                "plural.csv",
+                self.get_csv_content(
+                    [
+                        {
+                            "source": plural_unit.get_source_plurals()[1],
+                            "target": "Existing one plural form.\n",
+                            "id_hash": self.get_csv_id_hash(plural_unit.id_hash),
+                            "source_plural_form": "1",
+                            "target_plural_form": "0",
+                        },
+                    ]
+                ),
+            ),
+            "",
+            method="add",
+        )
+
+        self.assertEqual(result, (0, 1, 0, 1))
+        self.assertEqual(translation.unit_set.count(), initial_count)
 
 
 class BOMImportTest(ImportTest):
@@ -263,21 +1095,21 @@ class ImportMoPoTest(ImportTest):
 
     test_file = TEST_MO
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_po()
 
 
 class ImportJoomlaTest(ImportTest):
     has_plurals = False
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_joomla()
 
 
 class ImportCSVTest(ImportTest):
     has_plurals = False
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_csv_mono()
 
     def test_import_source(self) -> None:
@@ -305,33 +1137,104 @@ class ImportCSVTest(ImportTest):
 class ImportJSONTest(ImportTest):
     has_plurals = False
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_json()
 
 
 class ImportJSONMonoTest(ImportTest):
     has_plurals = False
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_json_mono()
 
 
 class ImportPHPMonoTest(ImportTest):
     has_plurals = False
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_php_mono()
 
 
 class StringsImportTest(ImportTest):
     has_plurals = False
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_iphone()
 
 
+class RubyPluralImportText(ImportBaseTest):
+    test_file = TEST_RUBY
+
+    def create_component(self) -> Component:
+        return self.create_ruby_yaml()
+
+    def test_import_plural(self) -> None:
+        """Test importing normally."""
+        response = self.do_import()
+        self.assertRedirects(response, self.translation_url)
+
+        # Verify stats
+        translation = self.get_translation()
+        self.assertEqual(translation.stats.translated, 1)
+        self.assertEqual(translation.stats.fuzzy, 0)
+        self.assertEqual(translation.stats.all, 4)
+
+        # Verify unit
+        unit = self.get_unit("Orangutan has %d banana.\n")
+        self.assertEqual(
+            unit.get_target_plurals(),
+            [
+                "Orangutan má %d banán.\n",
+                "Orangutan má %d banány.\n",
+                "Orangutan má %d banánů.\n",
+            ],
+        )
+
+    def test_import_pt_br(self) -> None:
+        language = Language.objects.get(code="pt_BR")
+        with self.captureOnCommitCallbacks(execute=True):
+            translation = self.component.add_new_language(language, None)
+        assert translation is not None
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                reverse("upload", kwargs={"path": translation.get_url_path()}),
+                {
+                    "file": BytesIO(
+                        r"""
+pt_br:
+  weblate:
+    orangutan:
+      one: "Orangutan má %d banán.\n"
+      many: "Orangutan má %d banány.\n"
+      other: "Orangutan má %d banánů.\n"
+""".encode()
+                    ),
+                    "method": "translate",
+                    "author_name": self.user.full_name,
+                    "author_email": self.user.email,
+                },
+                follow=True,
+            )
+        self.assertRedirects(response, translation.get_absolute_url())
+
+        self.assertEqual(translation.stats.translated, 1)
+        self.assertEqual(translation.stats.fuzzy, 0)
+        self.assertEqual(translation.stats.all, 4)
+
+        # Verify unit
+        unit = self.get_unit("Orangutan has %d banana.\n", "pt_BR")
+        self.assertEqual(
+            unit.get_target_plurals(),
+            [
+                "Orangutan má %d banán.\n",
+                "Orangutan má %d banány.\n",
+                "Orangutan má %d banánů.\n",
+            ],
+        )
+
+
 class AndroidImportTest(ViewTestCase):
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_android()
 
     def test_import(self) -> None:
@@ -428,7 +1331,10 @@ class CSVImportTest(ViewTestCase):
         translation = self.get_translation()
         self.assertEqual(translation.stats.translated, 0)
         self.assertEqual(translation.stats.fuzzy, 0)
-        with open(self.test_file, "rb") as handle:
+        with (
+            open(self.test_file, "rb") as handle,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             self.client.post(
                 reverse("upload", kwargs=self.kw_translation),
                 {
@@ -461,13 +1367,13 @@ class ExportTest(ViewTestCase):
 
     source = "Hello, world!\n"
     target = "Nazdar svete!\n"
-    test_match_1 = "Weblate Hello World 2016"
-    test_match_2 = "Nazdar svete!"
-    test_header = "attachment; filename=test-test-cs.po"
+    test_match_1: str | bytes = "Weblate Hello World 2016"
+    test_match_2: str | bytes = "Nazdar svete!"
+    test_header = 'attachment; filename="test-test-cs.po"'
     test_source = "Orangutan has %d banana"
     test_source_plural = "Orangutan has %d bananas"
 
-    def create_component(self):
+    def create_component(self) -> Component:
         # Needs to create PO file to have language pack option
         return self.create_po()
 
@@ -503,6 +1409,145 @@ class ExportTest(ViewTestCase):
         response = self.client.get(reverse("download", kwargs=self.kw_translation))
         self.assert_response_contains(response, self.test_match_1, self.test_match_2)
         self.assertEqual(response["Content-Disposition"], self.test_header)
+
+    def test_export_opens_file_with_repository_locked(self) -> None:
+        translation = self.get_translation()
+        if len(translation.filenames) != 1:
+            self.skipTest("single-file download only")
+        repository = translation.component.repository
+        request = RequestFactory().get(reverse("download", kwargs=self.kw_translation))
+        request.user = self.user
+
+        from weblate.utils import views  # ruff: ignore[import-outside-top-level]
+
+        file_response = views.FileResponse
+
+        def check_lock(*args, **kwargs) -> FileResponse:
+            self.assertTrue(repository.lock.is_locked)
+            return file_response(*args, **kwargs)
+
+        clock = count(step=301)
+        with (
+            patch.object(views, "FileResponse", side_effect=check_lock),
+            patch.object(repository.lock, "reacquire") as reacquire,
+            patch.object(views, "monotonic", side_effect=lambda: next(clock)),
+        ):
+            response = download_translation_file(request, translation)
+
+        self.assert_response_contains(response, self.test_match_1, self.test_match_2)
+        reacquire.assert_called()
+        response.file_to_stream.close()
+
+    def test_export_snapshots_file_with_repository_locked(self) -> None:
+        translation = self.get_translation()
+        if len(translation.filenames) != 1:
+            self.skipTest("single-file download only")
+        filename = translation.filenames[0]
+        original = Path(filename).read_bytes()
+        request = RequestFactory().get(reverse("download", kwargs=self.kw_translation))
+        request.user = self.user
+
+        from weblate.utils import views  # ruff: ignore[import-outside-top-level]
+
+        file_response = views.FileResponse
+        expected = b""
+        response = None
+
+        def rewrite_source(*args, **kwargs) -> FileResponse:
+            nonlocal expected
+            expected = Path(filename).read_bytes()
+            Path(filename).write_bytes(b"rewritten after response construction")
+            return file_response(*args, **kwargs)
+
+        try:
+            with patch.object(views, "FileResponse", side_effect=rewrite_source):
+                response = download_translation_file(request, translation)
+            self.assertEqual(b"".join(response.streaming_content), expected)
+        finally:
+            if response is not None:
+                response.file_to_stream.close()
+            Path(filename).write_bytes(original)
+
+    def test_head_export_skips_snapshot(self) -> None:
+        translation = self.get_translation()
+        if len(translation.filenames) != 1:
+            self.skipTest("single-file download only")
+        filename = translation.filenames[0]
+        request = RequestFactory().head(reverse("download", kwargs=self.kw_translation))
+        request.user = self.user
+
+        with patch("weblate.utils.views.snapshot_file_response") as snapshot:
+            response = download_translation_file(request, translation)
+
+        snapshot.assert_not_called()
+        self.assertTrue(response.streaming)
+        self.assertEqual(b"".join(response.streaming_content), b"")
+        self.assertEqual(int(response["Content-Length"]), os.path.getsize(filename))
+        self.assertEqual(response["Content-Disposition"], self.test_header)
+
+    def test_head_export_preserves_content_negotiation(self) -> None:
+        translation = self.get_translation()
+        if len(translation.filenames) != 1:
+            self.skipTest("single-file download only")
+        url = reverse("download", kwargs=self.kw_translation)
+
+        def streaming_response(
+            filename: str, content_type: str, _refresh_lock: object
+        ) -> StreamingHttpResponse:
+            response = StreamingHttpResponse((b"content",), content_type=content_type)
+            response["Content-Length"] = os.path.getsize(filename)
+            return response
+
+        with patch(
+            "weblate.utils.views.snapshot_file_response",
+            side_effect=streaming_response,
+        ):
+            for accept_encoding in ("identity", "gzip"):
+                with self.subTest(accept_encoding=accept_encoding):
+                    get_request = RequestFactory().get(
+                        url, headers={"accept-encoding": accept_encoding}
+                    )
+                    head_request = RequestFactory().head(
+                        url, headers={"accept-encoding": accept_encoding}
+                    )
+                    get_request.user = head_request.user = self.user
+                    get_response = download_translation_file(get_request, translation)
+                    head_response = download_translation_file(head_request, translation)
+
+                    self.assertTrue(head_response.streaming)
+                    for header in (
+                        "Content-Type",
+                        "Content-Disposition",
+                        "Content-Encoding",
+                        "Content-Length",
+                        "Vary",
+                    ):
+                        self.assertEqual(
+                            head_response.get(header), get_response.get(header), header
+                        )
+
+    def test_export_repository_lock_timeout(self) -> None:
+        translation = self.get_translation()
+        repository = translation.component.repository
+        request = RequestFactory().get(reverse("download", kwargs=self.kw_translation))
+        request.user = self.user
+        error = WeblateLockTimeoutError(
+            "repository locked", lock=repository.lock.lock_object
+        )
+
+        with (
+            patch.object(type(repository.lock), "__enter__", side_effect=error),
+            self.assertRaises(WeblateLockTimeoutError),
+        ):
+            download_translation_file(request, translation)
+
+        with patch(
+            "weblate.trans.views.files.download_translation_file", side_effect=error
+        ):
+            response = self.client.get(reverse("download", kwargs=self.kw_translation))
+
+        self.assertEqual(response.status_code, 423)
+        self.assertIn(b"Could not obtain the repository lock", response.content)
 
     def export_format(self, fmt, **extra):
         extra["format"] = fmt
@@ -546,14 +1591,14 @@ class ExportTest(ViewTestCase):
         response = self.export_format("xlsx")
         self.assert_excel(response)
         self.assertEqual(
-            response["Content-Disposition"], "attachment; filename=test-test-cs.xlsx"
+            response["Content-Disposition"], 'attachment; filename="test-test-cs.xlsx"'
         )
 
     def test_export_xlsx_empty(self) -> None:
         response = self.export_format("xlsx", q="check:inconsistent")
         self.assert_excel(response)
         self.assertEqual(
-            response["Content-Disposition"], "attachment; filename=test-test-cs.xlsx"
+            response["Content-Disposition"], 'attachment; filename="test-test-cs.xlsx"'
         )
 
     def test_export_invalid(self) -> None:
@@ -566,11 +1611,11 @@ class ExportMultifileTest(ExportTest):
     target = "Weblate - průběžná lokalizace"
     test_match_1 = b"PK\001\002"
     test_match_2 = b"PK\005\006"
-    test_header = "attachment; filename=test-test-cs.zip"
+    test_header = 'attachment; filename="test-test-cs.zip"'
     test_source = "https://www.youtube.com/watch?v=IVlXt6QdgdA"
     test_source_plural = "https://www.youtube.com/watch?v=IVlXt6QdgdA"
 
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_appstore()
 
 
@@ -582,6 +1627,49 @@ class FormTest(SimpleTestCase):
             [x[0] for x in form.fields["method"].choices],
             ["translate", "approve", "fuzzy", "replace", "source", "add"],
         )
+
+
+class LinkedSourceUploadOriginTest(ImportBaseTest):
+    test_file = TEST_POT_CHARSET
+    upload_method = "source"
+
+    def assert_linked_upload_origin(self, scope: str) -> None:
+        linked = self.create_link_existing(
+            file_format=self.component.file_format,
+            filemask=self.component.filemask,
+            template=self.component.template,
+        )
+        previous_changes = set(linked.change_set.values_list("pk", flat=True))
+        content = (
+            Path(self.test_file).read_bytes()
+            + b'\nmsgid "Linked upload origin"\nmsgstr ""\n'
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            with change_origin_context({"scope": scope}):
+                self.component.source_translation.handle_upload(
+                    self.get_request(),
+                    NamedBytesIO(self.test_file, content),
+                    "",
+                    method=self.upload_method,
+                )
+            self.assertEqual(get_change_origin(), {"scope": "system"})
+        changes = linked.change_set.exclude(pk__in=previous_changes)
+        self.assertTrue(changes.filter(unit__isnull=False).exists())
+        for change in changes:
+            self.assertEqual(change.details["change_origin"], {"scope": scope})
+
+    def test_upload_ui_origin(self) -> None:
+        self.assert_linked_upload_origin("ui")
+
+    def test_upload_api_origin(self) -> None:
+        self.assert_linked_upload_origin("api")
+
+
+class LinkedReplacementUploadOriginTest(LinkedSourceUploadOriginTest):
+    upload_method = "replace"
+
+    def create_component(self) -> Component:
+        return self.create_po_mono()
 
 
 class ImportReplaceTest(ImportBaseTest):
@@ -604,6 +1692,16 @@ class ImportReplaceTest(ImportBaseTest):
         unit = self.get_unit()
         self.assertEqual(unit.target, TRANSLATION_PO)
 
+    def test_import_wrong(self) -> None:
+        """Test importing normally."""
+        response = self.do_import(method="replace", test_file=TEST_TBX, follow=True)
+        self.assertRedirects(response, self.translation_url)
+        self.assertContains(response, "Could not parse uploaded file")
+
+        # Verify stats
+        translation = self.get_translation()
+        self.assertEqual(translation.stats.translated, 0)
+
 
 class ImportSourceTest(ImportBaseTest):
     """Testing of source strings update imports."""
@@ -623,6 +1721,7 @@ class ImportSourceTest(ImportBaseTest):
         self.assertFalse(
             translation.change_set.filter(action=ActionEvents.SOURCE_UPLOAD).exists()
         )
+
         response = self.do_import(method="source", follow=True)
         self.assertRedirects(response, self.translation.get_absolute_url())
         messages = list(response.context["messages"])
@@ -643,11 +1742,168 @@ class ImportSourceTest(ImportBaseTest):
             self.expected_uploads,
         )
 
+    def test_import_removes_obsolete(self) -> None:
+        self.component.file_format_params = {
+            **self.component.file_format_params,
+            "po_remove_obsolete": True,
+        }
+        self.component.save(update_fields=["file_format_params"])
+        translation = self.component.translation_set.get(language__code="cs")
+        translation_file = get_optional_path(translation.get_filename())
+        translation_file.write_text(
+            translation_file.read_text(encoding="utf-8").replace(
+                'msgid "Thank you for using Weblate."\nmsgstr ""',
+                'msgid "Thank you for using Weblate."\nmsgstr "Dekuji"',
+            ),
+            encoding="utf-8",
+        )
+        content = Path(TEST_POT).read_text(encoding="utf-8")
+        for line in ("14", "15"):
+            content = content.replace(
+                f"\n#: main.c:{line}\n"
+                'msgid "Thank you for using Weblate."\n'
+                'msgstr ""\n',
+                "\n",
+            )
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".pot", delete=False
+        ) as handle:
+            handle.write(content)
+            test_file = handle.name
+
+        try:
+            response = self.do_import(method="source", test_file=test_file, follow=True)
+        finally:
+            os.unlink(test_file)
+
+        self.assertRedirects(response, self.translation.get_absolute_url())
+        self.assertNotIn(
+            "#~ msgid",
+            get_optional_path(translation.get_filename()).read_text(encoding="utf-8"),
+        )
+
+
+class ImportSourceCountTest(ImportBaseTest):
+    test_file = TEST_POT_CHARSET
+
+    def assert_import_commits_only_updated_files(self) -> None:
+        repository = self.component.repository
+        unrelated = Path(self.component.full_path) / "unrelated.txt"
+        unrelated.write_text("Unrelated change", encoding="utf-8")
+        previous_revision = repository.last_revision
+
+        with (
+            open(self.test_file, "rb") as handle,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.component.source_translation.handle_upload(
+                self.get_request(), handle, "", method="source"
+            )
+
+        self.assertNotEqual(repository.last_revision, previous_revision)
+        self.assertTrue(repository.needs_commit([str(unrelated)]))
+        for translation in self.component.translation_set.exclude(
+            language=self.component.source_language
+        ):
+            self.assertFalse(repository.needs_commit(translation.filenames))
+            self.assertEqual(translation.unit_set.count(), 3)
+        self.assertEqual(self.component.source_translation.unit_set.count(), 3)
+
+    def test_import_commits_only_updated_files(self) -> None:
+        self.assert_import_commits_only_updated_files()
+
+    def test_import_commits_new_base(self) -> None:
+        self.component.new_base = "po/hello.pot"
+        self.component.save(update_fields=["new_base"])
+
+        self.assert_import_commits_only_updated_files()
+
+        filename = self.component.get_new_base_filename()
+        assert filename is not None
+        self.assertFalse(self.component.repository.needs_commit([filename]))
+        self.assertEqual(Path(filename).read_bytes(), Path(self.test_file).read_bytes())
+
+    def test_import_count_before_cleanup(self) -> None:
+        source = self.component.source_translation
+        self.assertEqual(source.unit_set.count(), 4)
+
+        with (
+            open(self.test_file, "rb") as handle,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            result = source.handle_upload(
+                self.get_request(), handle, "", method="source"
+            )
+            self.assertEqual(result, (0, 0, 3, 3))
+            self.assertEqual(source.unit_set.count(), 4)
+            self.assertEqual(
+                source.change_set.get(action=ActionEvents.FILE_UPLOAD).details,
+                {
+                    "method": "source",
+                    "change_origin": {"scope": "system"},
+                    "not_found": 0,
+                    "skipped": 0,
+                    "accepted": 3,
+                    "total": 3,
+                },
+            )
+
+        self.assertEqual(source.unit_set.count(), 3)
+
+    def test_import_ignore_language(self) -> None:
+        source = self.component.source_translation
+        with (
+            open(self.test_file, "rb") as handle,
+            self.captureOnCommitCallbacks(execute=True),
+            patch.object(source, "validate_upload_language") as validate_language,
+        ):
+            result = source.handle_upload(
+                self.get_request(), handle, "", method="source", ignore_language=True
+            )
+
+        self.assertEqual(result, (0, 0, 3, 3))
+        validate_language.assert_not_called()
+        self.assertEqual(source.unit_set.count(), 3)
+
+    def test_import_ignore_language_keeps_parse_validation(self) -> None:
+        with self.assertRaises(FileParseError):
+            self.component.source_translation.handle_upload(
+                self.get_request(),
+                NamedBytesIO("test.pot", b"not a PO file"),
+                "",
+                method="source",
+                ignore_language=True,
+            )
+
 
 class ImportAddTest(ImportBaseTest):
     """Testing of source strings update imports."""
 
     test_file = TEST_TBX
+
+    def test_add_upload_holds_component_lock(self) -> None:
+        translation = self.get_translation()
+        request = self.get_request()
+        store = object()
+
+        def handle_add_upload(*args, **kwargs) -> tuple[int, int, int, int]:
+            self.assertTrue(translation.component.lock.is_locked)
+            return (0, 0, 0, 0)
+
+        with (
+            patch.object(translation, "load_uploaded_file", return_value=store),
+            patch.object(
+                translation, "handle_add_upload", side_effect=handle_add_upload
+            ) as add_upload,
+        ):
+            translation.handle_upload(
+                request,
+                NamedBytesIO("upload.tbx", b""),
+                "",
+                method="add",
+            )
+
+        add_upload.assert_called_once()
 
     def test_import(self) -> None:
         """Test importing normally."""
@@ -681,6 +1937,25 @@ class ImportAddTest(ImportBaseTest):
         self.assertEqual(translation.stats.fuzzy, 0)
         self.assertEqual(translation.stats.all, 168)
 
+    def test_add_plural(self) -> None:
+        self.component.manage_units = True
+        self.component.save(update_fields=["manage_units"])
+        response = self.do_import(method="add", follow=True, test_file=TEST_PO_PLURAL)
+        self.assertRedirects(response, self.translation_url)
+        messages = [message.message for message in response.context["messages"]]
+        self.assertIn(
+            (
+                "Processed 1 string from the uploaded files (skipped: 1, not found: 0, updated: 0)."
+            ),
+            messages,
+        )
+
+        # Verify stats
+        translation = self.get_translation()
+        self.assertEqual(translation.stats.translated, 0)
+        self.assertEqual(translation.stats.fuzzy, 0)
+        self.assertEqual(translation.stats.all, 4)
+
 
 class ImportSourceBrokenTest(ImportSourceTest):
     test_file = TEST_POT
@@ -690,15 +1965,366 @@ class ImportSourceBrokenTest(ImportSourceTest):
 
 
 class DownloadMultiTest(ViewTestCase):
+    def test_commit_repositories_are_sorted_and_deduplicated(self) -> None:
+        other = self.create_po(project=self.project, name="Other")
+        linked = self.create_link_existing()
+        second_link = self.create_link_existing(name="Third", slug="third")
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/download"))
+        request.user = self.user
+
+        for fmt in (None, "zip:csv"):
+            for include_owner in (False, True):
+                with self.subTest(fmt=fmt, include_owner=include_owner):
+                    components = [other, second_link, linked, other]
+                    if include_owner:
+                        components.append(self.component)
+                    with patch.object(
+                        Component, "commit_pending", autospec=True
+                    ) as commit:
+                        response = download_multi(
+                            request, [], iter(components), fmt=fmt
+                        )
+
+                    assert response.file_to_stream is not None
+                    self.addCleanup(response.file_to_stream.close)
+                    self.assertEqual(
+                        [call.args[0].pk for call in commit.call_args_list],
+                        [self.component.pk, other.pk],
+                    )
+                    for call in commit.call_args_list:
+                        self.assertEqual(call.args[1], "download")
+                    self.assert_zip(response)
+
+    def test_commit_repository_failure_is_not_retried_through_links(self) -> None:
+        other = self.create_po(project=self.project, name="Other")
+        project = Project.objects.create(
+            name="Linked downloads", slug="linked-downloads"
+        )
+        linked = self.create_link_existing(project=project)
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/download"))
+        request.user = self.user
+        error = WeblateLockTimeoutError(
+            "repository locked", lock=self.component.repository.lock.lock_object
+        )
+
+        with (
+            patch.object(
+                Component, "commit_pending", autospec=True, side_effect=[error, True]
+            ) as commit,
+            patch("weblate.trans.views.files.report_error") as report,
+        ):
+            response = download_multi(request, [], [other, linked, self.component])
+
+        assert response.file_to_stream is not None
+        self.addCleanup(response.file_to_stream.close)
+        self.assertEqual(
+            [call.args[0].pk for call in commit.call_args_list],
+            [self.component.pk, other.pk],
+        )
+        report.assert_called_once_with("Download commit", project=self.project)
+        self.assert_zip(response)
+
+    def test_linked_download_commits_owner_without_expanding_archive(self) -> None:
+        project = Project.objects.create(
+            name="Linked downloads", slug="linked-downloads"
+        )
+        linked = self.create_link_existing(project=project)
+        self.user.is_superuser = True
+        self.user.save(update_fields=["is_superuser"])
+        self.user.clear_permissions_cache()
+
+        with patch.object(Component, "commit_pending", autospec=True) as commit:
+            response = self.client.get(
+                reverse("download", kwargs={"path": project.get_url_path()})
+            )
+
+        self.addCleanup(list, response)
+        commit.assert_called_once_with(self.component, "download", ANY)
+        self.assertEqual(response.status_code, 200)
+        root = data_dir("vcs")
+        expected = {
+            os.path.relpath(filename, root)
+            for translation in linked.translation_set.all()
+            for filename in translation.filenames
+        }
+        self.assertTrue(expected)
+        with ZipFile(BytesIO(b"".join(response))) as archive:
+            self.assertEqual(set(archive.namelist()), expected)
+
+    def test_commit_repository_loading_has_constant_query_count(self) -> None:
+        project = Project.objects.create(
+            name="Linked downloads", slug="linked-downloads"
+        )
+        linked = self.create_link_existing(project=project)
+        second_link = self.create_link_existing(name="Third", slug="third")
+
+        for components in ([linked], [self.component, linked, second_link]):
+            with self.subTest(components=[component.pk for component in components]):
+                translations = Translation.objects.filter(component__in=components)
+                with self.assertNumQueries(1):
+                    repositories = _get_download_commit_repositories(
+                        get_download_components(translations)
+                    )
+                    projects = [repository.project for repository in repositories]
+
+                self.assertEqual(repositories, [self.component])
+                self.assertEqual(projects, [self.project])
+
+    def grant_language_download(self, *, membership_limit: bool = False) -> Group:
+        self.user.groups.clear()
+        group = Group.objects.create(
+            name="Scoped component downloads",
+            language_selection=SELECTION_ALL if membership_limit else SELECTION_MANUAL,
+        )
+        group.projects.add(self.project)
+        language = Language.objects.get(code="cs")
+        if not membership_limit:
+            group.languages.add(language)
+        role = Role.objects.create(name="Scoped download role")
+        role.permissions.add(
+            *Permission.objects.filter(
+                codename__in={"translation.download", "contribution.view_author"}
+            )
+        )
+        group.roles.add(role)
+        self.user.groups.add(group)
+        if membership_limit:
+            TeamMembership.objects.get(user=self.user, group=group).limit_languages.add(
+                language
+            )
+        self.user.clear_permissions_cache()
+        return group
+
+    def assert_scoped_component_archive(self, fmt: str) -> None:
+        response = self.client.get(
+            reverse("download", kwargs=self.kw_component), {"format": fmt}
+        )
+        self.assertEqual(response.status_code, 200)
+        with ZipFile(BytesIO(b"".join(response))) as archive:
+            names = archive.namelist()
+        suffix = ".csv" if fmt == "zip:csv" else ".po"
+        self.assertTrue(any(name.endswith(f"cs{suffix}") for name in names))
+        self.assertFalse(any(name.endswith(f"de{suffix}") for name in names))
+
+    def test_component_download_team_language_scope(self) -> None:
+        group = self.grant_language_download()
+
+        self.assertTrue(self.user.has_perm("translation.download", self.component))
+        response = self.client.get(
+            reverse("download", kwargs={"path": (*self.kw_component["path"], "de")})
+        )
+        self.assertEqual(response.status_code, 403)
+        for fmt in ("zip", "zip:csv"):
+            with self.subTest(fmt=fmt):
+                self.assert_scoped_component_archive(fmt)
+
+        group.languages.clear()
+        self.user.clear_permissions_cache()
+        response = self.client.get(reverse("download", kwargs=self.kw_component))
+        self.assertEqual(response.status_code, 403)
+
+    def test_component_download_membership_language_scope(self) -> None:
+        group = self.grant_language_download(membership_limit=True)
+
+        self.assertFalse(self.user.has_perm("translation.download", self.component))
+        self.assert_scoped_component_archive("zip")
+
+        unavailable = Language.objects.get(code="ja")
+        self.assertFalse(
+            self.component.translation_set.filter(language=unavailable).exists()
+        )
+        membership = TeamMembership.objects.get(user=self.user, group=group)
+        membership.limit_languages.set([unavailable])
+        self.user.clear_permissions_cache()
+        response = self.client.get(reverse("download", kwargs=self.kw_component))
+        self.assertEqual(response.status_code, 403)
+
     def test_component(self) -> None:
         response = self.client.get(reverse("download", kwargs=self.kw_component))
         self.assert_zip(response, "test/test/po/cs.po")
+
+    def test_component_holds_repository_lock_while_archiving(self) -> None:
+        translation = self.get_translation()
+        repository = translation.component.repository
+
+        def check_lock(*args, **kwargs) -> None:
+            self.assertTrue(repository.lock.is_locked)
+            return write_zip_files(*args, **kwargs)
+
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/download"))
+        request.user = self.user
+        clock = count(step=301)
+        with (
+            patch("weblate.trans.views.files.write_zip_files", side_effect=check_lock),
+            patch.object(repository.lock, "reacquire") as reacquire,
+            patch("weblate.utils.views.monotonic", side_effect=lambda: next(clock)),
+        ):
+            response = download_multi(
+                request,
+                [translation],
+                [translation.component],
+            )
+
+        assert response.file_to_stream is not None
+        self.addCleanup(response.file_to_stream.close)
+        self.assertTrue(response.streaming)
+        self.assertFalse(repository.lock.is_locked)
+        self.assert_zip(response, "test/test/po/cs.po")
+        reacquire.assert_called()
+
+    def test_component_repository_lock_timeout(self) -> None:
+        translation = self.get_translation()
+        repository = translation.component.repository
+        error = WeblateLockTimeoutError(
+            "repository locked", lock=repository.lock.lock_object
+        )
+
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/download"))
+        request.user = self.user
+        with (
+            patch(
+                "weblate.trans.views.files._write_repository_download_files",
+                side_effect=error,
+            ),
+            self.assertRaises(WeblateLockTimeoutError),
+        ):
+            download_multi(
+                request,
+                [translation],
+                [translation.component],
+            )
+
+        with patch(
+            "weblate.trans.views.files._write_repository_download_files",
+            side_effect=error,
+        ):
+            response = self.client.get(reverse("download", kwargs=self.kw_component))
+
+        self.assertEqual(response.status_code, 423)
+        self.assertIn(b"Could not obtain the repository lock", response.content)
+
+    def test_later_repository_timeout_releases_archive_and_locks(self) -> None:
+        other = self.create_po(project=self.project, name="Other download repository")
+        translation = self.get_translation()
+        other_translation = other.translation_set.get(language__code="cs")
+        repository = translation.component.repository
+        other_repository = other.repository
+        error = WeblateLockTimeoutError(
+            "repository locked", lock=other_repository.lock.lock_object
+        )
+        lock_class = type(repository.lock)
+        enter_lock = lock_class.__enter__
+
+        def enter(lock) -> None:
+            if lock.name == other_repository.lock.name:
+                self.assertFalse(repository.lock.is_locked)
+                raise error
+            enter_lock(lock)
+
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/download"))
+        request.user = self.user
+        with (
+            tempfile.TemporaryFile() as snapshot,
+            patch("weblate.utils.views.tempfile.TemporaryFile", return_value=snapshot),
+            patch.object(lock_class, "__enter__", autospec=True, side_effect=enter),
+        ):
+            with self.assertRaises(WeblateLockTimeoutError):
+                download_multi(request, [translation, other_translation], [])
+
+            self.assertTrue(snapshot.closed)
+            self.assertFalse(repository.lock.is_locked)
+            self.assertFalse(other_repository.lock.is_locked)
 
     def test_project(self) -> None:
         response = self.client.get(
             reverse("download", kwargs={"path": self.project.get_url_path()})
         )
         self.assert_zip(response, "test/test/po/de.po")
+
+    def test_workspace(self) -> None:
+        workspace = Workspace.objects.create(name="Download workspace")
+        self.project.workspace = workspace
+        self.project.save(update_fields=["workspace"])
+
+        response = self.client.get(
+            reverse("download", kwargs={"path": workspace.get_url_path()})
+        )
+
+        self.assert_zip(response, "test/test/po/de.po")
+        self.assertIn(f"workspace-{workspace.pk}.zip", response["Content-Disposition"])
+
+    def test_workspace_commits_only_downloadable_components(self) -> None:
+        workspace = Workspace.objects.create(name="Download workspace")
+        self.project.workspace = workspace
+        self.project.save(update_fields=["workspace"])
+        self.create_po(
+            project=self.project,
+            name="Restricted",
+            restricted=True,
+        )
+        self.user.clear_permissions_cache()
+
+        with (
+            patch.object(
+                Component, "commit_pending", autospec=True
+            ) as component_commit,
+            patch.object(Project, "commit_pending") as project_commit,
+        ):
+            response = self.client.get(
+                reverse("download", kwargs={"path": workspace.get_url_path()})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.addCleanup(list, response)
+        component_commit.assert_called_once_with(self.component, "download", ANY)
+        commit_user = component_commit.call_args.args[2]
+        self.assertEqual(commit_user.username, "weblate:commit")
+        self.assertTrue(commit_user.is_bot)
+        project_commit.assert_not_called()
+
+    def test_workspace_download_check_uses_permission_scope(self) -> None:
+        workspace = Workspace.objects.create(name="Download workspace")
+        self.project.workspace = workspace
+        self.project.save(update_fields=["workspace"])
+        self.create_po(project=self.project, name="Second")
+
+        with patch.object(
+            self.user,
+            "has_perm",
+            side_effect=AssertionError("Used object permission checks"),
+        ) as has_perm:
+            self.assertTrue(can_download_workspace(self.user, workspace))
+
+        has_perm.assert_not_called()
+
+    def test_workspace_ownership_does_not_bypass_project_access(self) -> None:
+        workspace = Workspace.objects.create(name="Private download workspace")
+        workspace.add_owner(self.user)
+        self.project.workspace = workspace
+        self.project.access_control = self.project.ACCESS_PRIVATE
+        self.project.save(update_fields=["workspace", "access_control"])
+        self.user.clear_permissions_cache()
+
+        response = self.client.get(
+            reverse("download", kwargs={"path": workspace.get_url_path()})
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_workspace_download_excludes_restricted_components(self) -> None:
+        workspace = Workspace.objects.create(name="Restricted download workspace")
+        workspace.add_owner(self.user)
+        self.project.workspace = workspace
+        self.project.save(update_fields=["workspace"])
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+
+        response = self.client.get(
+            reverse("download", kwargs={"path": workspace.get_url_path()})
+        )
+
+        self.assertEqual(response.status_code, 403)
 
     def test_project_lang(self) -> None:
         response = self.client.get(
@@ -714,11 +2340,120 @@ class DownloadMultiTest(ViewTestCase):
         )
         self.assert_zip(response, "test/test/po/cs.po")
 
+    def test_aggregate_downloads_filter_restricted_component(self) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Download category", slug="download-category"
+        )
+        self.component.category = category
+        self.component.restricted = True
+        self.component.save(update_fields=["category", "restricted"])
+        regular = self.create_po(
+            project=self.project,
+            category=category,
+            name="Download regular",
+            slug="download-regular",
+        )
+        component_list = ComponentList.objects.create(
+            name="Download components", slug="download-components"
+        )
+        component_list.components.add(self.component, regular)
+
+        role = Role.objects.get(name="Add suggestion")
+        group = Group.objects.create(name="Restricted component suggestions")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        self.assertFalse(self.user.has_perm("translation.download", self.component))
+        regular_filename = regular.translation_set.get(
+            language__code="cs"
+        ).get_filename()
+        assert regular_filename is not None
+        regular_archive_name = os.path.relpath(regular_filename, data_dir("vcs"))
+        restricted_archive_root = (
+            f"{os.path.relpath(self.component.full_path, data_dir('vcs'))}/"
+        )
+        paths = (
+            self.project.get_url_path(),
+            (*self.project.get_url_path(), "-", "cs"),
+            category.get_url_path(),
+            (*category.get_url_path(), "-", "cs"),
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                response = self.client.get(reverse("download", kwargs={"path": path}))
+                self.assertEqual(response.status_code, 200)
+                with ZipFile(BytesIO(b"".join(response))) as archive:
+                    names = archive.namelist()
+                self.assertIn(regular_archive_name, names)
+                self.assertFalse(
+                    any(name.startswith(restricted_archive_root) for name in names)
+                )
+
+        response = self.client.get(
+            reverse(
+                "download_component_list",
+                kwargs={"name": component_list.slug},
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        with ZipFile(BytesIO(b"".join(response))) as archive:
+            names = archive.namelist()
+        self.assertIn(regular_archive_name, names)
+        self.assertFalse(
+            any(name.startswith(restricted_archive_root) for name in names)
+        )
+
+    def test_empty_component_list_denied(self) -> None:
+        ComponentList.objects.create(name="TestCL", slug="testcl")
+
+        response = self.client.get(
+            reverse("download_component_list", kwargs={"name": "testcl"})
+        )
+
+        self.assertEqual(response.status_code, 404)
+
     def test_component_csv(self) -> None:
         response = self.client.get(
             reverse("download", kwargs=self.kw_component), {"format": "zip:csv"}
         )
         self.assert_zip(response, "test-test-cs.csv")
+
+    def test_project_mo_skips_incompatible_translations(self) -> None:
+        self.create_appstore(project=self.project, name="Metadata")
+
+        response = self.client.get(
+            reverse("download", kwargs={"path": self.project.get_url_path()}),
+            {"format": "zip:mo"},
+        )
+
+        with ZipFile(BytesIO(b"".join(response))) as archive:
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("test-test-cs.mo", archive.namelist())
+            self.assertEqual(
+                archive.read("test-metadata-cs.mo.skipped"),
+                b"File format is not compatible with this translation",
+            )
+
+    def test_component_with_exporter_disabled(self) -> None:
+        # omit CSV exporter
+        exporters = tuple(
+            path
+            for path in settings.WEBLATE_EXPORTERS
+            if path != "weblate.formats.exporters.CSVExporter"
+        )
+        with override_settings(WEBLATE_EXPORTERS=exporters):
+            response = self.client.get(self.project.get_absolute_url())
+            self.assertNotContains(
+                response, "Download translations as CSV in a ZIP file"
+            )
+            self.assertContains(response, "format=zip:xlsx")
+
+            response = self.client.get(
+                reverse("download", kwargs=self.kw_component), {"format": "zip:csv"}
+            )
+        self.assertEqual(response.status_code, 404)
 
     def test_component_xlsx(self) -> None:
         response = self.client.get(
@@ -726,6 +2461,35 @@ class DownloadMultiTest(ViewTestCase):
         )
         content = self.assert_zip(response, "test-test-cs.xlsx")
         load_workbook(BytesIO(content))
+
+    def test_component_skips_symlinked_template(self) -> None:
+        self.component.template = "template.pot"
+        self.component.save(update_fields=["template"])
+
+        template_path = os.path.join(self.component.full_path, self.component.template)
+        Path(template_path).write_bytes(Path(TEST_POT).read_bytes())
+
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"outside repository")
+        self.addCleanup(os.unlink, handle.name)
+
+        os.unlink(template_path)
+        os.symlink(handle.name, template_path)
+
+        response = self.client.get(reverse("download", kwargs=self.kw_component))
+        self.assertEqual(response.status_code, 200)
+
+        with ZipFile(BytesIO(b"".join(response)), "r") as zipfile:
+            zip_names = set(zipfile.namelist())
+
+        root = data_dir("vcs")
+        translation_filename = self.get_translation().get_filename()
+        assert translation_filename is not None
+        translation_rel = os.path.relpath(translation_filename, root)
+        template_rel = os.path.relpath(template_path, root)
+
+        self.assertIn(translation_rel, zip_names)
+        self.assertNotIn(template_rel, zip_names)
 
 
 EXPECTED_CSV = """location,source,target,id,fuzzy,context,translator_comments,developer_comments\r
@@ -747,7 +2511,7 @@ UPLOAD_CSV = """
 
 
 class ImportExportAddTest(ViewTestCase):
-    def create_component(self):
+    def create_component(self) -> Component:
         return self.create_json_mono()
 
     def test_notchanged(self) -> None:
@@ -783,6 +2547,38 @@ class ImportExportAddTest(ViewTestCase):
 
         handle = NamedBytesIO(
             "test.csv", UPLOAD_CSV.replace("Hello, world", "Hi, World").encode()
+        )
+        params = {
+            "file": handle,
+            "method": "translate",
+            "author_name": self.user.full_name,
+            "author_email": self.user.email,
+        }
+        response = self.client.post(
+            reverse("upload", kwargs=self.kw_translation),
+            params,
+            follow=True,
+        )
+        self.assertContains(response, "(skipped: 0, not found: 0, updated: 1)")
+
+    def test_xliff(self) -> None:
+        self.component.source_translation.add_unit(
+            None, "amp", "Source & translation", author=self.user
+        )
+        response = self.client.get(
+            reverse("download", kwargs=self.kw_translation),
+            {"format": "xliff11"},
+        )
+        content = response.text
+        placeholder = """<source>Source &amp; translation</source>
+        <target></target>"""
+        translation = """<source>Source &amp; translation</source>
+        <target>Zdroj &amp; překlad</target>"""
+
+        self.assertIn(placeholder, content)
+
+        handle = NamedBytesIO(
+            "test.xliff", content.replace(placeholder, translation).encode()
         )
         params = {
             "file": handle,

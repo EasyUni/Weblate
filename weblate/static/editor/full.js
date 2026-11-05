@@ -5,144 +5,221 @@
 (() => {
   const EditorBase = WLT.Editor.Base;
 
-  const _tmServiceName = "weblate-translation-memory";
+  // Shared two-step keyboard sequence state.
+  // Only one sequence can be pending at a time — starting a new one cancels
+  // the previous.
+  const _seqState = { name: null, timer: null };
 
-  const $window = $(window);
+  function _seqStart(name) {
+    clearTimeout(_seqState.timer);
+    _seqState.name = name;
+    _seqState.timer = setTimeout(() => {
+      _seqState.name = null;
+    }, 2000);
+  }
+
+  function _seqMatch(name) {
+    if (_seqState.name === name) {
+      clearTimeout(_seqState.timer);
+      _seqState.name = null;
+      return true;
+    }
+    return false;
+  }
+
+  // Machinery rows store their raw payload as JSON in a data attribute so that
+  // it survives DOM operations without relying on jQuery's data cache.
+  function setRawData(row, data) {
+    row.dataset.raw = JSON.stringify(data);
+  }
+
+  function getRawData(row) {
+    return row?.dataset.raw ? JSON.parse(row.dataset.raw) : undefined;
+  }
+
+  const DETAILS_STORAGE_KEY = "translate-details";
+
+  function machineryRows(el) {
+    return Array.from(el.children).filter((child) =>
+      child.matches(".machinery-row"),
+    );
+  }
 
   function FullEditor() {
     EditorBase.call(this);
 
-    this.csrfToken = $("#link-post").find("input").val();
+    this.csrfToken = document.querySelector("#link-post input")?.value;
 
     this.initTranslationForm();
     this.initTabs();
+    this.initDetails();
     this.initChecks();
     this.initGlossary();
+    this.initSuggestions();
+
+    const copyMachinery = (row, mark) => {
+      const raw = getRawData(row);
+      if (!raw) {
+        return;
+      }
+      if (raw.multivalue) {
+        WLT.Editor.insertEditor(raw.text, row, true);
+      } else {
+        for (const pluralForm of raw.plural_forms) {
+          const area = this.translationArea[pluralForm];
+          if (area) {
+            replaceValue(area, raw.text);
+          }
+        }
+      }
+      mark(this.translationForm);
+    };
 
     /* Copy machinery results */
-    this.$editor.on("click", ".js-copy-machinery", (e) => {
-      const $el = $(e.target);
-      const raw = $el.parent().parent().data("raw");
-
-      raw.plural_forms.forEach((pluralForm) => {
-        $(this.$translationArea.get(pluralForm)).replaceValue(raw.text);
-      });
-      autosize.update(this.$translationArea);
-      WLT.Utils.markFuzzy(this.$translationForm);
+    delegate(this.editors, "click", ".js-copy-machinery", (e) => {
+      copyMachinery(e.target.closest(".machinery-row"), WLT.Utils.markFuzzy);
     });
 
     /* Copy and save machinery results */
-    this.$editor.on("click", ".js-copy-save-machinery", (e) => {
-      const $el = $(e.target);
-      const raw = $el.parent().parent().data("raw");
-
-      raw.plural_forms.forEach((pluralForm) => {
-        $(this.$translationArea.get(pluralForm)).replaceValue(raw.text);
-      });
-      autosize.update(this.$translationArea);
-      WLT.Utils.markTranslated(this.$translationForm);
-      submitForm({ target: this.$translationArea });
+    delegate(this.editors, "click", ".js-copy-save-machinery", (e) => {
+      copyMachinery(
+        e.target.closest(".machinery-row"),
+        WLT.Utils.markTranslated,
+      );
+      submitForm({ target: this.translationArea[0] });
     });
 
     /* Copy, approve and save machinery results */
-    this.$editor.on("click", ".js-copy-approve-save-machinery", (e) => {
-      const $el = $(e.target);
-      const raw = $el.parent().parent().data("raw");
-
-      raw.plural_forms.forEach((pluralForm) => {
-        $(this.$translationArea.get(pluralForm)).replaceValue(raw.text);
-      });
-      autosize.update(this.$translationArea);
-      WLT.Utils.markApproved(this.$translationForm);
-      submitForm({ target: this.$translationArea });
+    delegate(this.editors, "click", ".js-copy-approve-save-machinery", (e) => {
+      copyMachinery(e.target.closest(".machinery-row"), WLT.Utils.markApproved);
+      submitForm({ target: this.translationArea[0] });
     });
 
     /* Delete machinery results */
-    this.$editor.on("click", ".js-delete-machinery", (e) => {
-      const $el = $(e.target);
+    delegate(this.editors, "click", ".js-delete-machinery", (e) => {
+      const deleteButton = e.target.closest(".js-delete-machinery");
+      const self = this;
 
       /* Delete Url dialog */
-      let $deleteEntriesDialog = null;
-      this.$editor.on("show.bs.modal", "#delete-url-modal", (e) => {
-        $deleteEntriesDialog = $(e.currentTarget);
-        $deleteEntriesDialog.find(".modal-body").html("");
-        const text = $el.parent().parent().data("raw").text;
-        const modalBody = this.machinery.renderDeleteUrls(text);
-        $deleteEntriesDialog.find(".modal-body").append(modalBody);
+      let deleteEntriesDialog = null;
+      delegate(
+        self.editors,
+        "shown.bs.modal",
+        "#delete-url-modal",
+        function () {
+          deleteEntriesDialog = this;
+          const modalBody = deleteEntriesDialog.querySelector(".modal-body");
+          modalBody.replaceChildren();
+          const text = getRawData(deleteButton.closest(".machinery-row")).text;
+          modalBody.append(self.machinery.renderDeleteUrls(text));
+        },
+      );
+
+      delegate(self.editors, "hidden.bs.modal", "#delete-url-modal", () => {
+        deleteEntriesDialog = null;
       });
 
-      this.$editor.on("hide.bs.modal", "#delete-url-modal", (_e) => {
-        $deleteEntriesDialog = null;
-      });
-
-      this.$editor.on("submit", ".delete-url-form", (e) => {
-        const $form = $(e.currentTarget);
-        const $deleteEntries = $form.find("input.form-check-input:checked");
-        if ($deleteEntriesDialog === null) {
-          return false;
+      delegate(self.editors, "submit", ".delete-url-form", function (ev) {
+        ev.preventDefault();
+        const deleteEntries = this.querySelectorAll(
+          "input.form-check-input:checked",
+        );
+        if (deleteEntriesDialog === null) {
+          return;
         }
-        $deleteEntriesDialog.modal("hide");
+        bootstrap.Modal.getInstance(deleteEntriesDialog)?.hide();
 
-        Object.entries($deleteEntries).forEach(([_, entry]) => {
-          if (typeof entry.id !== "undefined") {
-            this.removeTranslationEntry(entry.id);
+        for (const entry of deleteEntries) {
+          if (entry.id) {
+            self.removeTranslationEntry(entry.id);
           }
-        });
-        return false;
+        }
       });
     });
 
-    Mousetrap.bindGlobal("alt+end", (_e) => {
-      window.location = $("#button-end").attr("href");
+    hotkeys("alt+end", () => {
+      const button = document.getElementById("button-end");
+      if (button?.href) {
+        window.location = button.href;
+      }
       return false;
     });
-    Mousetrap.bindGlobal(["alt+pagedown", "mod+down", "alt+down"], (_e) => {
-      window.location = $("#button-next").attr("href");
+    hotkeys("alt+pagedown,ctrl+down,command+down,alt+down", () => {
+      const button = document.getElementById("button-next");
+      if (button?.href) {
+        window.location = button.href;
+      }
       return false;
     });
-    Mousetrap.bindGlobal(["alt+pageup", "mod+up", "alt+up"], (_e) => {
-      window.location = $("#button-prev").attr("href");
+    hotkeys("alt+pageup,ctrl+up,command+up,alt+up", () => {
+      const button = document.getElementById("button-prev");
+      if (button?.href) {
+        window.location = button.href;
+      }
       return false;
     });
-    Mousetrap.bindGlobal("alt+home", (_e) => {
-      window.location = $("#button-first").attr("href");
+    hotkeys("alt+home", () => {
+      const button = document.getElementById("button-first");
+      if (button?.href) {
+        window.location = button.href;
+      }
       return false;
     });
-    Mousetrap.bindGlobal("mod+o", (_e) => {
-      $(".source-language-group [data-clone-value]").click();
+    hotkeys("ctrl+o,command+o", () => {
+      document
+        .querySelector(".source-language-group [data-clone-value]")
+        ?.click();
       return false;
     });
-    Mousetrap.bindGlobal("mod+y", (_e) => {
-      $('input[name="fuzzy"]').click();
+    hotkeys("ctrl+y,command+y", () => {
+      document.querySelector('input[name="fuzzy"]')?.click();
       return false;
     });
-    Mousetrap.bindGlobal("mod+shift+enter", (e, combo) => {
-      $('input[name="fuzzy"]').prop("checked", false);
-      return submitForm(e, combo);
+    hotkeys("ctrl+shift+enter,command+shift+enter", (e) => {
+      const fuzzy = document.querySelector('input[name="fuzzy"]');
+      if (fuzzy) fuzzy.checked = false;
+      return submitForm(e);
     });
-    Mousetrap.bindGlobal("alt+enter", (e, combo) =>
-      submitForm(e, combo, 'button[name="suggest"]'),
-    );
-    Mousetrap.bindGlobal("mod+e", () => {
-      this.$translationArea.get(0).focus();
+    hotkeys("ctrl+alt+enter,command+alt+enter", (e) => {
+      const approved = this.translationForm?.querySelector(
+        'input[type="radio"][name="review"][value="30"]',
+      );
+      const save = this.translationForm?.querySelector('button[name="save"]');
+      if (
+        !e.repeat &&
+        approved &&
+        !approved.matches(":disabled") &&
+        save &&
+        !save.matches(":disabled")
+      ) {
+        approved.click();
+        save.click();
+      }
       return false;
     });
-    Mousetrap.bindGlobal("mod+s", (_e) => {
-      $("#search-dropdown").click();
-      $('textarea[name="q"]').focus();
+    hotkeys("alt+enter", (e) => {
+      return submitForm(e, null, 'button[name="suggest"]');
+    });
+    hotkeys("ctrl+e,command+e", () => {
+      this.translationArea[0]?.focus();
       return false;
     });
-    Mousetrap.bindGlobal("mod+u", (_e) => {
-      $('.nav [href="#comments"]').click();
-      $('textarea[name="comment"]').focus();
+    hotkeys("ctrl+s,command+s", () => {
+      document.getElementById("search-dropdown")?.click();
+      document.querySelector('textarea[name="q"]')?.focus();
       return false;
     });
-    Mousetrap.bindGlobal("mod+j", (_e) => {
-      $('.nav [href="#nearby"]').click();
+    hotkeys("ctrl+u,command+u", () => {
+      document.querySelector('.nav [data-bs-target="#comments"]')?.click();
+      document.querySelector('textarea[name="comment"]')?.focus();
       return false;
     });
-    Mousetrap.bindGlobal("mod+m", (_e) => {
-      $('.nav [href="#machinery"]').click();
+    hotkeys("ctrl+j,command+j", () => {
+      document.querySelector('.nav [data-bs-target="#nearby"]')?.click();
+      return false;
+    });
+    hotkeys("ctrl+m,command+m", () => {
+      document.querySelector('.nav [data-bs-target="#machinery"]')?.click();
       return false;
     });
   }
@@ -150,164 +227,320 @@
   FullEditor.prototype.constructor = FullEditor;
 
   FullEditor.prototype.initTranslationForm = function () {
-    this.$translationForm = $(".translation-form");
+    this.translationForm = document.querySelector(".translation-form");
 
     /* Report source bug */
-    this.$translationForm.on("click", ".bug-comment", () => {
-      $('.translation-tabs a[href="#comments"]').tab("show");
-      $("#id_scope").val("report");
-      $([document.documentElement, document.body]).animate(
-        {
-          scrollTop: $("#comment-form").offset().top,
-        },
-        1000,
-      );
-      $("#id_comment").focus();
+    delegate(this.translationForm, "click", ".bug-comment", () => {
+      bootstrap.Tab.getOrCreateInstance(
+        document.querySelector(
+          '.translation-tabs a[data-bs-target="#comments"]',
+        ),
+      ).show();
+      const scope = document.getElementById("id_scope");
+      if (scope) {
+        scope.value = "report";
+      }
+      document
+        .getElementById("comment-form")
+        ?.scrollIntoView({ behavior: "smooth" });
+      document.getElementById("id_comment")?.focus();
     });
 
-    this.$translationForm.on("click", ".add-alternative-post", () => {
-      const elm = $("<input>")
-        .attr("type", "hidden")
-        .attr("name", "add_alternative")
-        .attr("value", "1");
-      this.$translationForm.append(elm);
-      this.$translationForm.submit();
-      return false;
+    delegate(this.translationForm, "click", ".add-alternative-post", (e) => {
+      e.preventDefault();
+      const elm = document.createElement("input");
+      elm.type = "hidden";
+      elm.name = "add_alternative";
+      elm.value = "1";
+      this.translationForm.append(elm);
+      this.translationForm.requestSubmit();
     });
 
     /* Form persistence. Restores translation form upon comment submission */
     const restoreKey = "translation_autosave";
+    const stateSelector =
+      'input[name="fuzzy"], input[name="review"], [name="explanation"]';
     const restoreValue = localStorage.getItem(restoreKey);
     if (restoreValue !== null) {
-      const translationRestore = JSON.parse(restoreValue);
+      const restored = JSON.parse(restoreValue);
+      const areas = Array.isArray(restored) ? restored : restored.areas;
+      const state = Array.isArray(restored) ? [] : restored.state;
 
-      translationRestore.forEach((restoreArea) => {
+      areas.forEach((restoreArea) => {
         const target = document.getElementById(restoreArea.id);
         if (target) {
           target.value = restoreArea.value;
-          autosize.update(target);
+          target.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      });
+      state.forEach((restoreField) => {
+        const target = document.getElementById(restoreField.id);
+        if (target === null) {
+          return;
+        }
+        if (target.type === "checkbox" || target.type === "radio") {
+          target.checked = restoreField.checked;
+        } else {
+          target.value = restoreField.value;
         }
       });
       localStorage.removeItem(restoreKey);
     }
 
-    this.$editor.on("submit", ".auto-save-translation", () => {
-      const data = this.$translationArea.map(function () {
-        const $this = $(this);
+    delegate(this.editors, "submit", ".auto-save-translation", () => {
+      const data = {
+        areas: Array.from(this.translationArea, (area) => ({
+          id: area.id,
+          value: area.value,
+        })),
+        state: Array.from(
+          this.translationForm?.querySelectorAll(stateSelector) ?? [],
+          (field) => ({
+            id: field.id,
+            value: field.value,
+            checked: field.checked,
+          }),
+        ),
+      };
 
-        return {
-          id: $this.attr("id"),
-          value: $this.val(),
-        };
-      });
-
-      localStorage.setItem(restoreKey, JSON.stringify(data.get()));
+      localStorage.setItem(restoreKey, JSON.stringify(data));
     });
   };
 
   FullEditor.prototype.initTabs = function () {
     /* Store active tab in a local storage */
-    $('.translation-tabs a[data-toggle="tab"]').on("shown.bs.tab", function () {
-      const current = localStorage.getItem("translate-tab");
-      const desired = $(this).attr("href");
+    for (const tab of document.querySelectorAll(
+      '.translation-tabs a[data-bs-toggle="tab"]',
+    )) {
+      tab.addEventListener("shown.bs.tab", function () {
+        const current = localStorage.getItem("translate-tab");
+        const desired = this.getAttribute("data-bs-target");
 
-      if (current !== desired) {
-        localStorage.setItem("translate-tab", desired);
-      }
-    });
+        if (current !== desired) {
+          localStorage.setItem("translate-tab", desired);
+        }
+      });
+    }
 
     /* Machinery */
     this.isMachineryLoaded = false;
-    this.$editor.on("show.bs.tab", '[data-load="machinery"]', () => {
+    delegate(this.editors, "show.bs.tab", '[data-load="machinery"]', () => {
       if (this.isMachineryLoaded) {
         return;
       }
       this.initMachinery();
     });
+
+    /* The active tab is restored before the listener above is registered, load it now in that case. */
+    const machineryTab = document.querySelector('[data-load="machinery"]');
+    if (machineryTab?.classList.contains("active")) {
+      if (this.isMachineryLoaded) {
+        return;
+      }
+      this.initMachinery();
+    }
+  };
+
+  FullEditor.prototype.initDetails = () => {
+    /* Keep the string details open across strings once the user opens them */
+    const details = document.querySelector(
+      '.accordion-collapse[id^="string-info-details-"]',
+    );
+    if (details === null) {
+      return;
+    }
+
+    let shown = false;
+    try {
+      shown = localStorage.getItem(DETAILS_STORAGE_KEY) === "shown";
+    } catch (_error) {
+      /* Local storage can be unavailable, keep the details collapsed */
+    }
+    if (shown) {
+      /* Set before Bootstrap creates the collapse, so it does not animate */
+      details.classList.add("show");
+      for (const button of document.querySelectorAll(
+        `[data-bs-target="#${details.id}"]`,
+      )) {
+        button.classList.remove("collapsed");
+        button.setAttribute("aria-expanded", "true");
+      }
+    }
+
+    const store = (event, value) => {
+      if (event.target !== details) {
+        return;
+      }
+      try {
+        localStorage.setItem(DETAILS_STORAGE_KEY, value);
+      } catch (_error) {
+        /* Ignore, the details still open and close on this page */
+      }
+    };
+    details.addEventListener("shown.bs.collapse", (event) =>
+      store(event, "shown"),
+    );
+    details.addEventListener("hidden.bs.collapse", (event) =>
+      store(event, "hidden"),
+    );
   };
 
   FullEditor.prototype.initMachinery = function () {
     this.isMachineryLoaded = true;
     this.machinery = new Machinery();
+    this.machineryPending = 0;
+    this.initMachineryHotkeys();
 
-    $("#js-translate")
-      .data("services")
-      .forEach((serviceName) => {
-        increaseLoading("machinery");
-        this.fetchMachinery(serviceName);
-      });
+    const services = JSON.parse(
+      document.getElementById("js-translate").dataset.services,
+    );
+    services.forEach((serviceName) => {
+      this.startMachineryRequest();
+      this.fetchMachinery(serviceName);
+    });
+    /* Show the empty state right away when there is no service to wait for */
+    this.updateMachineryEmpty();
 
-    this.$editor.on("submit", "#memory-search", (e) => {
-      const $form = $(e.currentTarget);
+    delegate(this.editors, "submit", "#memory-search", (e) => {
+      const form = e.target.closest("#memory-search");
+      e.preventDefault();
 
-      increaseLoading("machinery");
+      this.startMachineryRequest();
       this.machinery.setState({ translations: [] });
-      $("#machinery-translations").empty();
-      $.ajax({
-        type: "POST",
-        url: $form.attr("action"),
-        data: $form.serialize(),
-        dataType: "json",
-        success: (data) => {
+      document.getElementById("machinery-translations").replaceChildren();
+      fetch(form.getAttribute("action"), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "X-Requested-With": "XMLHttpRequest",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams(new FormData(form)),
+      })
+        .then((response) => response.json())
+        .then((data) => {
           this.processMachineryResults(data);
-        },
-        error: (jqXhr, textStatus, errorThrown) => {
-          this.processMachineryError(jqXhr, textStatus, errorThrown);
-        },
-      });
+        })
+        .catch((error) => {
+          this.processMachineryError(error);
+        });
       return false;
     });
   };
 
-  FullEditor.prototype.removeTranslationEntry = function (deleteUrl) {
-    $.ajax({
-      type: "DELETE",
-      url: deleteUrl,
-      headers: { "X-CSRFToken": this.csrfToken },
-      success: () => {
-        addAlert(gettext("Translation memory entry removed."));
-      },
-      error: (_jqXhr, _textStatus, errorThrown) => {
-        addAlert(errorThrown);
-      },
+  FullEditor.prototype.initMachineryHotkeys = () => {
+    const toggleMachineryNumbers = (shown) => {
+      document
+        .getElementById("machinery-translations")
+        ?.classList.toggle("show-machinery-numbers", shown);
+    };
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Control" || e.key === "Meta") {
+        toggleMachineryNumbers(true);
+      }
     });
+    document.addEventListener("keyup", (e) => {
+      if (e.key === "Control" || e.key === "Meta") {
+        toggleMachineryNumbers(false);
+      }
+    });
+
+    hotkeys("ctrl+m,command+m", () => {
+      _seqStart("machinery");
+      return false;
+    });
+
+    hotkeys("1,2,3,4,5,6,7,8,9,0", (e) => {
+      if (!_seqMatch("machinery")) {
+        return;
+      }
+
+      const rows = machineryRows(
+        document.getElementById("machinery-translations"),
+      );
+      for (const row of rows) {
+        if (row.dataset.machineryKey === e.key) {
+          const copyButton = row.querySelector(".js-copy-machinery");
+          if (copyButton) {
+            copyButton.click();
+            return false;
+          }
+          break;
+        }
+      }
+    });
+  };
+
+  FullEditor.prototype.removeTranslationEntry = function (deleteUrl) {
+    fetch(deleteUrl, {
+      method: "DELETE",
+      credentials: "same-origin",
+      headers: { "X-CSRFToken": this.csrfToken },
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        addAlert(gettext("Translation memory entry removed."), "success");
+      })
+      .catch((error) => {
+        addAlert(error.message);
+      });
   };
 
   FullEditor.prototype.fetchMachinery = function (serviceName) {
-    $.ajax({
-      type: "POST",
-      url: $("#js-translate").attr("href").replace("__service__", serviceName),
-      success: (data) => {
+    const url = document
+      .getElementById("js-translate")
+      .getAttribute("href")
+      .replace("__service__", serviceName);
+    fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        Accept: "application/json",
+      },
+      body: new URLSearchParams({ csrfmiddlewaretoken: this.csrfToken }),
+    })
+      .then((response) => response.json())
+      .then((data) => {
         this.processMachineryResults(data);
-      },
-      error: (jqXhr, textStatus, errorThrown) => {
-        this.processMachineryError(jqXhr, textStatus, errorThrown);
-      },
-      dataType: "json",
-      data: {
-        csrfmiddlewaretoken: this.csrfToken,
-      },
-    });
+      })
+      .catch((error) => {
+        this.processMachineryError(error);
+      });
   };
 
-  FullEditor.prototype.processMachineryError = (
-    jqXhr,
-    textStatus,
-    errorThrown,
-  ) => {
+  FullEditor.prototype.startMachineryRequest = function () {
+    this.machineryPending += 1;
+    increaseLoading("machinery");
+    document.getElementById("machinery-empty").hidden = true;
+  };
+
+  FullEditor.prototype.updateMachineryEmpty = function () {
+    const translationsEl = document.getElementById("machinery-translations");
+    document.getElementById("machinery-empty").hidden =
+      this.machineryPending > 0 || machineryRows(translationsEl).length > 0;
+  };
+
+  FullEditor.prototype.finishMachineryRequest = function () {
     decreaseLoading("machinery");
-    if (jqXhr.state() !== "rejected") {
-      addAlert(
-        `${gettext(
-          "The request for machine translation has failed:",
-        )} ${textStatus}: ${errorThrown}`,
-      );
-    }
+    this.machineryPending = Math.max(this.machineryPending - 1, 0);
+    this.updateMachineryEmpty();
+  };
+
+  FullEditor.prototype.processMachineryError = function (error) {
+    this.finishMachineryRequest();
+    addAlert(
+      `${gettext("The request for machine translation has failed:")} ${
+        error.message
+      }`,
+    );
   };
 
   FullEditor.prototype.processMachineryResults = function (data) {
-    decreaseLoading("machinery");
     if (data.responseStatus !== 200) {
+      this.finishMachineryRequest();
       const msg = interpolate(
         gettext("The request for machine translation using %s has failed:"),
         [data.service],
@@ -328,19 +561,14 @@
     });
     this.machinery.render(data.translations);
 
-    // Cancel out browser's `meta+m` and let Mousetrap handle the rest
-    document.addEventListener("keydown", (e) => {
-      const isMod = WLT.Config.IS_MAC ? e.metaKey : e.ctrlKey;
-      if (isMod && e.key.toLowerCase() === "m") {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    });
+    const translationRows = machineryRows(
+      document.getElementById("machinery-translations"),
+    );
 
-    const $translationRows = $("#machinery-translations").children("tr");
-    $translationRows.each(function (idx) {
+    translationRows.forEach((row, idx) => {
+      const numberEl = row.querySelector(".machinery-number");
       if (idx < 10) {
-        const key = WLT.Utils.getNumericKey(idx);
+        const key = String(WLT.Utils.getNumericKey(idx));
 
         let title;
         if (WLT.Config.IS_MAC) {
@@ -348,100 +576,159 @@
         } else {
           title = interpolate(gettext("Ctrl+M then %s"), [key]);
         }
-        $(this)
-          .find(".machinery-number")
-          .html($("<kbd/>").attr("title", title).text(key));
-        Mousetrap.bindGlobal([`mod+m ${key}`, `mod+m mod+${key}`], () => {
-          $translationRows.eq(idx).find(".js-copy-machinery").click();
-          return false;
-        });
+        row.setAttribute("data-machinery-key", key);
+        if (numberEl) {
+          const kbd = document.createElement("kbd");
+          kbd.setAttribute("title", title);
+          kbd.textContent = key;
+          numberEl.replaceChildren(kbd);
+        }
       } else {
-        $(this).find(".machinery-number").html("");
+        row.removeAttribute("data-machinery-key");
+        if (numberEl) {
+          numberEl.replaceChildren();
+        }
       }
     });
+
+    this.finishMachineryRequest();
   };
 
   FullEditor.prototype.initChecks = function () {
     /* Clicking links (e.g. comments, suggestions)
      * This is inside things to checks, but not a check-item */
-    this.$editor.on("click", '.check [data-toggle="tab"]', function (e) {
-      const href = $(this).attr("href");
-
-      e.preventDefault();
-      $(`.nav [href="${href}"]`).click();
-      $window.scrollTop($(".translation-tabs").offset().top);
+    delegate(this.editors, "click", ".check [data-tab-target]", () => {
+      const tabs = document.querySelector(".translation-tabs");
+      if (tabs) {
+        window.scrollTo(0, tabs.getBoundingClientRect().top + window.scrollY);
+      }
     });
 
-    const $checks = $(".check-item");
-    if ($checks.length === 0) {
+    const checks = document.querySelectorAll(".check-item");
+    if (checks.length === 0) {
       return;
     }
 
     /* Check ignoring */
-    this.$editor.on("click", ".check-dismiss", (e) => {
-      const $el = $(e.currentTarget);
-      let url = $el.attr("href");
-      const $check = $el.closest(".check");
-      const dismissAll = $check.find("input").prop("checked");
+    delegate(this.editors, "click", ".check-dismiss", (e) => {
+      e.preventDefault();
+      const el = e.target.closest(".check-dismiss");
+      let url = el.getAttribute("href");
+      const check = el.closest(".check");
+      const dismissAll = check.querySelector("input")?.checked;
       if (dismissAll) {
-        url = $el.data("dismiss-all");
+        url = el.dataset.dismissAll;
       }
 
-      $.ajax({
-        type: "POST",
-        url: url,
-        data: {
-          csrfmiddlewaretoken: this.csrfToken,
+      fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "X-Requested-With": "XMLHttpRequest",
+          Accept: "application/json",
         },
-        error: (_jqXhr, _textStatus, errorThrown) => {
-          addAlert(errorThrown);
-        },
-        success: (data) => {
+        body: new URLSearchParams({ csrfmiddlewaretoken: this.csrfToken }),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return response.json();
+        })
+        .then((data) => {
           if (dismissAll) {
             const { extra_flags, all_flags } = data;
-            $("#id_extra_flags").val(extra_flags);
-            $("#unit_all_flags").html(all_flags).addClass("flags-updated");
+            const extraFlags = document.getElementById("id_source_flags");
+            if (extraFlags) {
+              extraFlags.value = extra_flags;
+              extraFlags.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            const allFlags = document.getElementById("unit_all_flags");
+            if (allFlags) {
+              allFlags.textContent = all_flags;
+              allFlags.classList.add("flags-updated");
+            }
           }
-        },
-      });
+        })
+        .catch((error) => {
+          addAlert(error.message);
+        });
       if (dismissAll) {
-        $check.remove();
+        check.remove();
       } else {
-        $check.toggleClass("check-dismissed");
+        check.classList.toggle("check-dismissed");
       }
-      return false;
     });
 
+    /* Automatically translated dismissal */
+    delegate(
+      this.editors,
+      "click",
+      ".dismiss-automatically-translated",
+      (e) => {
+        e.preventDefault();
+        const el = e.target.closest(".dismiss-automatically-translated");
+        const url = el.getAttribute("href");
+        const check = el.closest(".check");
+
+        fetch(url, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "X-Requested-With": "XMLHttpRequest",
+            Accept: "application/json",
+          },
+          body: new URLSearchParams({ csrfmiddlewaretoken: this.csrfToken }),
+        })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            const listGroup = check.closest(".list-group");
+            check.remove();
+
+            // Hide the entire "Things to check" panel if no checks remain
+            if (
+              listGroup &&
+              listGroup.querySelectorAll(".list-group-item").length === 0
+            ) {
+              listGroup.closest(".panel")?.remove();
+            }
+          })
+          .catch((error) => {
+            addAlert(error.message);
+          });
+      },
+    );
+
     /* Check fix */
-    this.$editor.on("click", "[data-check-fixup]", (e) => {
-      const $el = $(e.currentTarget);
-      const fixups = $el.data("check-fixup");
-      this.$translationArea.each(function () {
-        const $this = $(this);
-        $.each(fixups, (_key, value) => {
-          const re = new RegExp(value[0], value[2]);
-          $this.replaceValue($this.val().replace(re, value[1]));
-        });
+    delegate(this.editors, "click", "[data-check-fixup]", (e) => {
+      const el = e.target.closest("[data-check-fixup]");
+      const fixups = JSON.parse(el.dataset.checkFixup);
+      this.translationArea.forEach((area, plural) => {
+        for (const value of fixups) {
+          if (value[0] === "regex") {
+            const re = new RegExp(value[1], value[3]);
+            replaceValue(area, area.value.replace(re, value[2]));
+          } else if (value[0] === "plurals") {
+            replaceValue(area, value[1][plural]);
+          } else {
+            addAlert(`Unknown fixup: ${value}`);
+          }
+        }
       });
       return false;
     });
 
     /* Keyboard shortcuts */
-    // Cancel out browser's `meta+i` and let Mousetrap handle the rest
-    document.addEventListener("keydown", (e) => {
-      const isMod = WLT.Config.IS_MAC ? e.metaKey : e.ctrlKey;
-      if (isMod && e.key.toLowerCase() === "i") {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    });
+    // Two-step sequence: Ctrl/Cmd+I then a digit key dismisses a check
+    const checkActions = {};
 
-    $checks.each(function (idx) {
-      const $this = $(this);
-      const $number = $(this).find(".check-number");
+    checks.forEach((check, idx) => {
+      const numberEl = check.querySelector(".check-number");
 
       if (idx < 10) {
-        if ($number.length === 0) {
+        if (!numberEl) {
           return;
         }
         const key = WLT.Utils.getNumericKey(idx);
@@ -457,39 +744,61 @@
             [key],
           );
         }
-        $number.html($("<kbd/>").attr("title", title).text(key));
+        const kbd = document.createElement("kbd");
+        kbd.title = title;
+        kbd.textContent = key;
+        numberEl.replaceChildren(kbd);
 
-        Mousetrap.bindGlobal([`mod+i ${key}`, `mod+i mod+${key}`], (_e) => {
-          $this.find(".check-dismiss-single").click();
-          return false;
-        });
+        checkActions[key] = () => {
+          check.querySelector(".check-dismiss-single")?.click();
+        };
       } else {
-        $number.html("");
+        if (numberEl) numberEl.textContent = "";
+      }
+    });
+
+    hotkeys("ctrl+i,command+i", () => {
+      _seqStart("checks");
+      return false;
+    });
+
+    hotkeys("1,2,3,4,5,6,7,8,9,0", (e) => {
+      if (_seqMatch("checks") && checkActions[e.key]) {
+        checkActions[e.key]();
+        return false;
       }
     });
   };
 
   FullEditor.prototype.initGlossary = function () {
+    delegate(this.editors, "click", ".glossary-copy", (e) => {
+      const button = e.target.closest(".glossary-copy");
+      if (!button.disabled) {
+        WLT.Editor.insertEditor(button.dataset.glossaryText, button);
+      }
+    });
+
     /* Copy from glossary */
-    this.$editor.on("click", ".glossary-embed", (e) => {
+    delegate(this.editors, "click", ".glossary-embed", (e) => {
+      const currentTarget = e.target.closest(".glossary-embed");
       /* Avoid copy when clicked on a link */
-      if ($(e.target).parents("a").length > 0) {
+      const link = e.target.closest("a");
+      if (link && link !== currentTarget) {
         return;
       }
 
-      const target = $(e.currentTarget);
-      let text = target.find(".target").text();
-      if (target.hasClass("warning")) {
-        text = target.find(".source").text();
+      let text = currentTarget.querySelector(".target")?.textContent ?? "";
+      if (currentTarget.classList.contains("warning")) {
+        text = currentTarget.querySelector(".source")?.textContent ?? "";
       }
 
-      this.insertIntoTranslation($.trim(text));
+      this.insertIntoTranslation(text.trim());
       e.preventDefault();
     });
 
     /* Glossary dialog */
-    const $glossaryDialog = $("#add-glossary-form");
-    $glossaryDialog.on("show.bs.modal", (e) => {
+    const glossaryDialog = document.getElementById("add-glossary-form");
+    glossaryDialog?.addEventListener("show.bs.modal", (e) => {
       /* Prefill adding to glossary with current string */
       if (e.target.hasAttribute("data-shown")) {
         return;
@@ -517,43 +826,68 @@
       }
       e.target.setAttribute("data-shown", true);
     });
-    this.$editor.on("hidden.bs.modal", "#add-glossary-form", () => {
-      this.$translationArea.first().focus();
+    delegate(this.editors, "hidden.bs.modal", "#add-glossary-form", () => {
+      this.translationArea[0]?.focus();
     });
 
     /* Inline glossary adding */
-    $(".add-dict-inline").on("submit", (e) => {
-      const $form = $(e.currentTarget);
+    delegate(document, "submit", ".add-dict-inline", (e) => {
+      const form = e.target.closest(".add-dict-inline");
 
       increaseLoading("glossary-add");
-      $glossaryDialog.modal("hide");
-      $.ajax({
-        type: "POST",
-        url: $form.attr("action"),
-        data: $form.serialize(),
-        dataType: "json",
-        success: (data) => {
+      bootstrap.Modal.getOrCreateInstance(glossaryDialog)?.hide();
+      fetch(form.getAttribute("action"), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "X-Requested-With": "XMLHttpRequest",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams(new FormData(form)),
+      })
+        .then((response) => response.json())
+        .then((data) => {
           decreaseLoading("glossary-add");
           if (data.responseCode === 200) {
-            $("#glossary-terms").html(data.results);
-            $form.find("[name=terms]").attr("value", data.terms);
-            $form.trigger("reset");
+            const terms = document.getElementById("glossary-terms");
+            if (terms) {
+              terms.innerHTML = data.results;
+            }
+            const termsInput = form.querySelector("[name=terms]");
+            if (termsInput) {
+              termsInput.setAttribute("value", data.terms);
+            }
+            form.reset();
           } else {
             addAlert(data.responseDetails);
           }
-        },
-        error: (_xhr, _textStatus, errorThrown) => {
-          addAlert(errorThrown);
+        })
+        .catch((error) => {
+          addAlert(error.message);
           decreaseLoading("glossary-add");
-        },
-      });
+        });
+      e.preventDefault();
       return false;
     });
   };
 
-  FullEditor.prototype.insertIntoTranslation = function (text) {
-    this.$translationArea.insertAtCaret($.trim(text));
+  FullEditor.prototype.initSuggestions = function () {
+    /* Clone suggestion to translation */
+    delegate(this.editors, "click", ".js-copy-suggestion", (e) => {
+      e.preventDefault();
+      const btn = e.target.closest(".js-copy-suggestion");
+      WLT.Utils.copySuggestion(btn, this.translationArea);
+    });
   };
+
+  FullEditor.prototype.insertIntoTranslation = function (text) {
+    for (const area of this.translationArea) {
+      insertAtCaret(area, text.trim());
+    }
+  };
+
+  /* Number of origins listed per service before collapsing the rest */
+  const MACHINERY_VISIBLE_ORIGINS = 5;
 
   class Machinery {
     constructor(_initialState = {}) {
@@ -569,110 +903,237 @@
       this.state = { ...this.state, ...newState };
     }
 
-    renderTranslation(el, service) {
-      el.plural_forms = [el.plural_form];
-      const row = $("<tr/>").data("raw", el);
-      row.append(
-        $("<td/>")
-          .attr("class", "target machinery-text")
-          .attr("lang", this.state.lang)
-          .attr("dir", this.state.dir)
-          .html(el.html),
-      );
-      row.append($("<td>").attr("class", "machinery-text").html(el.diff));
-      row.append(
-        $("<td/>").attr("class", "machinery-text").html(el.source_diff),
-      );
-      row.append(service);
+    cloneTemplate(id) {
+      return document
+        .getElementById(id)
+        .content.firstElementChild.cloneNode(true);
+    }
 
-      /* Quality score as bar with the text */
-      const qualityCell = $("<td class='number'></td>");
-      if (el.show_quality) {
-        qualityCell.html(`<strong>${el.quality}</strong> %`);
+    renderActions(el) {
+      const actions = this.cloneTemplate("machinery-actions");
+      if (!WLT.Config.HAS_REVIEW_WORKFLOW) {
+        actions.querySelector(".js-copy-approve-save-machinery").remove();
       }
-      row.append(qualityCell);
-      /* Translators: Verb for copy operation */
-      row.append(
-        $(
-          `<td><a class="js-copy-machinery btn btn-warning">${gettext(
-            "Clone to translation",
-          )}<span class="mt-number text-info"></span></a></td><td><a class="js-copy-save-machinery btn btn-primary">${gettext(
-            "Accept",
-          )}</a></td>`,
-        ),
-      );
+      if (!this.state.weblateTranslationMemory.has(el.text)) {
+        actions.querySelector(".js-delete-machinery").remove();
+      }
+      return actions;
+    }
 
-      if (WLT.Config.HAS_REVIEW_WORKFLOW) {
-        row.append(
-          $(
-            `<td><a class="js-copy-approve-save-machinery btn btn-warning">${gettext(
-              "Accept and approve",
-            )}</a></td>`,
-          ),
-        );
-      } else {
-        row.append($("<td></td>"));
+    renderTranslation(el, service = null) {
+      /* These accumulate while merging, they might be already filled in by it */
+      if (typeof el.plural_forms === "undefined") {
+        el.plural_forms = [el.plural_form];
       }
+      if (typeof el.contexts === "undefined") {
+        el.contexts = el.context ? [el.context] : [];
+      }
+      if (typeof el.origins === "undefined") {
+        el.origins = [this.originEntry(el)];
+      }
+      const row = this.cloneTemplate("machinery-row");
+      setRawData(row, el);
 
-      if (this.state.weblateTranslationMemory.has(el.text)) {
-        row.append(
-          $(
-            `<td><a class="js-delete-machinery btn btn-danger" data-toggle="modal" data-target="#delete-url-modal">${gettext(
-              "Delete entry",
-            )}</a></td>`,
-          ),
-        );
-      } else {
-        row.append($("<td></td>"));
+      const target = row.querySelector(".machinery-target");
+      target.setAttribute("lang", this.state.lang);
+      target.setAttribute("dir", this.state.dir);
+      target.innerHTML = el.html;
+
+      row.querySelector(".machinery-diff").innerHTML = el.diff;
+      row.querySelector(".machinery-source").innerHTML = el.source_diff;
+
+      let origin = service;
+      if (origin === null) {
+        origin = document.createElement("div");
+        origin.classList.add("machinery-origin");
       }
+      row.querySelector(".machinery-number").before(origin);
+
+      this.renderOrigins(row, el.origins);
+      this.renderContext(row, el.contexts);
+
+      row.querySelector(".history-data").prepend(this.renderActions(el));
 
       return row;
     }
 
-    renderService(el) {
-      const service = $("<td/>").text(el.service);
-      if (typeof el.origin !== "undefined") {
-        service.append(" (");
-        let origin;
-        const _deleteUrl = false;
-        if (typeof el.origin_detail !== "undefined") {
-          origin = $("<abbr/>").text(el.origin).attr("title", el.origin_detail);
-        } else if (typeof el.origin_url !== "undefined") {
-          origin = $("<a/>").text(el.origin).attr("href", el.origin_url);
-        } else {
-          origin = el.origin;
-        }
-        if (el.delete_url) {
-          this.state.weblateTranslationMemory.add(el.text);
-        }
-        service.append(origin);
-        service.append(")");
+    renderContext(row, contexts) {
+      const context = row.querySelector(".machinery-context");
+      context.replaceChildren(
+        ...contexts.map((value) => {
+          const item = document.createElement("code");
+          item.classList.add("list-group-item");
+          item.textContent = value;
+          return item;
+        }),
+      );
+      const hidden = contexts.length === 0;
+      context.hidden = hidden;
+      row.querySelector(".machinery-context-label").hidden = hidden;
+    }
+
+    originEntry(el) {
+      return {
+        service: el.service,
+        quality: el.quality,
+        show_quality: el.show_quality,
+        origin: el.origin,
+        origin_detail: el.origin_detail,
+        origin_url: el.origin_url,
+        installation_slug: el.installation_slug,
+      };
+    }
+
+    renderOrigin(el) {
+      if (typeof el.origin_detail !== "undefined") {
+        const origin = document.createElement("abbr");
+        origin.textContent = el.origin;
+        origin.setAttribute("title", el.origin_detail);
+        return origin;
       }
-      return service;
+      if (typeof el.origin_url !== "undefined") {
+        const originUrl = WLT.URLs.getHttpUrl(el.origin_url);
+        if (originUrl !== null) {
+          const origin = document.createElement("a");
+          origin.textContent = el.origin;
+          origin.setAttribute("href", originUrl);
+          return origin;
+        }
+      }
+      return document.createTextNode(String(el.origin));
+    }
+
+    renderOriginDetail(el) {
+      const detail = document.createElement("div");
+      detail.classList.add("machinery-origin-detail", "text-muted");
+      if (typeof el.origin !== "undefined") {
+        detail.append(this.renderOrigin(el));
+      }
+      if (el.installation_slug) {
+        if (typeof el.origin !== "undefined") {
+          detail.append(" · ");
+        }
+        detail.append(`${gettext("Slug")}: ${el.installation_slug}`);
+      }
+      if (el.show_quality) {
+        detail.append(` (${el.quality}%)`);
+      }
+      return detail;
+    }
+
+    renderServiceEntry(serviceName, entries, expanded) {
+      const entry = document.createElement("div");
+      entry.classList.add("machinery-service");
+
+      /* The score of results without an origin or slug stays with the service name */
+      const scores = entries
+        .filter(
+          (el) =>
+            typeof el.origin === "undefined" &&
+            !el.installation_slug &&
+            el.show_quality,
+        )
+        .map((el) => el.quality);
+      const name = document.createElement("strong");
+      name.classList.add("machinery-service-name");
+      name.textContent =
+        scores.length > 0
+          ? `${serviceName} (${Math.max(...scores)}%)`
+          : serviceName;
+      entry.append(name);
+
+      /* List each origin once, the best matching ones first */
+      const seen = new Set();
+      const origins = entries
+        .filter((el) => {
+          if (typeof el.origin === "undefined" && !el.installation_slug) {
+            return false;
+          }
+          const key = JSON.stringify(el);
+          if (seen.has(key)) {
+            return false;
+          }
+          seen.add(key);
+          return true;
+        })
+        .sort((a, b) => b.quality - a.quality)
+        .map((el) => this.renderOriginDetail(el));
+
+      entry.append(...origins.slice(0, MACHINERY_VISIBLE_ORIGINS));
+      if (origins.length > MACHINERY_VISIBLE_ORIGINS) {
+        const hidden = origins.slice(MACHINERY_VISIBLE_ORIGINS);
+        const details = document.createElement("details");
+        details.classList.add("machinery-origin-more");
+        details.open = expanded;
+        const summary = document.createElement("summary");
+        summary.classList.add("machinery-origin-detail", "text-muted");
+        summary.textContent = interpolate(
+          ngettext("%s more origin", "%s more origins", hidden.length),
+          [hidden.length],
+        );
+        details.append(summary, ...hidden);
+        entry.append(details);
+      }
+      return entry;
+    }
+
+    renderOrigins(row, origins) {
+      const container = row.querySelector(".machinery-origin");
+
+      const expanded = new Set(
+        Array.from(
+          container.querySelectorAll(".machinery-origin-more[open]"),
+          (details) => details.closest(".machinery-service").dataset.service,
+        ),
+      );
+
+      const services = new Map();
+      for (const el of origins) {
+        if (!services.has(el.service)) {
+          services.set(el.service, []);
+        }
+        services.get(el.service).push(el);
+      }
+      const bestQuality = (entries) =>
+        Math.max(...entries.map((el) => el.quality));
+
+      container.replaceChildren(
+        ...Array.from(services)
+          .sort((a, b) => bestQuality(b[1]) - bestQuality(a[1]))
+          .map(([serviceName, entries]) => {
+            const entry = this.renderServiceEntry(
+              serviceName,
+              entries,
+              expanded.has(serviceName),
+            );
+            entry.dataset.service = serviceName;
+            return entry;
+          }),
+      );
     }
 
     renderDeleteUrls(text) {
       const translations = this.state.translations;
-      const modalBody = $("<label>").text("");
+      const modalBody = document.createElement("label");
 
       translations.forEach((translation) => {
         if (
           text === translation.text &&
           typeof translation.delete_url !== "undefined"
         ) {
-          const inputElement = $("<input>")
-            .attr("class", "form-check-input")
-            .attr("type", "checkbox")
-            .attr("value", "")
-            .attr("id", translation.delete_url)
-            .attr("checked", true);
-          const labelElement = $("<label>")
-            .attr("class", "form-check-label")
-            .attr("for", translation.delete_url)
-            .text(translation.origin);
-          const divElement = $("<div>")
-            .attr("class", "form-check")
-            .append(inputElement, labelElement);
+          const inputElement = document.createElement("input");
+          inputElement.className = "form-check-input";
+          inputElement.type = "checkbox";
+          inputElement.value = "";
+          inputElement.id = translation.delete_url;
+          inputElement.checked = true;
+          const labelElement = document.createElement("label");
+          labelElement.className = "form-check-label";
+          labelElement.setAttribute("for", translation.delete_url);
+          labelElement.textContent = translation.origin;
+          const divElement = document.createElement("div");
+          divElement.className = "form-check";
+          divElement.append(inputElement, labelElement);
           modalBody.append(divElement);
         }
       });
@@ -680,16 +1141,19 @@
     }
 
     render(translations) {
-      const $translations = $("#machinery-translations");
+      const translationsEl = document.getElementById("machinery-translations");
       translations.forEach((translation) => {
-        const service = this.renderService(translation);
+        if (translation.delete_url) {
+          this.state.weblateTranslationMemory.add(translation.text);
+        }
+        const origin = this.originEntry(translation);
+        let service = null;
         let insertBefore = null;
         let done = false;
 
         /* This is the merging and insert sort logic */
-        $translations.children("tr").each(function (_idx) {
-          const $this = $(this);
-          const base = $this.data("raw");
+        for (const row of machineryRows(translationsEl)) {
+          const base = getRawData(row);
           if (
             base.text === translation.text &&
             base.source === translation.source
@@ -698,31 +1162,45 @@
             if (!base.plural_forms.includes(translation.plural_form)) {
               base.plural_forms.push(translation.plural_form);
             }
-            // Add origin to current ones
-            const current = $this.children("td:nth-child(4)");
-            if (base.quality < translation.quality) {
-              service.append("<br/>");
-              service.append(current.html());
-              $this.remove();
-              return false;
+            // Add context, only some of the merged results carry one
+            if (
+              translation.context &&
+              !base.contexts.includes(translation.context)
+            ) {
+              base.contexts.push(translation.context);
             }
-            current.append($("<br/>"));
-            current.append(service.html());
+            // Add origin to current ones
+            base.origins.push(origin);
+            if (base.quality < translation.quality) {
+              translation.plural_forms = base.plural_forms;
+              translation.contexts = base.contexts;
+              translation.origins = base.origins;
+              // Reuse the origin column to keep its expanded state
+              service = row.querySelector(".machinery-origin");
+              if (!insertBefore) {
+                insertBefore = row.nextElementSibling;
+              }
+              row.remove();
+              break;
+            }
+            setRawData(row, base);
+            this.renderOrigins(row, base.origins);
+            this.renderContext(row, base.contexts);
             done = true;
-            return false;
+            break;
           }
           if (base.quality <= translation.quality && !insertBefore) {
             // Insert match before lower quality one
-            insertBefore = $this;
+            insertBefore = row;
           }
-        });
+        }
 
         if (!done) {
           const newRow = this.renderTranslation(translation, service);
           if (insertBefore) {
             insertBefore.before(newRow);
           } else {
-            $translations.append(newRow);
+            translationsEl.append(newRow);
           }
         }
       });

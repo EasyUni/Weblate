@@ -2,12 +2,32 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
 import os
+import tempfile
+from io import BytesIO
+from pathlib import Path
+from typing import Never, cast
+from unittest.mock import patch
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.files.base import File
 from django.test import SimpleTestCase
 
-from weblate.utils.files import remove_tree
+from weblate.utils.files import (
+    REPO_TEMP_DIRNAME,
+    get_archive_vcs_metadata_members,
+    get_repo_temp_dir,
+    is_excluded,
+    is_managed_vcs_metadata_path,
+    is_path_within_directory,
+    is_unsafe_path,
+    read_file_bytes,
+    remove_tree,
+    should_skip,
+)
 from weblate.utils.unittest import tempdir_setting
 
 
@@ -19,8 +39,7 @@ class FilesTestCase(SimpleTestCase):
         filename = os.path.join(target, "file")
         os.makedirs(target)
         os.makedirs(nested)
-        with open(filename, "w") as handle:
-            handle.write("test")
+        Path(filename).write_text("test", encoding="utf-8")
         if callback:
             callback(target, nested, filename)
         remove_tree(target)
@@ -37,3 +56,287 @@ class FilesTestCase(SimpleTestCase):
             os.chmod(nested, 0)
 
         self.test_remove(callback_readonly)
+
+    def test_read_file_bytes_rejects_oversized_file(self) -> None:
+        with self.assertRaisesMessage(ValidationError, "Uploaded file is too big."):
+            read_file_bytes(File(BytesIO(b"test"), name="test.bin"), max_size=3)
+
+    def test_read_file_bytes_rejects_oversized_file_without_size(self) -> None:
+        class FileWithoutSize(BytesIO):
+            @property
+            def size(self) -> Never:
+                raise AttributeError
+
+        with self.assertRaisesMessage(ValidationError, "Uploaded file is too big."):
+            read_file_bytes(cast("File", FileWithoutSize(b"test")), max_size=3)
+
+    def test_read_file_bytes_resets_position_to_start(self) -> None:
+        filelike = File(BytesIO(b"test"), name="test.bin")
+        filelike.seek(2)
+
+        self.assertEqual(read_file_bytes(filelike, max_size=10), b"test")
+        self.assertEqual(filelike.tell(), 0)
+
+    def test_is_excluded_rejects_path_traversal_and_absolute_paths(self) -> None:
+        self.assertTrue(is_excluded("../outside.po"))
+        self.assertTrue(is_excluded("/etc/passwd"))
+        self.assertTrue(is_excluded(r"C:\temp\escape.po"))
+
+    def test_is_excluded_allows_regular_relative_paths(self) -> None:
+        self.assertFalse(is_excluded("locale/cs/messages.po"))
+
+    def test_is_excluded_rejects_casefolded_paths(self) -> None:
+        for path in (
+            ".GIT/config",
+            ".Git/CONFIG",
+            "nested/.gIt/config",
+            ".HG/HGRC",
+            r"nested\.Hg\hgrc",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(is_excluded(path))
+
+    def test_managed_metadata_paths_are_excluded(self) -> None:
+        for name in (".git", ".hg"):
+            for spelling in (name, name.upper(), name.lower(), name.title()):
+                for path in (
+                    spelling,
+                    f"{spelling}.",
+                    f"{spelling} ",
+                    f"{spelling}. ",
+                    f"nested/{spelling}/data",
+                    f"nested/{spelling}./data",
+                    f"nested\\{spelling}\\data",
+                    f"nested\\{spelling} \\data",
+                ):
+                    with self.subTest(path=path):
+                        self.assertTrue(is_managed_vcs_metadata_path(path))
+                        self.assertTrue(is_excluded(path))
+
+    def test_archive_vcs_metadata_members(self) -> None:
+        metadata = (
+            ".svn/entries",
+            ".bzr/README",
+            "CVS/Root",
+            "CVS/Entries/file",
+            "CVSROOT/passwd",
+            "_darcs/patches",
+            "RCS/foo,v",
+            "SCCS/s.foo",
+            "_FOSSIL_",
+            ".fslckout",
+            "_MTN/options",
+            ".pijul/changes/one",
+            ".pc/patch.diff/file",
+            "BitKeeper/etc/config",
+            "ChangeSet/1.1",
+        )
+        ordinary = (
+            "CVS/translation.po",
+            "CVSROOT/translation.po",
+            "RCS/translation.po",
+            "SCCS/translation.po",
+            "ChangeSet/translation.po",
+            "BK/current",
+        )
+
+        excluded = get_archive_vcs_metadata_members(metadata)
+
+        self.assertEqual(excluded, frozenset(path.casefold() for path in metadata))
+        self.assertEqual(get_archive_vcs_metadata_members(ordinary), frozenset())
+
+    def test_archive_vcs_metadata_members_normalizes_ntfs_suffixes(self) -> None:
+        metadata = (
+            ".svn./entries",
+            "nested/.BZR /README",
+            "nested\\CVS.\\Root",
+        )
+
+        self.assertEqual(
+            get_archive_vcs_metadata_members(metadata),
+            frozenset((".svn/entries", "nested/.bzr/readme", "nested/cvs/root")),
+        )
+
+    def test_archive_vcs_metadata_members_many_roots(self) -> None:
+        paths = tuple(
+            path
+            for index in range(10_000)
+            for path in (f"root-{index}/.svn/entries", f"root-{index}/regular.po")
+        )
+
+        excluded = get_archive_vcs_metadata_members(paths)
+
+        self.assertEqual(len(excluded), 10_000)
+        self.assertNotIn("root-9999/regular.po", excluded)
+
+    def test_archive_vcs_metadata_members_deep_path(self) -> None:
+        prefix = "/".join("d" for _index in range(5_000))
+        metadata = f"{prefix}/.svn/entries"
+        ordinary = f"{prefix}/regular.po"
+
+        excluded = get_archive_vcs_metadata_members((metadata, ordinary))
+
+        self.assertEqual(excluded, frozenset((metadata,)))
+
+    def test_is_excluded_preserves_mixed_case_excludes(self) -> None:
+        self.assertTrue(is_excluded(".DS_Store"))
+        self.assertTrue(is_excluded("__MACOSX/metadata"))
+
+    def test_is_excluded_allows_similar_names(self) -> None:
+        for path in (
+            ".gitignore",
+            ".gitignore. ",
+            ".hgignore",
+            "docs/.gitish/config",
+            "docs/.git\N{NO-BREAK SPACE}/config",
+            "CVS-backup/Root",
+            ".svnignore",
+            "docs/my_darcs/file",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(is_excluded(path))
+                self.assertFalse(is_managed_vcs_metadata_path(path))
+
+    def test_is_unsafe_path(self) -> None:
+        self.assertTrue(is_unsafe_path("../outside.po"))
+        self.assertTrue(is_unsafe_path("/etc/passwd"))
+        self.assertTrue(is_unsafe_path(r"C:\temp\escape.po"))
+        self.assertFalse(is_unsafe_path("build/translation.txt"))
+
+    def test_is_managed_vcs_metadata_path(self) -> None:
+        for path in (
+            ".git/config",
+            "path/.hg/hgrc",
+            ".GIT/CONFIG",
+            r"path\.Hg\hgrc",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(is_managed_vcs_metadata_path(path))
+        self.assertFalse(is_managed_vcs_metadata_path("build/translation.txt"))
+        self.assertFalse(is_managed_vcs_metadata_path("node_modules/translation.txt"))
+        self.assertFalse(is_managed_vcs_metadata_path("docs/.gitish/config"))
+        self.assertFalse(is_managed_vcs_metadata_path(".svn/wc.db"))
+        self.assertFalse(is_managed_vcs_metadata_path("path/CVS/Root"))
+        self.assertFalse(is_managed_vcs_metadata_path("docs/.svnignore"))
+        self.assertFalse(is_managed_vcs_metadata_path("docs/.bzrignore"))
+
+    def test_is_path_within_directory_accepts_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo_path = os.path.join(tempdir, "repo")
+            nested_path = os.path.join(repo_path, "locale", "cs.po")
+            os.makedirs(os.path.dirname(nested_path))
+            Path(nested_path).write_text("test", encoding="utf-8")
+
+            self.assertTrue(is_path_within_directory(nested_path, repo_path))
+
+    def test_is_path_within_directory_rejects_prefix_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo_path = os.path.join(tempdir, "repo")
+            outside_path = os.path.join(tempdir, "repo_outside", "secrets.po")
+            os.makedirs(repo_path)
+            os.makedirs(os.path.dirname(outside_path))
+            Path(outside_path).write_text("test", encoding="utf-8")
+
+            self.assertFalse(is_path_within_directory(outside_path, repo_path))
+
+    def test_should_skip_rejects_prefix_collision(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tempdir,
+            self.settings(
+                DATA_DIR=os.path.join(tempdir, "data"),
+            ),
+        ):
+            location = os.path.join(tempdir, "weblate-other", "locale", "django.po")
+            os.makedirs(os.path.dirname(location))
+            Path(location).write_text("test", encoding="utf-8")
+
+            self.assertTrue(should_skip(location))
+
+    def test_get_repo_temp_dir_prefers_explicit_temp_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir) / "repo"
+            locale = repo / "locale"
+            locale.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            filename = locale / "cs.po"
+            temp_dir = repo / ".git" / REPO_TEMP_DIRNAME
+
+            self.assertEqual(
+                get_repo_temp_dir(filename, temp_dir=temp_dir),
+                temp_dir,
+            )
+
+    def test_get_repo_temp_dir_does_not_create_unused_target_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir) / "repo"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            filename = repo / "locale" / "cs.po"
+            temp_dir = repo / ".git" / REPO_TEMP_DIRNAME
+
+            self.assertEqual(
+                get_repo_temp_dir(filename, temp_dir=temp_dir),
+                temp_dir,
+            )
+            self.assertTrue(temp_dir.is_dir())
+            self.assertFalse(filename.parent.exists())
+
+    def test_get_repo_temp_dir_avoids_cross_device_explicit_temp_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir) / "repo"
+            locale = repo / "locale"
+            locale.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            filename = locale / "docs.pot"
+            temp_dir = repo / ".git" / REPO_TEMP_DIRNAME
+            resolved_locale = locale.resolve(strict=False)
+            resolved_temp_dir = temp_dir.resolve(strict=False)
+
+            def fake_get_path_device_id(path: Path) -> int | None:
+                resolved = path.resolve(strict=False)
+                if resolved == resolved_locale:
+                    return 1
+                if resolved == resolved_temp_dir:
+                    return 2
+                return None
+
+            with patch(
+                "weblate.utils.files._get_path_device_id",
+                side_effect=fake_get_path_device_id,
+            ):
+                self.assertEqual(
+                    get_repo_temp_dir(filename, temp_dir=temp_dir).resolve(
+                        strict=False
+                    ),
+                    resolved_locale,
+                )
+
+    def test_get_repo_temp_dir_avoids_unknown_explicit_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir) / "repo"
+            locale = repo / "locale"
+            locale.mkdir(parents=True)
+            (repo / ".git").mkdir()
+            filename = locale / "docs.pot"
+            temp_dir = repo / ".git" / REPO_TEMP_DIRNAME
+            resolved_locale = locale.resolve(strict=False)
+            resolved_temp_dir = temp_dir.resolve(strict=False)
+
+            def fake_get_path_device_id(path: Path) -> int | None:
+                resolved = path.resolve(strict=False)
+                if resolved == resolved_locale:
+                    return 1
+                if resolved == resolved_temp_dir:
+                    return None
+                return 1
+
+            with patch(
+                "weblate.utils.files._get_path_device_id",
+                side_effect=fake_get_path_device_id,
+            ):
+                self.assertEqual(
+                    get_repo_temp_dir(filename, temp_dir=temp_dir).resolve(
+                        strict=False
+                    ),
+                    resolved_locale,
+                )

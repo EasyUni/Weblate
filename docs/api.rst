@@ -10,25 +10,25 @@ Weblate's REST API
 The API is accessible on the ``/api/`` URL and it is based on
 `Django REST framework <https://www.django-rest-framework.org/>`_.
 You can use it directly or by :ref:`wlc`.
+See :doc:`devel/libraries` for official tools and community-maintained integrations.
 
 The API is also documented using OpenAPI 3.1 on the ``/api/schema/`` URL, you
 can browse at ``/api/docs/``.
-
-.. note::
-
-   OpenAPI is available as a feature preview. The documentation is most likely
-   incomplete at this point and subject to change. Please consult the
-   documentation below for more detailed information on the API.
 
 .. _api-generic:
 
 Authentication and generic parameters
 +++++++++++++++++++++++++++++++++++++
 
-The public project API is available without authentication, though
-unauthenticated requests are heavily throttled (by default to 100 requests per
-day), so it is recommended to use authentication. The authentication uses a
-token, which you can get in your profile. Use it in the ``Authorization`` header:
+The read-only API is available without authentication unless
+:setting:`REQUIRE_LOGIN` is turned on. Unauthenticated requests are heavily
+throttled (by default to 100 requests per day), so it is recommended to use
+authentication.
+
+The authentication uses a token, which you can get in your profile. Use it in
+the ``Authorization`` header with the ``Token`` or ``Bearer`` scheme.
+Unsupported schemes, such as ``Basic``, return :http:statuscode:`401`, even
+for public endpoints or when you are signed in using a browser session.
 
 .. http:any:: /
 
@@ -36,9 +36,9 @@ token, which you can get in your profile. Use it in the ``Authorization`` header
     parameters here apply to all endpoints as well.
 
     :query format: Response format (overrides :http:header:`Accept`).
-                   Possible values depends on REST framework setup,
+                   Possible values depend on REST framework setup,
                    by default ``json``, ``csv`` and ``api`` are supported. The
-                   latter provides web browser interface for API.
+                   latter provides a web browser interface for the API.
     :query page: Returns given page of paginated results (use `next` and `previous` fields in response to automate the navigation).
     :query page_size: Return the given number of items per request.
                       The default is 50 and the maximum is 1000.
@@ -63,6 +63,7 @@ token, which you can get in your profile. Use it in the ``Authorization`` header
     :status 201: when a new object was created successfully
     :status 204: when an object was deleted successfully
     :status 400: when form parameters are missing
+    :status 401: when authentication credentials are invalid or the authentication scheme is unsupported
     :status 403: when access is denied
     :status 429: when throttling is in place
 
@@ -198,12 +199,45 @@ The API requests are rate limited; the default configuration limits it to 100
 requests per day for anonymous users and 5000 requests per hour for authenticated
 users.
 
-Rate limiting can be adjusted in the :file:`settings.py`; see
-`Throttling in Django REST framework documentation <https://www.django-rest-framework.org/api-guide/throttling/>`_
-for more details how to configure it.
+Configure the default limits in :file:`settings.py` using
+:setting:`API_RATELIMIT_ANON` and :setting:`API_RATELIMIT_USER`.
 
 In the Docker container this can be configured using
 :envvar:`WEBLATE_API_RATELIMIT_ANON` and :envvar:`WEBLATE_API_RATELIMIT_USER`.
+
+Use :setting:`API_RATELIMIT_USER_OVERRIDES` to give an automation account a
+different limit. Use :setting:`API_RATELIMIT_IP_OVERRIDES` for individual IP
+addresses or networks, including anonymous CI clients:
+
+.. code-block:: python
+
+    API_RATELIMIT_USER_OVERRIDES = {"automation": "20000/hour"}
+    API_RATELIMIT_IP_OVERRIDES = {
+        "192.0.2.42": None,
+        "198.51.100.0/24": "10000/hour",
+        "2001:db8::/48": "10000/hour",
+    }
+
+An explicit username override takes precedence over IP rules. Otherwise, the
+most specific matching network applies; an individual address is equivalent to
+a single-address network. A value of ``None`` exempts matching requests from API
+rate limits, including the anonymous limit. Authentication and permissions still
+apply: an exemption does not grant access to private projects or write operations.
+
+Limits are counted per authenticated user, or per client IP for anonymous
+requests. Clients within a network do not share a single budget. Each override
+rule and rate has a separate budget, so changing a rule or rate starts a new
+budget. Requests without an override use the default limits.
+
+IP rules use the client address resolved by Weblate. Behind a reverse proxy,
+configure :setting:`IP_BEHIND_REVERSE_PROXY`, :setting:`IP_PROXY_HEADER`, and
+:setting:`IP_PROXY_OFFSET` correctly. The trusted proxy must supply the client
+address, and untrusted clients must not be able to bypass it. Exempting a shared
+proxy address can exempt all clients using that proxy.
+
+In Docker, configure the equivalent JSON mappings using
+:envvar:`WEBLATE_API_RATELIMIT_USER_OVERRIDES` and
+:envvar:`WEBLATE_API_RATELIMIT_IP_OVERRIDES`. Use JSON ``null`` for exemptions.
 
 The status of rate limiting is reported in following headers:
 
@@ -214,6 +248,8 @@ The status of rate limiting is reported in following headers:
 +---------------------------+------------------------------------------------------+
 | ``X-RateLimit-Reset``     | Number of seconds until the rate-limit window resets |
 +---------------------------+------------------------------------------------------+
+
+Requests exempt from rate limiting do not include these headers.
 
 .. versionchanged:: 4.1
 
@@ -274,6 +310,7 @@ API Entry Point
             "languages":"http://example.com/api/languages/"
         }
 
+.. _api-users:
 
 Users
 +++++
@@ -282,11 +319,30 @@ Users
 
 .. http:get:: /api/users/
 
-    Returns a list of users if you have permissions to see manage users. If not, then you get to see
-    only your own details.
+    Returns no results to unauthenticated users. Authenticated users without the
+    global ``user.view`` or ``user.edit`` permission see only their own basic
+    details when listing without a username filter. They can search for other
+    users by supplying a username prefix of at least two characters after
+    trimming surrounding whitespace; these searches return the user ID,
+    username, and full name of matching non-bot users. Users with either
+    permission can list all users and receive detailed information.
 
-    :query string username: Username to search for
+    Without ``user.browse``, discovery requires a resource-bounded ``q`` query
+    or accessible ``unit`` context. Generic filters cannot expand that scope.
+    Scoped REST discovery does not require ``user.search`` or ``user.profile``.
+    Self and administrative access remain available. See :doc:`admin/privacy`.
+
+    :query string q: User search query, such as ``contributes:project`` or ``contributes:project/component``. Every matching Boolean branch must have a positive resource scope in restricted directory modes.
+    :query int unit: Rank contributors to this string first. Requires contributor identity access to the string, independently of directory privileges. In restricted directory modes, results are limited to contributors to its translation.
+    :query string username: Username prefix to search for. At least two characters after trimming surrounding whitespace are required for users without the global ``user.view`` or ``user.edit`` permission.
     :query int id: User ID to search for
+    :query string email: Email to search for (case-insensitive, exact match). Requires ``user.view`` or ``user.edit`` permission; the parameter is ignored for unprivileged users.
+
+    Username searches by users without the global ``user.view`` or ``user.edit``
+    permission exclude bot accounts other than the caller's own account.
+    This restriction does not apply to direct lookups by exact username;
+    bot accounts follow the profile access rules at
+    :http:get:`/api/users/(str:username)/`.
 
     .. seealso::
 
@@ -295,6 +351,9 @@ Users
 .. http:post:: /api/users/
 
     Creates a new user.
+
+    Requires the global ``user.edit`` permission. See
+    :ref:`access-control` for the user management permission model.
 
     :param username: Username
     :type username: string
@@ -311,6 +370,9 @@ Users
 
 .. http:get:: /api/users/(str:username)/
 
+    Access follows the global ``user.profile`` permission. Restricted profiles
+    return HTTP 404; self access and global administrative access are retained.
+
     Returns information about users.
 
     :param username: User's username
@@ -324,7 +386,7 @@ Users
     :>json string date_joined: date the user is created
     :>json string last_login: date the user last signed in
     :>json array groups: link to associated groups; see :http:get:`/api/groups/(int:id)/`
-    :>json array languages: link to translated languages; see :http:get:`/api/languages/(string:language)/`
+    :>json object profile: user profile preferences; see :ref:`api-user-profile`. Returned only with the ``user.view`` or ``user.edit`` permission.
 
     **Example JSON data:**
 
@@ -338,15 +400,53 @@ Users
                 "http://example.com/api/groups/2/",
                 "http://example.com/api/groups/3/"
             ],
-            "languages": [
-                "http://example.com/api/languages/cs/",
-            ],
+            "profile": {
+                "language": "en",
+                "languages": [
+                    "http://example.com/api/languages/cs/"
+                ],
+                "secondary_languages": [],
+                "translated": 42,
+                "suggested": 3,
+                "uploaded": 1,
+                "commented": 5,
+                "theme": "auto",
+                "hide_completed": false,
+                "secondary_in_zen": true,
+                "hide_source_secondary": false,
+                "wide_tables": false,
+                "listing_columns": ["untranslated", "untranslated_words", "untranslated_chars", "nottranslated", "checks", "suggestions", "comments"],
+                "editor_link": "",
+                "translate_mode": 0,
+                "zen_mode": 0,
+                "special_chars": "",
+                "nearby_strings": 10,
+                "auto_watch": true,
+                "contribute_personal_tm": true,
+                "dashboard_view": 1,
+                "dashboard_component_list": null,
+                "watched": [],
+                "website": "https://example.com/",
+                "contact": "",
+                "liberapay": "",
+                "fediverse": "",
+                "codesite": "",
+                "github": "",
+                "twitter": "",
+                "linkedin": "",
+                "location": "",
+                "company": "",
+                "public_email": "",
+                "commit_email": "",
+                "commit_name": 0,
+                "last_2fa": ""
+            },
             "is_superuser": true,
             "is_active": true,
             "is_bot": false,
             "date_joined": "2020-03-29T18:42:42.617681Z",
             "url": "http://example.com/api/users/exampleusername/",
-            "contributions_url": "http://example.com/api/users/exampleusername/contributions/"
+            "contributions_url": "http://example.com/api/users/exampleusername/contributions/",
             "statistics_url": "http://example.com/api/users/exampleusername/statistics/"
         }
 
@@ -354,6 +454,10 @@ Users
 
     Changes the user parameters.
 
+    Requires the global ``user.edit`` permission unless a user is updating
+    their own account or profile fields. See :ref:`access-control` for the user
+    management permission model.
+
     :param username: User's username
     :type username: string
     :>json string username: username of a user
@@ -363,11 +467,16 @@ Users
     :>json boolean is_active: whether the user is active
     :>json boolean is_bot: whether the user is bot (used for project scoped tokens)
     :>json string date_joined: date the user is created
+    :>json object profile: updated profile preferences when included in the request; see :ref:`api-user-profile`
 
 .. http:patch:: /api/users/(str:username)/
 
     Changes the user parameters.
 
+    Requires the global ``user.edit`` permission unless a user is updating
+    their own account or profile fields. See :ref:`access-control` for the user
+    management permission model.
+
     :param username: User's username
     :type username: string
     :>json string username: username of a user
@@ -377,10 +486,14 @@ Users
     :>json boolean is_active: whether the user is active
     :>json boolean is_bot: whether the user is bot (used for project scoped tokens)
     :>json string date_joined: date the user is created
+    :>json object profile: updated profile preferences when included in the request; see :ref:`api-user-profile`
 
 .. http:delete:: /api/users/(str:username)/
 
     Deletes all user information and marks the user inactive.
+
+    Requires the global ``user.edit`` permission. See
+    :ref:`access-control` for the user management permission model.
 
     :param username: User's username
     :type username: string
@@ -388,6 +501,12 @@ Users
 .. http:post:: /api/users/(str:username)/groups/
 
     Associate groups with a user.
+
+    Requires the global ``user.edit`` permission. See
+    :ref:`access-control` for the user management permission model.
+    This permission authorizes membership changes for every team, including
+    project and workspace teams; no separate permission over the target team is
+    required.
 
     :param username: User's username
     :type username: string
@@ -398,6 +517,12 @@ Users
     .. versionadded:: 4.13.1
 
     Remove user from a group.
+
+    Requires the global ``user.edit`` permission. See
+    :ref:`access-control` for the user management permission model.
+    This permission authorizes membership changes for every team, including
+    project and workspace teams; no separate permission over the target team is
+    required.
 
     :param username: User's username
     :type username: string
@@ -429,6 +554,8 @@ Users
 
     :param username: User's username
     :type username: string
+    :>json string project: Link to the project, or ``null`` for other scopes
+    :>json string component: Link to the component, or ``null`` for other scopes
 
 .. http:post:: /api/users/(str:username)/notifications/
 
@@ -448,6 +575,8 @@ Users
     :type username: string
     :param subscription_id: ID of notification registered
     :type subscription_id: int
+    :>json string project: Link to the project, or ``null`` for other scopes
+    :>json string component: Link to the component, or ``null`` for other scopes
 
 .. http:put:: /api/users/(str:username)/notifications/(int:subscription_id)/
 
@@ -482,11 +611,34 @@ Users
     :param subscription_id: Name of notification registered
     :param subscription_id: int
 
+.. _api-user-profile:
+
+User profile
+++++++++++++
+
+.. versionadded:: 2026.8
+
+The user API exposes profile preferences in a nested ``profile`` object. The
+object is returned on :http:get:`/api/users/(str:username)/` only for callers
+with the ``user.view`` or ``user.edit`` permission. Users without those
+permissions can still update their own profile through
+:http:patch:`/api/users/(str:username)/`; the response then includes the updated
+``profile`` object.
+
+Profile fields mirror the settings described in :ref:`user-profile`.
+
 
 Groups
 ++++++
 
 .. versionadded:: 4.0
+
+Changing a site-wide group's access scope requires the global ``group.edit``
+permission. This trusted administrative permission is not limited by the
+caller's project access: project and component association endpoints can grant
+team members access to private projects the caller cannot access directly. See
+:ref:`site-wide-team-management` for the permission model and narrower
+delegation options.
 
 .. http:get:: /api/groups/
 
@@ -524,6 +676,7 @@ Groups
     :>json array components: link to associated components; see :http:get:`/api/components/(string:project)/(string:component)/`
     :>json array componentlists: link to associated componentlist; see :http:get:`/api/component-lists/(str:slug)/`
     :>json str defining_project: link to the defining project, used for :ref:`manage-acl`; see :http:get:`/api/projects/(string:project)/`
+    :>json array admins: link to associated administrators; see :http:get:`/api/users/(str:username)/`
 
     **Example JSON data:**
 
@@ -550,6 +703,9 @@ Groups
             "componentlist": "http://example.com/api/component-lists/new/",
             "components": [
                 "http://example.com/api/components/demo/weblate/"
+            ],
+            "admins": [
+                "http://example.com/api/users/exampleusername/"
             ]
         }
 
@@ -717,6 +873,8 @@ Roles
     :type id: int
     :>json string name: Role name
     :>json array permissions: list of codenames of permissions
+    :>json boolean is_builtin: whether this is a built-in role (read-only)
+    :>json boolean is_customized: whether a built-in role differs from current defaults (read-only)
 
     **Example JSON data:**
 
@@ -733,7 +891,7 @@ Roles
 
 .. http:put:: /api/roles/(int:id)/
 
-    Changes the role parameters.
+    Changes the role parameters. Built-in role names cannot be changed.
 
     :param id: Role's ID
     :type id: int
@@ -742,7 +900,11 @@ Roles
 
 .. http:patch:: /api/roles/(int:id)/
 
-    Changes the role parameters.
+    Changes the role parameters. Built-in role names cannot be changed.
+
+    When supplied, ``permissions`` replaces the role's complete permission set.
+    Omit it to keep the existing permissions unchanged, or pass an empty list to
+    remove all permissions.
 
     :param id: Role's ID
     :type id: int
@@ -751,7 +913,17 @@ Roles
 
 .. http:delete:: /api/roles/(int:id)/
 
-    Deletes the role.
+    Deletes a custom role. Built-in roles cannot be deleted.
+
+    :param id: Role's ID
+    :type id: int
+
+
+.. http:post:: /api/roles/(int:id)/reset/
+
+    Resets a built-in role to current upstream permission defaults and returns
+    the updated role. Requires the same role-management permission as editing.
+    Custom roles cannot be reset.
 
     :param id: Role's ID
     :type id: int
@@ -832,7 +1004,9 @@ Languages
     :<json string name: Language name
     :<json string direction: Text direction
     :<json int population: Number of speakers
-    :<json object plural: Language plural details
+
+    The ``plural`` field can only be set when creating a language and is
+    rejected on updates.
 
 .. http:patch:: /api/languages/(string:language)/
 
@@ -843,7 +1017,9 @@ Languages
     :<json string name: Language name
     :<json string direction: Text direction
     :<json int population: Number of speakers
-    :<json object plural: Language plural details
+
+    The ``plural`` field can only be set when creating a language and is
+    rejected on updates.
 
 .. http:delete:: /api/languages/(string:language)/
 
@@ -885,6 +1061,34 @@ Projects
     :type slug: string
     :param web: Project website
     :type web: string
+    :param workspace: Optional workspace UUID. Creating a project in a workspace
+                       requires :guilabel:`Add projects to workspace` permission
+                       for that workspace. When omitted, Weblate can use the
+                       only eligible workspace. Creating a project without an
+                       eligible workspace requires the site-wide
+                       :guilabel:`Add new projects` permission. See
+                       :ref:`workspace-project-creation`.
+    :type workspace: string
+    :param access_control: :ref:`project-access_control`
+    :type access_control: integer
+    :param public_sharing: :ref:`project-public_sharing`
+    :type public_sharing: boolean
+    :param use_shared_tm: :ref:`project-use_shared_tm`
+    :type use_shared_tm: boolean
+    :param contribute_shared_tm: :ref:`project-contribute_shared_tm`
+    :type contribute_shared_tm: boolean
+    :param use_workspace_tm: :ref:`project-use-workspace-tm`
+    :type use_workspace_tm: boolean
+    :param contribute_workspace_tm: :ref:`project-contribute-workspace-tm`
+    :type contribute_workspace_tm: boolean
+    :param autoclean_tm: :ref:`project-autoclean_tm`
+    :type autoclean_tm: boolean
+
+    Omit ``access_control`` to use the configured default. Explicit non-default
+    access control requires a superuser unless a billing plan determines the
+    value. On Hosted Weblate, Custom access control is unavailable and each
+    translation-memory contribution setting is forced to match its
+    corresponding usage setting.
 
 .. http:get:: /api/projects/(string:project)/
 
@@ -898,13 +1102,26 @@ Projects
     :>json string components_list_url: URL to components list; see :http:get:`/api/projects/(string:project)/components/`
     :>json string repository_url: URL to repository status; see :http:get:`/api/projects/(string:project)/repository/`
     :>json string changes_list_url: URL to changes list; see :http:get:`/api/projects/(string:project)/changes/`
-    :>json string credits_url: URL to list contributor credits; see :http:get:`/api/projects/(string:project)/credits/`
+    :>json string reports_url: URL to list or generate scoped reports; see :http:get:`/api/projects/(string:project)/reports/`
     :>json boolean translation_review: :ref:`project-translation_review`
     :>json boolean source_review: :ref:`project-source_review`
-    :>json boolean set_language_team: :ref:`project-set_language_team`
     :>json boolean enable_hooks: :ref:`project-enable_hooks`
+    :>json string workspace: workspace UUID, or ``null`` when the project is not
+                            assigned to a workspace
     :>json string instructions: :ref:`project-instructions`
     :>json string language_aliases: :ref:`project-language_aliases`
+    :>json string license: :ref:`project-license`
+    :>json array enforced_checks: Locally configured :ref:`enforced checks <component-enforced_checks>`.
+    :>json boolean inherit_enforced_checks: Whether enforced checks are inherited from the workspace.
+    :>json array effective_enforced_checks: Enforced checks currently applied to the project (read-only).
+    :>json integer access_control: :ref:`project-access_control`
+    :>json boolean public_sharing: :ref:`project-public_sharing`
+    :>json boolean use_shared_tm: :ref:`project-use_shared_tm`
+    :>json boolean contribute_shared_tm: :ref:`project-contribute_shared_tm`
+    :>json boolean use_workspace_tm: :ref:`project-use-workspace-tm`
+    :>json boolean contribute_workspace_tm: :ref:`project-contribute-workspace-tm`
+    :>json boolean autoclean_tm: :ref:`project-autoclean_tm`
+    :>json string announcements_url: URL to announcements; see :http:get:`/api/projects/(string:project)/announcements/`
 
     **Example JSON data:**
 
@@ -918,16 +1135,105 @@ Projects
             "web_url": "http://example.com/projects/hello/"
         }
 
+.. http:get:: /api/projects/(string:project)/languages/(string:language)/workflow/
+
+    Return project-language workflow settings. When no project override exists,
+    return inherited site-wide workflow settings, or defaults when none exist,
+    without creating an override. Reviews remain disabled when both project
+    review settings are disabled. The language is identified by its code.
+    Access to the project is required.
+
+    :>json string language: Language code (read-only)
+    :>json string source_language: Custom source language code, or null for the component source; see :ref:`workflow-source-language`
+    :>json boolean translation_review: Enable translation review
+    :>json boolean enable_suggestions: Enable suggestions
+    :>json boolean restrict_direct_editing: Require suggestions instead of direct editing
+    :>json boolean suggestion_voting: Enable voting on suggestions
+    :>json integer suggestion_autoaccept: Number of votes required to accept suggestions, or 0 to disable
+
+.. http:patch:: /api/projects/(string:project)/languages/(string:language)/workflow/
+
+    Create or update a project-language workflow override. Requires permission
+    to edit the project. Accepts the writable fields returned by
+    :http:get:`/api/projects/(string:project)/languages/(string:language)/workflow/`.
+    Omitted fields retain their values, including inherited workflow settings
+    when creating an override. Enabling reviews requires source or translation
+    reviews to be enabled on the project. Set ``source_language`` to null to use
+    the component source. Source languages must exist in the project and must
+    not form a dependency cycle. Changes reconcile affected units before the
+    request completes.
+
+.. http:delete:: /api/projects/(string:project)/languages/(string:language)/workflow/
+
+    Remove the project-language workflow override, restoring inherited settings.
+    Requires permission to edit the project. Returns HTTP 204, including when
+    no override exists.
+
+    All three methods return HTTP 409 if legacy data contains multiple workflow
+    overrides for the same project and language. Resolve the duplicate settings
+    before using this endpoint; the API does not choose or delete them implicitly.
+
 .. http:patch:: /api/projects/(string:project)/
 
     .. versionadded:: 4.3
 
     Edit a project by a :http:method:`PATCH` request.
 
+    The ``project`` value is the project slug. To avoid using a wrong
+    identifier, use the project ``url`` returned by :http:get:`/api/projects/`
+    or :http:get:`/api/projects/(string:project)/`.
+
+    The request body accepts project fields such as ``instructions``,
+    ``license``, ``access_control``, and translation-memory settings.
+
+    **Example JSON data:**
+
+    .. code-block:: json
+
+        {
+            "instructions": "Translate consistently.",
+            "license": "MIT",
+            "use_shared_tm": true,
+            "access_control": 100
+        }
+
+    Changing ``access_control`` or ``public_sharing`` requires permission to
+    manage project access.
+    Making a project publicly accessible can require licenses on its components
+    when :setting:`LICENSE_REQUIRED` is enabled. On Hosted Weblate, Custom
+    access control is unavailable and each translation-memory contribution
+    setting is forced to match its corresponding usage setting.
+
+    Changing ``workspace`` moves the project. Moving a project requires
+    permission to edit the project and the :guilabel:`Edit workspace settings`
+    permission for the source and target workspace. The target workspace also
+    requires the :guilabel:`Add projects to workspace` permission. Moving a
+    project out of a workspace also requires the site-wide :guilabel:`Add new
+    projects` permission. See :ref:`workspace-project-creation`.
+
     :param project: Project URL slug
     :type project: string
-    :param component: Component URL slug
-    :type component: string
+    :param instructions: :ref:`project-instructions`
+    :type instructions: string
+    :param license: :ref:`project-license`
+    :type license: string
+    :param access_control: :ref:`project-access_control`
+    :type access_control: integer
+    :param public_sharing: :ref:`project-public_sharing`
+    :type public_sharing: boolean
+    :param use_shared_tm: :ref:`project-use_shared_tm`
+    :type use_shared_tm: boolean
+    :param contribute_shared_tm: :ref:`project-contribute_shared_tm`
+    :type contribute_shared_tm: boolean
+    :param use_workspace_tm: :ref:`project-use-workspace-tm`
+    :type use_workspace_tm: boolean
+    :param contribute_workspace_tm: :ref:`project-contribute-workspace-tm`
+    :type contribute_workspace_tm: boolean
+    :param autoclean_tm: :ref:`project-autoclean_tm`
+    :type autoclean_tm: boolean
+    :param workspace: Optional workspace UUID, or ``null`` to move the project
+                       out of a workspace
+    :type workspace: string
 
 .. http:put:: /api/projects/(string:project)/
 
@@ -935,8 +1241,29 @@ Projects
 
     Edit a project by a :http:method:`PUT` request.
 
+    Changing ``workspace`` follows the same permission checks as
+    :http:patch:`/api/projects/(string:project)/`.
+
     :param project: Project URL slug
     :type project: string
+    :param instructions: :ref:`project-instructions`
+    :type instructions: string
+    :param license: :ref:`project-license`
+    :type license: string
+    :param access_control: :ref:`project-access_control`
+    :type access_control: integer
+    :param public_sharing: :ref:`project-public_sharing`
+    :type public_sharing: boolean
+    :param use_shared_tm: :ref:`project-use_shared_tm`
+    :type use_shared_tm: boolean
+    :param contribute_shared_tm: :ref:`project-contribute_shared_tm`
+    :type contribute_shared_tm: boolean
+    :param use_workspace_tm: :ref:`project-use-workspace-tm`
+    :type use_workspace_tm: boolean
+    :param contribute_workspace_tm: :ref:`project-contribute-workspace-tm`
+    :type contribute_workspace_tm: boolean
+    :param autoclean_tm: :ref:`project-autoclean_tm`
+    :type autoclean_tm: boolean
 
 .. http:delete:: /api/projects/(string:project)/
 
@@ -958,7 +1285,7 @@ Projects
 
     .. versionadded:: 5.5
 
-    Downloads all available translations associated with the project as an archive file using the requested format and language.
+    Downloads translations associated with the project as an archive file using the requested format and language. The archive includes only translations for which the user has download permission. Component restrictions and language limits are evaluated for each translation.
 
     :param project: Project URL slug
     :type project: string
@@ -972,20 +1299,30 @@ Projects
     only an overall summary for all repositories for the project. To get more detailed
     status use :http:get:`/api/components/(string:project)/(string:component)/repository/`.
 
+    Repository status includes repositories where the user has a VCS permission
+    on the component owning that repository. Repositories whose owners do not
+    grant this permission are omitted and reported separately.
+
     :param project: Project URL slug
     :type project: string
     :>json boolean needs_commit: whether there are any pending changes to commit
     :>json boolean needs_merge: whether there are any upstream changes to merge
     :>json boolean needs_push: whether there are any local changes to push
+    :>json array included_components: full paths of project components included in the status
+    :>json array skipped_components: full paths of project components omitted from the status
+    :>json array permission_blockers: full paths of components preventing access to omitted repositories
 
     **Example JSON data:**
 
     .. code-block:: json
 
         {
+            "included_components": ["hello/app"],
             "needs_commit": true,
             "needs_merge": false,
-            "needs_push": true
+            "needs_push": true,
+            "permission_blockers": ["shared/glossary"],
+            "skipped_components": ["hello/glossary"]
         }
 
 
@@ -993,11 +1330,27 @@ Projects
 
     Performs given operation on the VCS repository.
 
+    Repository operations process repositories where the user has the requested
+    VCS permission on the component owning that repository. Repositories
+    whose owners do not grant this permission are skipped. The request is
+    denied when no repository is eligible for the operation.
 
     :param project: Project URL slug
     :type project: string
     :<json string operation: Operation to perform: one of ``push``, ``pull``, ``commit``, ``reset``, ``cleanup``, ``file-sync``, ``file-scan``
-    :>json boolean result: result of the operation
+    :<json boolean background: Schedule the operation as a background task instead of waiting for it to finish. Defaults to ``false``.
+    :>json boolean result: result of a synchronous operation
+    :>json array included_components: full paths of project components included in the operation
+    :>json array skipped_components: full paths of project components omitted from the operation
+    :>json array permission_blockers: full paths of components preventing access to omitted repositories
+    :>json string detail: Status of a background operation
+    :>json string task_url: URL for tracking a background operation; see :http:get:`/api/tasks/(str:uuid)/`
+
+    With ``background`` set to ``true``, the endpoint returns ``202 Accepted``.
+    Repeating an identical queued operation returns the existing task URL. A
+    conflicting operation returns ``423 Locked`` and the active task URL when
+    available. Eligible project repositories are processed sequentially in one
+    task.
 
     **CURL example:**
 
@@ -1034,7 +1387,39 @@ Projects
         Content-Language: en
         Allow: GET, POST, HEAD, OPTIONS
 
-        {"result":true}
+        {
+            "included_components": ["hello/app"],
+            "permission_blockers": ["shared/glossary"],
+            "result": true,
+            "skipped_components": ["hello/glossary"]
+        }
+
+    **Background JSON request example:**
+
+    .. sourcecode:: http
+
+        POST /api/projects/hello/repository/ HTTP/1.1
+        Host: example.com
+        Accept: application/json
+        Content-Type: application/json
+        Authorization: Token TOKEN
+
+        {"operation":"pull","background":true}
+
+    **Background JSON response example:**
+
+    .. sourcecode:: http
+
+        HTTP/1.0 202 Accepted
+        Content-Type: application/json
+
+        {
+            "detail": "Repository operation has been queued.",
+            "included_components": ["hello/app"],
+            "permission_blockers": ["shared/glossary"],
+            "skipped_components": ["hello/glossary"],
+            "task_url": "https://example.com/api/tasks/01234567-89ab-cdef-0123-456789abcdef/"
+        }
 
 
 .. http:get:: /api/projects/(string:project)/components/
@@ -1071,6 +1456,7 @@ Projects
     :type project: string
     :form file zipfile: ZIP file to upload into Weblate for translations initialization
     :form file docfile: Document to translate
+    :form string from_component: Optional source component reference used to duplicate the new component. Accepts either a numeric component ID or a full Weblate component path. When provided, the new component inherits the source component configuration and translations into a new local repository. Repository fields such as ``repo``, ``vcs``, ``branch``, ``push``, and ``push_branch`` can not be combined with this option.
     :form boolean disable_autoshare: Disables automatic repository sharing via :ref:`internal-urls`.
     :<json object: Component parameters, see :http:get:`/api/components/(string:project)/(string:component)/`
     :>json object result: Created component object; see :http:get:`/api/components/(string:project)/(string:component)/`
@@ -1100,6 +1486,10 @@ Projects
             --data-binary '{
                 "branch": "main",
                 "file_format": "po",
+                "file_format_params": {
+                    "po_line_wrap": 65535,
+                    "po_no_location": true
+                },
                 "filemask": "po/*.po",
                 "name": "Weblate",
                 "slug": "weblate",
@@ -1126,6 +1516,10 @@ Projects
         {
             "branch": "main",
             "file_format": "po",
+            "file_format_params": {
+                "po_line_wrap": 65535,
+                "po_no_location": true
+            },
             "filemask": "po/*.po",
             "name": "Weblate",
             "slug": "weblate",
@@ -1147,14 +1541,9 @@ Projects
         Content-Length: 20
 
         {
-            "file_format": "po",
-            "filemask": "po/*.po",
+            "from_component": "hello/weblate",
             "name": "Weblate",
-            "slug": "weblate",
-            "repo": "weblate://weblate/hello",
-            "template": "",
-            "new_base": "po/hello.pot",
-            "vcs": "git"
+            "slug": "weblate"
         }
 
     **JSON response example:**
@@ -1173,6 +1562,10 @@ Projects
         {
             "branch": "main",
             "file_format": "po",
+            "file_format_params": {
+                "po_line_wrap": 65535,
+                "po_no_location": true
+            },
             "filemask": "po/*.po",
             "git_export": "",
             "license": "",
@@ -1194,7 +1587,7 @@ Projects
                 "web": "https://weblate.org/",
                 "web_url": "http://example.com/projects/hello/"
             },
-            "repo": "file:///home/nijel/work/weblate-hello",
+            "repo": "https://github.com/WeblateOrg/hello.git",
             "template": "",
             "new_base": "",
             "url": "http://example.com/api/components/hello/weblate/",
@@ -1229,6 +1622,29 @@ Projects
 
        Returned attributes are described in :ref:`api-statistics`.
 
+.. http:get:: /api/projects/(string:project)/metrics/
+
+    .. versionadded:: 2026.8
+
+    Returns translation metrics for the project components visible to the
+    caller. Components are identified by their project-relative path and the
+    result is grouped by component and language. When multiple components have
+    the same project-relative path, ``@`` and the component ID are appended to
+    each colliding path.
+
+    The OpenMetrics representation exposes ``weblate_translation_info`` and
+    ``weblate_*`` gauges compatible with the project translation statistics.
+    Strings containing suggestions use
+    ``weblate_strings_with_suggestions`` to distinguish them from the
+    server-wide ``weblate_suggestions`` object count.
+    The CSV representation contains one row for each component, language, and
+    numeric metric.
+
+    :param project: Project URL slug
+    :type project: string
+    :query string format: Response format; use ``openmetrics`` or ``csv`` for
+       monitoring and tabular output.
+
 .. http:get:: /api/projects/(string:project)/categories/
 
    .. versionadded:: 5.0
@@ -1254,54 +1670,258 @@ Projects
 
    .. versionadded:: 5.3
 
-    Creates a label for a project.
+    Creates a label for a project. The label color is required.
 
     :param project: Project URL slug
     :type project: string
     :<json string name: name of the label
     :<json string color: color of the label
 
-.. http:get:: /api/projects/(string:project)/credits/
+.. http:delete:: /api/projects/(string:project)/labels/(int:label_id)/
 
-    Returns contributor credits for a project.
+   .. versionadded:: 5.14
 
-    .. versionadded:: 5.7
+    Deletes a label from a project.
 
     :param project: Project URL slug
     :type project: string
-    :param start: Lower-bound ISO 8601 timestamp (mandatory)
-    :type start: date
-    :param end: Upper-bound ISO 8601 timestamp (mandatory)
-    :type end: date
-    :param lang: Language code to search for
-    :type lang: source_language
-    :>json string email: Email of the contributor
-    :>json string full_name: Full name of the contributor
-    :>json string change_count: Number of changes done in the time range
+    :param label_id: ID of the label to delete
+    :type label_id: integer
+
+.. http:get:: /api/projects/(string:project)/saved-searches/
+
+   .. versionadded:: 2026.11
+
+    Returns :ref:`saved searches <saved-searches>` for a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :>json int id: ID of the saved search
+    :>json string name: name of the saved search
+    :>json string query: :doc:`search query </user/search>`
+    :>json string description: description of the saved search
+
+.. http:post:: /api/projects/(string:project)/saved-searches/
+
+   .. versionadded:: 2026.11
+
+    Creates a saved search for a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :<json string name: name of the saved search, unique within the project
+    :<json string query: :doc:`search query </user/search>`
+    :<json string description: description of the saved search (optional)
+
+.. http:delete:: /api/projects/(string:project)/saved-searches/(int:saved_search_id)/
+
+   .. versionadded:: 2026.11
+
+    Deletes a saved search from a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :param saved_search_id: ID of the saved search to delete
+    :type saved_search_id: integer
+
+.. http:get:: /api/projects/(string:project)/reports/
+
+    Lists accessible reports generated directly for a project.
+
+.. http:post:: /api/projects/(string:project)/reports/
+
+    Schedules a report using the project as its scope. The request and response
+    match :http:post:`/api/reports/`; scope fields must be omitted.
 
 
-.. http:get:: /api/projects/{string:project}/machinery_settings/
+.. http:get:: /api/projects/(string:project)/translation-services/
 
     .. versionadded:: 5.9
 
-    Returns automatic suggestion settings for a project, consisting of the configurations defined for each translation service installed.
+    Returns a list of translation service installations configured directly on
+    the project. Each entry has an ``id``, ``selector``, ``engine``, optional
+    ``slug``, ``configuration``, ``enabled`` state, and scope fields. The
+    configuration can contain credentials and is returned only to users who
+    can edit the installation's scope.
 
     :param project: Project URL slug
     :type project: string
-    :>json object suggestion_settings: Configuration for all installed services.
+    :>json array installations: Project installations.
 
 
-.. http:post:: /api/projects/{string:project}/machinery_settings/
+.. http:post:: /api/projects/(string:project)/translation-services/
 
     .. versionadded:: 5.9
 
-    Create or update the service configuration for a project.
+    Create a translation service installation for a project. Use
+    ``/api/translation-services/(int:id)/`` to update or remove one. The
+    ``/api/translation-service-exclusions/`` endpoint manages inherited installations
+    excluded by a workspace or project. An installation's service cannot be
+    changed after creation; create another installation to use a different
+    service. An exclusion's scope and target cannot be changed after creation;
+    remove it and create another exclusion to select a different target.
 
     :param project: Project URL slug
     :type project: string
-    :form string service: Service name
+    :form string engine: Service name
+    :form string slug: Optional installation slug
     :form string configuration: Service configuration in JSON
 
+.. http:get:: /api/projects/(string:project)/machinery_settings/
+
+    .. versionremoved:: 2026.11
+
+       Use :http:get:`/api/projects/(string:project)/translation-services/` instead.
+
+.. http:post:: /api/projects/(string:project)/machinery_settings/
+
+    .. versionremoved:: 2026.11
+
+       Use :http:post:`/api/projects/(string:project)/translation-services/` instead.
+
+.. http:get:: /api/projects/(string:project)/languages/(string:language_code)/file/
+
+    .. versionchanged:: 5.15.1
+
+       Added ability to download ZIP file of all components translations in a project for 1 specific language.
+
+    Download a ZIP file of permitted translation files for a specified ``language_code`` across the components of a given ``project`` rather than downloading individual translated files and manually zipping them. The archive is named `{project-slug}-{language-code}.zip` and organized by component paths (e.g., `component-slug/po/lang.po`). Component restrictions and download permission are evaluated for each translation.
+
+    :param project: Project URL slug
+    :type project: string
+    :param language_code: Language code
+    :type language_code: string
+    :query string filter: Optional case-insensitive substring to filter components by slug (e.g., ``?filter=core`` will match components with 'core' anywhere in their slug); only components whose slugs contain the substring will be included in the download.
+    :query string format: The archive format to use; If not specified, defaults to ``zip``; Supported formats: ``zip`` and ``zip:CONVERSION`` where ``CONVERSION`` is one of converters listed at :ref:`download`.
+
+    .. note::
+
+        Possible responses:
+
+        - ``200 OK`` with the permitted translations for the specified language. If no components have translations for the specified language, an empty ZIP file will be returned.
+        - ``403 Forbidden`` if matching translations exist but the user cannot download any of them.
+        - ``404 Not Found`` if the project slug or language code does not exist.
+
+.. http:get:: /api/projects/(string:project)/languages/(string:language_code)/announcements/
+
+   .. versionadded:: 2026.6
+
+    Returns announcements for a specified ``language_code`` in a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :param language_code: Language code
+    :type language_code: string
+    :>json int id: ID of the announcement
+    :>json string message: announcement text
+    :>json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :>json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :>json bool notify: send notification to subscribed users? (optional)
+
+.. http:post:: /api/projects/(string:project)/languages/(string:language_code)/announcements/
+
+   .. versionadded:: 2026.6
+
+    Creates an announcement for a specified ``language_code`` in a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :param language_code: Language code
+    :type language_code: string
+    :<json string message: announcement text
+    :<json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :<json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :<json bool notify: send notification to subscribed users? (optional)
+
+.. http:delete:: /api/projects/(string:project)/languages/(string:language_code)/announcements/(int:announcement_id)/
+
+   .. versionadded:: 2026.6
+
+    Deletes an announcement from a specified ``language_code`` in a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :param language_code: Language code
+    :type language_code: string
+    :param announcement_id: ID of the announcement to delete
+    :type announcement_id: integer
+
+.. http:get:: /api/projects/(string:project)/announcements/
+
+   .. versionadded:: 5.17
+
+    Returns announcements for a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :>json int id: ID of the announcement
+    :>json string message: announcement text
+    :>json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :>json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :>json bool notify: send notification to subscribed users? (optional)
+
+.. http:post:: /api/projects/(string:project)/announcements/
+
+   .. versionadded:: 5.17
+
+    Creates an announcement for a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :<json string message: announcement text
+    :<json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :<json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :<json bool notify: send notification to subscribed users? (optional)
+
+.. http:delete:: /api/projects/(string:project)/announcements/(int:announcement_id)/
+
+   .. versionadded:: 5.17
+
+    Deletes an announcement from a project.
+
+    :param project: Project URL slug
+    :type project: string
+    :param announcement_id: ID of the announcement to delete
+    :type announcement_id: integer
+
+.. http:get:: /api/projects/(string:project)/backups/
+
+   .. versionadded:: 2026.7
+
+    Returns a list of :ref:`projectbackup` archives. Project backups contain all
+    project components, including restricted components, and require
+    :guilabel:`Edit project settings`.
+
+    :param project: Project URL slug
+    :type project: string
+    :>json string name: Backup file name, for example ``1718803200.zip``
+    :>json string timestamp: Backup creation time in ISO 8601 format
+    :>json int size: Backup file size in bytes
+
+.. http:post:: /api/projects/(string:project)/backups/
+
+   .. versionadded:: 2026.7
+
+    Schedules creation of a new :ref:`projectbackup` archive. Once ready, the backup appears in
+    :http:get:`/api/projects/(string:project)/backups/`.
+
+    :param project: Project URL slug
+    :type project: string
+    :>json string detail: Result message
+    :>json string url: URL to list backups
+
+.. http:get:: /api/projects/(string:project)/backups/(string:backup)/
+
+   .. versionadded:: 2026.7
+
+    Downloads a :ref:`projectbackup` archive containing all project components,
+    including restricted components. This requires :guilabel:`Edit project
+    settings`.
+
+    :param project: Project URL slug
+    :type project: string
+    :param backup: Backup file name, e.g. ``1718803200.zip``
+    :type backup: string
 
 Components
 ++++++++++
@@ -1330,6 +1950,7 @@ Components
     :>json string name: :ref:`component-name`
     :>json string slug: :ref:`component-slug`
     :>json string vcs: :ref:`component-vcs`
+    :>json object vcs_params: :ref:`component-vcs_params`
     :>json string linked_component: component whose repository is linked via :ref:`internal-urls`
     :>json string repo: :ref:`component-repo`, this is the actual repository URL even when :ref:`internal-urls` are used, use ``linked_component`` to detect this situation
     :>json string git_export: :ref:`component-git_export`
@@ -1342,6 +1963,7 @@ Components
     :>json string intermediate: :ref:`component-intermediate`
     :>json string new_base: :ref:`component-new_base`
     :>json string file_format: :ref:`component-file_format`
+    :>json object file_format_params: :ref:`component-file_format_params`
     :>json string license: :ref:`component-license`
     :>json string agreement: :ref:`component-agreement`
     :>json string new_lang: :ref:`component-new_lang`
@@ -1349,9 +1971,12 @@ Components
     :>json object source_language: source language object; see :http:get:`/api/languages/(string:language)/`
     :>json string check_flags: :ref:`component-check_flags`
     :>json string priority: :ref:`component-priority`
-    :>json string enforced_checks: :ref:`component-enforced_checks`
+    :>json array enforced_checks: Locally configured :ref:`enforced checks <component-enforced_checks>`.
+    :>json boolean inherit_enforced_checks: Whether enforced checks are inherited from the category, project, or workspace.
+    :>json array effective_enforced_checks: Enforced checks currently applied to the component (read-only).
     :>json string restricted: :ref:`component-restricted`
     :>json string repoweb: :ref:`component-repoweb`
+    :>json string repoweb_translations: :ref:`component-repoweb-translations`
     :>json string report_source_bugs: :ref:`component-report_source_bugs`
     :>json string merge_style: :ref:`component-merge_style`
     :>json string commit_message: :ref:`component-commit_message`
@@ -1361,13 +1986,16 @@ Components
     :>json string addon_message: :ref:`component-addon_message`
     :>json string pull_message: :ref:`component-pull_message`
     :>json string allow_translation_propagation: :ref:`component-allow_translation_propagation`
+    :>json boolean hide_glossary_matches: :ref:`component-hide_glossary_matches`
+    :>json boolean contribute_project_tm: :ref:`component-contribute_project_tm`
     :>json string enable_suggestions: :ref:`component-enable_suggestions`
     :>json string suggestion_voting: :ref:`component-suggestion_voting`
     :>json string suggestion_autoaccept: :ref:`component-suggestion_autoaccept`
-    :>json string push_on_commit: :ref:`component-push_on_commit`
+    :>json boolean push_on_commit: :ref:`component-push_on_commit`; linked repositories expose the effective value from the linked component
+    :>json boolean push_on_update: :ref:`component-push_on_update`; linked repositories expose the effective value from the linked component
     :>json bool locked: Whether component is locked, this field is read-only; see :http:get:`/api/components/(string:project)/(string:component)/lock/`
-    :>json string commit_pending_age: :ref:`component-commit_pending_age`
-    :>json string auto_lock_error: :ref:`component-auto_lock_error`
+    :>json integer commit_pending_age: :ref:`component-commit_pending_age`; linked repositories expose the effective value from the linked component
+    :>json boolean auto_lock_error: :ref:`component-auto_lock_error`; linked repositories expose the effective value from the linked component
     :>json string language_regex: :ref:`component-language_regex`
     :>json string variant_regex: :ref:`component-variant_regex`
     :>json bool is_glossary: :ref:`component-is_glossary`
@@ -1377,7 +2005,11 @@ Components
     :>json string lock_url: URL to lock status; see :http:get:`/api/components/(string:project)/(string:component)/lock/`
     :>json string changes_list_url: URL to changes list; see :http:get:`/api/components/(string:project)/(string:component)/changes/`
     :>json string task_url: URL to a background task (if any); see :http:get:`/api/tasks/(str:uuid)/`
-    :>json string credits_url: URL to list contributor credits; see :http:get:`/api/components/(string:project)/(string:component)/credits/`
+    :>json string reports_url: URL to list or generate scoped reports; see :http:get:`/api/components/(string:project)/(string:component)/reports/`
+    :>json string announcements_url: URL to announcements; see :http:get:`/api/components/(string:project)/(string:component)/announcements/`
+
+    Repository fields, including ``linked_component``, are returned only with
+    the :guilabel:`View upstream repository location` permission.
 
     **Example JSON data:**
 
@@ -1386,6 +2018,10 @@ Components
         {
             "branch": "main",
             "file_format": "po",
+            "file_format_params": {
+                "po_line_wrap": 65535,
+                "po_no_location": true
+            },
             "filemask": "po/*.po",
             "git_export": "",
             "license": "",
@@ -1415,7 +2051,7 @@ Components
                 "url": "http://example.com/api/languages/en/",
                 "web_url": "http://example.com/languages/en/"
             },
-            "repo": "file:///home/nijel/work/weblate-hello",
+            "repo": "https://github.com/WeblateOrg/hello.git",
             "template": "",
             "new_base": "",
             "url": "http://example.com/api/components/hello/weblate/",
@@ -1436,6 +2072,13 @@ Components
     :<json string name: name of component
     :<json string slug: slug of component
     :<json string repo: VCS repository URL
+    :<json boolean hide_glossary_matches: :ref:`component-hide_glossary_matches`
+    :<json boolean contribute_project_tm: :ref:`component-contribute_project_tm`
+
+    Linking to another Weblate component using an :ref:`internal URL
+    <internal-urls>` requires permission to edit the referenced component.
+    Changing :ref:`component-restricted` follows the same direct
+    component-access restrictions as the web interface.
 
     **CURL example:**
 
@@ -1478,6 +2121,10 @@ Components
         {
             "branch": "main",
             "file_format": "po",
+            "file_format_params": {
+                "po_line_wrap": 65535,
+                "po_no_location": true
+            },
             "filemask": "po/*.po",
             "git_export": "",
             "license": "",
@@ -1499,7 +2146,7 @@ Components
                 "web": "https://weblate.org/",
                 "web_url": "http://example.com/projects/hello/"
             },
-            "repo": "file:///home/nijel/work/weblate-hello",
+            "repo": "https://github.com/WeblateOrg/hello.git",
             "template": "",
             "new_base": "",
             "url": "http://example.com/api/components/hello/weblate/",
@@ -1517,6 +2164,7 @@ Components
     :type component: string
     :<json string branch: VCS repository branch
     :<json string file_format: file format of translations
+    :<json object file_format_params: parameters related to the file
     :<json string filemask: mask of translation files in the repository
     :<json string name: name of component
     :<json string slug: slug of component
@@ -1524,6 +2172,9 @@ Components
     :<json string template: base file for monolingual translations
     :<json string new_base: base file for adding new translations
     :<json string vcs: version control system
+    :<json object vcs_params: :ref:`component-vcs_params`
+    :<json boolean hide_glossary_matches: :ref:`component-hide_glossary_matches`
+    :<json boolean contribute_project_tm: :ref:`component-contribute_project_tm`
 
 .. http:delete:: /api/components/(string:project)/(string:component)/
 
@@ -1644,6 +2295,10 @@ Components
 
     The response is same as for :http:get:`/api/projects/(string:project)/repository/`.
 
+    Repository status requires component-wide permission on the component that
+    owns the repository, including when accessing it through a linked component
+    in another project.
+
     :param project: Project URL slug
     :type project: string
     :param component: Component URL slug
@@ -1660,6 +2315,10 @@ Components
     Performs the given operation on a VCS repository.
 
     See :http:post:`/api/projects/(string:project)/repository/` for documentation.
+
+    Repository operations require component-wide permission on the component
+    that owns the repository, including when accessing it through a linked
+    component in another project.
 
     :param project: Project URL slug
     :type project: string
@@ -1742,6 +2401,7 @@ Components
     :param component: Component URL slug
     :type component: string
     :<json string language_code: translation language code; see :http:get:`/api/languages/(string:language)/`
+    :<json array from_component: optional ordered list of source component references used for automatic translation. Accepts numeric component IDs or full Weblate component paths. For form submissions this field can be provided multiple times.
     :>json object result: new translation object created
 
     **CURL example:**
@@ -1764,7 +2424,10 @@ Components
         Authorization: Token TOKEN
         Content-Length: 20
 
-        {"language_code": "cs"}
+        {
+            "language_code": "cs",
+            "from_component": ["hello/weblate", 123]
+        }
 
     **JSON response example:**
 
@@ -1831,6 +2494,9 @@ Components
 
     Returns projects linked with a component.
 
+    Component managers see every linked project. Other callers see only linked
+    projects they can access.
+
     .. versionadded:: 4.5
 
     :param project: Project URL slug
@@ -1843,13 +2509,18 @@ Components
 
     Associate project with a component.
 
+    This requires permission to edit the component and the target project.
+
     .. versionadded:: 4.5
+    .. versionchanged:: 5.17
 
     :param project: Project URL slug
     :type project: string
     :param component: Component URL slug
     :type component: string
     :form string project_slug: Project slug
+    :form int category_id: Category ID in the target project (optional).
+        The category must belong to the specified project.
 
 .. http:delete:: /api/components/(string:project)/(string:component)/links/(string:project_slug)/
 
@@ -1864,23 +2535,59 @@ Components
     :param project_slug: Slug of the project to remove
     :type project_slug: string
 
-.. http:get:: /api/components/(string:project)/(string:component)/credits/
+.. http:get:: /api/components/(string:project)/(string:component)/reports/
 
-    Returns contributor credits for a project.
+    Lists accessible reports generated directly for a component.
 
-    .. versionadded:: 5.7
+.. http:post:: /api/components/(string:project)/(string:component)/reports/
+
+    Schedules a report using the component as its scope. The request and response
+    match :http:post:`/api/reports/`; scope fields must be omitted.
+
+.. http:get:: /api/components/(string:project)/(string:component)/announcements/
+
+   .. versionadded:: 5.17
+
+    Returns announcements for a component.
 
     :param project: Project URL slug
     :type project: string
-    :param start: Lower-bound ISO 8601 timestamp (mandatory)
-    :type start: date
-    :param end: Upper-bound ISO 8601 timestamp (mandatory)
-    :type end: date
-    :param lang: Language code to search for
-    :type lang: source_language
-    :>json string email: Email of the contributor
-    :>json string full_name: Full name of the contributor
-    :>json string change_count: Number of changes done in the time range
+    :param component: Component URL slug
+    :type component: string
+    :>json int id: ID of the announcement
+    :>json string message: announcement text
+    :>json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :>json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :>json bool notify: send notification to subscribed users? (optional)
+
+.. http:post:: /api/components/(string:project)/(string:component)/announcements/
+
+   .. versionadded:: 5.17
+
+    Creates an announcement for a component.
+
+    :param project: Project URL slug
+    :type project: string
+    :param component: Component URL slug
+    :type component: string
+    :<json string message: announcement text
+    :<json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :<json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :<json bool notify: send notification to subscribed users? (optional)
+
+.. http:delete:: /api/components/(string:project)/(string:component)/announcements/(int:announcement_id)/
+
+   .. versionadded:: 5.17
+
+    Deletes an announcement from a component.
+
+    :param project: Project URL slug
+    :type project: string
+    :param component: Component URL slug
+    :type component: string
+    :param announcement_id: ID of the announcement to delete
+    :type announcement_id: integer
+
 
 Translations
 ++++++++++++
@@ -1930,6 +2637,7 @@ Translations
     :>json string file_url: URL to file object; see :http:get:`/api/translations/(string:project)/(string:component)/(string:language)/file/`
     :>json string changes_list_url: URL to changes list; see :http:get:`/api/translations/(string:project)/(string:component)/(string:language)/changes/`
     :>json string units_list_url: URL to strings list; see :http:get:`/api/translations/(string:project)/(string:component)/(string:language)/units/`
+    :>json string announcements_url: URL to announcements; see :http:get:`/api/translations/(string:project)/(string:component)/(string:language)/announcements/`
 
     **Example JSON data:**
 
@@ -1939,6 +2647,10 @@ Translations
             "component": {
                 "branch": "main",
                 "file_format": "po",
+                "file_format_params": {
+                    "po_line_wrap": 65535,
+                    "po_no_location": true
+                },
                 "filemask": "po/*.po",
                 "git_export": "",
                 "license": "",
@@ -1960,7 +2672,7 @@ Translations
                     "web": "https://weblate.org/",
                     "web_url": "http://example.com/projects/hello/"
                 },
-                "repo": "file:///home/nijel/work/weblate-hello",
+                "repo": "https://github.com/WeblateOrg/hello.git",
                 "slug": "weblate",
                 "template": "",
                 "url": "http://example.com/api/components/hello/weblate/",
@@ -2058,6 +2770,8 @@ Translations
     :<json int state: String state; see :http:get:`/api/units/(int:id)/`
     :>json object unit: newly created unit; see :http:get:`/api/units/(int:id)/`
 
+    Creating a unit in the approved state requires permission to review strings.
+
     .. seealso::
 
        * :ref:`component-manage_units`
@@ -2069,6 +2783,10 @@ Translations
 
        The ``filter_type`` parameter is no longer supported and filtering is done by the ``q`` parameter.
 
+    .. versionchanged:: 2026.10
+
+       Added the ``background`` parameter.
+
     Trigger automatic translation.
 
     :param project: Project URL slug
@@ -2077,12 +2795,26 @@ Translations
     :type component: string
     :param language: Translation language code
     :type language: string
-    :<json string mode: Automatic translation mode
+    :<json string mode: Automatic translation mode; one of ``suggest``, ``translate``, ``fuzzy``, ``approved``
     :<json string q: Automatic translation search string, see :ref:`search-strings`.
     :<json string auto_source: Automatic translation source - ``mt`` or ``others``
-    :<json string component: Turn on contribution to shared translation memory for the project to get access to additional components.
-    :<json array engines: Machine translation engines
-    :<json string threshold: Score threshold
+    :<json string component: Component ID (always accepted); when the project has 30 or more eligible source components, a component slug or ``project/component`` path is also accepted; leave blank to use all components in the project
+    :<json array engines: Translation services to use when ``auto_source`` is ``mt``
+    :<json int threshold: Score threshold for machine translation (1–100)
+    :<json boolean background: Schedule automatic translation as a background task instead of waiting for it to finish. Defaults to ``false``.
+    :>json string details: Human-readable summary of the translation result, or status of a background task
+    :>json array errors: Errors encountered during automatic translation; an empty array when completed without errors. Omitted while a background task is queued.
+    :>json string task_url: URL for tracking a background task; see :http:get:`/api/tasks/(str:uuid)/`
+
+    With ``background`` set to ``true``, the endpoint returns ``202 Accepted``
+    once the task is scheduled. Validation and permission errors are still
+    reported immediately.
+
+    Completed requests return ``200 OK``, including when some or all translation
+    service batches fail. Successful translations are retained. Check ``errors``
+    to distinguish provider failures from a run with nothing to update. Error
+    details follow the diagnostic permissions described in :ref:`api-tasks`;
+    other readers receive a generic error explanation.
 
 .. http:get:: /api/translations/(string:project)/(string:component)/(string:language)/file/
 
@@ -2119,10 +2851,11 @@ Translations
     :type component: string
     :param language: Translation language code
     :type language: string
+    :form boolean ignore_language: Ignore a mismatch between the declared file language and the translation language (defaults to ``false``), see :ref:`upload-ignore_language`
     :form string conflicts: How to deal with conflicts (``ignore``, ``replace-translated`` or ``replace-approved``), see :ref:`upload-conflicts`
-    :form file file: Uploaded file
-    :form string email: Author e-mail
-    :form string author: Author name
+    :form file file: Uploaded file or file content sent as a form field without a filename
+    :form string author_email: Author e-mail
+    :form string author_name: Author name
     :form string method: Upload method (``translate``, ``approve``, ``suggest``, ``fuzzy``, ``replace``, ``source``, ``add``), see :ref:`upload-method`
     :form string fuzzy: Fuzzy (marked for edit) strings processing (*empty*, ``process``, ``approve``)
 
@@ -2135,11 +2868,28 @@ Translations
             -H "Authorization: Token TOKEN" \
             http://example.com/api/translations/hello/android/cs/file/
 
+    The ``file`` field can also be sent as form content without a filename, for
+    example when piping data from another command:
+
+    .. code-block:: sh
+
+        curl -X POST \
+            -F 'file=<strings.xml' \
+            -H "Authorization: Token TOKEN" \
+            http://example.com/api/translations/hello/android/cs/file/
+
+    The content is used as submitted, byte for byte, so any file encoding works.
+
 .. http:get:: /api/translations/(string:project)/(string:component)/(string:language)/repository/
 
     Returns information about the VCS repository status.
 
     The response is same as for :http:get:`/api/components/(string:project)/(string:component)/repository/`.
+
+    Repository status requires component-wide permission on the component that
+    owns the repository, including when accessing it through a linked component
+    in another project. A permission limited to the requested language is not
+    sufficient.
 
     :param project: Project URL slug
     :type project: string
@@ -2153,6 +2903,11 @@ Translations
     Performs given operation on the VCS repository.
 
     See :http:post:`/api/projects/(string:project)/repository/` for documentation.
+
+    Repository operations require component-wide permission on the component
+    that owns the repository, including when accessing it through a linked
+    component in another project. A permission limited to the requested
+    language is not sufficient.
 
     :param project: Project URL slug
     :type project: string
@@ -2178,6 +2933,58 @@ Translations
 
        Returned attributes are described in :ref:`api-statistics`.
 
+.. http:get:: /api/translations/(string:project)/(string:component)/(string:language)/announcements/
+
+   .. versionadded:: 5.17
+
+    Returns announcements for a translation.
+
+    :param project: Project URL slug
+    :type project: string
+    :param component: Component URL slug
+    :type component: string
+    :param language: Translation language code
+    :type language: string
+    :>json int id: ID of the announcement
+    :>json string message: announcement text
+    :>json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :>json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :>json bool notify: send notification to subscribed users? (optional)
+
+.. http:post:: /api/translations/(string:project)/(string:component)/(string:language)/announcements/
+
+   .. versionadded:: 5.17
+
+    Creates an announcement for a translation.
+
+    :param project: Project URL slug
+    :type project: string
+    :param component: Component URL slug
+    :type component: string
+    :param language: Translation language code
+    :type language: string
+    :<json string message: announcement text
+    :<json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :<json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :<json bool notify: send notification to subscribed users? (optional)
+
+.. http:delete:: /api/translations/(string:project)/(string:component)/(string:language)/announcements/(int:announcement_id)/
+
+   .. versionadded:: 5.17
+
+    Deletes an announcement from a translation.
+
+    :param project: Project URL slug
+    :type project: string
+    :param component: Component URL slug
+    :type component: string
+    :param language: Translation language code
+    :type language: string
+    :param announcement_id: ID of the announcement to delete
+    :type announcement_id: integer
+
+
+.. _api-memory:
 
 Memory
 ++++++
@@ -2186,7 +2993,36 @@ Memory
 
 .. http:get:: /api/memory/
 
-    Returns a list of memory results.
+    Returns a paginated list of memory results visible to the authenticated
+    user. When no source filter is supplied, the response enumerates all visible
+    entries, including the global shared translation memory. Shared entries
+    contain their source string, translation, and project and component origin.
+    Project access control does not restrict entries explicitly published to
+    shared translation memory; see :ref:`shared-tm`.
+
+    :query source: Case-insensitive substring filter on source text (optional)
+    :type source: string
+    :query source_language: Source language code filter (optional)
+    :type source_language: string
+    :query target_language: Target language code filter (optional)
+    :type target_language: string
+    :query project: Project slug filter (optional)
+    :type project: string
+
+.. http:post:: /api/memory/lookup/
+
+    Looks up translation memory matches for the provided source strings.
+
+    :query source_language: Source language code
+    :type source_language: string
+    :query target_language: Target language code
+    :type target_language: string
+    :query project: Project slug filter (optional)
+    :type project: string
+    :query exact: Return exact matches only and skip fuzzy matching (optional)
+    :type exact: boolean
+    :<json array strings: List of source strings to look up
+    :>json array results: Ordered lookup results with the best match for each query or ``null`` when no match was found
 
 .. http:delete:: /api/memory/(int:memory_object_id)/
 
@@ -2226,6 +3062,10 @@ and XLIFF.
 
        The ``last_updated`` attribute is now exposed.
 
+    .. versionchanged:: 2026.10
+
+       The ``screenshots_url`` attribute is now exposed.
+
     Returns information about the translation unit.
 
     :param id: Unit ID
@@ -2252,10 +3092,16 @@ and XLIFF.
     :>json int num_words: number of source words
     :>json int priority: translation priority; 100 is default
     :>json int id: unit identifier
+    :>json object tbx_terms: Read-only TBX metadata with source and target alternative lists. Each record contains text, optional ID, administrative status, and notes with text, origin, category, and scope (concept, language, or term). Empty for other formats.
     :>json string explanation: String explanation, available on source units, see :ref:`additional`
-    :>json string extra_flags: Additional string flags, available on source units, see :ref:`custom-checks`
+    :>json string extra_flags: Additional flags for this unit; source flags apply to all languages and translation flags apply only to that language, see :ref:`additional-flags`
     :>json string web_url: URL where the unit can be edited
     :>json string source_unit: Source unit link; see :http:get:`/api/units/(int:id)/`
+    :>json string screenshots_url: URL to list and manage associated screenshots; see :http:get:`/api/units/(int:id)/screenshots/`
+    :>json string translation_parent: Read-only link to the configured parent unit, or null when using the component source or the configured parent is missing; see :ref:`workflow-source-language`
+    :>json array effective_source: Read-only source text used for translation, including plural forms. The existing ``source`` field continues to contain the canonical file source.
+    :>json array effective_previous_source: Read-only previous source text shown before an effective-source change, including plural forms. The existing ``previous_source`` field retains the canonical file-source value.
+    :>json string effective_source_language: Read-only language code of the effective source, retaining the configured language when its source is missing
     :>json boolean pending: whether the unit is pending for write
     :>json timestamp timestamp: string age
     :>json timestamp last_updated: last string update
@@ -2271,7 +3117,7 @@ and XLIFF.
     :<json int state: unit state, 0 - untranslated, 10 - needs editing, 20 - translated, 30 - approved (need review workflow enabled, see :ref:`reviews`)
     :<json array target: target string
     :<json string explanation: String explanation, available on source units, see :ref:`additional`
-    :<json string extra_flags: Additional string flags, available on source units, see :ref:`custom-checks`
+    :<json string extra_flags: Additional flags for this unit; source flags apply to all languages and translation flags apply only to that language, see :ref:`additional-flags`
     :<json array labels: labels, available on source units
 
 .. http:put:: /api/units/(int:id)/
@@ -2285,8 +3131,31 @@ and XLIFF.
     :<json int state: unit state, 0 - untranslated, 10 - needs editing, 20 - translated, 30 - approved (need review workflow enabled, see :ref:`reviews`)
     :<json array target: target string
     :<json string explanation: String explanation, available on source units, see :ref:`additional`
-    :<json string extra_flags: Additional string flags, available on source units, see :ref:`custom-checks`
+    :<json string extra_flags: Additional flags for this unit; source flags apply to all languages and translation flags apply only to that language, see :ref:`additional-flags`
     :<json array labels: labels, available on source units
+
+.. http:post:: /api/units/(int:id)/source/
+
+    Edit the source string associated with a unit, updating its existing
+    translations within the component. Requires source-editing permission and
+    :ref:`component-manage_units`. See :ref:`edit-source` for format support
+    and restrictions.
+
+    :param int id: unit ID in any language
+    :<json integer content_hash: current content hash of the source unit, required to detect stale edits
+    :<json array source: replacement source forms, preserving the existing number of forms; optional
+    :<json string context: replacement key or context; optional
+    :<json string explanation: source explanation; optional
+    :>json object: updated source unit, in the same format as :http:get:`/api/units/(int:id)/`
+    :statuscode 200: source updated, or the request made no changes
+    :statuscode 400: invalid edit, conflicting key, unsupported operation, or stale content hash
+    :statuscode 403: editing is not permitted
+    :statuscode 423: component is busy; retry later
+
+    Omitted fields remain unchanged. Translation text and associated history
+    are retained. Source-text changes mark translations as needing editing;
+    key-only changes preserve translation states. Files are updated by the
+    normal pending-change queue, respecting the project's commit policy.
 
 .. http:delete:: /api/units/(int:id)/
 
@@ -2302,6 +3171,45 @@ and XLIFF.
    .. versionadded:: 5.11
 
    Returns a list of all target translation units for the given source translation unit.
+
+.. http:get:: /api/units/(int:id)/screenshots/
+
+   .. versionadded:: 2026.10
+
+   Returns a paginated list of screenshots associated with the unit.
+
+   :param id: Unit ID
+   :type id: int
+
+   .. seealso::
+
+       Screenshot object attributes are documented at :http:get:`/api/screenshots/(int:id)/`.
+
+.. http:post:: /api/units/(int:id)/screenshots/
+
+   .. versionadded:: 2026.10
+
+   Associate screenshot with unit.
+
+   :param id: Unit ID
+   :type id: int
+   :form string screenshot_id: Screenshot ID; the screenshot must belong to the
+       same component and language as the unit
+
+   .. seealso::
+
+       Returns the associated screenshot; see :http:get:`/api/screenshots/(int:id)/`.
+
+.. http:delete:: /api/units/(int:id)/screenshots/(int:screenshot_id)
+
+   .. versionadded:: 2026.10
+
+   Remove screenshot association with unit.
+
+   :param id: Unit ID
+   :type id: int
+   :param screenshot_id: Screenshot ID
+   :type screenshot_id: int
 
 .. http:post:: /api/units/(int:id)/comments/
 
@@ -2320,6 +3228,134 @@ and XLIFF.
     :>json string user: URL of the commenter's object
     :>json string timestamp: creation timestamp of the comment
 
+.. http:get:: /api/units/(int:id)/comments/
+
+    .. versionadded:: 5.15
+
+    Returns a list of comments on a given translation unit
+
+    :param id: Unit ID
+    :type id: int
+    :>json int id: comment identifier
+    :>json string comment: content of the comment
+    :>json string timestamp: creation timestamp of the comment
+    :>json string user: URL of the commenter's object
+
+.. http:post:: /api/units/(int:id)/suggestions/
+
+    .. versionadded:: 2026.8
+
+    Create a new suggestion on the given translation unit.
+
+    Requires authentication and the :guilabel:`Add suggestion` permission on the
+    translation. Suggestions must be enabled on the translation, the translation
+    must not be read-only, and the user must have signed any required contributor
+    agreement.
+
+    :param id: Unit ID
+    :type id: int
+    :<json array target: suggested translation text as a list of plural forms; use a single-element array for non-plural strings
+    :>json int id: suggestion identifier
+    :>json array target: suggested translation text as a list of plural forms
+    :>json string unit: URL of the related unit object
+    :>json string user: URL of the suggester's object
+    :>json string timestamp: creation timestamp of the suggestion
+    :>json int votes: net vote count for the suggestion
+
+    Users who also have the :guilabel:`Vote on suggestion` permission
+    automatically upvote their suggestion when it is created.
+
+    When the same suggestion already exists from another user and the caller has
+    the :guilabel:`Vote on suggestion` permission, the existing suggestion is
+    upvoted instead and the response uses the same format as
+    :http:post:`/api/suggestions/(int:id)/vote/` (HTTP status 200 instead of 201).
+
+.. http:get:: /api/units/(int:id)/suggestions/
+
+    .. versionadded:: 2026.8
+
+    Returns a paginated list of suggestions on a given translation unit.
+
+    :param id: Unit ID
+    :type id: int
+    :>json array results: array of suggestion objects; see :http:get:`/api/suggestions/(int:id)/`
+
+Suggestions
++++++++++++
+
+.. http:get:: /api/suggestions/
+
+    .. versionadded:: 2026.8
+
+    Returns a paginated list of suggestions the user has access to, ordered by
+    creation time (most recent first).
+
+    .. seealso::
+
+        Suggestion object attributes are documented at :http:get:`/api/suggestions/(int:id)/`.
+
+    :>json array results: array of suggestion objects; see :http:get:`/api/suggestions/(int:id)/`
+
+.. http:get:: /api/suggestions/(int:id)/
+
+    .. versionadded:: 2026.8
+
+    Returns information about a suggestion.
+
+    :param id: Suggestion ID
+    :type id: int
+    :>json int id: suggestion identifier
+    :>json array target: suggested translation text as a list of plural forms
+    :>json string unit: URL of the related unit object
+    :>json string user: URL of the suggester's object, or ``null`` for anonymous suggestions
+    :>json string timestamp: creation timestamp of the suggestion
+    :>json int votes: net vote count for the suggestion
+
+.. http:delete:: /api/suggestions/(int:id)/
+
+    .. versionadded:: 2026.8
+
+    Delete or reject a suggestion.
+
+    Requires the :guilabel:`Delete suggestion` permission on the related
+    translation, or ownership of the suggestion.
+
+    :param id: Suggestion ID
+    :type id: int
+    :<json string rejection_reason: optional reason for rejecting the suggestion
+    :<json boolean is_spam: whether to report the suggestion as spam
+
+    The request body is optional. When ``is_spam`` is ``true``, the suggestion
+    content is reported to the antispam service.
+
+.. http:post:: /api/suggestions/(int:id)/accept/
+
+    .. versionadded:: 2026.8
+
+    Accept a suggestion and apply it to the translation unit.
+
+    Requires the :guilabel:`Accept suggestion` permission on the related
+    translation unit.
+
+    :param id: Suggestion ID
+    :type id: int
+    :<json boolean approve: whether to mark the translation as approved after accepting; requires the :guilabel:`Review strings` permission and review workflow enabled (see :ref:`reviews`)
+    :>json string result: ``accepted`` when the suggestion was accepted
+
+.. http:post:: /api/suggestions/(int:id)/vote/
+
+    .. versionadded:: 2026.8
+
+    Vote for or against a suggestion.
+
+    Requires the :guilabel:`Vote on suggestion` permission and voting enabled
+    on the related translation (see :ref:`voting`).
+
+    :param id: Suggestion ID
+    :type id: int
+    :<json int value: ``1`` to vote for the suggestion or ``-1`` to vote against it
+    :>json string result: ``voted`` when the suggestion remains open; ``accepted`` when auto-accept applied it
+    :>json object suggestion: updated suggestion object when ``result`` is ``voted``; ``null`` when ``result`` is ``accepted``
 
 Changes
 +++++++
@@ -2336,8 +3372,9 @@ Changes
 
         Change object attributes are documented at :http:get:`/api/changes/(int:id)/`.
 
-    :query string user: Username of user to filters
-    :query int action: Action to filter, can be used several times
+    :query string user: Username of the user to filter by
+    :query int action: Action to filter, can be used several times; see
+                       :ref:`change-actions` for available values
     :query timestamp timestamp_after: ISO 8601 formatted timestamp to list changes after
     :query timestamp timestamp_before: ISO 8601 formatted timestamp to list changes before
 
@@ -2360,12 +3397,35 @@ Changes
     :>json object details: additional details about the change
     :>json int id: change identifier
 
+    When an IP address is recorded for an anonymous change, the ``ip_address``
+    attribute in ``details`` is included only for superusers.
+
+    New changes include a ``change_origin`` object in ``details``, for example
+    ``{"change_origin": {"scope": "api"}}``. The scope is ``ui`` for browser sessions,
+    including session-authenticated API requests, or ``api`` for successful
+    Token or Bearer authentication. Repository string imports use ``repository``,
+    including imports triggered through the UI or API. Uploads retain their
+    UI or API origin. Changes without request or inherited background-task
+    attribution use ``system``. Background tasks inherit their initiating origin.
+
+    Changes made by :ref:`automation <automation-reference>` use the ``automation`` scope and identify
+    both the installed add-on and its execution log, for example
+    ``{"change_origin": {"scope": "automation", "automation": {"addon_id": 12, "activity_id": 34}}}``.
+    This attribution also applies to background work and repository processing
+    initiated by the automation. The identifiers remain in change history after
+    the add-on or execution log is deleted. Workflow settings are not included.
+
+    Historical changes can omit ``change_origin``. The separate ``origin`` field
+    on component creation events describes how the component was created.
+    Clients should allow additional scopes and origin attributes. Token
+    credentials are never included.
+
 Screenshots
 +++++++++++
 
 .. http:get:: /api/screenshots/
 
-    Returns a list of screenshot string information.
+    Returns a list of screenshots.
 
     .. seealso::
 
@@ -2378,7 +3438,8 @@ Screenshots
     :param id: Screenshot ID
     :type id: int
     :>json string name: name of a screenshot
-    :>json string component: URL of a related component object
+    :>json string repository_filename: repository path used to match repository-based screenshot updates
+    :>json string translation: URL of a related translation object
     :>json string file_url: URL to download a file; see :http:get:`/api/screenshots/(int:id)/file/`
     :>json array units: link to associated source string information; see :http:get:`/api/units/(int:id)/`
 
@@ -2436,8 +3497,10 @@ Screenshots
     :form string project_slug: Project slug
     :form string component_slug: Component slug
     :form string language_code: Language code
+    :form string repository_filename: Optional repository path used to associate later repository updates
     :>json string name: name of a screenshot
-    :>json string component: URL of a related component object
+    :>json string repository_filename: repository path used to match repository-based screenshot updates
+    :>json string translation: URL of a related translation object
     :>json string file_url: URL to download a file; see :http:get:`/api/screenshots/(int:id)/file/`
     :>json array units: link to associated source string information; see :http:get:`/api/units/(int:id)/`
 
@@ -2448,7 +3511,8 @@ Screenshots
     :param id: Screenshot ID
     :type id: int
     :>json string name: name of a screenshot
-    :>json string component: URL of a related component object
+    :>json string repository_filename: repository path used to match repository-based screenshot updates
+    :>json string translation: URL of a related translation object
     :>json string file_url: URL to download a file; see :http:get:`/api/screenshots/(int:id)/file/`
     :>json array units: link to associated source string information; see :http:get:`/api/units/(int:id)/`
 
@@ -2459,7 +3523,8 @@ Screenshots
     :param id: Screenshot ID
     :type id: int
     :>json string name: name of a screenshot
-    :>json string component: URL of a related component object
+    :>json string repository_filename: repository path used to match repository-based screenshot updates
+    :>json string translation: URL of a related translation object
     :>json string file_url: URL to download a file; see :http:get:`/api/screenshots/(int:id)/file/`
     :>json array units: link to associated source string information; see :http:get:`/api/units/(int:id)/`
 
@@ -2470,6 +3535,56 @@ Screenshots
     :param id: Screenshot ID
     :type id: int
 
+.. _kotlin-sdk-build-api:
+
+Kotlin SDK builds
++++++++++++++++++
+
+.. warning::
+
+   The Kotlin SDK is available as an alpha release. No compatibility is
+   guaranteed until the final Kotlin SDK is released. Endpoints, build metadata, CDN manifests, and
+   generated resource formats may change without backward compatibility.
+
+The API contract is also documented in the OpenAPI schema at ``/api/schema/``.
+The registration metadata has a :download:`JSON Schema
+</specs/schemas/weblate-kotlin-sdk-build.schema.json>`.
+See :ref:`addon-weblate.cdn.kotlin` for add-on installation, lifecycle settings, and the
+CDN manifest contract.
+
+.. http:post:: /api/components/(string:project)/(string:component)/addons/kotlin-sdk/builds/
+
+    Register resource IDs for :ref:`addon-weblate.cdn.kotlin`. Requires the
+    :guilabel:`Kotlin SDK CDN` add-on (``weblate.cdn.kotlin``) installed directly
+    on the component and ``component.edit`` permission. Send JSON with:
+
+    :<json integer schemaVersion: Metadata version, currently 1; defaults to 1.
+    :<json string packageName: Android application package name, at most 127 characters.
+    :<json integer versionCode: Android version code between 1 and 2100000000.
+    :<json object strings: String resource names mapped to hexadecimal IDs, such as ``0x7f090003``; defaults to an empty object.
+    :<json object plurals: Plural resource names mapped to hexadecimal IDs; defaults to an empty object. Quantities and translated values come from Weblate.
+
+    Include at least one resource across the two maps. The request limit is
+    5 MiB and 100000 combined resources. IDs must belong to application package
+    ``0x7f`` and use one distinct type ID per resource kind. Duplicate IDs,
+    invalid names, unknown fields, and unsupported schema versions are rejected.
+    The same name can occur in both maps with different IDs.
+
+    A new registration returns 202; an identical existing registration returns
+    200. Conflicting metadata for an existing package/version returns 409.
+    The response includes ``packageName``, ``versionCode``, ``status``, ``error``,
+    ``status_url``, and ``manifest_url``. Publication is asynchronous; the manifest
+    need not exist when registration returns.
+
+.. http:get:: /api/components/(string:project)/(string:component)/addons/kotlin-sdk/builds/(string:package)/(int:version)/
+
+    Return the registration response fields for an existing build. Requires the
+    :guilabel:`Kotlin SDK CDN` add-on (``weblate.cdn.kotlin``) installed directly
+    on the component and ``component.edit`` permission. Status is ``pending``,
+    ``published``, ``failed``, or ``retired``. A failed replacement may still have
+    a previous successful manifest. Missing installations or registrations
+    return 404.
+
 .. _addons-api:
 
 Add-ons
@@ -2479,7 +3594,9 @@ Add-ons
 
 .. http:get:: /api/addons/
 
-    Returns a list of add-ons.
+    Returns a list of add-ons the caller can manage. Site-wide add-on managers
+    can access site-wide add-ons without gaining access to project or component
+    add-on configuration.
 
     .. seealso::
 
@@ -2502,6 +3619,12 @@ Add-ons
 .. http:post:: /api/components/(string:project)/(string:component)/addons/
 
     Creates a new add-on.
+
+    The xgettext and Meson extraction add-ons accept ``data_dirs`` in
+    ``configuration`` as an ordered list of repository-relative ITS data
+    directories, for example ``{"data_dirs": ["po"]}``. Each directory must
+    contain an :file:`its/` subdirectory. See
+    :ref:`addon-weblate.gettext.xgettext` for supported formats and validation.
 
     :param string project_slug: Project slug
     :param string component_slug: Component slug
@@ -2530,6 +3653,42 @@ Add-ons
 
     :param id: Add-on ID
     :type id: int
+
+.. http:post:: /api/addons/(int:id)/trigger/
+
+    Trigger a manual run of an add-on that supports manual triggering.
+
+    .. versionadded:: 5.17.1
+
+    :param id: Add-on ID
+    :type id: int
+    :json int component: For automations, the target component ID. Required for inherited installations; defaults to the installed component otherwise.
+    :json int change: For automations, a change in the target component matching a configured change subscription. Required for change-only workflows.
+
+    Automations execute their saved workflow for one component using the supplied
+    context. Trigger-scoped actions require a change containing a string.
+    Invalid context returns HTTP 400 before scheduling. Other add-ons retain
+    their existing manual execution behavior and do not use these fields.
+
+.. http:post:: /api/addons/(int:id)/preview/
+
+    Preview an :ref:`automation-workflows` definition without executing actions.
+    Requires the same management permission as configuring the add-on. Other
+    built-in add-on types reject this operation. Custom preview providers require
+    an explicit workflow and component ID.
+
+    :param id: Add-on ID.
+    :json object workflow: Workflow definition, using the same structure as configuration. Required for custom preview providers; automations default to the saved workflow.
+    :json int component: Component ID within the installed add-on's scope. Required for custom preview providers and inherited automations; component-level automations default to the installed component.
+    :json int change: Change ID belonging to that component and matching a configured change subscription. Required for change-only workflows.
+
+    Preview validates context using the same rules as manual execution, including
+    requiring a change containing a string for trigger-scoped actions.
+
+    Returns ``workflow``, execution ``context``, a ``trace`` of evaluated conditions
+    and planned or conditional actions, and ``preview: true``. Configuration and
+    scope errors return HTTP 400. Preview does not save configuration or create an
+    activity log.
 
 
 
@@ -2615,12 +3774,53 @@ Component lists
     :type component_slug: string
 
 Glossary
-+++++++++
+++++++++
 
 .. versionchanged:: 4.5
 
    Glossaries are now stored as regular components, translations and strings,
    please use respective API instead.
+
+Reports
++++++++
+
+.. http:get:: /api/reports/
+
+    Lists stored reports accessible to the authenticated user. The optional
+    ``kind``, ``workspace``, ``project``, ``category``, and ``component`` query
+    parameters filter the result. The :guilabel:`Manage reports` permission is
+    authoritative for the selected scope and includes reports containing data
+    from private projects and restricted components below that scope.
+
+.. http:post:: /api/reports/
+
+    Schedules report generation and returns ``202 Accepted`` with a ``task_url``.
+    The task result links to the created report. The ``kind`` is one of
+    ``credits``, ``contributor_stats``, ``cost_estimate``, or ``translator_work``.
+    Specify at most one of ``workspace``, ``project``, ``category``, or
+    ``component``; omitting all of them creates a global report. Contribution
+    reports require ``start`` and ``end`` ISO 8601 timestamps. A workspace can
+    be selected when the user has :guilabel:`Manage reports` for it, even without
+    access to the regular workspace page.
+
+.. http:get:: /api/reports/(int:id)/
+
+    Returns report metadata, generation parameters, stored JSON ``data``, and
+    links to the JSON, HTML, and reStructuredText renderings.
+
+.. http:get:: /api/reports/(int:id)/json/
+
+    Downloads only the stored report data without metadata.
+
+.. http:get:: /api/reports/(int:id)/html/
+
+    Downloads an HTML rendering of the stored report.
+
+.. http:get:: /api/reports/(int:id)/rst/
+
+    Downloads a reStructuredText rendering of the stored report.
+
+.. _api-tasks:
 
 Tasks
 +++++
@@ -2635,12 +3835,43 @@ Tasks
 
     Returns information about a task.
 
+    Authentication is required.
+
     :param uuid: Task UUID
     :type uuid: string
     :>json boolean completed: Whether the task has completed
     :>json int progress: Task progress in percent
     :>json object result: Task result or progress details
     :>json string log: Task log
+    :>json boolean cancellable: Whether the task can be cancelled
+
+    Log entries are limited to components you can access. Sensitive diagnostics
+    additionally require the :guilabel:`View upstream repository location`
+    permission on the repository-owning component and access to all components
+    referenced by the entry. General progress and failure messages remain
+    available without this permission. Repository operations report start and
+    completion summaries under the linked components included in the task, even
+    when the repository-owning component is inaccessible. Failure results contain a summary;
+    authorized users can find the detailed explanation in the task log.
+    Automatic translation warnings identify source components only when you can
+    access them. Other readers receive a general explanation of the warning.
+    Completed automatic translation results include an ``errors`` array, with
+    one entry per failed batch or operation. Provider diagnostics require the
+    same permissions as sensitive task log entries. Other readers receive a
+    generic error explanation. Completion summaries report errors alongside
+    the number of updated strings, including when some translations succeeded.
+    Normal task outcomes, including unsuccessful bulk suggestion acceptance,
+    retain their outcome messages. Backend failures use generic summaries.
+    Aggregate automatic translation backend failures without component provenance retain
+    cleaned failure diagnostics for the initiating user only.
+
+.. http:delete:: /api/tasks/(str:uuid)/
+
+    Cancels a running task when its ``cancellable`` property is ``true``.
+    Requires :guilabel:`Edit component settings` permission on every component
+    associated with the task.
+    Repository operation tasks cannot be cancelled because interruption can
+    leave a repository operation incomplete.
 
 .. _api-statistics:
 
@@ -2702,6 +3933,18 @@ Statistics
 Metrics
 +++++++
 
+.. http:get:: /api/activity/
+
+    Returns global daily activity and up to ten recently active projects visible
+    to the authenticated user. Authentication is required.
+
+    ``daily_activity`` contains 52 daily translation-change counts, oldest first,
+    ending today. ``projects`` contains project statistics with positive
+    ``recent_changes`` and a non-null ``last_change``, ordered by newest change
+    first, with project ID breaking ties. Fewer than ten projects can be returned.
+    The global totals retain the same instance-wide scope as the former
+    ``/activity/month.json`` endpoint, which has been removed.
+
 .. http:get:: /api/metrics/
 
     Returns server metrics.
@@ -2709,6 +3952,11 @@ Metrics
     .. versionchanged:: 5.6.1
 
        Metrics can now be exposed in OpenMetrics compatible format with ``?format=openmetrics``.
+
+    .. versionchanged:: 2026.8
+
+       OpenMetrics responses now include ``HELP`` and ``TYPE`` metadata and use
+       the versioned OpenMetrics content type.
 
     :>json int units: Number of units
     :>json int units_translated: Number of translated units
@@ -2722,10 +3970,36 @@ Metrics
     :>json int configuration_errors: Number of configuration errors
     :>json int suggestions: Number of pending suggestions
     :>json object celery_queues: Lengths of Celery queues, see :ref:`celery`
+    :>json object bot_protection: Best-effort hourly bot protection counts, or null when disabled or unavailable
     :>json string name: Configured server name
+    :>json string version: Running Weblate version, included when :setting:`VERSION_DISPLAY` is ``show`` or ``soft``
+
+    In OpenMetrics format, the version is exposed as ``weblate_info{version="..."} 1``
+    when :setting:`VERSION_DISPLAY` is ``show`` or ``soft``. All metrics are
+    exposed as gauges.
+
+    ``bot_protection`` contains ``current_hour`` and ``previous_24_hours``
+    objects. The latter covers the previous 24 completed hours, excluding the
+    current hour. Each contains integer counts for ``issued``, ``pow_required``, ``success``,
+    ``expired_challenge``, ``invalid_solution``, ``replayed_challenge``,
+    ``csrf_failed``, and ``verification_unavailable``. Hours are UTC-aligned;
+    counts can be lost through cache eviction or outages. The ``pow_required``
+    count covers requests rejected without issuing a challenge because of their
+    method or Accept header. It excludes explicit ``bot_denied`` policy denials
+    and exempt requests, and counts requests rather than unique clients.
+
+    CSV responses flatten these objects into columns. OpenMetrics exposes
+    ``bot_protection_events`` gauges with ``window`` and ``event`` labels,
+    omitting these samples when protection is disabled or counters are unavailable.
+
+Project metrics expose translation statistics for each visible component and
+language at :http:get:`/api/projects/(string:project)/metrics/`. They include
+translated, total, fuzzy, failing-check, and approved string, word, and
+character counts; suggestions; comments; and translated and approved
+percentages.
 
 Search
-+++++++
+++++++
 
 .. http:get:: /api/search/
 
@@ -2772,6 +4046,11 @@ Categories
    :>json str slug: Slug of category.
    :>json str project: Link to a project.
    :>json str category: Link to a parent category.
+   :>json array enforced_checks: Locally configured :ref:`enforced checks <component-enforced_checks>`.
+   :>json boolean inherit_enforced_checks: Whether enforced checks are inherited from the parent category, project, or workspace.
+   :>json array effective_enforced_checks: Enforced checks currently applied to the category (read-only).
+   :>json string announcements_url: URL to announcements; see :http:get:`/api/categories/(int:id)/announcements/`
+   :>json string reports_url: URL to list or generate scoped reports; see :http:get:`/api/categories/(int:id)/reports/`
 
 .. http:patch:: /api/categories/(int:id)/
 
@@ -2808,12 +4087,59 @@ Categories
 
     Returns statistics for a category.
 
-    :param project: Category ID
-    :type project: int
+    :param id: Category ID
+    :type id: int
 
     .. seealso::
 
        Returned attributes are described in :ref:`api-statistics`.
+
+.. http:get:: /api/categories/(int:id)/reports/
+
+    Lists accessible reports generated directly for a category.
+
+.. http:post:: /api/categories/(int:id)/reports/
+
+    Schedules a report using the category as its scope. The request and response
+    match :http:post:`/api/reports/`; scope fields must be omitted.
+
+.. http:get:: /api/categories/(int:id)/announcements/
+
+   .. versionadded:: 5.17.1
+
+    Returns announcements for a category.
+
+    :param id: Category ID
+    :type id: int
+    :>json int id: ID of the announcement
+    :>json string message: announcement text
+    :>json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :>json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :>json bool notify: send notification to subscribed users? (optional)
+
+.. http:post:: /api/categories/(int:id)/announcements/
+
+   .. versionadded:: 5.17.1
+
+    Creates an announcement for a category.
+
+    :param id: Category ID
+    :type id: int
+    :<json string message: announcement text
+    :<json string severity: color of the message, one of ``info`` (light blue), ``warning`` (yellow), ``danger`` (red), ``success`` (green)
+    :<json date expiry: hide after this date, ISO 8601 extended format date (optional)
+    :<json bool notify: send notification to subscribed users? (optional)
+
+.. http:delete:: /api/categories/(int:id)/announcements/(int:announcement_id)/
+
+   .. versionadded:: 5.17.1
+
+    Deletes an announcement from a category.
+
+    :param id: Category ID
+    :type id: int
+    :param announcement_id: ID of the announcement to delete
+    :type announcement_id: integer
 
 .. _hooks:
 
@@ -2821,7 +4147,35 @@ Notification hooks
 ++++++++++++++++++
 
 Notification hooks allow external applications to notify Weblate that the VCS
-repository has been updated.
+repository has been updated. Weblate matches the delivery to components by
+repository URL; see :ref:`hooks-target-matching`.
+
+The generic hook endpoints return diagnostics intended to help configure
+repository notifications. The ``match_status`` object contains:
+
+``repository_matches``
+    Number of components whose repository URL matches the payload.
+``branch_matches``
+    Number of repository matches whose configured branch matches the payload.
+    For events without a branch, every repository match is counted as a branch
+    match.
+``enabled_hook_matches``
+    Number of branch matches whose project has hooks enabled.
+
+A successful update response names the updated project/component slugs in
+``message`` and returns their absolute API URLs in ``updated_components``. These
+diagnostics include private projects and restricted components because matching
+does not apply user access control. Components managed through an authenticated
+integration are excluded from generic matching and diagnostics; currently this
+applies to the :guilabel:`GitHub (via Weblate GitHub app)` VCS backend. When an
+update event completes target matching but schedules no update, the response
+uses HTTP status code 202 and retains ``match_status`` so the repository,
+branch, and project hook settings can be diagnosed. Ping and ignored events
+return HTTP status code 201 without matching diagnostics. These responses can
+confirm that a supplied repository URL is registered, but do not grant access
+to the linked API objects or expose repository content, translations, or
+credentials. See :ref:`hooks-target-matching` for the security and compatibility
+implications.
 
 You can use repository endpoints for projects, components and translations to
 update individual repositories; see
@@ -2834,8 +4188,7 @@ update individual repositories; see
         Please use :http:post:`/api/components/(string:project)/(string:component)/repository/`
         instead which works properly with authentication for ACL limited projects.
 
-   Triggers update of a component (pulling from VCS and scanning for
-   translation changes).
+   .. versionremoved:: 5.14
 
 .. http:get:: /hooks/update/(string:project)/
 
@@ -2844,8 +4197,7 @@ update individual repositories; see
         Please use :http:post:`/api/projects/(string:project)/repository/`
         instead which works properly with authentication for ACL limited projects.
 
-   Triggers update of all components in a project (pulling from VCS and
-   scanning for translation changes).
+   .. versionremoved:: 5.14
 
 .. http:post:: /hooks/github/
 
@@ -2860,7 +4212,7 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`github-setup`
+        :ref:`GitHub notifications <code-hosting-github-notifications>`
             For instruction on setting up GitHub integration
         https://docs.github.com/en/get-started/customizing-your-github-workflow/exploring-integrations/about-webhooks
             Generic information about GitHub Webhooks
@@ -2874,7 +4226,7 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`gitlab-setup`
+        :ref:`GitLab notifications <code-hosting-gitlab-notifications>`
             For instruction on setting up GitLab integration
         https://docs.gitlab.com/user/project/integrations/webhooks/
             Generic information about GitLab Webhooks
@@ -2888,7 +4240,7 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`bitbucket-setup`
+        :ref:`Bitbucket notifications <code-hosting-bitbucket-notifications>`
             For instruction on setting up Bitbucket integration
         https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/
             Generic information about Bitbucket Webhooks
@@ -2902,10 +4254,8 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`pagure-setup`
+        :ref:`Pagure notifications <code-hosting-pagure-notifications>`
             For instruction on setting up Pagure integration
-        https://docs.pagure.org/pagure/usage/using_webhooks.html
-            Generic information about Pagure Webhooks
         :setting:`ENABLE_HOOKS`
             For enabling hooks for whole Weblate
 
@@ -2921,7 +4271,7 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`azure-setup`
+        :ref:`Azure Repos notifications <code-hosting-azure-repos-notifications>`
             For instruction on setting up Azure integration
         https://learn.microsoft.com/en-us/azure/devops/service-hooks/services/webhooks?view=azure-devops
             Generic information about Azure DevOps Web Hooks
@@ -2935,10 +4285,24 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`gitea-setup`
+        :ref:`Gitea notifications <code-hosting-gitea-notifications>`
             For instruction on setting up Gitea integration
-        https://docs.gitea.io/en-us/webhooks/
+        https://docs.gitea.com/usage/repository/webhooks
             Generic information about Gitea Webhooks
+        :setting:`ENABLE_HOOKS`
+            For enabling hooks for whole Weblate
+
+.. http:post:: /hooks/forgejo/
+
+    Special hook for handling Forgejo Webhook notifications and automatically
+    updating matching components.
+
+    .. seealso::
+
+        :ref:`Forgejo notifications <code-hosting-forgejo-notifications>`
+            For instruction on setting up Forgejo integration
+        https://forgejo.org/docs/latest/user/webhooks/
+            Generic information about Forgejo Webhooks
         :setting:`ENABLE_HOOKS`
             For enabling hooks for whole Weblate
 
@@ -2949,9 +4313,9 @@ update individual repositories; see
 
     .. seealso::
 
-        :ref:`gitee-setup`
+        :ref:`Gitee notifications <code-hosting-gitee-notifications>`
             For instruction on setting up Gitee integration
-        https://gitee.com/help/categories/40
+        https://help.gitee.com/webhook
             Generic information about Gitee Webhooks
         :setting:`ENABLE_HOOKS`
             For enabling hooks for whole Weblate
@@ -2962,6 +4326,37 @@ RSS feeds
 +++++++++
 
 Changes in translations are exported in RSS feeds.
+
+The feeds contain only changes in projects and components the requesting user
+can access.
+
+Filtered RSS feeds are available from the changes browser. These accept the same
+filters as the changes page, for example ``action``, ``user``, ``exclude_user``,
+and ``period``.
+
+.. http:get:: /changes/rss/
+
+    Retrieves RSS feed with recent changes matching changes browsing filters.
+
+.. http:get:: /changes/rss/(string:project)/(string:component)/(string:language)/
+
+    Retrieves RSS feed with recent changes matching changes browsing filters in a
+    translation.
+
+.. http:get:: /changes/rss/(string:project)/(string:component)/
+
+    Retrieves RSS feed with recent changes matching changes browsing filters in a
+    component.
+
+.. http:get:: /changes/rss/(string:project)/-/(string:language)/
+
+    Retrieves RSS feed with recent changes matching changes browsing filters in a
+    project language.
+
+.. http:get:: /changes/rss/-/-/(string:language)/
+
+    Retrieves RSS feed with recent changes matching changes browsing filters in a
+    language.
 
 .. http:get:: /exports/rss/(string:project)/(string:component)/(string:language)/
 

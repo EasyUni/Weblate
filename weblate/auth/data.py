@@ -18,7 +18,7 @@ SELECTION_ALL_PROTECTED = 4
 
 PERMISSIONS = (
     # Translators: Permission name
-    ("billing.view", gettext_noop("View billing info")),
+    ("contribution.view_author", gettext_noop("View contributor identities")),
     # Translators: Permission name
     ("change.download", gettext_noop("Download changes")),
     # Translators: Permission name
@@ -52,7 +52,7 @@ PERMISSIONS = (
     # Translators: Permission name
     ("project.permissions", gettext_noop("Manage project access")),
     # Translators: Permission name
-    ("reports.view", gettext_noop("Download reports")),
+    ("reports.view", gettext_noop("Manage reports")),
     # Translators: Permission name
     ("screenshot.add", gettext_noop("Add screenshot")),
     # Translators: Permission name
@@ -71,6 +71,8 @@ PERMISSIONS = (
     ("unit.edit", gettext_noop("Edit strings")),
     # Translators: Permission name
     ("unit.review", gettext_noop("Review strings")),
+    # Translators: Permission name
+    ("unit.bulk_edit", gettext_noop("Bulk edit strings")),
     # Translators: Permission name
     ("unit.override", gettext_noop("Edit string when suggestions are enforced")),
     # Translators: Permission name
@@ -113,6 +115,14 @@ PERMISSIONS = (
     ("vcs.update", gettext_noop("Update the internal repository")),
     # Translators: Permission name
     ("announcement.add", gettext_noop("Post announcements")),
+    # Translators: Permission name
+    ("announcement.delete", gettext_noop("Delete announcements")),
+    # Translators: Permission name
+    ("workspace.edit", gettext_noop("Edit workspace settings")),
+    # Translators: Permission name
+    ("workspace.add_project", gettext_noop("Add projects to workspace")),
+    # Translators: Permission name
+    ("workspace.edit_members", gettext_noop("Manage workspace access")),
 )
 
 PERMISSION_NAMES = {perm[0] for perm in PERMISSIONS}
@@ -120,9 +130,19 @@ PERMISSION_NAMES = {perm[0] for perm in PERMISSIONS}
 # Permissions which are not scoped per project
 GLOBAL_PERMISSIONS = (
     # Translators: Permission name
+    ("user.browse", gettext_noop("Browse users")),
+    # Translators: Permission name
+    ("user.search", gettext_noop("Search resource contributors")),
+    # Translators: Permission name
+    ("user.profile", gettext_noop("View user profiles")),
+    # Translators: Permission name
     ("management.use", gettext_noop("Use management interface")),
     # Translators: Permission name
+    ("management.configure", gettext_noop("Manage site configuration")),
+    # Translators: Permission name
     ("project.add", gettext_noop("Add new projects")),
+    # Translators: Permission name
+    ("workspace.add", gettext_noop("Add new workspaces")),
     # Translators: Permission name
     ("language.add", gettext_noop("Add language definitions")),
     # Translators: Permission name
@@ -130,15 +150,21 @@ GLOBAL_PERMISSIONS = (
     # Translators: Permission name
     ("group.edit", gettext_noop("Manage teams")),
     # Translators: Permission name
+    ("group.view", gettext_noop("View team info")),
+    # Translators: Permission name
     ("user.edit", gettext_noop("Manage users")),
     # Translators: Permission name
+    ("user.view", gettext_noop("View user info")),
+    # Translators: Permission name
     ("role.edit", gettext_noop("Manage roles")),
+    # Translators: Permission name
+    ("role.view", gettext_noop("View role info")),
     # Translators: Permission name
     ("announcement.edit", gettext_noop("Manage announcements")),
     # Translators: Permission name
     ("memory.manage", gettext_noop("Manage translation memory")),
     # Translators: Permission name
-    ("machinery.edit", gettext_noop("Manage machinery")),
+    ("machinery.edit", gettext_noop("Manage translation services")),
     # Translators: Permission name
     ("componentlist.edit", gettext_noop("Manage component lists")),
     # Translators: Permission name
@@ -150,7 +176,7 @@ GLOBAL_PERMISSIONS = (
 GLOBAL_PERM_NAMES = {perm[0] for perm in GLOBAL_PERMISSIONS}
 
 
-def filter_perms(prefix: str, exclude: set | None = None):
+def filter_perms(prefix: str, exclude: set[str] | None = None) -> set[str]:
     """Filter permission based on prefix."""
     result = {perm[0] for perm in PERMISSIONS if perm[0].startswith(prefix)}
     if exclude:
@@ -158,8 +184,12 @@ def filter_perms(prefix: str, exclude: set | None = None):
     return result
 
 
+WORKSPACE_SCOPED_PERM_NAMES = filter_perms("workspace.") | {"reports.view"}
+
+
 # Translator permissions
 TRANSLATE_PERMS = {
+    "contribution.view_author",
     "comment.add",
     "suggestion.accept",
     "suggestion.add",
@@ -175,17 +205,25 @@ TRANSLATE_PERMS = {
 # Default set of roles
 ROLES = (
     (
+        pgettext_noop("Access-control role", "Discover users"),
+        {"user.browse", "user.search"},
+    ),
+    (pgettext_noop("Access-control role", "View user profiles"), {"user.profile"}),
+    (
         pgettext_noop("Access-control role", "Administration"),
-        [x[0] for x in PERMISSIONS],
+        [x[0] for x in PERMISSIONS if not x[0].startswith("workspace.")],
     ),
     (
         pgettext_noop("Access-control role", "Edit source"),
         TRANSLATE_PERMS | {"unit.template", "source.edit"},
     ),
-    (pgettext_noop("Access-control role", "Add suggestion"), {"suggestion.add"}),
+    (
+        pgettext_noop("Access-control role", "Add suggestion"),
+        {"suggestion.add", "contribution.view_author"},
+    ),
     (
         pgettext_noop("Access-control role", "Access repository"),
-        {"translation.download", "vcs.access", "vcs.view"},
+        {"translation.download", "vcs.access", "vcs.view", "contribution.view_author"},
     ),
     (
         pgettext_noop("Access-control role", "Manage glossary"),
@@ -208,6 +246,7 @@ ROLES = (
         TRANSLATE_PERMS
         | {
             "announcement.add",
+            "announcement.delete",
             "translation.add",
             "unit.template",
             "suggestion.delete",
@@ -227,7 +266,12 @@ ROLES = (
     (pgettext_noop("Access-control role", "Translate"), TRANSLATE_PERMS),
     (
         pgettext_noop("Access-control role", "Manage languages"),
-        filter_perms("translation.", {"translation.auto"}),
+        filter_perms("translation.", {"translation.auto"})
+        | {"contribution.view_author"},
+    ),
+    (
+        pgettext_noop("Access-control role", "Bulk editing"),
+        {"unit.bulk_edit"},
     ),
     (
         pgettext_noop("Access-control role", "Automatic translation"),
@@ -245,21 +289,31 @@ ROLES = (
         pgettext_noop("Access-control role", "Manage repository"),
         filter_perms("vcs.") | {"component.lock"},
     ),
-    (pgettext_noop("Access-control role", "Billing"), filter_perms("billing.")),
-    (pgettext_noop("Access-control role", "Add new projects"), {"project.add"}),
+    (
+        pgettext_noop("Access-control role", "Workspace administration"),
+        WORKSPACE_SCOPED_PERM_NAMES,
+    ),
+    (
+        pgettext_noop("Access-control role", "Add workspace projects"),
+        {"workspace.add_project"},
+    ),
+    (
+        pgettext_noop("Access-control role", "Add new projects"),
+        {"project.add", "workspace.add"},
+    ),
 )
 
 # Default set of roles for groups
 GROUPS = (
     (
         pgettext_noop("Access-control team name", "Guests"),
-        ("Add suggestion", "Access repository"),
+        ("Add suggestion", "Access repository", "View user profiles"),
         SELECTION_ALL_PUBLIC,
     ),
     (pgettext_noop("Access-control team name", "Viewers"), (), SELECTION_ALL_PROTECTED),
     (
         pgettext_noop("Access-control team name", "Users"),
-        ("Power user",),
+        ("Power user", "Discover users", "View user profiles"),
         SELECTION_ALL_PUBLIC,
     ),
     (
@@ -300,8 +354,10 @@ ACL_GROUPS = {
         "Per-project access-control team name", "Screenshots"
     ): "Manage screenshots",
     pgettext_noop(
+        "Per-project access-control team name", "Bulk editing"
+    ): "Bulk editing",
+    pgettext_noop(
         "Per-project access-control team name", "Automatic translation"
     ): "Automatic translation",
     pgettext_noop("Per-project access-control team name", "VCS"): "Manage repository",
-    pgettext_noop("Per-project access-control team name", "Billing"): "Billing",
 }

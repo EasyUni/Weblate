@@ -2,16 +2,23 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test.utils import override_settings
 from django.urls import reverse
 
 from weblate.fonts.models import Font, FontGroup
 from weblate.fonts.tests.utils import FONT, FONT_BOLD, FontTestCase
 from weblate.lang.models import Language
+from weblate.trans.models import Project
 
 
 class FontViewTest(FontTestCase):
     @property
-    def fonts_url(self):
+    def fonts_url(self) -> str:
         return reverse("fonts", kwargs=self.kw_project)
 
     def test_noperm(self) -> None:
@@ -19,6 +26,82 @@ class FontViewTest(FontTestCase):
         response = self.client.get(self.fonts_url)
         self.assertContains(response, font.family)
         self.assertNotContains(response, "Add font")
+
+    def test_upload_rejects_renamed_web_fonts(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        for signature in (b"wOF2", b"wOFF"):
+            for extension in ("ttf", "otf"):
+                with (
+                    self.subTest(signature=signature, extension=extension),
+                    patch("weblate.fonts.utils.ImageFont.truetype") as parser,
+                ):
+                    uploaded = SimpleUploadedFile(
+                        f"font.{extension}", signature + bytes(44)
+                    )
+                    response = self.client.post(self.fonts_url, {"font": uploaded})
+
+                    self.assertContains(response, "Unsupported file format.")
+                    self.assertEqual(Font.objects.count(), 0)
+                    parser.assert_not_called()
+
+    def test_edit_rejects_renamed_web_fonts(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        font = self.add_font()
+        original_name = font.font.name
+        with font.font.open("rb") as handle:
+            original_content = handle.read()
+        original_metadata = (font.family, font.style)
+
+        for signature in (b"wOF2", b"wOFF"):
+            for extension in ("ttf", "otf"):
+                with (
+                    self.subTest(signature=signature, extension=extension),
+                    patch("weblate.fonts.utils.ImageFont.truetype") as parser,
+                ):
+                    uploaded = SimpleUploadedFile(
+                        f"font.{extension}", signature + bytes(44)
+                    )
+                    response = self.client.post(
+                        font.get_absolute_url(), {"font": uploaded}
+                    )
+
+                    self.assertContains(response, "Unsupported file format.")
+                    font.refresh_from_db()
+                    self.assertEqual(font.font.name, original_name)
+                    self.assertEqual((font.family, font.style), original_metadata)
+                    with font.font.open("rb") as handle:
+                        self.assertEqual(handle.read(), original_content)
+                    self.assertEqual(Font.objects.count(), 1)
+                    parser.assert_not_called()
+
+    @override_settings(ALLOWED_ASSET_SIZE=1)
+    def test_upload_too_big(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+
+        with FONT.open("rb") as handle:
+            response = self.client.post(self.fonts_url, {"font": handle}, follow=True)
+
+        self.assertContains(response, "Uploaded file is too big.")
+        self.assertEqual(Font.objects.count(), 0)
+
+    @override_settings(ALLOWED_ASSET_SIZE=1)
+    def test_edit_too_big(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        font = self.add_font()
+        original_name = font.font.name
+
+        with FONT.open("rb") as handle:
+            response = self.client.post(font.get_absolute_url(), {"font": handle})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Uploaded file is too big.")
+        font.refresh_from_db()
+        self.assertEqual(font.font.name, original_name)
 
     def test_manage(self) -> None:
         self.user.is_superuser = True
@@ -95,3 +178,45 @@ class FontViewTest(FontTestCase):
         # Remove font
         self.client.post(font.get_absolute_url(), {"delete": 1})
         self.assertEqual(Font.objects.count(), 0)
+
+    def test_override_project_scope(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        local_font = self.add_font()
+        private_project = Project.objects.create(
+            name="Private",
+            slug="private",
+            access_control=Project.ACCESS_PRIVATE,
+        )
+        private_font = Font.objects.create(
+            family="Private font",
+            style="Regular",
+            font=local_font.font.name,
+            project=private_project,
+            user=self.user,
+        )
+        group = FontGroup.objects.create(
+            name="font-group", font=local_font, project=self.project
+        )
+        language = Language.objects.get(code="zh_Hant")
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("project.edit", self.project))
+        self.assertFalse(self.user.can_access_project(private_project))
+        self.assertNotContains(
+            self.client.get(group.get_absolute_url()), "Private font"
+        )
+
+        response = self.client.post(
+            group.get_absolute_url(),
+            {"language": language.pk, "font": private_font.pk},
+        )
+        self.assertContains(response, "Select a valid choice.")
+        self.assertEqual(group.fontoverride_set.count(), 0)
+
+        response = self.client.post(
+            group.get_absolute_url(),
+            {"language": language.pk, "font": local_font.pk},
+        )
+        self.assertRedirects(response, group.get_absolute_url())
+        override = group.fontoverride_set.get()
+        self.assertEqual(override.font, local_font)

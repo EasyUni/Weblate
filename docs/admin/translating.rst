@@ -25,15 +25,20 @@ the following setups:
 
 * Users suggest and vote for suggestions and a limited group controls what is
   accepted.
+
   - Turn on voting.
   - Turn off automatic acceptance.
   - Don't let users save translations.
+
 * Users suggest and vote for suggestions with automatic acceptance
   once the defined number of them agree.
+
   - Turn on voting.
   - Set the desired number of votes for automatic acceptance.
+
 * Optional voting for suggestions. (Can optionally be used by users when they are unsure about
   a translation by making multiple suggestions.)
+
   - Only turn on voting.
 
 .. _additional:
@@ -71,7 +76,7 @@ using the ``priority`` flag.
 
 .. seealso::
 
-   :ref:`checks`
+   :ref:`custom-checks`
 
 .. _additional-flags:
 
@@ -83,6 +88,21 @@ Customization of quality checks and other Weblate behavior, see
 
 The string flags are also inherited from the :ref:`component-check_flags` at
 :ref:`component` and flags from the translation file (see :doc:`/formats`).
+
+
+Use :guilabel:`Source flags — all languages` to configure every translation of
+a string, and :guilabel:`Translation flags` to configure the current language.
+Translation flags override source values such as ``max-length`` and ``max-size``.
+Removing a local value restores the inherited value. An explicit ``read-only``
+flag on the source applies to every language and cannot be discarded by a
+translation.
+
+The :guilabel:`Tools` menu can mark one translation or all languages read-only.
+When a translation is already read-only, choose
+:guilabel:`Make read-only apply to all languages` to move its flag to the source.
+Removing source-wide read-only preserves independently set translation flags.
+Editing flags requires source editing permission, or glossary editing permission
+for glossary entries, in each affected language.
 
 
 .. seealso::
@@ -115,8 +135,8 @@ Some file formats support storing explanation within the file, see :ref:`format-
 
 .. _screenshots:
 
-Visual context for strings
-++++++++++++++++++++++++++
+Screenshots and visual context
+------------------------------
 
 You can upload a screenshot showing a given source string in use within your
 program. This helps translators understand where it is used, and how it should
@@ -126,16 +146,71 @@ The uploaded screenshot is shown in the translation context sidebar:
 
 .. image:: /screenshots/screenshot-context.webp
 
-In addition to :ref:`additional`, screenshots have a separate management
-interface under the :guilabel:`Operations` menu.
-Upload screenshots, assign them to source strings manually, or use optical
-character recognition (OCR) to do so by pressing the :guilabel:`Automatically
-recognize` button.
+In addition to :ref:`additional`, screenshots can be managed in the Weblate UI,
+kept in sync from the repository, or handled through the :ref:`api`.
+
+Managing screenshots in the UI
+++++++++++++++++++++++++++++++
+
+Each screenshot is stored for a specific translation language. In the
+translate page, screenshots attached to the source language are shown for
+every translation of the string, while screenshots attached to any other
+language are shown only for that language. You can add a screenshot directly
+from the translate page using :guilabel:`Upload screenshot` in the
+:guilabel:`Screenshots` panel, or open the separate management
+interface under the :guilabel:`Operations` menu. There you can upload
+screenshots, assign them to source strings manually, or let Weblate find
+strings in the image using optical character recognition (OCR). Recognition runs
+in the background when a screenshot is added or replaced. Open the
+:guilabel:`Image text` tab to review suggested source strings. If recognition is
+still running, the list updates automatically when results are ready. Use
+:guilabel:`Search` to find source strings manually.
+
+Recognized text is cached and refreshed when the image or recognition software
+changes. Existing screenshots are processed when opened if cached results are
+missing or outdated. Recognition does not assign strings automatically.
+
+Image text suggestions process at most 512 recognized text parts and show at
+most 250 source strings. On dense images or large components, Weblate shows
+the matches found within the processing time limit and indicates when
+suggestions may be incomplete. Use :guilabel:`Search` to find other source
+strings.
+
+Matching source strings can be assigned individually, in a selected batch, or
+all at once.
+
+To associate an uploaded screenshot with the current string, use
+:guilabel:`Add existing screenshot` in the translation editor. See
+:ref:`add-existing-screenshot` for the workflow and required permission.
+
+The screenshot listing summarizes uploaded screenshots and lets you search or
+filter them:
+
+.. image:: /screenshots/screenshot-listing.webp
 
 Once a screenshot is uploaded, this interface handles
 management and source string association:
 
 .. image:: /screenshots/screenshot-ocr.webp
+
+Use the screenshot listing search to find screenshots by name, repository path,
+language, assigned source string, source string context, or source string
+location. The search accepts plain text as well as advanced screenshot queries,
+see :ref:`search-screenshots`. For example, use ``NOT has:string`` to find
+unassigned screenshots, ``has:string`` to find assigned screenshots, or
+``repository:fastlane`` to review screenshots discovered from repository paths.
+
+You can upload a screenshot from a local file, paste it from the clipboard, or
+provide a URL to download an image from an external source. URL-based uploads
+may be restricted based on the :setting:`ALLOWED_ASSET_DOMAINS` setting, which
+controls which domains are trusted for downloading external assets, including
+any redirects followed while fetching the image, and
+:setting:`ASSET_RESTRICT_PRIVATE`, which rejects internal or non-public targets
+unless they are included in :setting:`ASSET_PRIVATE_ALLOWLIST`. The
+:setting:`ALLOWED_ASSET_SIZE` setting limits maximal size for the asset.
+
+Managing screenshots from the repository
+++++++++++++++++++++++++++++++++++++++++
 
 You can add or update screenshots directly from your
 Version Control System (VCS) repository.
@@ -144,13 +219,43 @@ To enable this feature, you can either set a screenshot file mask
 when creating a component, which will be monitored for updates in
 the repository, or you can add or update screenshots when uploading them manually.
 
+To connect a manually uploaded screenshot with later repository updates, fill
+in :guilabel:`Repository path to screenshot` with the path tracked in the
+repository.
+
 When the repository is updated, the system will automatically scan
 for changes. Existing screenshots in the repository will be updated,
 and new screenshots matching the specified screenshot file mask will
 be added to the component.
 
-.. image:: /screenshots/screenshot-filemask-repository-filename.webp
+For application projects, a practical workflow is:
+
+#. Capture source-language screenshots for the most visible user interface.
+#. Store them in a stable repository path, for example below
+   :file:`fastlane/metadata/android/en-US/images/phoneScreenshots/`.
+#. Configure :ref:`component-screenshot_filemask` for that path.
+#. Update the component repository so Weblate discovers or refreshes the
+   screenshots.
+#. Use image text recognition or source string search to assign screenshots to the matching source
+   strings, and review the :guilabel:`Source strings without screenshots`
+   counter for important strings still missing visual context.
 
 .. seealso::
 
    :ref:`component-screenshot_filemask`
+
+.. image:: /screenshots/screenshot-filemask-repository-filename.webp
+
+Managing screenshots through the API
+++++++++++++++++++++++++++++++++++++
+
+Screenshot workflows are also available through the REST API. Use
+:http:get:`/api/components/(string:project)/(string:component)/screenshots/`
+to list screenshots for one component, :http:post:`/api/screenshots/` to
+create screenshots,
+:http:post:`/api/screenshots/(int:id)/file/` to replace the image,
+:http:post:`/api/screenshots/(int:id)/units/` and
+:http:delete:`/api/screenshots/(int:id)/units/(int:unit_id)` to manage source
+string associations, and :http:delete:`/api/screenshots/(int:id)/` to delete
+screenshots. Screenshot API objects include the related translation and the
+optional repository path used for repository-based updates.

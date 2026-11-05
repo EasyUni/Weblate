@@ -1,4 +1,4 @@
-{% load crispy_forms_tags i18n icons permissions translations %}
+{% load crispy_forms_tags i18n icons permissions translations user_display %}
 
 {% for item in unitdata %}
   <tbody class="zen-unit">
@@ -11,7 +11,25 @@
         {% else %}
           {{ item.unit.position }}
         {% endif %}
-        <div class="pull-right flip btn-padded">
+        <div class="float-end btn-padded">
+          {% if item.unit.suggestions %}
+            {% with suggestion_count=item.unit.suggestions|length %}
+              {% blocktranslate count count=suggestion_count asvar suggestion_label trimmed %}
+                {{ count }} suggestion
+              {% plural %}
+                {{ count }} suggestions
+              {% endblocktranslate %}
+              <button type="button"
+                      class="badge text-bg-secondary border-0 zen-suggestions-indicator"
+                      title="{{ suggestion_label }}"
+                      aria-controls="suggestions-{{ item.unit.checksum }}"
+                      aria-expanded="false"
+                      tabindex="-1">
+                <span aria-hidden="true">{% icon "suggest.svg" %} <span class="zen-suggestions-count">{{ suggestion_count }}</span></span>
+                <span class="visually-hidden zen-suggestions-label">{{ suggestion_label }}</span>
+              </button>
+            {% endwith %}
+          {% endif %}
           <a class="btn btn-link btn-xs"
              href="{{ site_url }}{{ item.unit.get_absolute_url }}"
              data-clipboard-value="{{ site_url }}{{ item.unit.get_absolute_url }}"
@@ -19,7 +37,7 @@
              title="{% translate "Copy permalink" %}"
              tabindex="-1">{% icon "link.svg" %}</a>
           <a class="btn btn-link btn-xs"
-             href="{% url 'translate' path=object.get_url_path %}?{{ search_url }}&amp;offset={{ item.offset }}"
+             href="{% url 'translate' path=object.get_url_path %}{% querystring query_params offset=item.offset %}"
              title="{% translate "Open in full editor" %}"
              tabindex="-1">{% icon "pencil-mini.svg" %}</a>
         </div>
@@ -35,7 +53,19 @@
           <label>{% translate "Explanation" %}</label>
           <div class="list-group">
             <div class="list-group-item">
-              <div class="list-group-item-text">{{ item.unit.source_unit.explanation|markdown }}</div>
+              <div class="list-group-item-text">{% user_markdown item.unit.source_unit.explanation %}</div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    {% elif item.unit.note %}
+      <tr id="row-explanation-{{ item.unit.checksum }}">
+        <td class="unit-state-cell"></td>
+        <td colspan="2" class="translatetext">
+          <label>{% translate "Source string description" %}</label>
+          <div class="list-group">
+            <div class="list-group-item">
+              <div class="list-group-item-text">{{ item.unit.note|urlize_ugc }}</div>
             </div>
           </div>
         </td>
@@ -53,29 +83,36 @@
           {% for unit in item.secondary %}
             <div class="form-group">
               <a href="{{ unit.get_absolute_url }}" class="language" tabindex="-1">{{ unit.translation.language }}</a>
-              {% if user.profile.hide_source_secondary %}
-                {% include "snippets/note-badge.html" with unit=item.unit %}
-              {% endif %}
               {% format_unit_target unit show_copy=True %}
             </div>
           {% endfor %}
         {% endif %}
 
-        {% if item.unit.previous_source and item.unit.fuzzy %}
+        {% if item.unit.effective_previous_source and item.unit.fuzzy %}
           <div class="form-group">
             <label>{% translate "Source change" %}</label>
-            {% format_unit_source item.unit diff=item.unit.previous_source %}
+            {% get_source_changes item.unit as source_changes %}
+            {% for source_change in source_changes %}
+              {% if source_change.label %}
+                <div>{{ source_change.label }} — <span class="language">{{ source_change.language }}</span></div>
+              {% endif %}
+              {% format_unit_source item.unit value=source_change.value language=source_change.language plural=source_change.plural diff=source_change.diff %}
+            {% endfor %}
           </div>
         {% endif %}
 
         {% if not item.unit.is_source %}
           {% if not user.profile.hide_source_secondary or not item.secondary %}
             <div class="form-group">
-              <a href="{{ item.unit.source_unit.get_absolute_url }}"
-                 class="language"
-                 tabindex="-1">{{ item.unit.translation.component.source_language }}</a>
-              {% include "snippets/note-badge.html" with unit=item.unit %}
-              {% format_unit_source item.unit search_match=search_query glossary=item.glossary show_copy=True %}
+              {% if item.unit.missing_source_snapshot %}
+                <span class="language">{{ item.unit.effective_source_language }}</span>
+                <p class="alert alert-info">{% translate "The configured source string is missing. Translation is blocked until it becomes available." %}</p>
+              {% else %}
+                <a href="{{ item.unit.effective_source_unit.get_absolute_url }}"
+                   class="language"
+                   tabindex="-1">{{ item.unit.effective_source_language }}</a>
+              {% endif %}
+              {% format_unit_source item.unit search_match=search_query glossary=item.glossary show_copy=item.unit.effective_source_unit %}
             </div>
           {% endif %}
         {% endif %}
@@ -83,20 +120,34 @@
       </td>
 
       {% if user.profile.zen_mode != user.profile.ZEN_HORIZONTAL %}
-      </tr>
+        </tr>
 
 
-      <tr id="row-edit-{{ item.unit.checksum }}">
-        <td id="status-{{ item.unit.checksum }}"
-            class="unit-state-cell {% unit_state_class item.unit %}"
-            title="{% unit_state_title item.unit %}"></td>
+        <tr id="row-edit-{{ item.unit.checksum }}">
+          <td id="status-{{ item.unit.checksum }}"
+              class="unit-state-cell {% unit_state_class item.unit %}"
+              title="{% unit_state_title item.unit %}"></td>
       {% endif %}
       <td {% if user.profile.zen_mode != user.profile.ZEN_HORIZONTAL %}colspan="2"{% endif %}
           class="translator">
-        <button class="btn btn-light btn-sm hide-sticky" title="{% translate "Collapse" %}">{% icon "close.svg" %}</button>
+        <button class="btn btn-light btn-sm hide-sticky"
+                title="{% translate "Collapse" %}"
+                type="button">{% icon "close.svg" %}</button>
         {% crispy item.form %}
       </td>
     </tr>
+
+
+    {% if item.unit.suggestions %}
+      <tr id="row-suggestions-{{ item.unit.checksum }}" class="zen-suggestions-row">
+        <td class="unit-state-cell"></td>
+        <td colspan="2" class="zen-suggestions">
+          <div id="suggestions-{{ item.unit.checksum }}" class="zen-suggestions-container">
+            {% include "snippets/zen-suggestions.html" with unit=item.unit suggestion_url=item.suggestion_urls.suggestion_url unit_url=item.suggestion_urls.unit_url %}
+          </div>
+        </td>
+      </tr>
+    {% endif %}
 
 
   </tbody>
@@ -106,7 +157,7 @@
   <tbody>
     <tr>
       <td colspan="3" id="last-section">
-        {% translate 'The translation has come to an end.' as msg %}
+        {% translate "The translation has come to an end." as msg %}
         {% show_message 'info' msg %}
       </td>
     </tr>

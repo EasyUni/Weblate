@@ -9,8 +9,7 @@ Installing on RedHat, Fedora and CentOS
 
    dnf install \
       libxslt-devel libxml2-devel freetype-devel libjpeg-devel zlib-devel \
-      libyaml-devel libffi-devel cairo-devel cairo-gobject-devel pango-devel \
-      gobject-introspection-devel libacl-devel lz4-devel libzstd-devel xxhash-devel \
+      libyaml-devel libffi-devel libacl-devel lz4-devel libzstd-devel xxhash-devel \
       libtool-ltdl-devel python3-devel git
 
 .. include:: steps/install-system-optional.rst
@@ -31,8 +30,8 @@ Installing on RedHat, Fedora and CentOS
     # Web server option 2: Apache with ``mod_wsgi``
     dnf install httpd python3-mod_wsgi
 
-    # Caching backend: Redis
-    dnf install redis
+    # Caching backend: Valkey
+    dnf install valkey
 
     # Database server: PostgreSQL
     dnf install postgresql postgresql-contrib
@@ -40,7 +39,7 @@ Installing on RedHat, Fedora and CentOS
     # SMTP server
     dnf install postfix
 
-    # Gettext for the msgmerge add-on
+    # Gettext tools for gettext POT/PO update add-ons
     dnf install gettext
 
 .. include:: steps/install-uv.rst

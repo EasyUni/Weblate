@@ -6,10 +6,11 @@
 
 """Synchronizes Read the Docs projects for all languages."""
 
-import os
+# ruff: ignore[suspicious-subprocess-import]
 import subprocess
+from pathlib import Path
 
-import requests
+import httpx2
 from weblate_language_data.docs import DOCUMENTATION_LANGUAGES
 
 # List of translations
@@ -26,15 +27,16 @@ FIELDS = {
 }
 
 
-def get_update(value):
-    if isinstance(value, dict) and "code" in value:
-        return value["code"]
-    if isinstance(value, set):
-        return list(value)
+def get_update(new_value):
+    if isinstance(new_value, dict) and "code" in new_value:
+        return new_value["code"]
+    if isinstance(new_value, set):
+        return list(new_value)
     return value
 
 
 git_tag = subprocess.run(
+    # ruff: ignore[start-process-with-partial-path]
     ["git", "describe", "--tags", "--abbrev=0"],
     capture_output=True,
     text=True,
@@ -44,20 +46,21 @@ git_tag = subprocess.run(
 LATEST_RELEASE = git_tag.stdout.strip()
 
 # Read the authorization token
-with open(os.path.expanduser("~/.config/readthedocs.token")) as handle:
-    TOKEN = handle.read().strip()
+TOKEN = Path("~/.config/readthedocs.token").expanduser().read_text(encoding="utf-8")
 
 AUTH = {"Authorization": f"Token {TOKEN}", "Content-Type": "application/json"}
 
-response = requests.get(
-    "https://readthedocs.org/api/v3/projects/weblate/", headers=AUTH, timeout=1
+response = httpx2.get(
+    "https://app.readthedocs.org/api/v3/projects/weblate/",
+    headers=AUTH,
+    timeout=1,
 )
 response.raise_for_status()
 base = response.json()
 
-result = {"next": "https://readthedocs.org/api/v3/projects/"}
+result = {"next": "https://app.readthedocs.org/api/v3/projects/"}
 while result["next"]:
-    response = requests.get(result["next"], headers=AUTH, timeout=1)
+    response = httpx2.get(result["next"], headers=AUTH, timeout=1)
     response.raise_for_status()
     result = response.json()
     for project in result["results"]:
@@ -78,7 +81,7 @@ while result["next"]:
                         f"Different {name} on {project['name']}: {current}",
                         project["urls"]["home"],
                     )
-                    response = requests.patch(
+                    response = httpx2.patch(
                         project["_links"]["_self"],
                         json={name: get_update(value)},
                         headers=AUTH,
@@ -88,12 +91,13 @@ while result["next"]:
             if not project["translation_of"] and code != "en":
                 print(f"Not a translation {project['name']}: ", project["urls"]["home"])
             # Check versions
-            versions_response = requests.get(
-                f"{project['_links']['versions']}?active=true", headers=AUTH, timeout=1
+            versions_response = httpx2.get(
+                f"{project['_links']['versions']}?active=true",
+                headers=AUTH,
+                timeout=1,
             )
             versions_response.raise_for_status()
             versions = versions_response.json()
-            found = None
             while LATEST_RELEASE not in {
                 version["slug"] for version in versions["results"]
             }:
@@ -103,8 +107,10 @@ while result["next"]:
                         project["urls"]["home"],
                     )
                     break
-                versions_response = requests.get(
-                    versions["next"], headers=AUTH, timeout=1
+                versions_response = httpx2.get(
+                    versions["next"],
+                    headers=AUTH,
+                    timeout=1,
                 )
                 versions_response.raise_for_status()
                 versions = versions_response.json()
@@ -119,7 +125,7 @@ while result["next"]:
 # Create missing ones
 for language in LOCALES:
     print(f"Creating {language}")
-    payload = {
+    payload: dict[str, str | dict[str, str]] = {
         "language": language,
         "name": f"Weblate ({language})",
         "repository": {
@@ -127,9 +133,9 @@ for language in LOCALES:
             "type": "git",
         },
     }
-    for name, value in FIELDS.items():
-        payload[name] = get_update(value)
-    response = requests.post(
+    for name, expected_value in FIELDS.items():
+        payload[name] = get_update(expected_value)
+    response = httpx2.post(
         "https://readthedocs.org/api/v3/projects/",
         json=payload,
         headers=AUTH,

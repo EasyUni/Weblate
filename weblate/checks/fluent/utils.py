@@ -5,26 +5,89 @@
 from __future__ import annotations
 
 import re
+from itertools import islice
 from typing import TYPE_CHECKING
 
 from django.utils.html import escape, format_html, format_html_join
 from django.utils.safestring import mark_safe
+from django.utils.translation import gettext
+from fluent.syntax import ast
 from translate.storage.fluent import (
+    FluentContentError,
     FluentPart,
-    FluentReference,
-    FluentSelectorBranch,
     FluentUnit,
 )
+
+from weblate.checks.base import Highlight
+from weblate.utils.fluent import fluent_ast_is_too_complex
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from django.utils.safestring import SafeString
+    from translate.storage.fluent import (
+        FluentReference,
+        FluentSelectorBranch,
+    )
 
     from weblate.checks.models import Check as CheckModel
     from weblate.trans.models.unit import Unit as TransUnitModel
 
-HighlightsType = list[tuple[int, int, str]]
+HighlightsType = list[Highlight]
+
+# The variant count grows exponentially with the number of selectors. Three
+# selectors with all six plural categories have 216 variants.
+MAX_FLUENT_VARIANTS = 256
+# Approximates the text to process for all variants: variants * string length.
+MAX_FLUENT_VARIANTS_LENGTH = 1_000_000
+MAX_FLUENT_DESCRIPTION_ERRORS = 50
+# Compiling a regular expression with many alternatives is slow.
+MAX_FLUENT_HIGHLIGHT_PATTERNS = 64
+
+
+class FluentComplexityError(Exception):
+    """A Fluent value would take disproportionate resources to analyze."""
+
+
+# Recursion can still overflow when the call stack is already deep.
+FLUENT_COMPLEXITY_ERRORS = (FluentComplexityError, RecursionError)
+
+
+def fluent_complexity_description() -> str:
+    """Return description for a check which could not analyze the string."""
+    return gettext("The Fluent value could not be checked because it is too complex.")
+
+
+def fluent_too_complex_error() -> str:
+    """Return the syntax error for a value which is beyond the limits."""
+    return gettext("the value is too complex or nested too deeply")
+
+
+def _count_variants(branch: FluentSelectorBranch) -> int:
+    """Count the paths branch_paths() would generate, without enumerating them."""
+    count = 1
+    for node in branch.child_nodes:
+        count *= sum(_count_variants(child) for child in node.child_branches)
+        if count > MAX_FLUENT_VARIANTS:
+            # Already over the limit, the exact count is not needed.
+            return count
+    return count
+
+
+def bounded_branch_paths(
+    branch: FluentSelectorBranch, source_length: int
+) -> Iterator[list[FluentSelectorBranch]]:
+    """
+    Return all variants of the branch if they can be processed.
+
+    :raises FluentComplexityError: if there are too many variants
+    """
+    count = _count_variants(branch)
+    if count > MAX_FLUENT_VARIANTS or (
+        count > 1 and count * source_length > MAX_FLUENT_VARIANTS_LENGTH
+    ):
+        raise FluentComplexityError
+    return branch.branch_paths()
 
 
 def translation_from_check(
@@ -33,7 +96,7 @@ def translation_from_check(
     """Extract a translation unit, source and target from a Check Model."""
     unit = check_model.unit
     # Do not currently support plurals.
-    return (unit, unit.get_source_plurals()[0], unit.get_target_plurals()[0])
+    return (unit, unit.get_effective_source_plurals()[0], unit.get_target_plurals()[0])
 
 
 def format_html_code(
@@ -47,15 +110,16 @@ def format_html_code(
     }
     if safe_kwargs:
         return format_html(escape(format_string), **safe_kwargs)
-    return mark_safe(escape(format_string))  # noqa: S308
+    # ruff: ignore[suspicious-mark-safe-usage]
+    return mark_safe(escape(format_string))
 
 
 def format_html_error_list(errors: Iterable[str]) -> SafeString:
-    """Return a HTML SafeString with each given error on a new line."""
+    """Return an HTML SafeString with each given error on a new line."""
     return format_html_join(
         mark_safe("<br />"),
         "{}",
-        ((err,) for err in errors),
+        ((err,) for err in islice(errors, MAX_FLUENT_DESCRIPTION_ERRORS)),
     )
 
 
@@ -63,7 +127,7 @@ def variant_name(branches: list[FluentSelectorBranch]) -> str:
     """Get a variant name for the given branch path."""
     if not branches:
         return ""
-    return "[" + "][".join(branch.key for branch in branches) + "]"
+    return f"[{']['.join(branch.key for branch in branches)}]"
 
 
 class FluentPatterns:
@@ -72,31 +136,11 @@ class FluentPatterns:
     BLANK = r"( |\n|\r\n)*"
     # Match string or number literals.
     ESCAPED_CHAR = r'(\\\\|\\"|\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{6})'
-    STRING_LITERAL = r'"(' + ESCAPED_CHAR + r'|[^"\\])*"'
+    STRING_LITERAL = rf'"({ESCAPED_CHAR}|[^"\\])*"'
     NUMBER_LITERAL = r"-?[0-9]+(\.[0-9]+)?"
     IDENTIFIER = r"[a-zA-Z][a-zA-Z0-9_-]*"
-    NAMED_ARGUMENT = (
-        IDENTIFIER
-        + BLANK
-        + r":"
-        + BLANK
-        + r"("
-        + STRING_LITERAL
-        + r"|"
-        + NUMBER_LITERAL
-        + r")"
-    )
-    NAMED_ARGUMENT_LIST = (
-        r"("
-        + NAMED_ARGUMENT
-        + BLANK
-        + r","
-        + BLANK
-        + r")*"
-        + r"("
-        + NAMED_ARGUMENT
-        + r")?"
-    )
+    NAMED_ARGUMENT = f"{IDENTIFIER}{BLANK}:{BLANK}({STRING_LITERAL}|{NUMBER_LITERAL})"
+    NAMED_ARGUMENT_LIST = rf"({NAMED_ARGUMENT}{BLANK},{BLANK})*({NAMED_ARGUMENT})?"
     NAMED_ARGUMENTS_CALL = BLANK + r"\(" + BLANK + NAMED_ARGUMENT_LIST + BLANK + r"\)"
 
     @classmethod
@@ -125,7 +169,7 @@ class FluentPatterns:
             # Instead, we just build the regex to match named arguments, which
             # can only be string or number literals.
             return cls.placeable(
-                r"-" + re.escape(ref.name) + r"(" + cls.NAMED_ARGUMENTS_CALL + ")?"
+                rf"-{re.escape(ref.name)}({cls.NAMED_ARGUMENTS_CALL})?"
             )
         if ref.type_name == "variable":
             return cls.placeable(r"\$" + re.escape(ref.name))
@@ -173,11 +217,11 @@ class FluentPatterns:
                 literal = literal_match.group("number")
             else:
                 literal = ""
-                for pos, chars in enumerate(
+                for index, chars in enumerate(
                     # Remove outer quotes from string literal.
                     cls.ESCAPED_CHAR_REGEX.split(string_literal[1:-1])
                 ):
-                    if not pos % 2:
+                    if not index % 2:
                         # Not an escaped character.
                         literal += chars
                     elif chars in {'\\"', "\\\\"}:
@@ -186,7 +230,8 @@ class FluentPatterns:
                     else:
                         # Remove the leading "\u" or "\U" and convert hex
                         # sequence to a number.
-                        unicode_point = int(chars[2:], 16)  # noqa: FURB166
+                        # ruff: ignore[int-on-sliced-str]
+                        unicode_point = int(chars[2:], 16)
                         try:
                             # Try unescape the unicode sequence.
                             literal += chr(unicode_point)
@@ -211,11 +256,14 @@ class FluentPatterns:
         Generate a list of highlights for the given source.
 
         Highlights all matches for the patterns in highlight_patterns, except
-        within a literal expression. Returns the highlights as a list of
-        3-tuples of the highlighted regions' starting positions, ending
-        positions and text.
+        within a literal expression.
         """
-        unique_highlights = {p for p in highlight_patterns if p}
+        unique_highlights = list(
+            islice(
+                dict.fromkeys(p for p in highlight_patterns if p),
+                MAX_FLUENT_HIGHLIGHT_PATTERNS,
+            )
+        )
         if not unique_highlights:
             return []
         regex = re.compile("|".join(unique_highlights), flags=re.MULTILINE)
@@ -223,7 +271,12 @@ class FluentPatterns:
         for start, text, _ in cls.split_literal_expressions(source):
             # NOTE: text may be empty if two literals touch.
             highlights.extend(
-                (start + match.start(), start + match.end(), match.group())
+                Highlight(
+                    start + match.start(),
+                    start + match.end(),
+                    match.group(),
+                    kind="grammar",
+                )
                 for match in regex.finditer(text)
             )
         return highlights
@@ -265,11 +318,34 @@ class FluentUnitConverter:
         unit = self.to_fluent_unit()
         if unit is None:
             return None
-        return unit.get_parts()
+        if unit.fluent_type not in {"Message", "Term"}:
+            return []
+        try:
+            entry = unit.to_entry()
+        except (FluentContentError, RecursionError):
+            return None
+        if not isinstance(entry, (ast.Message, ast.Term)):
+            return []
+        # Reported by get_syntax_error. Check before building the selector tree.
+        if fluent_ast_is_too_complex(entry):
+            return None
+        parts = [FluentPart("", entry.value)] if entry.value else []
+        parts.extend(FluentPart(attr.id.name, attr.value) for attr in entry.attributes)
+        return parts
 
     def get_syntax_error(self) -> str | None:
         """Get the syntax error that would be produced for the unit."""
         unit = self.to_fluent_unit()
         if unit is None:
             return None
-        return unit.get_syntax_error()
+        try:
+            syntax_error = unit.get_syntax_error()
+            if syntax_error:
+                return syntax_error
+            entry = unit.to_entry()
+        except RecursionError:
+            return fluent_too_complex_error()
+        # Writing such a value to the file would fail.
+        if entry is not None and fluent_ast_is_too_complex(entry):
+            return fluent_too_complex_error()
+        return None

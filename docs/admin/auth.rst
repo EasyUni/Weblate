@@ -29,6 +29,106 @@ of other Django-based projects (see :ref:`pootle-migration`).
    :ref:`docker-auth` describes how to configure authentication in the official
    Docker image.
 
+.. _sso-team-sync:
+
+Teams from identity providers
+-----------------------------
+
+.. versionadded:: 2026.10.1
+
+Weblate can synchronize selected teams from external group memberships or
+application roles during social authentication.
+The default native and Docker pipelines include synchronization after
+authentication checks and two-factor authentication. Extraction and assignment
+are disabled until configured. If you use a custom authentication pipeline,
+place ``social_core.pipeline.user.sync_groups`` after all authentication checks,
+including ``weblate.legal.pipeline.tos_confirm`` when terms acceptance is enabled.
+
+Map external identifiers to lists of existing Weblate team IDs. Find team IDs
+in the administration interface URL or the teams REST API. Names can repeat
+across project and workspace scopes, so they are not used as mapping targets.
+
+For Microsoft Entra ID, prefer application roles::
+
+    SOCIAL_AUTH_AZUREAD_TENANT_OAUTH2_GROUPS_KEY = "roles"
+    SOCIAL_AUTH_AZUREAD_TENANT_OAUTH2_GROUPS_MAP = {
+        "Weblate.Translator": [42],
+        "Weblate.Reviewer": [43],
+    }
+
+Configure the provider to issue these roles. Group identifiers can instead be
+selected with ``GROUPS_KEY = "groups"``. Group overage causes authentication
+to fail; Weblate does not retrieve memberships from Microsoft Graph. Restrict
+the trusted tenant and issuer before granting permissions, especially when
+using a common Azure endpoint.
+
+For generic OpenID Connect or Keycloak, configure a literal claim name::
+
+    SOCIAL_AUTH_OIDC_GROUPS_KEY = "groups"
+    SOCIAL_AUTH_OIDC_GROUPS_MAP = {"translators": [42]}
+
+    SOCIAL_AUTH_KEYCLOAK_GROUPS_KEY = "groups"
+    SOCIAL_AUTH_KEYCLOAK_GROUPS_MAP = {"/organization/reviewers": [43]}
+
+For GitLab, explicitly enable membership retrieval::
+
+    SOCIAL_AUTH_GITLAB_GROUPS_ENABLED = True
+    SOCIAL_AUTH_GITLAB_GROUPS_MAP = {"organization/translators": [42]}
+
+Enabling retrieval automatically requests ``read_api`` unless ``read_api`` or
+``api`` is already requested. Enable the corresponding permission in the GitLab
+OAuth application settings alongside ``read_user``.
+
+GitLab uses full group paths by default. Use stable numeric group IDs instead
+when paths might change or be reused::
+
+    SOCIAL_AUTH_GITLAB_GROUPS_IDENTIFIER = "id"
+    SOCIAL_AUTH_GITLAB_GROUPS_MAP = {"12345": [42]}
+
+For SAML, add the group attribute and mapping to each existing entry in
+``SOCIAL_AUTH_SAML_ENABLED_IDPS``::
+
+    SOCIAL_AUTH_SAML_ENABLED_IDPS["company"].update(
+        {
+            "attr_groups": "https://example.com/claims/groups",
+            "groups_map": {"translators": [42]},
+            "allow_groups": ["translators", "reviewers"],
+        }
+    )
+
+All targets in a mapping become provider-managed teams. Authentication adds
+desired memberships and removes obsolete managed memberships. Unrelated
+teams and existing membership language restrictions are preserved. Changes
+are recorded in the audit log. Manual membership in a managed team is subject
+to replacement at the next authentication. A team may be managed by only one
+configured provider or SAML IdP; conflicting mappings and nonexistent teams
+cause errors before memberships change. No teams are created automatically.
+
+A missing configured claim fails authentication. When a provider omits claims
+for users without assignments, explicitly enable its
+``SOCIAL_AUTH_<BACKEND>_GROUPS_MISSING_AS_EMPTY`` setting. SAML uses
+``groups_missing_as_empty`` in the IdP entry. An empty membership list removes
+all provider-managed memberships. An empty ``GROUPS_MAP`` disables assignment.
+
+Login restrictions are independent of assignment. Configure
+``SOCIAL_AUTH_<BACKEND>_ALLOW_GROUPS`` to require membership in any listed
+external group or role. Unknown identifiers grant nothing, but do not reject
+login unless an allow list is configured. Existing CAS allow lists require no
+new settings or pipeline entries.
+
+Synchronization applies to login, registration, and authentication-method
+linking. Password reset and account removal do not synchronize teams. Updates
+occur only during authentication; this does not deactivate accounts or revoke
+access in the background. Synchronization does not store external membership
+snapshots.
+
+In Docker installations, use :ref:`docker-custom-config` to supply these Python
+settings; there are no dedicated environment variables for team mappings.
+
+.. seealso::
+
+   :doc:`psa:groups`
+
 Social authentication
 ---------------------
 
@@ -53,6 +153,18 @@ in :doc:`psa:configuration/django`.
 
        :doc:`psa:pipeline`
 
+Provider names are normalized by Python Social Auth's ``social_names`` pipeline
+step before Weblate initializes an empty full name. Existing full names are
+preserved. Weblate cleans and limits the resulting name and falls back to the
+username when the provider name is missing or invalid.
+
+``SOCIAL_AUTH_FIRSTLAST_FROM_FULL`` and ``SOCIAL_AUTH_FULL_FROM_FIRSTLAST``
+control name conversion and both default to ``True``. Backend-specific settings
+are supported, for example ``SOCIAL_AUTH_SAML_FULL_FROM_FIRSTLAST = False``.
+See :ref:`psa:name-normalization` for the conversion rules. Custom
+``SOCIAL_AUTH_PIPELINE`` configurations should include
+``social_core.pipeline.social_auth.social_names`` after ``social_details``.
+
 Enabling individual backends is quite easy, it's just a matter of adding an entry to
 the :setting:`django:AUTHENTICATION_BACKENDS` setting and possibly adding keys needed for a given
 authentication method. Please note that some backends do not provide user e-mail by
@@ -68,6 +180,20 @@ to properly credit contributions users make.
 .. seealso::
 
     :doc:`Python Social Auth backend <psa:backends/index>`
+
+Authentication storage cleanup
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Weblate removes expired OpenID protocol associations and OpenID Connect login
+nonces in its hourly authentication cleanup task. OIDC login attempts have a
+30-minute nonce lifetime by default; expiry is enforced during login even before
+the next cleanup runs. Linked accounts are preserved. Verification codes and
+partial pipelines retain their existing :setting:`AUTH_TOKEN_VALID` policy.
+
+The social-auth database migration gives existing undated OIDC nonces a
+30-minute grace period from upgrade. Follow the usual upgrade procedure with
+old login-serving processes stopped while applying migrations. For backend
+configuration, see :doc:`psa:backends/oidc`.
 
 OpenID authentication
 ~~~~~~~~~~~~~~~~~~~~~
@@ -288,7 +414,7 @@ ensure you mark the `read_user` scope.
 .. _gitea_auth:
 
 Gitea OAuth 2
-~~~~~~~~~~~~~~
+~~~~~~~~~~~~~
 
 For using Gitea OAuth 2, you need to register an application at
 ``https://GITEA SERVER/user/settings/applications``.
@@ -324,9 +450,15 @@ The redirect URL is ``https://WEBLATE SERVER/accounts/complete/gitea/``.
    :doc:`psa:backends/gitea`
 
 .. _azure-auth:
+.. _entra-auth:
 
-Microsoft Azure Active Directory
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Microsoft Entra ID
+~~~~~~~~~~~~~~~~~~
+
+Azure Active Directory (Azure AD) is now Microsoft Entra ID. Weblate keeps the
+``azuread-oauth2`` and ``azuread-tenant-oauth2`` backend names for
+compatibility with the underlying Python Social Auth backends and existing
+deployments.
 
 Weblate can be configured to use common or specific tenants for authentication.
 
@@ -336,13 +468,15 @@ for tenant-specific authentication.
 
 You will need following:
 
-* *Application (client) ID* can be obtained from application page. *Object ID* is not used in Weblate.
+* *Application (client) ID* is available on the app registration overview in the
+  Microsoft Entra admin center. *Object ID* is not used in Weblate.
 * *Directory (tenant) ID* is needed for tenant scoped authentication, what is usually desired.
-* *Secret value* is displayed once you generate a secret for an application. *Secret ID* is not used in Weblate.
+* *Secret value* is displayed once you create a client secret for the app
+  registration. *Secret ID* is not used in Weblate.
 
 .. code-block:: python
 
-    # Azure AD common
+    # Microsoft Entra ID common
 
     # Authentication configuration
     AUTHENTICATION_BACKENDS = (
@@ -357,7 +491,7 @@ You will need following:
 
 .. code-block:: python
 
-    # Azure AD Tenant
+    # Microsoft Entra ID with Tenant
 
     # Authentication configuration
     AUTHENTICATION_BACKENDS = (
@@ -409,10 +543,73 @@ The redirect URL is ``https://WEBLATE SERVER/accounts/complete/slack/``.
    :doc:`psa:backends/slack`
 
 
+.. _weblate-auth:
+
+Weblate OpenID Connect
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 2026.11
+
+To sign in through Hosted Weblate or another Weblate installation, register a
+confidential authorization-code client with RSA SHA-256 signing on its
+:ref:`oidc-provider`. Register this installation's exact HTTPS callback URL,
+for example ``https://weblate.example.com/accounts/complete/weblate/``.
+
+Add the backend and client credentials to your settings:
+
+.. code-block:: python
+
+    # Authentication configuration
+    AUTHENTICATION_BACKENDS = (
+        "social_core.backends.weblate.WeblateOpenIdConnect",
+        "social_core.backends.email.EmailAuth",
+        "weblate.accounts.auth.WeblateUserBackend",
+    )
+
+    # Social auth backends setup
+    SOCIAL_AUTH_WEBLATE_KEY = "Client ID"
+    SOCIAL_AUTH_WEBLATE_SECRET = "Client secret"
+
+The default issuer is ``https://hosted.weblate.org/oidc``. To authenticate
+against another installation, configure its issuer URL, including any
+deployment prefix:
+
+.. code-block:: python
+
+    SOCIAL_AUTH_WEBLATE_OIDC_ENDPOINT = "https://example.com/translations/oidc"
+
+Do not append ``/.well-known/openid-configuration``. The backend discovers the
+provider endpoints and requests the ``openid profile email`` scopes. Keep
+PKCE enabled; Weblate requires it.
+
+The sign-in label is :guilabel:`Hosted Weblate` for Hosted Weblate and
+:guilabel:`Weblate` for other installations. Override the label or icon with
+``SOCIAL_AUTH_WEBLATE_TITLE`` or ``SOCIAL_AUTH_WEBLATE_IMAGE``.
+
+Changing the issuer requires an explicit migration of existing account
+associations: the same subject identifier on different servers can refer to
+different people.
+
+.. include:: /snippets/oauth-site.rst
+
+.. seealso::
+
+   * :ref:`docker-weblate-auth`
+   * :doc:`psa:backends/weblate`
+
+
 Overriding authentication method names and icons
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-You can override the authentication method display name and icon using using settings as
+Display names and bundled icons come from python-social-auth backend metadata.
+Weblate retains translated labels and local icons for its password and e-mail
+methods, and supplies its own fallback icon for providers without a logo.
+Add ``social_django.finders.SocialAuthIconFinder`` after the standard finders in
+``STATICFILES_FINDERS`` to collect the provider icons from social-auth-core.
+The example and Docker settings include this finder. Run
+:samp:`weblate collectstatic --noinput` after upgrading.
+
+You can override the authentication method display name and icon using settings as
 ``SOCIAL_AUTH_<NAME>_IMAGE`` and ``SOCIAL_AUTH_<NAME>_TITLE``. For example
 overriding naming for Auth0 would look like:
 
@@ -420,6 +617,11 @@ overriding naming for Auth0 would look like:
 
    SOCIAL_AUTH_AUTH0_IMAGE = "custom.svg"
    SOCIAL_AUTH_AUTH0_TITLE = "Custom auth"
+
+Relative image names retain the ``auth/`` static directory convention. Existing
+bundled filenames, such as ``auth0.svg``, also resolve to the shared
+``social_auth/icons/`` directory when no local override exists. Full HTTP URLs
+and data URLs continue to work.
 
 .. _disable-email-auth:
 
@@ -472,6 +674,131 @@ passwords below a certain threshold.
    * :doc:`/security/passwords`
 
 
+.. _oidc-provider:
+
+OpenID Connect identity provider
+--------------------------------
+
+.. versionadded:: 2026.11
+
+Weblate can act as an optional OpenID Connect (OIDC) identity provider for
+other applications. This is separate from signing in to Weblate using an
+external OIDC provider.
+
+Install the ``oidc`` extra (``uv pip install Weblate[oidc]``). Generate a
+signing key and keep it outside version control:
+
+.. code-block:: sh
+
+   openssl genrsa -out /path/to/oidc.key 4096
+
+Enable :setting:`OIDC_PROVIDER_ENABLED`, add the optional applications, and
+configure :setting:`OAUTH2_PROVIDER` in your settings:
+
+.. code-block:: python
+
+   from pathlib import Path
+
+   OIDC_PROVIDER_ENABLED = True
+   INSTALLED_APPS += ["weblate.oidc", "oauth2_provider"]
+   OAUTH2_PROVIDER = {
+       "OIDC_RSA_PRIVATE_KEY": Path("/path/to/oidc.key").read_text(encoding="utf-8"),
+   }
+
+Run :wladmin:`migrate` before starting Weblate and its workers. Disabled
+installations do not need these applications, dependencies, or database tables.
+For Docker, see :envvar:`WEBLATE_OIDC_PROVIDER_ENABLED`.
+
+Register each client in :guilabel:`Django administration` under
+:guilabel:`Applications`. Select :guilabel:`Authorization code` and
+:guilabel:`RSA with SHA-256`. For clients supporting a secret, select
+:guilabel:`Confidential` and securely copy the generated client ID and secret.
+Secrets are hashed when saved. For clients without a secret, select
+:guilabel:`Public`; S256 PKCE is required for both client types. Register the
+client's exact HTTPS callback URL. Only select
+:guilabel:`Skip authorization` for trusted clients; other clients require user
+consent before accessing identity information.
+
+The issuer is the canonical Weblate site URL followed by ``/oidc``, including
+any :setting:`URL_PREFIX`. The discovery URL is the issuer followed by
+``/.well-known/openid-configuration``. Configure clients to use this discovery
+URL, authorization code flow, S256 PKCE, and scopes ``openid profile email``.
+Confidential-client authentication supports HTTP Basic or a form-encoded
+client secret. For Zammad, register a public client, set its issuer to the
+Weblate issuer URL, select ``sub`` as the UID field, request
+``openid profile email``, and enable PKCE. Its callback is
+``https://zammad.example.com/auth/openid_connect/callback``. Nextcloud's
+``user_oidc`` app can use a confidential client with the discovery URL.
+Shared logout and automatic client registration are not provided.
+
+Authorization requests can use GET or form-encoded POST. Clients exchange tokens
+and fetch UserInfo through their servers.
+
+Clients can request fresh authentication using ``prompt=login`` or limit the
+age of the existing authentication using ``max_age`` in seconds. The limit
+also applies when submitting consent. ``max_age=0`` always requires a new login.
+With ``prompt=none``, Weblate returns ``login_required`` or ``consent_required``
+when authentication or consent needs user interaction.
+
+Federated sign-in can reuse an upstream session without revealing its
+authentication time. These sign-ins omit ``auth_time`` from ID tokens and
+cannot satisfy ``prompt=login`` or ``max_age`` requests; Weblate returns
+``login_required`` instead. Use a password-based sign-in or e-mail verification
+when fresh authentication is required. A failed freshness request does not
+prevent later ordinary federated sign-ins.
+
+The ``sub`` claim is the Weblate user ID as a string, stable across username
+and e-mail changes. The ``profile`` scope adds ``preferred_username``, ``name``,
+and ``family_name``; both name claims contain Weblate's full name. The ``email``
+scope adds ``email`` and ``email_verified``. Verification is reported only when
+the current address has a recorded verification. Claims are available in
+ID tokens and from ``/oidc/userinfo/`` using an access token.
+
+When :ref:`legal` is installed, clients can additionally request the optional
+``weblate:legal`` scope. It adds ``weblate_tos_version`` to ID tokens and
+UserInfo, containing the version the user actually accepted as an ISO date,
+for example ``"2026-09-01"``. Older accepted versions are returned unchanged;
+the claim is omitted when no acceptance is recorded. Reading it does not
+record consent or expose the acceptance timestamp, IP address, or user agent.
+Without the legal module, this scope is unavailable.
+
+Receiving servers using the same legal package, such as ``wllegal``, can use
+this date to match their legal version. They must explicitly trust the issuer
+and match the accepted version to their own documents before suppressing
+local confirmation. This provider only exposes the information; accepting
+shared consent on receiving Weblate servers requires separate integration.
+
+New browser sessions created for OIDC sign-in expire after 60 seconds,
+including when sign-in requires :ref:`2fa`. Existing browser sessions keep
+their expiry policy. Sessions created before the provider recorded an
+authentication time require a fresh sign-in before authorizing a client.
+If the browser session expires while the consent page is open, submitting
+the form restarts sign-in and displays a new consent page. The earlier
+approval or denial is discarded; the user must submit the new form.
+Concurrent authorization attempts are tracked separately. Pending attempts
+expire after 15 minutes; starting more than 16 discards the oldest attempt.
+
+Access and ID tokens last one hour. Refresh tokens rotate
+on use and expire after 30 days of inactivity beyond their associated access
+token's expiry. ID tokens retain the original authentication time across
+refreshes, including its absence for federated sign-ins, even when the user
+signs in again elsewhere. Reusing an already
+rotated refresh token revokes its token
+family. Tokens work independently of the browser session and do not authorize
+Weblate REST API access. Account removal deletes provider credentials, and
+inactive accounts cannot authorize or use provider tokens. Celery periodically
+cleans expired credentials.
+
+To rotate signing keys, replace ``OIDC_RSA_PRIVATE_KEY`` and retain old private
+keys in ``OIDC_RSA_PRIVATE_KEYS_INACTIVE`` until outstanding ID tokens and
+cached key sets have expired. Only public key material is published by JWKS.
+
+When migrating a client from SAML, explicitly map its existing identities to
+the OIDC issuer and subject. Do not assume SAML NameIDs equal OIDC subjects,
+or link accounts solely by matching e-mail addresses. For weblate.org, existing
+accounts are linked by persistent SAML provider/identity pairs; its client
+integration and identity mapping require a separate migration.
+
 .. _saml-auth:
 
 SAML authentication
@@ -489,7 +816,8 @@ Please follow the Python Social Auth instructions for configuration. Notable dif
 
 * Weblate supports single IDP which has to be called ``weblate`` in
   ``SOCIAL_AUTH_SAML_ENABLED_IDPS``.
-* The SAML XML metadata URL is ``/accounts/metadata/saml/``.
+* The SAML XML metadata URL is ``/accounts/metadata/saml/``, which is also an entity ID.
+* The sign-in URL is ``/accounts/complete/saml/`` (also known as ACS URL).
 * Following settings are automatically filled in:
   ``SOCIAL_AUTH_SAML_SP_ENTITY_ID``, ``SOCIAL_AUTH_SAML_TECHNICAL_CONTACT``,
   ``SOCIAL_AUTH_SAML_SUPPORT_CONTACT``
@@ -514,9 +842,6 @@ Example configuration:
             "entity_id": "https://idp.testshib.org/idp/shibboleth",
             "url": "https://idp.testshib.org/idp/profile/SAML2/Redirect/SSO",
             "x509cert": "MIIEDjCCAvagAwIBAgIBADA ... 8Bbnl+ev0peYzxFyF5sQA==",
-            "attr_name": "full_name",
-            "attr_username": "username",
-            "attr_email": "email",
         }
     }
     SOCIAL_AUTH_SAML_ORG_INFO = {
@@ -535,8 +860,14 @@ Example configuration:
         "emailAddress": "support@example.com"
     }
 
+You can generate a new pair of keys using:
+
+.. code-block:: sh
+
+   openssl req -newkey rsa:4096 -new -x509 -days 3652 -nodes -out saml.crt -keyout saml.key
+
 The default configuration extracts user details from following attributes,
-configure your IDP to provide them:
+configure your IdP to provide them:
 
 +--------------+-----------------------------------------+
 | Attribute    | SAML URI reference                      |
@@ -552,10 +883,35 @@ configure your IDP to provide them:
 | Username     | ``urn:oid:0.9.2342.19200300.100.1.1``   |
 +--------------+-----------------------------------------+
 
+When configuring Weblate SP in your IdP, it is recommended to choose persistent
+:guilabel:`Name ID format`.
+
 .. hint::
 
-   The example above and the Docker image define an IDP called ``weblate``.
-   You might need to configure this string as :guilabel:`Relay` in your IDP.
+   Some identity providers (such as Microsoft Entra ID with multi-factor
+   authentication) require disabling the default ``requestedAuthnContext``
+   in the SAML security configuration:
+
+   .. code-block:: python
+
+      SOCIAL_AUTH_SAML_SECURITY_CONFIG = {"requestedAuthnContext": False}
+
+   In Docker, set :envvar:`WEBLATE_SAML_SECURITY_CONFIG` instead.
+
+.. hint::
+
+   The example above and the Docker image define an IdP called ``weblate``.
+   You might need to configure this string as :guilabel:`Relay` in your IdP.
+
+.. note::
+
+   Weblate authentication relies on the ``RelayState`` parameter to be passed
+   through the authentication process. This needs to be configured with some
+   identity providers:
+
+   * `How to Send a Custom RelayState with Okta`_
+
+.. _How to Send a Custom RelayState with Okta: https://support.okta.com/help/s/article/How-to-send-a-custom-relaystate-to-application-through-idp-initiated-authentication-urls
 
 .. seealso::
 
@@ -621,6 +977,9 @@ Once you have the package installed, you can hook it into the Django authenticat
         # Email is required for Weblate (used in VCS commits)
         "email": "mail",
     }
+    # Optional: route "Forgot your password?" to your LDAP self-service page
+    PASSWORD_RESET_URL = "https://id.example.net/password-reset/"
+
 
     # Hide the registration form
     REGISTRATION_OPEN = False
@@ -799,20 +1158,65 @@ Security keys (WebAuthn)
 
    Security keys are WebAuthn credentials that can only be used as a second factor of authentication, and these only validate user presence.
 
+   When signing in on a new computer or in a different browser, your passkey
+   might not be available. Use a device where the passkey is available, or
+   connect your registered security key. A verification error can mean that
+   the request timed out, was canceled, or that the credential is unavailable;
+   it does not identify the exact cause.
+
+   You can also select another configured verification method on the sign-in
+   page, such as :guilabel:`Use recovery codes`. If you cannot use any configured
+   method, contact the site administrator for help.
+
 Authenticator apps (TOTP)
    Authenticator apps and browser extensions like Aegis, Bitwarden, Google Authenticator,
    1Password, Authy, Microsoft Authenticator, etc. generate time-based one-time passwords
    that are used as a second factor to verify your identity when prompted
    during sign-in.
 
+   Registration becomes active only after you verify a code from the app.
+   Complete registration within 10 minutes of confirming your sign-in method;
+   otherwise confirm it again and use the new QR code. Each registration can be
+   completed only once. After registering, wait for the next code before using
+   the app to sign in.
+
+   Only one registration can be pending per account. Confirming your sign-in
+   method in another browser session invalidates the pending QR code and starts
+   a new registration.
+
+   If you have more than one registered authenticator app, select the app
+   you are using when entering its code during sign-in.
+
 Recovery codes
    Recovery codes can be used to access your account if you lose access to your device and cannot receive two-factor authentication codes.
 
    Keep your recovery codes as safe as your password. We recommend saving them with a password manager such as Bitwarden, 1Password, Authy, or Keeper.
 
-Each user can configure this in :ref:`profile-account` and second factor will
+Each user can configure this in :ref:`profile-security` and second factor will
 be required to sign in addition to the existing authentication method.
 
-This can be enforced for users at the project (see :ref:`project-enforced_2fa`) or team level.
+Before registering the first authenticator app or security key, confirm your
+existing sign-in method. Enter your current password, including one verified
+by a configured Django authentication backend such as LDAP, or sign in again
+through an already connected provider. If neither method is available, contact
+an administrator to recover access. Registering a new factor does not count as a
+recent second-factor verification for other sensitive actions, such as creating
+a project token; complete a separate second-factor challenge for those actions.
+
+Viewing the personal API key and changing credentials, access permissions, or
+account status requires credential verification from the last 10 minutes in a
+browser session. This includes managing project members and tokens, teams,
+roles, user accounts, and project visibility. Weblate prompts for a second
+factor when one is configured. Otherwise, enter your current password, verify
+through a configured Django authentication backend, or sign in again through
+an already connected provider. Account deletion still
+requires confirmation through a link sent to your e-mail address. API token
+requests continue to use token authentication.
+
+This can be enforced for users at the project (see :ref:`project-enforced_2fa`)
+or team level. In site-wide deployments, this can also be used to enforce
+two-factor authentication for all users by enabling it on the default
+:guilabel:`Users` team, which is assigned automatically to new users by
+:ref:`automatic team assignment <autoteam>`.
 
 The permissions of a team with enforced two-factor authentication won't be applied to users who do not have it configured.

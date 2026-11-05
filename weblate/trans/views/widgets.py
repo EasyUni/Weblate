@@ -6,9 +6,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from django.contrib.auth.decorators import login_not_required
+from django.core.serializers.json import DjangoJSONEncoder
 from django.http import Http404, HttpResponse
 from django.shortcuts import redirect
 from django.urls import reverse
+from django.utils.cache import patch_cache_control
 from django.utils.html import format_html
 from django.utils.translation import gettext
 from django.views.decorators.cache import cache_control
@@ -17,12 +20,18 @@ from django.views.generic import RedirectView
 
 from weblate.lang.models import Language
 from weblate.trans.forms import EngageForm
-from weblate.trans.models import Component, Project, Translation
+from weblate.trans.models import Category, Component, Project, Translation
 from weblate.trans.util import render
 from weblate.trans.widgets import WIDGETS, OpenGraphWidget
 from weblate.utils.site import get_site_url
-from weblate.utils.stats import ProjectLanguage
-from weblate.utils.views import parse_path, show_form_errors, try_set_language
+from weblate.utils.stats import CategoryLanguage, ProjectLanguage
+from weblate.utils.views import (
+    parse_path,
+    parse_path_for_public_sharing,
+    show_form_errors,
+    try_set_language,
+)
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
     from weblate.auth.models import AuthenticatedHttpRequest
@@ -31,6 +40,24 @@ if TYPE_CHECKING:
 def widgets_sorter(widget):
     """Provide better ordering of widgets."""
     return WIDGETS[widget].order
+
+
+def patch_widget_cache_control(
+    response: HttpResponse,
+    obj: Component | Category | Workspace | Project | Language | None,
+) -> None:
+    """Set shared cache policy based on the widget access scope."""
+    if isinstance(obj, Workspace):
+        publicly_shared = False
+    elif isinstance(obj, Project):
+        publicly_shared = obj.is_publicly_shared
+    elif isinstance(obj, (Component, Category)):
+        publicly_shared = obj.project.is_publicly_shared
+    else:
+        publicly_shared = True
+
+    directive = {"public": True} if publicly_shared else {"private": True}
+    patch_cache_control(response, max_age=3600, **directive)
 
 
 def widgets(request: AuthenticatedHttpRequest, path: list[str]):
@@ -103,7 +130,8 @@ def widgets(request: AuthenticatedHttpRequest, path: list[str]):
                     ],
                     "translation_status": gettext("Translation status"),
                     "widgets": widgets_json,
-                }
+                },
+                cls=DjangoJSONEncoder,
             ),
         },
     )
@@ -113,6 +141,7 @@ class WidgetRedirectView(RedirectView):
     permanent = True
     query_string = True
 
+    # pylint: disable=arguments-differ
     def get_redirect_url(
         self,
         project: str,
@@ -144,7 +173,7 @@ class WidgetRedirectView(RedirectView):
 
 
 @vary_on_cookie
-@cache_control(max_age=3600)
+@login_not_required
 def render_widget(
     request: AuthenticatedHttpRequest,
     path: list[str],
@@ -152,11 +181,20 @@ def render_widget(
     color: str,
     extension: str,
 ):
-    # We intentionally skip ACL here to allow widget sharing
-    obj = parse_path(
-        None,
+    obj = parse_path_for_public_sharing(
+        request,
         path,
-        (Component, ProjectLanguage, Project, Translation, Language, None),
+        (
+            Component,
+            ProjectLanguage,
+            CategoryLanguage,
+            Category,
+            Workspace,
+            Project,
+            Translation,
+            Language,
+            None,
+        ),
     )
     lang = set_lang = None
     if isinstance(obj, Language):
@@ -167,6 +205,8 @@ def render_widget(
         obj = obj.component
     if isinstance(obj, ProjectLanguage):
         obj = obj.project
+    if isinstance(obj, CategoryLanguage):
+        obj = obj.category
 
     if set_lang:
         if "native" not in request.GET:
@@ -191,11 +231,13 @@ def render_widget(
             "color": widget_obj.color,
             "extension": widget_obj.extension,
         }
-        return redirect("widget-image", permanent=True, **kwargs)
+        response = redirect("widget-image", permanent=True, **kwargs)
+    else:
+        # Render widget
+        response = HttpResponse(content_type=widget_obj.content_type)
+        widget_obj.render(request, response)
 
-    # Render widget
-    response = HttpResponse(content_type=widget_obj.content_type)
-    widget_obj.render(request, response)
+    patch_widget_cache_control(response, obj)
     return response
 
 

@@ -1,7 +1,11 @@
 {% load i18n icons %}
 
 <p>
-  {% blocktranslate %}This action cannot be undone. This will permanently delete the {{ object }} component and all related content.{% endblocktranslate %}
+  {% blocktranslate %}This action cannot be undone. This will permanently delete the {{ object }} component and its directly related content. Translation memory is handled separately below.{% endblocktranslate %}
+</p>
+
+<p class="alert alert-warning">
+  {% translate "Translation memory is retained by default. If this component is restricted, retained entries might become visible to other project or workspace members. Select the translation memory deletion option below to remove these entries." %}
 </p>
 
 {% with components=object.component_set.prefetch.order %}
@@ -27,7 +31,7 @@
     <div class="list-group-item">
       <div class="list-group-item-text">
         <button type="button"
-                class="btn btn-link btn-xs pull-right flip"
+                class="btn btn-link btn-xs float-end"
                 data-clipboard-value="{{ object.full_slug }}"
                 title="{% translate "Copy to clipboard" %}">{% icon "copy.svg" %}</button>
 

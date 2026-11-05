@@ -23,6 +23,8 @@ Weblate currently supports several variants of JSON translations:
 * :ref:`gotext-json`
 * :ref:`webex`
 * :ref:`arb`
+* :doc:`/formats/resjson`
+* :doc:`/formats/nextcloud-json`
 
 JSON translations are usually monolingual, so it is recommended to specify a base
 file with (what is most often the) English strings.
@@ -49,7 +51,7 @@ file with (what is most often the) English strings.
 
     * :doc:`tt:formats/json`
     * :ref:`updating-target-files`
-    * :ref:`addon-weblate.json.customize`
+    * :ref:`file_format_params`
     * :ref:`addon-weblate.cleanup.generic`
 
 Example files
@@ -64,6 +66,8 @@ Nested files are supported as well (see above for requirements), such a file can
 
 .. literalinclude:: ../../weblate/trans/tests/data/cs-nested.json
     :language: json
+
+.. include:: /snippets/format-features/json-features.rst
 
 Weblate configuration
 +++++++++++++++++++++

@@ -2,27 +2,41 @@
 
 {% load crispy_forms_tags i18n translations %}
 
+{% block extra_script %}{{ form.media }}{% endblock %}
+
+{% block breadcrumbs %}
+  <li class="breadcrumb-item">
+    <a href="{% url 'profile' %}#account">{% translate "Your profile" %}</a>
+  </li>
+  <li class="breadcrumb-item">
+    <a href="{% url 'email_login' %}">{% translate "Verify new e-mail address" %}</a>
+  </li>
+{% endblock breadcrumbs %}
+
 {% block content %}
 
 
   {% if form.errors %}
-    {% translate "Please fix errors in the registration form." as msg %}
+    {% translate "Please fix errors in the form." as msg %}
     {% show_message "error" msg %}
   {% endif %}
 
   <form action="{% url 'email_login' %}" method="post" accept-charset="utf-8">
 
-    <div class="panel panel-default">
-      <div class="panel-heading">
-        <h4 class="panel-title">{% translate "Verify new e-mail address" %}</h4>
+    <div class="card">
+      <div class="card-header">
+        <h4 class="card-title">{% translate "Verify new e-mail address" %}</h4>
       </div>
-      <div class="panel-body">
+      <div class="card-body">
 
         {% csrf_token %}
         {{ form|crispy }}
       </div>
-      <div class="panel-footer">
-        <input type="submit" value="{% translate 'Register' %}" class="btn btn-primary" />
+      <div class="card-footer d-flex flex-wrap align-items-center gap-2">
+        <input type="submit"
+               value="{% translate 'Send verification e-mail' %}"
+               class="btn btn-primary" />
+        <a class="btn btn-link" href="{% url 'profile' %}#account">{% translate "Back to account settings" %}</a>
       </div>
     </div>
   </form>

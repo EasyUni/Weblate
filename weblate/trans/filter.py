@@ -18,6 +18,46 @@ if TYPE_CHECKING:
 
 class FilterRegistry:
     @cached_property
+    def status_order(self) -> tuple[str, ...]:
+        return (
+            "all",
+            "readonly",
+            "approved",
+            "translated",
+            "unapproved",
+            "approved_suggestions",
+            "todo",
+            "nottranslated",
+            "fuzzy",
+            "suggestions",
+            "nosuggestions",
+            "allchecks",
+            "translated_checks",
+            "dismissed_checks",
+            *(CHECKS[check].url_id for check in CHECKS),
+            "comments",
+            "unlabeled",
+        )
+
+    @cached_property
+    def status_ranks(self) -> dict[str, int]:
+        return {name: index for index, name in enumerate(self.status_order)}
+
+    def get_filter_order(self, name: str) -> int:
+        if name.startswith("label:"):
+            name = "unlabeled"
+        return self.status_ranks.get(name, len(self.status_order))
+
+    def get_filter_color(self, name: str, *, enable_review: bool = False) -> str:
+        if name in {"approved", "approved_suggestions"}:
+            return "primary"
+        if name == "readonly":
+            return "primary" if enable_review else "success"
+        if name in {"translated", "unapproved"}:
+            return "success"
+        return ""
+
+    @cached_property
     def full_list(self):
         result: list[tuple[str, StrOrPromise, str]] = [
             ("all", gettext_lazy("All strings"), ""),
@@ -25,7 +65,7 @@ class FilterRegistry:
             ("nottranslated", gettext_lazy("Untranslated strings"), "state:empty"),
             ("todo", gettext_lazy("Unfinished strings"), "state:<translated"),
             ("translated", gettext_lazy("Translated strings"), "state:>=translated"),
-            ("fuzzy", gettext_lazy("Strings marked for edit"), "state:needs-editing"),
+            ("fuzzy", gettext_lazy("Strings marked for edit"), "is:needs-editing"),
             ("suggestions", gettext_lazy("Strings with suggestions"), "has:suggestion"),
             ("variants", gettext_lazy("Strings with variants"), "has:variant"),
             ("screenshots", gettext_lazy("Strings with screenshots"), "has:screenshot"),
@@ -37,6 +77,11 @@ class FilterRegistry:
                 "state:<translated AND NOT has:suggestion",
             ),
             ("comments", gettext_lazy("Strings with comments"), "has:comment"),
+            (
+                "source_comments",
+                gettext_lazy("Strings with source comments"),
+                "has:source-comment",
+            ),
             ("allchecks", gettext_lazy("Strings with any failing checks"), "has:check"),
             (
                 "translated_checks",
@@ -126,6 +171,7 @@ def get_filter_choice(project=None):
         ("suggestions", gettext("Strings with suggestions")),
         ("nosuggestions", gettext("Unfinished strings without suggestions")),
         ("comments", gettext("Strings with comments")),
+        ("source_comments", gettext("Strings with source comments")),
         ("allchecks", gettext("Strings with any failing checks")),
         ("approved", gettext("Approved strings")),
         ("approved_suggestions", gettext("Approved strings with suggestions")),

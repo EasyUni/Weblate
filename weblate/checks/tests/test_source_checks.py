@@ -4,18 +4,28 @@
 
 """Tests for source checks."""
 
-from datetime import timedelta
+from __future__ import annotations
 
+from datetime import timedelta
+from typing import cast
+from unittest.mock import patch
+
+from django.template import Context, Template
 from django.test import TestCase
 from django.utils import timezone
 
+from weblate.checks.models import Check
 from weblate.checks.source import (
     EllipsisCheck,
     LongUntranslatedCheck,
+    MultipleFailingCheck,
     OptionalPluralCheck,
+    SourceMaxLengthCheck,
 )
-from weblate.checks.tests.test_checks import MockUnit
-from weblate.trans.tests.test_views import FixtureTestCase
+from weblate.trans.models import Category, Unit
+from weblate.trans.tests.factories import make_language, make_unit
+from weblate.trans.tests.test_views import FixtureComponentTestCase, FixtureTestCase
+from weblate.utils.state import STATE_EMPTY, STATE_TRANSLATED
 
 
 class OptionalPluralCheckTest(TestCase):
@@ -23,13 +33,13 @@ class OptionalPluralCheckTest(TestCase):
         self.check = OptionalPluralCheck()
 
     def test_none(self) -> None:
-        self.assertFalse(self.check.check_source(["text"], MockUnit()))
+        self.assertFalse(self.check.check_source(["text"], make_unit()))
 
     def test_plural(self) -> None:
-        self.assertFalse(self.check.check_source(["text", "texts"], MockUnit()))
+        self.assertFalse(self.check.check_source(["text", "texts"], make_unit()))
 
     def test_failing(self) -> None:
-        self.assertTrue(self.check.check_source(["text(s)"], MockUnit()))
+        self.assertTrue(self.check.check_source(["text(s)"], make_unit()))
 
 
 class EllipsisCheckTest(TestCase):
@@ -37,33 +47,270 @@ class EllipsisCheckTest(TestCase):
         self.check = EllipsisCheck()
 
     def test_none(self) -> None:
-        self.assertFalse(self.check.check_source(["text"], MockUnit()))
+        self.assertFalse(self.check.check_source(["text"], make_unit()))
 
     def test_good(self) -> None:
-        self.assertFalse(self.check.check_source(["text…"], MockUnit()))
+        self.assertFalse(self.check.check_source(["text…"], make_unit()))
 
     def test_failing(self) -> None:
-        self.assertTrue(self.check.check_source(["text..."], MockUnit()))
+        self.assertTrue(self.check.check_source(["text..."], make_unit()))
+
+    def test_description_html(self) -> None:
+        check = Check(name="ellipsis")
+        rendered = Template("{{ check.get_description }}").render(
+            Context({"check": check})
+        )
+        self.assertEqual(
+            rendered,
+            "The string uses three dots <code>...</code> instead of an ellipsis character <code>…</code>.",
+        )
+
+    def test_description_contexts(self) -> None:
+        check = Check(name="ellipsis")
+        check_obj = cast("EllipsisCheck", check.check_obj)
+        with patch.object(
+            check_obj,
+            "description_template",
+            'Use {ellipsis}, not {dots}: "quotes" & <text>.',
+        ):
+            self.assertEqual(
+                check.get_description(),
+                "Use <code>…</code>, not <code>...</code>: &quot;quotes&quot; &amp; &lt;text&gt;.",
+            )
+            self.assertEqual(
+                check.get_plain_description(), 'Use …, not ...: "quotes" & <text>.'
+            )
+            self.assertEqual(
+                check_obj.get_documentation_description(),
+                'Use ``…``, not ``...``: "quotes" & <text>.',
+            )
+            self.assertEqual(
+                Template(
+                    '<span title="{{ check.get_plain_description|force_escape }}"></span>'
+                ).render(Context({"check": check})),
+                '<span title="Use …, not ...: &quot;quotes&quot; &amp; &lt;text&gt;."></span>',
+            )
 
 
-class LongUntranslatedCheckTestCase(FixtureTestCase):
+class SourceMaxLengthCheckTest(TestCase):
+    def setUp(self) -> None:
+        self.check = SourceMaxLengthCheck()
+
+    def get_unit(self, flags: str, source_language: str = "en") -> Unit:
+        unit = make_unit(flags=flags, is_source=True)
+        language = make_language(source_language)
+        unit.translation.language = language
+        unit.translation.language_code = language.code
+        unit.translation.component.source_language = language
+        return unit
+
+    def test_no_flag(self) -> None:
+        self.assertFalse(self.check.check_source(["x" * 200], self.get_unit("")))
+
+    def test_english_allows_fifteen_percent_headroom(self) -> None:
+        unit = self.get_unit("max-length:100")
+
+        self.assertFalse(self.check.check_source(["x" * 85], unit))
+        self.assertTrue(self.check.check_source(["x" * 86], unit))
+
+    def test_english_variant_uses_headroom(self) -> None:
+        unit = self.get_unit("max-length:100", "en_US")
+
+        self.assertFalse(self.check.check_source(["x" * 85], unit))
+        self.assertTrue(self.check.check_source(["x" * 86], unit))
+
+    def test_non_english_uses_max_length(self) -> None:
+        unit = self.get_unit("max-length:100", "cs")
+
+        self.assertFalse(self.check.check_source(["x" * 100], unit))
+        self.assertTrue(self.check.check_source(["x" * 101], unit))
+
+    def test_invalid_flag(self) -> None:
+        self.assertTrue(
+            self.check.check_source(["text"], self.get_unit("max-length:*"))
+        )
+
+    def test_ignored(self) -> None:
+        unit = self.get_unit("max-length:100, ignore-source-max-length")
+
+        self.assertFalse(self.check.check_source(["x" * 86], unit))
+
+    def test_plural(self) -> None:
+        unit = self.get_unit("max-length:100")
+
+        self.assertFalse(self.check.check_source(["x" * 84, "x" * 85], unit))
+        self.assertTrue(self.check.check_source(["x" * 84, "x" * 86], unit))
+
+    def test_replacements(self) -> None:
+        unit = self.get_unit('max-length:100, replacements:%s:"very long text"')
+
+        self.assertFalse(self.check.check_source(["x" * 82], unit))
+        self.assertTrue(self.check.check_source(["x" * 82 + "%s"], unit))
+
+    def test_invalid_replacements(self) -> None:
+        unit = self.get_unit("max-length:100, replacements:%s")
+
+        self.assertFalse(self.check.check_source(["x" * 85], unit))
+        self.assertTrue(self.check.check_source(["x" * 86], unit))
+
+    def test_xml_text(self) -> None:
+        unit = self.get_unit("max-length:100, xml-text")
+
+        self.assertFalse(self.check.check_source([f"<mrk>{'x' * 85}</mrk>"], unit))
+        self.assertTrue(self.check.check_source([f"<mrk>{'x' * 86}</mrk>"], unit))
+
+
+class LongUntranslatedCheckTestCase(FixtureComponentTestCase):
     check = LongUntranslatedCheck()
 
     def test_recent(self) -> None:
         unit = self.get_unit(language="en")
         unit.timestamp = timezone.now()
+        unit.save()
         unit.run_checks()
         self.assertNotIn("long_untranslated", unit.all_checks_names)
 
     def test_old(self) -> None:
         unit = self.get_unit(language="en")
         unit.timestamp = timezone.now() - timedelta(days=100)
+        unit.save()
         unit.run_checks()
         self.assertNotIn("long_untranslated", unit.all_checks_names)
 
     def test_old_untranslated(self) -> None:
         unit = self.get_unit(language="en")
         unit.timestamp = timezone.now() - timedelta(days=100)
+        unit.save()
         unit.translation.component.stats.set_data({"translated": 1, "all": 1})
+        unit.translation.component.stats.save()
         unit.run_checks()
         self.assertIn("long_untranslated", unit.all_checks_names)
+
+    def test_old_untranslated_batched(self) -> None:
+        unit = self.get_unit(language="en")
+        unit.timestamp = timezone.now() - timedelta(days=100)
+        unit.save()
+        Unit.objects.filter(translation__component=unit.translation.component).exclude(
+            source_unit=unit
+        ).update(state=STATE_TRANSLATED)
+        unit.unit_set.exclude(pk=unit.pk).update(state=STATE_EMPTY, target="")
+        self.check.perform_batch(self.component)
+        unit = Unit.objects.get(pk=unit.pk)
+        self.assertIn("long_untranslated", unit.all_checks_names)
+
+
+class MultipleFailingCheckTestCase(FixtureTestCase):
+    check = MultipleFailingCheck()
+
+    def test_description(self) -> None:
+        unit = self.get_unit(
+            source="Try Weblate at <https://demo.weblate.org/>!\n", language="en"
+        )
+        check = Check(unit=unit)
+        with self.assertNumQueries(1):
+            description = self.check.get_description(check)
+        self.assertIn(
+            "Following checks are failing:<dl><dt>Unchanged translation</dt>",
+            description,
+        )
+        self.assertIn("Czech", description)
+        self.assertIn("German", description)
+
+    def test_description_query_count(self) -> None:
+        unit = self.get_unit(
+            source="Try Weblate at <https://demo.weblate.org/>!\n", language="en"
+        )
+        check = Check(unit=unit)
+        for language in ("cs", "de"):
+            target = self.get_unit(source=unit.source, language=language)
+            Check.objects.get_or_create(unit=target, name="end_stop")
+            expected_links = list(
+                self.check.get_related_checks([unit.pk])
+                .select_related("unit__translation__language")
+                .order_by("pk")
+            )
+            with self.assertNumQueries(1):
+                description = self.check.get_description(check)
+            self.assertEqual(description.count("<a "), len(expected_links))
+            for related in expected_links:
+                self.assertIn(related.unit.get_absolute_url(), description)
+
+    def test_description_category_links(self) -> None:
+        unit = self.get_unit(
+            source="Try Weblate at <https://demo.weblate.org/>!\n", language="en"
+        )
+        check = Check(unit=unit)
+        parent = None
+        for depth in range(1, 4):
+            with self.subTest(depth=depth):
+                parent = Category.objects.create(
+                    name=f"Category {depth}",
+                    slug=f"category-{depth}",
+                    project=self.project,
+                    category=parent,
+                )
+                type(self.component).objects.filter(pk=self.component.pk).update(
+                    category=parent
+                )
+                expected_links = [
+                    related.unit.get_absolute_url()
+                    for related in self.check.get_related_checks([unit.pk])
+                ]
+                self.assertTrue(expected_links)
+                with self.assertNumQueries(1):
+                    description = self.check.get_description(check)
+                for url in expected_links:
+                    self.assertIn(url, description)
+
+    def test_description_without_related_checks(self) -> None:
+        unit = self.get_unit(
+            source="Try Weblate at <https://demo.weblate.org/>!\n", language="en"
+        )
+        self.check.get_related_checks([unit.pk]).delete()
+        with self.assertNumQueries(1):
+            description = self.check.get_description(Check(unit=unit))
+        self.assertEqual(description, self.check.description)
+
+    def test_multiple_failures(self) -> None:
+        # Create multiple units with the same source to trigger the "same" check
+        for unit in Unit.objects.filter(
+            translation__component=self.component, source__startswith="Hello, world!\n"
+        ):
+            if not unit.is_source:
+                self.edit_unit(
+                    unit.source,
+                    unit.source,
+                    unit.translation.language.code,
+                    True,
+                    unit.translation,
+                )
+        source_unit = self.get_unit(language="en")
+        child_unit = source_unit.unit_set.exclude(pk=source_unit.id).first()
+        self.assertIsNotNone(child_unit)
+        checked_child_unit = cast("Unit", child_unit)
+        checked_child_unit.run_checks()
+        self.assertIn("same", checked_child_unit.all_checks_names)
+        source_unit.run_checks()
+        self.assertTrue(self.check.check_source([], source_unit))
+
+    def test_multiple_failures_batched(self) -> None:
+        # Create multiple units with the same source to trigger the "same" check
+        for unit in Unit.objects.filter(
+            translation__component=self.component, source__startswith="Hello, world!\n"
+        ):
+            if not unit.is_source:
+                self.edit_unit(
+                    unit.source,
+                    unit.source,
+                    unit.translation.language.code,
+                    True,
+                    unit.translation,
+                )
+        source_unit = self.get_unit(language="en")
+        child_unit = source_unit.unit_set.exclude(pk=source_unit.id).first()
+        self.assertIsNotNone(child_unit)
+        checked_child_unit = cast("Unit", child_unit)
+        checked_child_unit.run_checks()
+        self.assertIn("same", checked_child_unit.all_checks_names)
+        self.check.perform_batch(self.component)
+        self.assertTrue(self.check.check_source([], source_unit))

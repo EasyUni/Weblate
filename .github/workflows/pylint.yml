@@ -6,9 +6,9 @@ name: pylint check
 
 on:
   push:
-    branches-ignore:
-    - renovate/**
-    - weblate
+    branches:
+    - main
+    - stable
   pull_request:
 
 permissions:
@@ -16,18 +16,25 @@ permissions:
 
 jobs:
   pylint:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - uses: astral-sh/setup-uv@4959332f0f014c5280e7eac8b70c90cb574c9f9b # v6.6.0
+    - name: Install apt dependencies
+      run: sudo ./ci/apt-install
     - name: Setup Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      id: setup_python
       with:
-        python-version: '3.13'
-    - name: Add pylint annotator
-      uses: pr-annotators/pylint-pr-annotator@9c31057f2f495d9aee9b96e10299cc6b0a010cc2 # v0.0.1
+        python-version: '3.14'
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        save-cache: ${{ github.ref == 'refs/heads/main' }}
+        cache-suffix: ${{ steps.setup_python.outputs.python-version }}
+        version: 0.13.6
+    - name: Install deps
+      run: uv sync --no-binary-package lxml --no-binary-package xmlsec --all-extras --group pylint
     - name: Run pylint
-      run: uv run --only-group pylint pylint weblate/
+      run: uv run --no-sync pylint --output-format=github weblate/ scripts/

@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 from itertools import zip_longest
-from typing import cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from django.core.cache import cache
 from django.db import models, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Exists, OuterRef, Q
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -18,25 +18,34 @@ from django.utils.functional import cached_property
 
 from weblate.auth.models import User
 from weblate.lang.models import Language
-from weblate.memory.models import Memory
+from weblate.memory.models import Memory, MemoryScope
 from weblate.screenshots.models import Screenshot
 from weblate.trans.actions import ActionEvents
 from weblate.trans.models import (
     Category,
     Component,
+    ComponentLink,
     ComponentList,
     Project,
     Translation,
 )
-from weblate.trans.models.change import Change, ChangeQuerySet
+from weblate.trans.models.change import Change, dt_as_day_range
 from weblate.utils.decorators import disable_for_loaddata
 from weblate.utils.stats import (
-    BaseStats,
     CategoryLanguage,
     GlobalStats,
     ProjectLanguage,
     prefetch_stats,
 )
+from weblate.workspaces.models import Workspace
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+
+    from weblate.trans.models.change import ChangeQuerySet
+    from weblate.utils.stats import (
+        BaseStats,
+    )
 
 BASIC_KEYS = {
     "all",
@@ -93,7 +102,102 @@ METRIC_ORDER = [
 ]
 
 
-class MetricQuerySet(models.QuerySet["Metric"]):
+class ChangeMetricData(TypedDict):
+    changes: int
+    contributors: int
+    contributors_total: int
+
+
+def get_user_change_metric_expressions() -> dict[str, Count]:
+    return {
+        "changes": Count("id"),
+        "comments": Count("id", filter=Q(action=ActionEvents.COMMENT)),
+        "suggestions": Count("id", filter=Q(action=ActionEvents.SUGGESTION)),
+        "translations": Count("id", filter=Q(action__in=Change.ACTIONS_CONTENT)),
+        "screenshots": Count(
+            "id",
+            filter=Q(
+                action__in=(
+                    ActionEvents.SCREENSHOT_ADDED,
+                    ActionEvents.SCREENSHOT_UPLOADED,
+                )
+            ),
+        ),
+    }
+
+
+def serialize_metric_data(data: dict) -> tuple[int, list[int] | None]:
+    """Extract the change count and serialize the remaining metric counters."""
+    changes = data.pop("changes")
+    db_data = None
+    if data:
+        db_data = [data.pop(name, 0) for name in METRIC_ORDER]
+        if data:
+            msg = f"Unsupported data: {data}"
+            raise ValueError(msg)
+    return changes, db_data
+
+
+def get_change_metric_data(changes: ChangeQuerySet, date: dt.date) -> ChangeMetricData:
+    """Calculate change metrics using two aggregate queries."""
+    active_user = Q(user__is_active=True, user__is_bot=False)
+    recent = changes.since_day(date - dt.timedelta(days=30)).aggregate(
+        changes=Count(
+            "id",
+            filter=Q(timestamp__range=dt_as_day_range(date - dt.timedelta(days=1))),
+        ),
+        contributors=Count("user", filter=active_user, distinct=True),
+    )
+    total = changes.aggregate(
+        contributors_total=Count("user", filter=active_user, distinct=True)
+    )
+    return {
+        "changes": recent["changes"],
+        "contributors": recent["contributors"],
+        "contributors_total": total["contributors_total"],
+    }
+
+
+def get_language_change_metric_data(
+    changes: ChangeQuerySet, date: dt.date
+) -> dict[int, ChangeMetricData]:
+    """Calculate change metrics grouped by translation language."""
+    active_user = Q(user__is_active=True, user__is_bot=False)
+    language_key = "translation__language_id"
+    result: dict[int, ChangeMetricData] = {}
+    for row in (
+        changes.since_day(date - dt.timedelta(days=30))
+        .values(language_key)
+        .annotate(
+            changes=Count(
+                "id",
+                filter=Q(timestamp__range=dt_as_day_range(date - dt.timedelta(days=1))),
+            ),
+            contributors=Count("user", filter=active_user, distinct=True),
+        )
+    ):
+        language_id = row[language_key]
+        if language_id is not None:
+            result[language_id] = {
+                "changes": row["changes"],
+                "contributors": row["contributors"],
+                "contributors_total": 0,
+            }
+    for row in (
+        changes.filter(active_user)
+        .values(language_key)
+        .annotate(contributors_total=Count("user", distinct=True))
+    ):
+        language_id = row[language_key]
+        if language_id is not None:
+            result.setdefault(
+                language_id,
+                {"changes": 0, "contributors": 0, "contributors_total": 0},
+            )["contributors_total"] = row["contributors_total"]
+    return result
+
+
+class MetricQuerySet(models.QuerySet["Metric", "Metric"]):
     def filter_metric(
         self, scope: int, relation: int, secondary: int = 0
     ) -> MetricQuerySet:
@@ -105,7 +209,7 @@ class MetricQuerySet(models.QuerySet["Metric"]):
         self, obj, scope: int, relation: int, secondary: int = 0
     ) -> Metric:
         today = timezone.now().date()
-        yesterday = today - datetime.timedelta(days=1)
+        yesterday = today - dt.timedelta(days=1)
 
         base = self.filter_metric(scope, relation, secondary)
 
@@ -136,7 +240,7 @@ class MetricManager(models.Manager["Metric"]):
         scope: int,
         relation: int,
         secondary: int = 0,
-        date=None,
+        date: dt.date | None = None,
     ):
         if stats is not None:
             for key in keys:
@@ -145,13 +249,7 @@ class MetricManager(models.Manager["Metric"]):
             date = timezone.now().date()
 
         # Prepare data for database
-        db_data = None
-        changes = data.pop("changes")
-        if data:
-            db_data = [data.pop(name, 0) for name in METRIC_ORDER]
-            if data:
-                msg = f"Unsupported data: {data}"
-                raise ValueError(msg)
+        changes, db_data = serialize_metric_data(data)
 
         metric, created = self.get_or_create(
             scope=scope,
@@ -202,7 +300,8 @@ class MetricManager(models.Manager["Metric"]):
             | User
             | Language
             | ProjectLanguage
-            | CategoryLanguage,
+            | CategoryLanguage
+            | Workspace,
         ):
             changes = cast("ChangeQuerySet", obj.change_set.all())  # type: ignore[misc]
         elif isinstance(obj, ComponentList):
@@ -213,7 +312,7 @@ class MetricManager(models.Manager["Metric"]):
             msg = f"Unsupported type for metrics: {obj!r}"
             raise TypeError(msg)
 
-        count = changes.filter_by_day(date - datetime.timedelta(days=1)).count()
+        count = changes.filter_by_day(date - dt.timedelta(days=1)).count()
         self.create_metrics(
             {"changes": count}, None, set(), scope, relation, secondary, date=date
         )
@@ -228,6 +327,8 @@ class MetricManager(models.Manager["Metric"]):
             return self.collect_component(obj)
         if isinstance(obj, Project):
             return self.collect_project(obj)
+        if isinstance(obj, Workspace):
+            return self.collect_workspace(obj)
         if isinstance(obj, Category):
             return self.collect_category(obj)
         if isinstance(obj, ComponentList):
@@ -242,8 +343,10 @@ class MetricManager(models.Manager["Metric"]):
         raise ValueError(msg)
 
     @transaction.atomic
-    def collect_global(self):
+    def collect_global(self, date: dt.date | None = None):
+        date = date or timezone.now().date()
         stats = GlobalStats()
+        changes = Change.objects.all()
         data = {
             "projects": Project.objects.count(),
             "public_projects": Project.objects.filter(
@@ -253,118 +356,144 @@ class MetricManager(models.Manager["Metric"]):
             "translations": Translation.objects.count(),
             "memory": Memory.objects.count(),
             "screenshots": Screenshot.objects.count(),
-            "changes": Change.objects.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1)
-            ).count(),
-            "contributors": Change.objects.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": Change.objects.count_users(),
             "users": User.objects.count(),
+            **get_change_metric_data(changes, date),
         }
-        return self.create_metrics(data, stats, SOURCE_KEYS, Metric.SCOPE_GLOBAL, 0)
-
-    @transaction.atomic
-    def collect_project_language(self, project_language: ProjectLanguage):
-        project = project_language.project
-        changes = project.change_set.filter(
-            translation__language=project_language.language
+        return self.create_metrics(
+            data, stats, SOURCE_KEYS, Metric.SCOPE_GLOBAL, 0, date=date
         )
 
-        data = {
-            "changes": changes.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1),
-            ).count(),
-            "contributors": changes.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": changes.count_users(),
-        }
+    @transaction.atomic
+    def collect_project_language(
+        self,
+        project_language: ProjectLanguage,
+        date: dt.date | None = None,
+        change_data: ChangeMetricData | None = None,
+    ):
+        date = date or timezone.now().date()
+        project = project_language.project
+        if change_data is None:
+            changes = project.change_set.filter(
+                translation__language=project_language.language
+            )
+            change_data = get_change_metric_data(changes, date)
 
         return self.create_metrics(
-            data,
+            dict(change_data),
             project_language.stats,
             SOURCE_KEYS,
             Metric.SCOPE_PROJECT_LANGUAGE,
             project.pk,
             project_language.language.pk,
+            date=date,
         )
 
     @transaction.atomic
-    def collect_category_language(self, category_language: CategoryLanguage):
+    def collect_category_language(
+        self,
+        category_language: CategoryLanguage,
+        date: dt.date | None = None,
+        change_data: ChangeMetricData | None = None,
+    ):
+        date = date or timezone.now().date()
         category = category_language.category
-        changes = category.project.change_set.for_category(category).filter(
-            translation__language=category_language.language
-        )
-
-        data = {
-            "changes": changes.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1),
-            ).count(),
-            "contributors": changes.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": changes.count_users(),
-        }
+        if change_data is None:
+            changes = Change.objects.for_category(category).filter(
+                translation__language=category_language.language
+            )
+            change_data = get_change_metric_data(changes, date)
 
         return self.create_metrics(
-            data,
+            dict(change_data),
             category_language.stats,
             SOURCE_KEYS,
             Metric.SCOPE_CATEGORY_LANGUAGE,
-            category.project.pk,
+            category.pk,
             category_language.language.pk,
+            date=date,
         )
 
     @transaction.atomic
-    def collect_category(self, category: Category):
+    def collect_category(self, category: Category, date: dt.date | None = None):
+        date = date or timezone.now().date()
+        changes = Change.objects.for_category(category)
+        language_change_data = get_language_change_metric_data(changes, date)
         languages = prefetch_stats(
             [CategoryLanguage(category, language) for language in category.languages]
         )
         for category_language in languages:
-            self.collect_category_language(category_language)
-        changes = Change.objects.for_category(category)
+            self.collect_category_language(
+                category_language,
+                date,
+                language_change_data.get(
+                    category_language.language.pk,
+                    {"changes": 0, "contributors": 0, "contributors_total": 0},
+                ),
+            )
+        category_filter = (
+            Q(category=category)
+            | Q(category__category=category)
+            | Q(category__category__category=category)
+        )
+        shared_component_ids = ComponentLink.objects.filter(
+            Q(category=category)
+            | Q(category__category=category)
+            | Q(category__category__category=category)
+        ).values_list("component_id", flat=True)
+        components = Component.objects.filter(
+            category_filter | Q(pk__in=shared_component_ids)
+        ).distinct()
         data = {
-            "components": category.component_set.count(),
+            "components": components.count(),
             "translations": Translation.objects.filter(
-                component__category=category
+                component__in=components
             ).count(),
-            "changes": changes.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1)
-            ).count(),
-            "contributors": changes.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": changes.count_users(),
+            **get_change_metric_data(changes, date),
         }
 
         return self.create_metrics(
-            data, category.stats, SOURCE_KEYS, Metric.SCOPE_CATEGORY, category.pk
+            data,
+            category.stats,
+            SOURCE_KEYS,
+            Metric.SCOPE_CATEGORY,
+            category.pk,
+            date=date,
         )
 
     @transaction.atomic
-    def collect_project(self, project: Project):
+    def collect_project(self, project: Project, date: dt.date | None = None):
+        date = date or timezone.now().date()
+        changes = project.change_set.all()
+        language_change_data = get_language_change_metric_data(changes, date)
         languages = prefetch_stats(
             [ProjectLanguage(project, language) for language in project.languages]
         )
         for project_language in languages:
-            self.collect_project_language(project_language)
+            self.collect_project_language(
+                project_language,
+                date,
+                language_change_data.get(
+                    project_language.language.pk,
+                    {"changes": 0, "contributors": 0, "contributors_total": 0},
+                ),
+            )
+        project_scope = MemoryScope.objects.filter(
+            memory_id=OuterRef("pk"),
+            project=project,
+            scope__in=(MemoryScope.SCOPE_PROJECT, MemoryScope.SCOPE_PROJECT_FILE),
+        )
         data = {
             "components": project.component_set.count(),
             "translations": Translation.objects.filter(
                 component__project=project
             ).count(),
-            "memory": project.memory_set.count(),
+            "memory": Memory.objects.alias(has_project_scope=Exists(project_scope))
+            .filter(has_project_scope=True)
+            .count(),
             "screenshots": Screenshot.objects.filter(
                 translation__component__project=project
             ).count(),
-            "changes": project.change_set.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1)
-            ).count(),
-            "contributors": project.change_set.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": project.change_set.count_users(),
+            **get_change_metric_data(changes, date),
         }
         keys = [
             f"machinery-accounting:internal:{project.id}",
@@ -378,59 +507,91 @@ class MetricManager(models.Manager["Metric"]):
         cache.delete_many(keys)
 
         return self.create_metrics(
-            data, project.stats, SOURCE_KEYS, Metric.SCOPE_PROJECT, project.pk
+            data,
+            project.stats,
+            SOURCE_KEYS,
+            Metric.SCOPE_PROJECT,
+            project.pk,
+            date=date,
         )
 
     @transaction.atomic
-    def collect_component(self, component: Component):
+    def collect_workspace(self, workspace: Workspace, date: dt.date | None = None):
+        date = date or timezone.now().date()
+        workspace_scope = MemoryScope.objects.filter(
+            memory_id=OuterRef("pk"),
+            workspace=workspace,
+            scope=MemoryScope.SCOPE_WORKSPACE,
+        )
+        changes = workspace.change_set.all()
+        data = {
+            "projects": workspace.projects.count(),
+            "components": Component.objects.filter(
+                project__workspace=workspace
+            ).count(),
+            "translations": Translation.objects.filter(
+                component__project__workspace=workspace
+            ).count(),
+            "memory": Memory.objects.alias(has_workspace_scope=Exists(workspace_scope))
+            .filter(has_workspace_scope=True)
+            .count(),
+            "screenshots": Screenshot.objects.filter(
+                translation__component__project__workspace=workspace
+            ).count(),
+            **get_change_metric_data(changes, date),
+        }
+        return self.create_metrics(
+            data,
+            workspace.stats,
+            SOURCE_KEYS,
+            Metric.SCOPE_WORKSPACE,
+            workspace.metric_id,
+            date=date,
+        )
+
+    @transaction.atomic
+    def collect_component(self, component: Component, date: dt.date | None = None):
+        date = date or timezone.now().date()
+        changes = component.change_set.all()
         data = {
             "translations": component.translation_set.count(),
             "screenshots": Screenshot.objects.filter(
                 translation__component=component
             ).count(),
-            "changes": component.change_set.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1)
-            ).count(),
-            "contributors": component.change_set.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": component.change_set.count_users(),
+            **get_change_metric_data(changes, date),
         }
         return self.create_metrics(
-            data, component.stats, SOURCE_KEYS, Metric.SCOPE_COMPONENT, component.pk
+            data,
+            component.stats,
+            SOURCE_KEYS,
+            Metric.SCOPE_COMPONENT,
+            component.pk,
+            date=date,
         )
 
     @transaction.atomic
-    def collect_component_list(self, clist: ComponentList):
+    def collect_component_list(self, clist: ComponentList, date: dt.date | None = None):
+        date = date or timezone.now().date()
         changes = Change.objects.filter(component__in=clist.components.all())
-        data = {
-            "changes": changes.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1)
-            ).count(),
-            "contributors": changes.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": changes.count_users(),
-        }
+        data = dict(get_change_metric_data(changes, date))
         return self.create_metrics(
             data,
             clist.stats,
             SOURCE_KEYS,
             Metric.SCOPE_COMPONENT_LIST,
             clist.pk,
+            date=date,
         )
 
     @transaction.atomic
-    def collect_translation(self, translation: Translation):
+    def collect_translation(
+        self, translation: Translation, date: dt.date | None = None
+    ):
+        date = date or timezone.now().date()
+        changes = translation.change_set.all()
         data = {
             "screenshots": translation.screenshot_set.count(),
-            "changes": translation.change_set.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1)
-            ).count(),
-            "contributors": translation.change_set.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": translation.change_set.count_users(),
+            **get_change_metric_data(changes, date),
         }
         return self.create_metrics(
             data,
@@ -438,41 +599,69 @@ class MetricManager(models.Manager["Metric"]):
             BASIC_KEYS,
             Metric.SCOPE_TRANSLATION,
             translation.pk,
+            date=date,
         )
 
-    @transaction.atomic
-    def collect_user(self, user: User):
-        data = user.change_set.filter_by_day(
-            timezone.now().date() - datetime.timedelta(days=1)
-        ).aggregate(
-            changes=Count("id"),
-            comments=Count("id", filter=Q(action=ActionEvents.COMMENT)),
-            suggestions=Count("id", filter=Q(action=ActionEvents.SUGGESTION)),
-            translations=Count("id", filter=Q(action__in=Change.ACTIONS_CONTENT)),
-            screenshots=Count(
-                "id",
-                filter=Q(
-                    action__in=(
-                        ActionEvents.SCREENSHOT_ADDED,
-                        ActionEvents.SCREENSHOT_UPLOADED,
-                    )
-                ),
-            ),
-        )
-        return self.create_metrics(data, None, set(), Metric.SCOPE_USER, user.pk)
+    def collect_users(self, user_ids: Collection[int], date: dt.date) -> None:
+        """Collect a batch of user metrics without per-user queries."""
+        if not user_ids:
+            return
+        user_ids = sorted(set(user_ids))
+        expressions = get_user_change_metric_expressions()
+        user_data = {}
+        for row in (
+            Change.objects.filter(user_id__in=user_ids)
+            .filter_by_day(date - dt.timedelta(days=1))
+            .order_by()
+            .values("user_id")
+            .annotate(**expressions)
+        ):
+            counters = dict(row)
+            user_data[counters.pop("user_id")] = counters
+        metrics = []
+        for user_id in user_ids:
+            changes, data = serialize_metric_data(
+                user_data.get(user_id, dict.fromkeys(expressions, 0))
+            )
+            metrics.append(
+                Metric(
+                    scope=Metric.SCOPE_USER,
+                    relation=user_id,
+                    secondary=0,
+                    date=date,
+                    changes=changes,
+                    data=data,
+                )
+            )
+
+        with transaction.atomic():
+            self.bulk_create(metrics, ignore_conflicts=True)
+            # Preserve completed metrics and existing change counts, just as
+            # create_metrics does. Lock incomplete rows before filling their data
+            # so overlapping collectors cannot overwrite a completed metric.
+            incomplete = list(
+                self.filter(
+                    Q(data__isnull=True) | Q(data=[]),
+                    scope=Metric.SCOPE_USER,
+                    relation__in=user_ids,
+                    secondary=0,
+                    date=date,
+                )
+                .order_by("relation")
+                .select_for_update()
+            )
+            data_by_user = {metric.relation: metric.data for metric in metrics}
+            for metric in incomplete:
+                metric.data = data_by_user[metric.relation]
+            self.bulk_update(incomplete, ["data"])
 
     @transaction.atomic
-    def collect_language(self, language: Language):
+    def collect_language(self, language: Language, date: dt.date | None = None):
+        date = date or timezone.now().date()
         changes = language.change_set.all()
         data = {
-            "changes": changes.filter_by_day(
-                timezone.now().date() - datetime.timedelta(days=1),
-            ).count(),
-            "contributors": changes.since_day(
-                timezone.now().date() - datetime.timedelta(days=30)
-            ).count_users(),
-            "contributors_total": changes.count_users(),
             "users": language.profile_set.count(),
+            **get_change_metric_data(changes, date),
         }
         return self.create_metrics(
             data,
@@ -480,6 +669,7 @@ class MetricManager(models.Manager["Metric"]):
             SOURCE_KEYS,
             Metric.SCOPE_LANGUAGE,
             language.pk,
+            date=date,
         )
 
 
@@ -494,9 +684,10 @@ class Metric(models.Model):
     SCOPE_LANGUAGE = 7
     SCOPE_CATEGORY = 8
     SCOPE_CATEGORY_LANGUAGE = 9
+    SCOPE_WORKSPACE = 10
 
     id = models.BigAutoField(primary_key=True)
-    date = models.DateField(default=datetime.date.today)
+    date = models.DateField(default=dt.date.today)
     scope = models.SmallIntegerField()
     relation = models.IntegerField()
     secondary = models.IntegerField(default=0)
@@ -506,6 +697,7 @@ class Metric(models.Model):
     objects = MetricManager.from_queryset(MetricQuerySet)()
 
     class Meta:
+        required_db_vendor = "postgresql"
         unique_together = (("scope", "relation", "secondary", "date"),)
         verbose_name = "Metric"
         verbose_name_plural = "Metrics"
@@ -530,6 +722,15 @@ def create_metrics_project(sender, instance, created=False, **kwargs) -> None:
     if created:
         Metric.objects.initialize_metrics(
             scope=Metric.SCOPE_PROJECT, relation=instance.pk
+        )
+
+
+@receiver(post_save, sender=Workspace)
+@disable_for_loaddata
+def create_metrics_workspace(sender, instance, created=False, **kwargs) -> None:
+    if created:
+        Metric.objects.initialize_metrics(
+            scope=Metric.SCOPE_WORKSPACE, relation=instance.metric_id
         )
 
 
@@ -573,6 +774,14 @@ def delete_metrics_category(sender, instance, **kwargs) -> None:
     Metric.objects.filter(
         scope__in=(Metric.SCOPE_CATEGORY_LANGUAGE, Metric.SCOPE_CATEGORY),
         relation=instance.pk,
+    ).delete()
+
+
+@receiver(post_delete, sender=Workspace)
+@disable_for_loaddata
+def delete_metrics_workspace(sender, instance, **kwargs) -> None:
+    Metric.objects.filter(
+        scope=Metric.SCOPE_WORKSPACE, relation=instance.metric_id
     ).delete()
 
 

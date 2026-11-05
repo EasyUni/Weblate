@@ -1,28 +1,42 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
-
+from __future__ import annotations
 
 import operator
+from typing import TYPE_CHECKING, ClassVar
 
+from botocore.exceptions import ClientError
 from django.utils.functional import cached_property
 
 from .base import (
-    DownloadTranslations,
+    MACHINERY_DEFAULT_THRESHOLD,
     GlossaryDoesNotExistError,
     GlossaryMachineTranslationMixin,
 )
 from .forms import AWSMachineryForm
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import (
+        DownloadTranslations,
+    )
 
 
 class AWSTranslation(GlossaryMachineTranslationMixin):
     """AWS machine translation."""
 
     name = "Amazon Translate"
+    # Short-term throttling; allow a conservative minute before retrying.
+    # https://docs.aws.amazon.com/translate/latest/APIReference/API_TranslateText.html
+    rate_limit_window = 60
     max_score = 88
-    language_map = {
+    language_map: ClassVar[dict[str, str]] = {
         "zh_Hant": "zh-TW",
         "zh_Hans": "zh",
+        "nb": "no",
         "nb_NO": "no",
     }
     settings_form = AWSMachineryForm
@@ -38,8 +52,30 @@ class AWSTranslation(GlossaryMachineTranslationMixin):
     def get_identifier(cls) -> str:
         return "aws"
 
+    def is_rate_limit_error(self, exc: Exception) -> bool:
+        if isinstance(exc, ClientError):
+            return (
+                exc.response.get("Error", {}).get("Code")
+                in {
+                    "TooManyRequestsException",
+                    "Throttling",
+                    "ThrottlingException",
+                    "RequestLimitExceeded",
+                }
+                or exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 429
+            )
+        return super().is_rate_limit_error(exc)
+
+    def get_rate_limit_timeout(self, exc: Exception) -> int:
+        if isinstance(exc, ClientError):
+            headers = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+            if (delay := self.get_retry_after(headers)) is not None:
+                return delay
+        return super().get_rate_limit_timeout(exc)
+
     @cached_property
     def client(self):
+        # ruff: ignore[import-outside-top-level]
         import boto3
 
         return boto3.client(
@@ -60,14 +96,14 @@ class AWSTranslation(GlossaryMachineTranslationMixin):
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
-        params = {
+        params: dict[str, object] = {
             "Text": text,
             "SourceLanguageCode": source_language,
             "TargetLanguageCode": target_language,
@@ -78,6 +114,17 @@ class AWSTranslation(GlossaryMachineTranslationMixin):
         )
         if glossary_name:
             params["TerminologyNames"] = [glossary_name]
+
+        settings = {}
+        for option, aws_key in (
+            ("formality", "Formality"),
+            ("brevity", "Brevity"),
+            ("profanity", "Profanity"),
+        ):
+            if value := self.settings.get(option):
+                settings[aws_key] = value
+        if settings:
+            params["Settings"] = settings
 
         response = self.client.translate_text(**params)
         yield {

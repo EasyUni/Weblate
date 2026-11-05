@@ -4,14 +4,21 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import os
-import re
+from __future__ import annotations
+
+# ruff: ignore[suspicious-subprocess-import]
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-import requests
+import httpx2
 from ruamel.yaml import YAML
+from update_version import VERSION_FILES, replace_file, update_version
+
+REPO_API = "https://api.github.com/repos/WeblateOrg/weblate"
+ACTIVITY_API = f"{REPO_API}/stats/commit_activity"
+FALLBACK_STATS_FILE = "weblate/trans/views/about.py"
 
 if len(sys.argv) != 2:
     print("Usage: ./scripts/set-version.py VERSION")
@@ -20,35 +27,77 @@ if len(sys.argv) != 2:
 version = version_full = sys.argv[1]
 if version.count(".") == 1:
     version_full = f"{version}.0"
+package_version = f"{version}.dev0"
 
 
-def replace_file(name, search, replace) -> None:
-    with open(name) as handle:
-        content = handle.read()
-
-    content = re.sub(search, replace, content, flags=re.MULTILINE)
-    with open(name, "w") as handle:
-        handle.write(content)
+def prepend_file(name: str, content: str) -> None:
+    content += Path(name).read_text(encoding="utf-8")
+    Path(name).write_text(content, encoding="utf-8")
 
 
-def prepend_file(name, content) -> None:
-    with open(name) as handle:
-        content += handle.read()
+def fetch_commit_activity(request_headers: dict[str, str]) -> list[dict[str, int]]:
+    """Fetch commit activity, retrying while GitHub prepares the stats."""
+    for _attempt in range(5):
+        activity_response = httpx2.get(
+            ACTIVITY_API,
+            headers=request_headers,
+            timeout=5,
+            follow_redirects=True,
+        )
+        if activity_response.status_code != 202:
+            activity_response.raise_for_status()
+            return activity_response.json()
+        time.sleep(1)
+    activity_response.raise_for_status()
+    msg = "GitHub commit activity is not ready"
+    raise RuntimeError(msg)
 
-    with open(name, "w") as handle:
-        handle.write(content)
+
+def fetch_fallback_stats(request_headers: dict[str, str]) -> dict[str, int]:
+    repo_response = httpx2.get(
+        REPO_API, headers=request_headers, timeout=5, follow_redirects=True
+    )
+    repo_response.raise_for_status()
+    repo = repo_response.json()
+    activity = sorted(
+        fetch_commit_activity(request_headers), key=lambda item: -item["week"]
+    )
+    return {
+        "stars": repo["stargazers_count"],
+        "issues": repo["open_issues_count"],
+        "commits": sum(item["total"] for item in activity[:8]),
+    }
+
+
+def update_fallback_stats(stats: dict[str, int]) -> None:
+    replace_file(
+        FALLBACK_STATS_FILE,
+        r"^FALLBACK_STATS = \{\n"
+        r'    "stars": \d+,\n'
+        r'    "issues": \d+,\n'
+        r'    "commits": \d+,\n'
+        r"\}",
+        "FALLBACK_STATS = {\n"
+        f'    "stars": {stats["stars"]},\n'
+        f'    "issues": {stats["issues"]},\n'
+        f'    "commits": {stats["commits"]},\n'
+        "}",
+    )
 
 
 yaml = YAML()
-with open(os.path.expanduser("~/.config/hub")) as handle:
-    config = yaml.load(handle.read())
+config = yaml.load(Path("~/.config/hub").expanduser().read_text(encoding="utf-8"))
 
 # Get/create milestone
-milestones_api = "https://api.github.com/repos/WeblateOrg/weblate/milestones"
+milestones_api = f"{REPO_API}/milestones"
 api_auth = f"token {config['github.com'][0]['oauth_token']}"
 headers = {"Authorization": api_auth, "Accept": "application/vnd.github.v3+json"}
-response = requests.get(
-    milestones_api, headers=headers, timeout=1, params={"state": "open"}
+response = httpx2.get(
+    milestones_api,
+    headers=headers,
+    timeout=1,
+    params={"state": "open"},
+    follow_redirects=True,
 )
 response.raise_for_status()
 milestone_url = None
@@ -57,7 +106,7 @@ for milestone in response.json():
         milestone_url = milestone["html_url"]
 
 if milestone_url is None:
-    response = requests.post(
+    response = httpx2.post(
         milestones_api, headers=headers, json={"title": version}, timeout=1
     )
     payload = response.json()
@@ -67,13 +116,14 @@ if milestone_url is None:
         print(payload)
         raise
 
+fallback_stats = fetch_fallback_stats(headers)
+
 # Set version in the files
-replace_file("weblate/utils/version.py", "^VERSION =.*", f'VERSION = "{version}-dev"')
-replace_file("docs/conf.py", "release =.*", f'release = "{version}"')
-replace_file("pyproject.toml", "^version = .*", f'version = "{version}"')
+update_version(package_version, version)
 replace_file(
     "client/package.json", '  "version": ".*",', f'  "version": "{version_full}",'
 )
+update_fallback_stats(fallback_stats)
 
 # Update changelog
 title = f"Weblate {version}"
@@ -87,6 +137,8 @@ header = f"""{title}
 
 .. rubric:: Improvements
 
+.. rubric:: Security fixes
+
 .. rubric:: Bug fixes
 
 .. rubric:: Compatibility
@@ -97,7 +149,7 @@ Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
 .. rubric:: Contributors
 
-.. include:: changes/contributors/{version}.rst
+.. include:: /changes/contributors/{version}.rst
 
 `All changes in detail <{milestone_url}?closed=1>`__.
 
@@ -109,22 +161,22 @@ version_contributors.write_text("""..
 """)
 
 files = [
-    "weblate/utils/version.py",
-    "docs/conf.py",
+    *VERSION_FILES,
     "docs/changes.rst",
-    "pyproject.toml",
     "client/package.json",
-    "uv.lock",
+    FALLBACK_STATS_FILE,
     version_contributors.as_posix(),
 ]
+# ruff: ignore[start-process-with-partial-path]
 subprocess.run(["git", "add", version_contributors.as_posix()], check=True)
 subprocess.run(
+    # ruff: ignore[start-process-with-partial-path]
     [
         "uv",
         "run",
         "--only-group",
         "pre-commit",
-        "pre-commit",
+        "prek",
         "run",
         "--files",
         *files,
@@ -132,5 +184,7 @@ subprocess.run(
     check=False,
 )
 subprocess.run(
-    ["git", "commit", "-m", f"chore: setting version to {version}", *files], check=True
+    # ruff: ignore[start-process-with-partial-path]
+    ["git", "commit", "-m", f"chore: setting version to {version}", *files],
+    check=True,
 )

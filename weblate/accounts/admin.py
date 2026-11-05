@@ -12,43 +12,56 @@ from weblate.wladmin.models import WeblateModelAdmin
 from .models import AuditLog, Profile, VerifiedEmail
 
 if TYPE_CHECKING:
+    from django.db.models import Model
+
     from weblate.auth.models import AuthenticatedHttpRequest
 
 
 @admin.register(AuditLog)
 class AuditLogAdmin(WeblateModelAdmin):
-    list_display = ["get_message", "user", "address", "user_agent", "timestamp"]
-    search_fields = ["user__username", "user__email", "address", "activity"]
+    list_display = ("get_message", "user", "address", "user_agent", "timestamp")
+    search_fields = (
+        "user__username",
+        "user__email",
+        "params__email",
+        "address",
+        "activity",
+    )
     date_hierarchy = "timestamp"
     ordering = ("-timestamp",)
 
     def has_delete_permission(
-        self, request: AuthenticatedHttpRequest, obj=None
+        self, request: AuthenticatedHttpRequest, obj: Model | None = None
     ) -> bool:
         return False
 
-    def has_add_permission(self, request: AuthenticatedHttpRequest, obj=None) -> bool:
+    def has_add_permission(
+        self, request: AuthenticatedHttpRequest, obj: Model | None = None
+    ) -> bool:
         return False
 
     def has_change_permission(
-        self, request: AuthenticatedHttpRequest, obj=None
+        self, request: AuthenticatedHttpRequest, obj: Model | None = None
     ) -> bool:
         return False
 
 
 @admin.register(Profile)
 class ProfileAdmin(WeblateModelAdmin):
-    list_display = ["user", "full_name", "language", "suggested", "translated"]
-    search_fields = ["user__username", "user__email", "user__full_name"]
-    list_filter = ["language"]
-    filter_horizontal = ("languages", "secondary_languages", "watched")
+    list_display = ("user", "full_name", "language", "suggested", "translated")
+    search_fields = ("user__username", "user__email", "user__full_name")
+    list_filter = ("language",)
+    filter_horizontal = ("languages", "secondary_languages")
+    autocomplete_fields = ("watched",)
 
     def has_delete_permission(
-        self, request: AuthenticatedHttpRequest, obj=None
+        self, request: AuthenticatedHttpRequest, obj: Model | None = None
     ) -> bool:
         return False
 
-    def has_add_permission(self, request: AuthenticatedHttpRequest, obj=None) -> bool:
+    def has_add_permission(
+        self, request: AuthenticatedHttpRequest, obj: Model | None = None
+    ) -> bool:
         return False
 
 
@@ -60,6 +73,6 @@ class VerifiedEmailAdmin(WeblateModelAdmin):
     ordering = ("email",)
 
     def has_delete_permission(
-        self, request: AuthenticatedHttpRequest, obj=None
+        self, request: AuthenticatedHttpRequest, obj: Model | None = None
     ) -> bool:
         return False

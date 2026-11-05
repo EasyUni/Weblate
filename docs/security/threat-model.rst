@@ -1,181 +1,1216 @@
 Weblate threat model
 ====================
 
-**Scope:** Core Weblate web application, its interactions with user browsers, backend components (web server, WSGI, database, Redis, Celery), and integration with external VCS.
-**Assumptions:** Standard Weblate deployment with typical components (nginx/Apache, Gunicorn/uWSGI, PostgreSQL, Redis, Celery) and user roles (Unauthenticated, Translator, Project Manager, Administrator).
+Project: Weblate
 
-System description and scope
-----------------------------
+Last reviewed for Weblate |release| at commit ``af7a54c07c``.
 
-Weblate is an open-source web-based localization platform built on Django. It
-integrates tightly with Git repositories to manage translations and offers
-CI/CD-style features for automation, hooks, and VCS synchronization.
+Date: 2026-09-24.
 
-Assets:
+Status: Accepted, 2026-09-01.
 
-* **Confidentiality:** Translation strings, API keys/credentials for VCS integration, user credentials (passwords, 2FA secrets), user personal data (email, name), session tokens, audit logs, private project data.
-* **Integrity:** Translation string content, VCS repository integrity, project and component configurations, user permissions, audit logs.
-* **Availability:** Weblate web interface, VCS integration, database access, background task processing.
-* **Authenticity/Non-repudiation:** Translation commit history, user attribution for translations, audit logs of administrative actions.
+Version binding: This model is versioned with Weblate releases. A report
+against Weblate version N is triaged against the model published for version N,
+not against the latest development branch. *(maintainer)*
 
-Conceptual data flow diagram
-----------------------------
+Reporting cross-reference: Reports that violate a property Weblate claims in
+`Security properties Weblate provides`_ are reported through :file:`SECURITY.md`
+and :doc:`/security/issues`. Reports that fall under `Out of scope`_ or
+`Security properties Weblate does not provide`_ can be closed by citing this
+document unless this model routes them to ``VALID-HARDENING``. *(documented)*
+(source: :doc:`/security/issues`)
 
-.. graphviz::
+Provenance legend: ``*(documented)*`` means the claim is stated in Weblate
+documentation; ``*(maintainer)*`` means it was stated by a maintainer during
+this threat-model process; ``*(inferred)*`` means it was reasoned from the
+current project shape and needs maintainer confirmation.
 
-   digraph translations {
-      graph [fontname = "sans-serif", fontsize=10];
-      node [fontname = "sans-serif", fontsize=10, margin=0.1, height=0, style=filled, fillcolor=white, shape=note];
-      edge [fontname = "sans-serif", fontsize=10, dir=both];
+Weblate is a Django-based web localization platform. It accepts work from
+browser users, API clients, project-scoped tokens, repository webhooks, VCS
+repositories, backup archives, background workers, and configured external
+services, then stores and synchronizes translation projects through a database,
+datastore, local filesystem repositories, and external code-hosting systems.
+*(documented)* (source: :doc:`/index`, :doc:`/api`, :doc:`/admin/continuous`)
 
-      "External user (browser)" -> "Web server (nginx/Apache)" [label="HTTPS"];
-      "Web server (nginx/Apache)" -> "Weblate application (WSGI, Celery)" [label="Internal API"];
-      "Weblate application (WSGI, Celery)" -> "Database (PostgreSQL, Redis)" [label="Database access"];
-      "Weblate application (WSGI, Celery)" -> "Internal VCS repository" [label="Filesystem access"];
-      "Weblate application (WSGI, Celery)" -> "External VCS repository" [label="Git/API"];
-      "Weblate application (WSGI, Celery)" -> "Logging (SIEM)" [label="GELF"];
-   }
+Scope and intended use
+----------------------
 
-
-Trust boundaries
-----------------
-
-* **Internet ↔ Web server:** Public internet traffic interacting with the first line of defense.
-* **Web server ↔ Weblate application:** Communication between the reverse proxy/web server and the application logic.
-* **Weblate application ↔ Database** Application logic accessing persistent and cached data.
-* **Weblate application ↔ Logging:** Application logic creating logs.
-* **Weblate application ↔ Internal VCS repository:** Application logic interacting with its local copy of the VCS repository.
-* **Weblate application ↔ External VCS repository:** Weblate reaching out to external code hosting platforms.
-* **Authenticated User ↔ Unauthenticated User:** Different privilege levels within the web application.
-
-Threat identification
----------------------
+This model describes shared trust boundaries and security properties. Features
+within a component family follow its general guidance unless an explicit
+exception applies; the representative surfaces below are not an exhaustive
+feature inventory. *(maintainer)*
 
 .. list-table::
    :header-rows: 1
 
-   * - Component/Interaction
-     - STRIDE threat category
-     - Threat description
-     - Potential impact
-   * - **Web server** (nginx/Apache)
-     - **DoS**
-     - **Denial of service:** Attacker floods the web server with requests, making Weblate unavailable.
-     - Loss of availability for translation.
-   * -
-     - **Information disclosure**
-     - **Configuration exposure:** Misconfigured server exposes sensitive files (e.g., config files, private keys).
-     - Exposure of credentials, internal architecture.
-   * -
-     - **Tampering**
-     - **Malicious request injection:** Attacker injects malicious data into HTTP headers or request bodies.
-     - Potential for SQL injection, XSS, or other injections if not properly handled by the backend.
-   * - **Weblate application**
-     - **Spoofing**
-     - **User impersonation:** Attacker gains access to a legitimate user's session (e.g., via session hijacking, compromised credentials).
-     - Unauthorized translation, repo access.
-   * - (WSGI/Celery)
-     - **Tampering**
-     - **Unauthorized translation modification:** Malicious user or exploited vulnerability allows altering translations, project configs, or VCS integration settings.
-     - Incorrect translations, broken build, RCE via VCS hooks.
-   * -
-     - **Tampering**
-     - **VCS integration manipulation:** Attacker manipulates Weblate's interaction with the VCS (e.g., injecting malicious commands via crafted repository URLs if not sanitized, leading to RCE).
-     - Code injection in target projects, data exfiltration.
-   * -
-     - **Repudiation**
-     - **Unattributed changes:** Malicious changes are made without proper attribution to the user or system responsible.
-     - Difficulty in auditing and accountability.
-   * -
-     - **Information disclosure**
-     - **Sensitive data leakage:** SQL injection, insecure API endpoints, or errors disclose sensitive data (e.g., other users' translations, VCS credentials, server information).
-     - Privacy breach, intellectual property theft.
-   * -
-     - **Information disclosure**
-     - **VCS credentials exposure:** Weblate's stored VCS credentials (SSH keys, tokens) are accessed by an attacker.
-     - Direct access to integrated code repositories.
-   * -
-     - **DoS**
-     - **Resource exhaustion:** Excessive background tasks or inefficient database queries triggered by an attacker lead to system slowdown or crash.
-     - Weblate unavailability.
-   * -
-     - **Elevation of privilege**
-     - **Role escalation:** A regular translator gains administrative privileges.
-     - Complete system compromise.
-   * -
-     - **Elevation of privilege**
-     - **Command injection:** Arbitrary code execution due to improper input validation in repository URLs or add-ons.
-     - System compromise, data exfiltration.
-   * - **Database/Redis**
-     - **Tampering**
-     - **Data corruption:** Direct access to the database allows altering translation strings, user data, or configuration.
-     - System malfunction, data integrity loss.
-   * -
-     - **Information disclosure**
-     - **Sensitive data access:** Unauthorized access to database/Redis exposes all stored data (credentials, translation memory, user profiles).
-     - Major data breach.
-   * -
-     - **DoS**
-     - **Database exhaustion:** Attacker floods the database with queries, or consumes all Redis memory/connections.
-     - Weblate unavailability.
-   * - **VCS integration**
-     - **Tampering**
-     - **Malicious commits from Weblate:** Compromised Weblate pushes malicious changes to the upstream repository.
-     - Introduction of malware/backdoors into target projects.
-   * -
-     - **Repudiation**
-     - **Fake commit attribution:** Weblate commits changes attributed to a wrong user (e.g., an admin forcing a commit in a translator's name without their consent).
-     - Accountability issues.
-   * - **User interaction**
-     - **Spoofing**
-     - **Phishing/social engineering:** Attacker tricks users into revealing credentials for Weblate or linked VCS accounts.
-     - Account compromise.
-   * - (Web UI)
-     - **Tampering**
-     - **Cross-Site scripting (XSS):** Malicious scripts injected into translations or user profiles execute in other users' browsers.
-     - Session hijacking, credential theft, defacement.
-   * -
-     - **Information disclosure**
-     - **Clickjacking/UI redress:** Attacker overlays malicious UI elements over Weblate, tricking users into unintended actions.
-     - Unauthorized actions, data manipulation.
-   * -
-     - **Information disclosure**
-     - **Sensitive data in UI:** Unintended exposure of sensitive data (e.g., another user's email) in the UI due to authorization flaws.
-     - Privacy breach.
+   * - Component family
+     - Representative surface
+     - Outside-process effects
+     - Model status
+   * - Web UI and REST API
+     - Browser views, forms, session endpoints, :doc:`/api`
+     - Database, datastore, e-mail, logs, uploaded files
+     - In scope. *(documented)* (source: :doc:`/api`, :doc:`/admin/install`)
+   * - Authentication, sessions, and authorization
+     - Login, 2FA, SSO, teams, permissions, project access, API tokens
+     - Database, identity providers, browser cookies
+     - In scope. *(documented)* (source: :doc:`/admin/auth`, :doc:`/admin/access`)
+   * - Project-scoped API tokens
+     - Tokens created in project :guilabel:`API access`
+     - Same application effects as the token permissions allow
+     - In scope as authenticated actors with delegated project scope.
+       *(documented)* (source: :doc:`/api`, :doc:`/admin/access`)
+   * - Webhooks
+     - :ref:`hooks`, project :ref:`project-enable_hooks`,
+       :ref:`code-hosting-github-app-webhook`
+     - Background task scheduling and VCS repository updates
+     - In scope as a public, deployment-hardened interface. *(documented)* (source: :ref:`hooks`, :ref:`project-enable_hooks`, :ref:`code-hosting-github-app-webhook`)
+   * - VCS integration
+     - Repository URLs, branches, pushes, pulls, merge requests, local clones,
+       and GitHub App registration, connections, component migration, and
+       removal
+     - Filesystem, child VCS commands, SSH/HTTPS network connections, and
+       provider repository or installation state
+     - In scope when reachable through Weblate configuration or project
+       content. *(documented)* (source: :doc:`/admin/continuous`,
+       :doc:`/admin/code-hosting`)
+   * - Background tasks
+     - Celery queues for repository updates, project deletion, notifications,
+       translation memory, translation, and backups
+     - Database, datastore, filesystem, outbound network
+     - In scope as Weblate-controlled execution of user or operator actions.
+       *(documented)* (source: :doc:`/admin/install`, :doc:`/api`)
+   * - Project backup import/export
+     - :ref:`projectbackup`, :doc:`/api` project backup endpoints,
+       :wladmin:`import_projectbackup`
+     - Uploaded ZIP archives, generated backup archives, filesystem restore,
+       repository state
+     - In scope. *(documented)* (source: :doc:`/admin/backup`, :doc:`/api`,
+       :doc:`/admin/management`)
+   * - Service backup
+     - BorgBackup configuration and :wladmin:`backup`
+     - Local or remote backup storage over filesystem or SSH
+     - In scope for Weblate's handling of configured backup jobs; Borg itself
+       is out of scope. *(documented)* (source: :doc:`/admin/backup`,
+       :doc:`/admin/management`)
+   * - Machine translation and outbound integrations
+     - Machine translation, avatars, status reporting, telemetry, error
+       reporting, VCS hosts, GitHub App connections, CDN add-on, Fedora
+       Messaging add-on, e-mail delivery (SMTP or AWS SES)
+     - Outbound HTTP(S), AMQP(S), provider APIs, logs
+     - In scope for Weblate's enforcement of configured access and network
+       restrictions. Provider behavior is out of scope. *(documented)* (source: :doc:`/admin/config`, :doc:`/admin/code-hosting`, :doc:`/admin/addons`)
+   * - Add-ons
+     - Built-in add-ons and administrator-configured add-on execution
+     - Varies by add-on; can mutate project or repository state or contact
+       services
+     - Built-in add-ons are in scope when enabled. Third-party add-ons are out
+       of scope except for Weblate's permission and installation gates.
+       *(maintainer)*
+   * - Management commands
+     - :program:`weblate` commands run by an operator
+     - Database, filesystem, VCS, backup storage
+     - In scope when processing untrusted Weblate data; the local operator
+       shell is trusted. *(maintainer)*
+   * - Tests, generated docs, screenshots, development fixtures
+     - :file:`docs/_build/`, :file:`docs/screenshots/`, tests, local fixtures
+     - Development-only files and generated artifacts
+     - Out of scope for product security claims. *(maintainer)*
 
-Mitigation strategies
+Development environments are not supported production deployments and do not
+provide security isolation from a malicious checkout or local user.
+*(maintainer)*
+
+The intended deployment is a server-side Weblate installation behind a web
+server or reverse proxy, with a WSGI or ASGI application server, PostgreSQL
+database, datastore, Celery workers, a writable data directory, and optional
+outbound VCS, backup, identity-provider, and machine-translation integrations.
+*(documented)* (source: :doc:`/admin/install`)
+
+The relevant actors are split by trust level: unauthenticated clients,
+authenticated users, reviewers, project managers, administrators,
+project-scoped API tokens, webhook senders, external VCS providers, configured
+external services, and local operators. *(documented)* (source: :doc:`/admin/access`,
+:doc:`/api`)
+
+Weblate is not intended to be embedded as an in-process security library, used
+as a sandbox for untrusted code, or exposed without the deployment controls
+documented for production use. *(maintainer)*
+
+Out of scope
+------------
+
+The following are explicit non-goals for this model:
+
+* A compromised operating system account, container runtime, database server,
+  datastore, reverse proxy, or administrator shell. Weblate runs inside those
+  boundaries and does not claim to protect itself from an already-compromised
+  host. *(maintainer)*
+* A malicious Weblate site administrator or local operator with unrestricted
+  server access. Such an actor can change settings, credentials, data, or code.
+  *(maintainer)*
+* Vulnerabilities in third-party dependencies as independent projects. General
+  Django, Django REST framework, Python Social Auth, BorgBackup, VCS, database,
+  and provider vulnerabilities are reported upstream unless the issue is in
+  Weblate's use of them. *(documented)* (source: :doc:`/security/issues`)
+* Build and release hygiene, including action pinning, artifact signing,
+  dependency freshness, and repository branch protection. These affect project
+  operations but are not threat-model claims about Weblate runtime behavior.
+  *(maintainer)*
+* General security of external VCS providers, identity providers, mail servers,
+  machine-translation services, avatar services, CDN storage, or backup
+  storage. Weblate models only its configured interactions with them.
+  *(maintainer)*
+* User organizations' translation-supply-chain choices outside Weblate.
+  Outsourced or crowdsourced translator risks are described separately in
+  :doc:`/security/localization-threat`. *(documented)* (source: :doc:`/security/localization-threat`)
+* Third-party add-on code, local customization code, development fixtures,
+  generated documentation output, test-only code, and demo or example data.
+  *(maintainer)*
+
+Trust boundaries and data flow
+------------------------------
+
+Weblate's primary trust boundary is the network-facing application surface:
+browser views, API endpoints, webhook endpoints, and upload endpoints accept
+data from less-trusted actors and translate it into database rows, local
+repository state, background tasks, outbound requests, and rendered UI.
+*(maintainer)*
+
+.. list-table::
+   :header-rows: 1
+
+   * - Boundary
+     - Trust transition
+   * - Client browser/API client to Weblate
+     - Untrusted or authenticated requests become permission-checked
+       application actions. *(documented)* (source: :doc:`/api`, :doc:`/admin/access`)
+   * - Weblate identity provider to relying applications
+     - Administrators register trusted OIDC clients and callback URLs. Users
+       authenticate through Weblate and share consented identity claims, or
+       administrators explicitly permit a client to skip consent. Newly issued
+       access and refresh token values are hashed by default. Provider
+       tokens remain valid independently of browser sessions and do not grant
+       Weblate REST API access. Relying applications control their own account
+       linking and sessions. *(documented)* (source: :ref:`oidc-provider`)
+   * - Weblate to public CDN storage and clients
+     - Enabling CDN publication deliberately moves selected translations and
+       public build identifiers and resource mappings outside
+       project access controls, including translations from private components.
+       Removing published origin files cannot revoke cached or downloaded copies.
+       Preparation files in the CDN filesystem remain non-public only when the
+       origin excludes the reserved staging directory as required by
+       :ref:`cdn-server-security`.
+       *(documented)* (source: :ref:`addon-weblate.cdn.kotlin`)
+   * - Projects to global shared translation memory
+     - Enabling contribution deliberately publishes source strings,
+       translations, and project and component origin outside project access
+       controls, including for Private and Custom projects. Restricted
+       components do not contribute. Disabling contribution prevents the
+       project's automatic entries from remaining visible through the shared
+       scope, but cannot revoke copies already observed or downloaded.
+       *(documented)* (source: :ref:`shared-tm`, :ref:`api-memory`)
+   * - Weblate request process to repository Celery worker
+     - Permission-checked browser and API repository actions become queued work
+       carrying the initiating user and affected repository scope. The worker
+       reacquires the datastore reservation and rechecks the user's current VCS
+       permission on the current repository owner before mutation.
+       The broker, datastore, and workers are trusted parts of the same Weblate
+       instance. *(maintainer)*
+   * - Webhook sender to Weblate
+     - Public forge notifications can schedule repository synchronization
+       where hooks are enabled, matching components by exact repository URL
+       rather than host or path suffix fallback. Generic hook responses expose
+       match counts and, for updated components, project/component slugs and API
+       URLs, including for private projects and restricted components.
+       Components managed through an authenticated integration are excluded
+       from generic matching and diagnostics; currently this applies to the
+       GitHub App VCS backend. Registered GitHub App webhooks authenticate with
+       a per-app URL token and GitHub signature verification. Opt-in legacy
+       GitHub App deliveries to the generic GitHub webhook URL authenticate
+       with a separately configured secret. *(documented)* (source: :ref:`hooks`,
+       :ref:`project-enable_hooks`, :ref:`hooks-target-matching`,
+       :ref:`code-hosting-github-app-webhook`,
+       :setting:`GITHUB_LEGACY_APP_WEBHOOK_SECRET`)
+   * - eTranslation service to Weblate
+     - A public callback carries text suggestions or failures into a short-lived
+       cache entry. Weblate accepts it only with the unpredictable token issued
+       for a pending request; it cannot edit translation units directly.
+       *(documented)* (source: :ref:`mt-etranslation`)
+   * - Weblate to database/datastore
+     - Permission-checked application state becomes persistent data and queued
+       work. *(documented)* (source: :doc:`/admin/install`)
+   * - Weblate to local VCS repositories
+     - Project configuration and repository content drive filesystem and VCS
+       operations. *(documented)* (source: :doc:`/admin/continuous`)
+   * - Weblate to external services
+     - Configured URLs, credentials, and provider settings drive outbound
+       network connections. *(documented)* (source: :doc:`/admin/code-hosting`,
+       :doc:`/admin/config`)
+   * - Project backup archives and Weblate filesystem
+     - Uploaded ZIP members and metadata become restored project state;
+       generated project backups are written to and read from local backup
+       storage. *(documented)* (source: :doc:`/admin/backup`, :doc:`/api`,
+       :ref:`projectbackup`)
+
+Reachability preconditions:
+
+* A web UI or API finding is in model only when reachable by an unauthenticated
+  client, authenticated user, or project-scoped token through documented
+  routes, forms, or API endpoints. *(maintainer)*
+* An authorization finding is in model only when it crosses a documented
+  permission, team, project, component, language, glossary, token, or site-wide
+  boundary. *(documented)* (source: :doc:`/admin/access`)
+* A webhook finding is in model only when a request can reach an enabled hook
+  endpoint and affect repository update scheduling, task volume, or information
+  returned to the caller beyond the documented matching diagnostics.
+  *(documented)* (source: :ref:`hooks`, :ref:`project-enable_hooks`,
+  :ref:`hooks-target-matching`)
+* A VCS finding is in model only when attacker-controlled or less-trusted
+  repository data, branch names, URLs, file names, commit metadata, or project
+  configuration can influence Weblate's VCS operations. *(maintainer)*
+* A backup import finding is in model only when reachable from a project backup
+  uploaded through Weblate or supplied to :wladmin:`import_projectbackup`.
+  *(documented)* (source: :ref:`projectbackup`, :wladmin:`import_projectbackup`)
+* A backup export finding is in model only when reachable from documented
+  project backup creation or download routes, including the REST API for users
+  or project-scoped tokens with project edit permission.
+  *(documented)* (source: :doc:`/api`, :ref:`projectbackup`, :doc:`/admin/access`)
+* A background-task finding is in model only when the task can be queued from
+  an in-scope Weblate surface or scheduled Weblate maintenance path.
+  *(documented)* (source: :doc:`/admin/install`)
+* A management-command finding is in model only when untrusted Weblate data is
+  processed by the command; arbitrary local shell access is not an attacker
+  capability. *(maintainer)*
+
+Environment assumptions
+-----------------------
+
+Weblate assumes a supported Python and Django runtime, a correctly configured
+database, a datastore, a writable data directory, and running workers for
+features that require background processing. *(documented)* (source: :doc:`/admin/install`)
+
+Production deployments are expected to configure the external web server or
+reverse proxy consistently with Weblate's HTTPS, host header, body-size, and
+proxy-header settings. *(documented)* (source: :doc:`/admin/install`,
+:setting:`ENABLE_HTTPS`, :setting:`ALLOWED_HOSTS`)
+
+The database, datastore, and internal service ports are assumed not to be
+directly exposed to untrusted networks. *(maintainer)*
+
+Filesystem permissions are assumed to prevent unrelated local users from
+modifying Weblate's data directory, configuration, VCS repositories, generated
+SSH wrappers, backups, and secret material. *(documented)* (source: :doc:`/admin/backup`,
+:doc:`/admin/install`)
+
+Celery workers are trusted components of the same Weblate instance. A malicious
+or compromised worker is equivalent to a compromised application process.
+*(maintainer)*
+
+Worker process and queue separation do not create security isolation; workers
+retain the same trusted application authority. *(maintainer)*
+
+VCS command execution, SSH, and HTTPS clients are assumed to execute as the
+Weblate service user with the credentials configured for the relevant project
+or integration, including database-stored GitHub App credentials used for
+installation tokens and webhook signature verification. *(documented)* (source: :doc:`/admin/code-hosting`,
+:setting:`SSH_EXTRA_ARGS`)
+
+What Weblate does to its host:
+
+* It opens outbound network connections for configured VCS, identity-provider,
+  avatar, machine-translation, backup, status-reporting, telemetry,
+  error-reporting, and add-on features such as outbound webhooks and Fedora
+  Messaging AMQP delivery.
+  *(documented)* (source: :doc:`/admin/config`, :doc:`/admin/code-hosting`,
+  :doc:`/admin/backup`)
+* It runs VCS and backup-related helper commands as part of repository and
+  backup workflows. *(documented)* (source: :doc:`/admin/continuous`,
+  :doc:`/admin/backup`)
+* It writes to the configured data directory, repository storage, media/fonts,
+  backup dumps, logs, and cache locations. *(documented)* (source: :doc:`/admin/config`,
+  :doc:`/admin/backup`)
+* It sends e-mail and notifications through configured providers.
+  Operator-controlled service endpoints and credentials are trusted
+  infrastructure, outside user-configurable private-target restrictions.
+  *(documented)* (source: :doc:`/admin/config`, :doc:`/admin/install/docker`)
+* It does not claim to be free of process-wide side effects such as logging,
+  cache writes, subprocess execution, or outbound network access. *(maintainer)*
+
+Build-time and configuration variants
+-------------------------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Knob
+     - Default or documented posture
+     - Effect on the model
+     - Maintainer stance
+   * - :setting:`ENABLE_HOOKS` and :ref:`project-enable_hooks`
+     - Anonymous remote hooks are configurable and must also be enabled for a
+       project. *(documented)*
+     - Exposes webhook endpoints as a public scheduling interface. Abuse
+       resistance depends on deployment controls. *(documented)* (source: :ref:`hooks`, :ref:`project-enable_hooks`)
+     - Production deployments exposing hooks use capacity monitoring,
+       body-size limits, minimal public exposure, and optional edge controls
+       appropriate for their provider traffic. Rate limiting can be unsuitable
+       when many legitimate projects deliver from shared provider
+       infrastructure. *(maintainer)*
+   * - :setting:`ENABLE_HTTPS`, proxy SSL headers, and HSTS settings
+     - HTTPS affects secure cookies, redirects, HSTS, WebAuthn, and generated
+       URLs. *(documented)* (source: :setting:`ENABLE_HTTPS`)
+     - Disabling or misconfiguring HTTPS removes transport and cookie
+       protections that Weblate relies on for browser security. *(documented)* (source: :setting:`ENABLE_HTTPS`)
+     - The documented production posture is HTTPS with correct proxy headers.
+       *(documented)*
+   * - :setting:`ALLOWED_HOSTS`
+     - Configures accepted HTTP hostnames. *(documented)* (source: :setting:`ALLOWED_HOSTS`)
+     - Broad host acceptance can weaken host-header based protections and URL
+       generation assumptions. *(maintainer)*
+     - Production deployments restrict this to instance hostnames. *(maintainer)*
+   * - :envvar:`WEBLATE_API_RATELIMIT_ANON`,
+       :envvar:`WEBLATE_API_RATELIMIT_USER`,
+       :setting:`API_RATELIMIT_USER_OVERRIDES`,
+       :setting:`API_RATELIMIT_IP_OVERRIDES`, :setting:`RATELIMIT_ATTEMPTS`,
+       and ``RATELIMIT_GITHUB_SETUP_ATTEMPTS``
+     - Rate limits are configurable. *(documented)* (source: :doc:`/api`,
+       :doc:`/admin/config`)
+     - Availability claims assume rate limits appropriate to deployment size
+       and exposure. *(maintainer)*
+     - Operators can override or exempt users and IP networks, including
+       anonymous clients. IP exemptions rely on trusted proxy configuration;
+       they do not grant authentication or permissions. *(documented)*
+       (source: :ref:`api-rate`, :setting:`IP_BEHIND_REVERSE_PROXY`).
+       Disabling rate limits changes DoS triage from Weblate bug to deployment
+       posture unless a single request violates a claimed property.
+       *(maintainer)*
+   * - :setting:`CSP_SCRIPT_SRC`, :setting:`CSP_IMG_SRC`,
+       :setting:`CSP_CONNECT_SRC`, :setting:`CSP_STYLE_SRC`,
+       :setting:`CSP_FONT_SRC`, :setting:`CSP_FORM_SRC`
+     - Content Security Policy sources are configurable. *(documented)*
+       (source: :doc:`/admin/config`) The default script policy permits inline
+       execution only on explicitly scoped compatibility paths. *(maintainer)*
+     - Broadening sources can reduce browser-side containment for XSS or
+       third-party content. *(maintainer)*
+     - Deployments adding third-party sources accept that expanded browser
+       trust. *(maintainer)*
+   * - :setting:`PROJECT_BACKUP_UPLOAD_MAX_SIZE`,
+       :setting:`PROJECT_BACKUP_IMPORT_MAX_MEMBERS`,
+       :setting:`PROJECT_BACKUP_IMPORT_MAX_TOTAL_UNCOMPRESSED_SIZE`,
+       :setting:`PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE`,
+       :setting:`PROJECT_BACKUP_IMPORT_MIN_RATIO_SIZE`,
+       :setting:`PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_RATIO`
+     - Defaults bound project backup upload and import size, member count, and
+       suspicious compression ratios. *(documented)* (source: :doc:`/admin/config`)
+     - Raising or disabling these limits expands restore-time resource exposure.
+       *(documented)* (source: :doc:`/admin/config`)
+     - The defaults documented above are part of backup-import resource guarantees.
+       *(documented)*
+   * - Private-target restrictions and allowlists for outbound URLs
+     - User-configurable outbound URL surfaces documented with private-target
+       restriction settings reject internal or non-public targets by default.
+       *(documented)*
+       (source: :setting:`ASSET_RESTRICT_PRIVATE`,
+       :setting:`PROJECT_WEB_RESTRICT_PRIVATE`,
+       :setting:`WEBHOOK_RESTRICT_PRIVATE`, :setting:`VCS_RESTRICT_PRIVATE`)
+       Protected direct HTTP requests are bound to addresses approved by
+       runtime validation; configured per-protocol HTTP proxies are trusted
+       infrastructure and resolve their destination hosts.
+       Protected Git HTTPS and SSH operations are bound to addresses approved
+       by runtime validation. Protected SSH operations validate the effective
+       ``HostName`` and ``Port``. Trusted administrator SSH configuration can
+       alter routing, and :setting:`SSH_EXTRA_ARGS` can override connection
+       binding. Permanent same-host Git HTTP redirects are probed without
+       automatic redirect following. Every direct destination is independently
+       validated and bound before use; configured per-protocol HTTP proxies use
+       the shared trusted outbound routing. Git LFS object transfers are
+       disabled and outside the supported VCS integration surface. VCS clients
+       without connection binding require an explicit trusted-host exemption.
+       *(maintainer)*
+     - Allowlist settings and privileged configuration can intentionally expand
+       reachability. A non-empty :setting:`VCS_ALLOW_HOSTS` also restricts all
+       configured VCS hosts, while :setting:`VCS_PRIVATE_ALLOWLIST` only exempts
+       matching hosts from private-target checks and does not bypass that host
+       filter. Fedora Messaging broker URLs are site-administrator configuration
+       and are trusted by this model. *(documented)* (source:
+       :setting:`ASSET_PRIVATE_ALLOWLIST`,
+       :setting:`PROJECT_WEB_RESTRICT_ALLOWLIST`,
+       :setting:`WEBHOOK_PRIVATE_ALLOWLIST`, :setting:`VCS_ALLOW_HOSTS`,
+       :setting:`VCS_PRIVATE_ALLOWLIST`)
+     - Default private-target rejection is an application-level security
+       property for the documented user-configurable URL surfaces.
+       *(maintainer)*
+   * - :setting:`SSH_EXTRA_ARGS`
+     - Allows custom SSH options. *(documented)* (source: :setting:`SSH_EXTRA_ARGS`)
+     - Weakening SSH algorithms or host verification changes VCS transport
+       assumptions. Routing options can override protected repository address
+       pinning. *(maintainer)*
+     - Operators own the security impact of custom SSH options. *(maintainer)*
+   * - Third-party add-ons and local customization
+     - Administrators can extend behavior. *(documented)* (source: :doc:`/admin/addons`)
+     - Custom code can add new trust boundaries and security properties outside
+       this model. *(maintainer)*
+     - Third-party code is modeled separately. *(maintainer)*
+   * - Declarative automation expressions
+     - Add-on managers configure ordered Weblate operations and CEL conditions.
+       *(documented)* (source: :ref:`automation-workflows`)
+     - Expressions receive JSON context rather than application objects. A
+       resource-limited helper process parses and evaluates CEL without custom
+       function bindings; workflows cannot supply Python code. This is a distinct
+       expression-evaluation boundary, not a sandbox for arbitrary Python.
+       On macOS, the helper enforces CPU and wall-time limits but no memory cap,
+       so expressions can exhaust memory within those time limits.
+       *(maintainer)*
+     - Existing add-on management authority governs mutations. Operation scopes,
+       validation, and automation-origin suppression constrain declarative runs;
+       custom Python add-ons retain their separate trust model. *(maintainer)*
+   * - Bulk regular expression replacement
+     - Users with bulk-edit permissions and add-on managers supply replacement
+       patterns and templates. *(maintainer)* (source: :ref:`bulk-edit`)
+     - A dedicated helper receives strings over bounded JSON messages, compiles
+       patterns, and expands replacements incrementally with input and output
+       limits. Cumulative CPU and application waiting budgets constrain a run;
+       supported platforms also enforce a helper address-space limit. The helper
+       receives no Django objects and accepts no Python code. This isolates regex
+       resource consumption, not arbitrary application extensions. On macOS,
+       native regex compilation and matching can still exhaust memory because
+       the address-space limit is unavailable. *(maintainer)*
+     - Existing edit and add-on management permissions govern mutations. Resource
+       failures abort the current batch; previously completed batches can
+       remain changed. See :ref:`bulk-edit` for limits and execution boundaries.
+       *(maintainer)*
+
+
+Input assumptions
+-----------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Surface
+     - Input
+     - Attacker-controllable?
+     - Caller or operator must enforce
+   * - Browser forms and REST API
+     - Request bodies, query strings, uploaded files, headers, cookies
+     - Yes, within the actor's authentication state. *(documented)* (source: :doc:`/api`)
+     - HTTPS, correct host/proxy configuration, rate limits, and permission
+       assignment. *(documented)* (source: :doc:`/admin/install`,
+       :doc:`/admin/access`)
+   * - Authentication endpoints
+     - Passwords, WebAuthn data, SSO callbacks, reset tokens
+     - Yes. *(documented)* (source: :doc:`/admin/auth`)
+     - Correct identity-provider configuration and HTTPS. *(documented)* (source: :doc:`/admin/auth`, :setting:`ENABLE_HTTPS`)
+   * - Project-scoped tokens
+     - API requests authenticated by token
+     - Yes, by whoever holds the token. *(documented)* (source: :doc:`/api`)
+     - Token storage, rotation, and least-privilege team membership.
+       *(maintainer)*
+   * - Translation content
+     - Source strings, translations, comments, suggestions, glossary entries
+     - Yes, from users with relevant permissions or imported repositories.
+       *(documented)* (source: :doc:`/user/translating`, :doc:`/admin/access`)
+     - Review workflows and permission assignment for project-specific content
+       integrity. *(documented)* (source: :doc:`/workflows`, :doc:`/admin/access`)
+   * - Aggregate translation downloads
+     - Translation files, templates, paths, and file metadata from individually
+       authorized translations
+     - Yes, from users with ``translation.download`` permission for the
+       component and language. *(documented)* (source: :doc:`/api`,
+       :doc:`/admin/access`)
+     - Filter every archive member by effective translation download permission,
+       including restricted-component and language limits. *(maintainer)*
+   * - Webhook endpoints
+     - Headers, event type, body, repository and branch metadata
+     - Yes, where endpoint is reachable. *(documented)* (source: :ref:`hooks`)
+     - Hook enablement only where needed, request limits, and monitoring.
+       *(maintainer)*
+   * - GitHub App lifecycle
+     - Registration and installation callbacks, GitHub OAuth code, signed
+       Weblate state, installation ID, account metadata, component migration
+       selections, and connection-removal requests
+     - Yes, from authenticated Weblate users and GitHub redirect query strings.
+       *(documented)* (source: :ref:`code-hosting-github-app-register`,
+       :ref:`code-hosting-github-app-migrate`)
+     - Registering App credentials requires the site-wide
+       ``management.configure`` permission. Connecting or removing an
+       installation requires management rights for its workspace, and Weblate
+       verifies GitHub administration of an installation before connecting it.
+       Component migration additionally requires edit permission for every
+       selected component. Removing the last workspace connection also attempts
+       to uninstall the App from GitHub. *(documented)*
+       (source: :ref:`code-hosting-github-app-register`,
+       :ref:`code-hosting-github-app-migrate`)
+   * - Repository configuration
+     - Repository URLs, branches, push URLs, credentials, Gerrit review push
+       options, add-on settings, and :ref:`vcs_params` controlling force pushes
+       and pull-request behavior
+     - Trusted to users with corresponding management permissions.
+       *(documented)* (source: :doc:`/admin/access`, :doc:`/admin/continuous`)
+       The automatic translation add-on can create approved strings when the
+       target language's effective review settings allow it. Configuring this
+       behavior uses add-on management permissions rather than the configuring
+       user's review permission. *(documented)* (source: :doc:`/admin/addons`)
+     - Assign VCS and project management permissions only to trusted users.
+       *(documented)* (source: :doc:`/admin/access`)
+   * - External repository content
+     - Translation files, paths, branch names, commit metadata
+     - Yes, if the upstream repository is controlled by another actor.
+       *(maintainer)*
+     - Trust the configured upstream repository or review imported changes.
+       *(maintainer)*
+   * - Project backup import
+     - ZIP archive members, metadata, translation files, repository state
+     - Yes, for whoever can upload or provide the backup. *(documented)* (source: :ref:`projectbackup`)
+     - Keep import limits at values appropriate for the instance. *(documented)* (source: :doc:`/admin/config`)
+   * - Project backup export
+     - Backup creation requests and requested backup file names
+     - Yes, for users or project-scoped tokens with project edit permission.
+       *(documented)* (source: :doc:`/api`, :ref:`projectbackup`, :doc:`/admin/access`)
+     - Grant project edit permission only to trusted project administrators.
+       *(documented)* (source: :doc:`/admin/access`)
+   * - Machine translation and external service configuration
+     - Provider URLs, credentials, model or service settings
+     - Trusted to administrators or users granted configuration permissions.
+       *(documented)* (source: :doc:`/admin/machine`, :doc:`/admin/access`)
+     - Treat configured providers as recipients of the data sent to them; the
+       submitted content varies by provider and enabled feature. *(maintainer)*
+   * - Management commands
+     - Command-line arguments and files supplied by the local operator
+     - Trusted local input unless processing Weblate data or project backups.
+       *(maintainer)*
+     - Restrict shell access to trusted operators. *(maintainer)*
+   * - Deployment configuration
+     - Environment variables, container arguments, mounted configuration,
+       image selection, and workload or orchestration manifests
+     - Trusted local-operator input. Systems that delegate selected deployment
+       values to less-trusted users introduce an external trust boundary;
+       Weblate does not treat those values as untrusted application input.
+       *(maintainer)*
+     - Restrict deployment access to trusted operators and validate delegated
+       values before they reach Weblate. *(maintainer)*
+
+Size and rate assumptions:
+
+* Weblate relies on application and reverse-proxy upload limits for large HTTP
+  requests. *(documented)* (source: :setting:`PROJECT_BACKUP_UPLOAD_MAX_SIZE`)
+* Project backup imports are bounded by member count, aggregate uncompressed
+  size, compressed entry size, minimum ratio size, and compression ratio
+  settings. *(documented)* (source: :doc:`/admin/config`)
+* Project backup metadata, object references, repository paths, outbound URLs,
+  regular expressions, and screenshot content are validated before restore
+  writes project state. Failed restores remove repository and media objects
+  created by that attempt. *(documented)* (source: :ref:`projectbackup`)
+* API and selected web actions are expected to be protected by configured rate
+  limits. *(documented)* (source: :doc:`/api`, :doc:`/admin/config`)
+* Repository size, number of projects, number of components, and worker
+  capacity are deployment-sizing concerns unless a single in-scope input
+  bypasses documented limits or permissions. *(maintainer)*
+
+Adversary model
+---------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Actor
+     - In-scope capabilities
+     - Out-of-scope capabilities
+   * - Unauthenticated internet client
+     - Send HTTP(S) requests to public pages, registration, login, API, and
+       reachable webhook endpoints. *(documented)* (source: :doc:`/api`)
+     - Read server memory, bypass reverse proxy controls, or access internal
+       services directly. *(maintainer)*
+   * - Authenticated user
+     - Perform actions allowed by assigned teams, permissions, and workflow.
+       *(documented)* (source: :doc:`/admin/access`)
+     - Act outside assigned permissions without exploiting a Weblate flaw.
+       *(documented)* (source: :doc:`/admin/access`)
+   * - Reviewer or project manager
+     - Exercise delegated project, component, language, review, VCS,
+       translation memory, screenshot, or access-management permissions.
+       *(documented)* (source: :doc:`/admin/access`)
+     - Become a site administrator unless granted that role or exploiting a
+       Weblate flaw. *(maintainer)*
+   * - Project-scoped API token holder
+     - Use API permissions assigned to the token's team memberships, including
+       project backup creation and download where project edit permission is
+       granted. *(documented)* (source: :doc:`/api`, :doc:`/admin/access`,
+       :ref:`projectbackup`)
+     - Access projects, components, or site-wide functions outside its scope.
+       *(documented)* (source: :doc:`/admin/access`)
+   * - Webhook sender
+     - Send forged, replayed, malformed, or high-volume webhook requests to
+       enabled hook endpoints and observe documented matching diagnostics.
+       *(documented)* (source: :ref:`hooks`, :ref:`hooks-target-matching`)
+     - Obtain forge-authenticated identity where Weblate does not verify it.
+       *(maintainer)*
+   * - External VCS or service provider
+     - Return repository data, API responses, redirects, or errors according
+       to the configured integration. *(documented)* (source: :doc:`/admin/code-hosting`)
+     - Compromise the Weblate host except through data or protocol behavior
+       Weblate processes. *(maintainer)*
+   * - Translator or localization contributor
+     - Submit translation content that downstream applications might consume.
+       *(documented)* (source: :doc:`/security/localization-threat`)
+     - Control downstream application escaping, rendering, or review policy
+       outside Weblate. *(documented)* (source: :doc:`/security/localization-threat`)
+   * - Local operator
+     - Run management commands, change configuration, and access backups.
+       *(documented)* (source: :doc:`/admin/management`, :doc:`/admin/backup`)
+     - Local malicious operators are trusted for this model. *(maintainer)*
+
+The modeled attacker tries to bypass authorization, modify translation or
+repository data without permission, disclose private project or user data,
+forge or abuse repository synchronization, trigger unsafe outbound requests,
+execute commands through Weblate-controlled workflows, or exhaust bounded
+application resources. *(maintainer)*
+
+Security properties Weblate provides
+------------------------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Property
+     - Conditions
+     - Violation symptom
+     - Severity tier
+   * - User discovery and profile access respect global role permissions.
+       *(documented)* (source: :doc:`/admin/privacy`)
+     - Operators configure the desired policy. Resource-scoped discovery and
+       contribution attribution have separate permission controls; this does
+       not provide contributor anonymity. *(documented)*
+     - Generic user enumeration bypasses a restricted directory policy, or
+       profile data is returned to a viewer excluded by the profile policy.
+     - Authorization bypass; assess the exposed data and configured policy.
+   * - Web authorization separates site, project, component, language,
+       glossary, VCS, translation memory, screenshot, review, and access
+       management permissions. *(documented)* (source: :doc:`/admin/access`,
+       :doc:`/admin/auth`, :doc:`/admin/memory`)
+     - Permission assignments match the intended trust relationship.
+       Team-level enforced 2FA is satisfied by human users before
+       team-derived permissions apply. Pending authenticator app registrations
+       do not satisfy 2FA requirements. Registration requires a valid,
+       single-use TOTP code and cannot be completed more than once, including
+       under concurrent submissions. First-factor registration also requires
+       recent confirmation of an existing password or an already-linked
+       authentication provider. Registration does not establish recent
+       second-factor verification for other sensitive actions. *(documented)*
+       (source: :ref:`2fa`)
+       Component administrators are trusted to
+       configure operations that can affect repository contents, for example by
+       selecting files through component settings, configuring add-ons, or
+       enabling force pushes and pull-request behavior through :ref:`vcs_params`.
+       Add-ons are persistent administrative configuration: project and category
+       add-ons operate on compatible restricted descendants, while component
+       add-ons can consume cross-component inputs documented by the add-on.
+       Their service identities and configured authority do not depend on the
+       configuring user's later account or permission state. Project backups
+       similarly contain every component in the project, including restricted
+       components. Project administrators with ``project.edit`` can directly
+       access and manage restricted components in their project, but retain
+       separate permissions for translation, review, and download actions.
+       Component restrictions protect other users' direct access and are not an
+       isolation boundary against these documented administrative capabilities.
+       Users with management rights for a workspace are trusted to connect and
+       remove its GitHub App installations; removing the final workspace
+       connection can uninstall the App from GitHub. GitHub App component
+       migration separately requires edit permission for every selected
+       component.
+       Linking a repository extends this trust to administrators of every
+       linked component for the complete shared checkout. Permissions for
+       explicit VCS actions are checked on the repository-owning component.
+       Linking accepts this owner's authority over the complete shared checkout;
+       permissions on downstream linked components neither grant nor veto
+       explicit VCS authority. Project-wide
+       VCS actions omit repositories where this permission check fails; they do
+       not partially operate on an individual shared checkout. Explicit VCS
+       actions queued from the browser or API retain the initiating user,
+       serialize access to the affected repositories, and recheck that user's
+       permission on the current repository owner in the worker
+       before mutation. Weblate's normal background commit and push of
+       authorized translation changes does not require the editor to have
+       these VCS permissions. The ``reports.view`` permission authorizes all
+       report data in the selected scope, including private projects and
+       restricted components below it. Complete workspace-level report access
+       requires two-factor authentication for regular users if any project in
+       the workspace enforces it. Superusers and bot accounts are exempt.
+       Workspace :ref:`translation propagation <workspace-propagation-scope>`
+       checks destination edit permissions and requires destination review
+       permission and enabled reviews to propagate an approved state. Otherwise,
+       propagated text awaits review where enabled. Its associated quality checks
+       compare strings across projects only when both projects use Public or
+       Protected access control, and preserve restricted-component boundaries
+       for warning presence and descriptions.
+       Translation memory
+       attributed to an existing restricted component follows that component's
+       access rules.
+       Unattributed automatic memory, including unmatched legacy entries and
+       memory retained after component removal, follows its remaining
+       translation-memory scope. Private and Custom project engage pages and
+       rendered status widgets follow project access control unless a trusted
+       access manager enables :ref:`project-public_sharing`. That explicit
+       opt-in publishes project and component names, including restricted
+       components, together with translation statistics, languages, and
+       progress, but does not grant access to project content or APIs.
+     - User or token can read or mutate data outside assigned scope.
+     - Security-critical when private data or privileged mutation is exposed.
+   * - Project-scoped API tokens are limited by assigned project/team
+       permissions. *(documented)* (source: :doc:`/api`, :doc:`/admin/access`)
+     - Token is created and stored by a trusted actor.
+     - Token can act outside project or team scope.
+     - Security-critical.
+   * - Automatic team assignments to project and workspace teams require the
+       recipient to accept an invitation before membership is granted.
+       Site-defined teams can assign users directly. *(documented)* (source:
+       :ref:`autoteam`)
+     - Rules are evaluated for newly created accounts.
+     - A scoped automatic assignment grants membership without acceptance.
+     - Security-critical. Pending invitations remain visible to team managers,
+       and matching rules can send unsolicited invitation e-mails.
+   * - Authentication and session controls protect browser sessions when HTTPS
+       and proxy settings are correct. Pending second-factor sessions are bound
+       to the current password authentication state, and repeated rejected
+       second-factor submissions lock password sign-in according to
+       :setting:`AUTH_LOCK_ATTEMPTS`. Access to personal API tokens and
+       changes to authentication credentials, access permissions, project
+       visibility, account status, and bulk user-contribution cleanup require
+       recent credential verification for browser sessions. Accounts with 2FA
+       use a second factor; other accounts confirm their password or an existing
+       sign-in provider. API tokens remain separate credentials. *(documented)* (source:
+       :doc:`/admin/auth`, :setting:`ENABLE_HTTPS`)
+     - Production HTTPS and secure-cookie settings are enabled.
+     - Session fixation, credential bypass, cross-user session confusion, or a
+       pending password sign-in remaining usable after a password change or
+       account lock.
+     - Security-critical.
+   * - User-supplied content rendered by Weblate is expected not to execute
+       script in other users' browsers. *(maintainer)*
+     - Content is displayed through Weblate UI templates and standard escaping.
+     - Stored or reflected XSS in the Weblate origin.
+     - Security-critical.
+   * - Repository, branch, path, and VCS inputs processed by Weblate must not
+       become shell command execution. *(maintainer)*
+     - VCS operations are invoked through Weblate-supported repository
+       workflows and configured credentials. Project backup restores allow only
+       non-executable Git, git-svn, and Mercurial repository state, and rebuild
+       repository-local configuration from validated component settings.
+       Weblate does not populate Git submodules (see :ref:`git-submodules`).
+     - Command injection or arbitrary code execution as the Weblate user.
+     - Security-critical.
+   * - Private project data other than documented generic webhook matching
+       diagnostics, metadata published through :ref:`project-public_sharing`,
+       translations explicitly published through :ref:`shared-tm`,
+       and translations, build identifiers, and resource mappings explicitly
+       published through CDN add-ons,
+       user data, credentials, tokens, SSH keys, and 2FA secrets are not
+       disclosed to actors lacking permission. *(documented)* (source:
+       :doc:`/admin/access`, :doc:`/security/privacy-compliance`, :doc:`/vcs`)
+     - Host, database, and storage permissions are intact. User-configurable
+       repository and push URLs cannot address the server filesystem. Generic webhook
+       responses expose only the match counts, project/component slugs, and API
+       URLs documented in :ref:`hooks-target-matching`. Public sharing permits
+       unauthenticated access to engage pages and rendered status widgets,
+       exposing project and component names, including restricted components,
+       translation statistics, languages, and progress. It does not grant
+       access to project content or APIs. Repository content
+       deliberately shared through linked components follows the linked
+       repository trust boundary. Project repository permission diagnostics
+       identify accessible repository owners where an operation requires
+       permission, but do not expose inaccessible component identities or
+       blocked repository content or status. Custom add-ons list only
+       non-sensitive fields as public configuration; unlisted values are
+       redacted from public change history. Installing the
+       :ref:`addon-weblate.cdn.kotlin` add-on explicitly publishes translations,
+       application package names and version codes, and the names and submitted
+       IDs of published resources
+       from that component to unauthenticated CDN clients, including for private
+       projects. CDN storage and cached client copies are outside project access
+       controls; removing origin files cannot revoke previously downloaded copies.
+       Enabling shared translation memory contribution explicitly publishes
+       source strings, translations, and project and component origin outside
+       project access controls, including for Private and Custom projects.
+     - Cross-project data leak not covered by the documented generic webhook
+       diagnostics, public-sharing metadata, explicit shared-memory or CDN
+       publication, or linked-repository trust boundary, credential exposure,
+       or unauthorized export.
+     - Security-critical.
+   * - Backup import rejects archives exceeding documented upload, member,
+       aggregate size, and suspicious compression thresholds. *(documented)* (source: :doc:`/admin/config`, :ref:`projectbackup`)
+     - Defaults or stricter limits remain configured.
+     - Oversized or highly amplified archive is accepted past configured
+       thresholds.
+     - Security-critical for single-request DoS; otherwise availability bug.
+   * - Documented user-configurable outbound URL surfaces reject internal or
+       non-public targets by default. *(documented)* (source:
+       :setting:`ASSET_RESTRICT_PRIVATE`,
+       :setting:`PROJECT_WEB_RESTRICT_PRIVATE`,
+       :setting:`WEBHOOK_RESTRICT_PRIVATE`, :setting:`VCS_RESTRICT_PRIVATE`)
+     - Default private-target checks are enabled and no trusted allowlist
+       exemption applies. Direct protected HTTP requests and Git HTTPS and SSH
+       operations retain address binding, VCS restrictions remain enabled,
+       and VCS backends without binding use only explicitly trusted hosts.
+       Configured per-protocol HTTP proxies remain trusted routing
+       infrastructure.
+     - A user-configurable screenshot URL, remote HTML URL, project website or
+       repository browser URL, outbound webhook URL, or VCS URL reaches an
+       internal or non-public target despite default controls.
+     - Security-critical when it exposes internal services or metadata.
+   * - Weblate records security-relevant account, permission, billing lifecycle,
+       authenticated web-action rate-limit lockouts, and project or component
+       setting changes in audit logs or history. Account-removal audit entries
+       retain the former e-mail address until :setting:`AUDITLOG_EXPIRY`.
+       *(documented)* (source: :doc:`/security/privacy-compliance`,
+       :ref:`rate-limit`, :ref:`billing`, :doc:`/changes`)
+     - Logging is configured, storage is available, and
+       :setting:`AUDITLOG_EXPIRY` reflects the operator's intended retention.
+     - Missing audit trail for an action Weblate claims to log, or personal data
+       retained beyond the configured audit-log expiry.
+     - Security-critical when it blocks investigation of privileged changes or
+       discloses retained personal data; privacy-impacting when data exceeds the
+       configured retention; correctness-only for minor event gaps.
+   * - Self-service trial creation grants only the designated commercial trial
+       plan or the Libre setup plan. *(maintainer)*
+     - The deployment offers self-service hosting trials.
+     - An authenticated user can select another public, private, or internal
+       billing plan when creating a trial.
+     - Security-critical when this bypasses paid service limits.
+   * - Rate-limited API and web actions enforce configured rate limits.
+       *(documented)* (source: :doc:`/api`, :doc:`/admin/config`)
+     - Rate limiting is enabled and backed by a working datastore.
+     - Requests exceeding configured thresholds continue to be processed.
+     - Availability/security hardening depending on endpoint sensitivity.
+   * - Built-in translation quality checks, history rendering, exports, and
+       reports must not permit user-controlled content within configured size
+       limits to monopolize request or background workers through
+       disproportionate resource consumption. *(maintainer)*
+     - Content is accepted through a supported browser or API translation write
+       and processed during the write or subsequently from stored history.
+     - A single accepted translation causes CPU or memory consumption
+       disproportionate to its size and stalls a request or background worker
+       during a write or subsequent processing.
+     - Security-critical for single-request DoS; otherwise availability bug.
+   * - Component file masks must not let a single path match monopolize request
+       or background workers through disproportionate CPU consumption.
+       *(maintainer)*
+     - A user with component management permission configures a file mask, and
+       validation or repository processing matches it against repository paths.
+     - A crafted mask and path stall a worker during component validation or
+       subsequent repository processing.
+     - Security-critical for single-request DoS; otherwise availability bug.
+   * - Generic webhooks schedule repository updates only for eligible components
+       whose repository URL exactly matches a repository URL from the payload,
+       including documented URL variants. Components managed through an
+       authenticated integration are excluded from generic matching and
+       diagnostics. Generic responses disclose only the documented matching
+       diagnostics for eligible components. *(documented)* (source:
+       :ref:`hooks-target-matching`)
+     - Hooks are enabled and the delivery reaches an in-scope hook endpoint.
+     - A delivery updates a component whose repository URL does not exactly
+       match the payload, including through host or path suffix fallback, or a
+       generic delivery updates or discloses a component managed through an
+       authenticated integration, or a response discloses component information
+       beyond the documented fields.
+     - Security-critical when it causes unauthorized repository synchronization
+       across unrelated components; otherwise correctness or hardening.
+   * - Weblate does not intentionally expose database, datastore, backup
+       storage, or raw internal storage directly through the public web
+       interface; exported VCS repositories are intentionally exposed by
+       :ref:`git-exporter` when that optional module is enabled; authorized
+       project backup downloads are intentionally exposed through documented
+       project backup routes. *(documented)* (source: :doc:`/api`,
+       :ref:`projectbackup`) *(maintainer)*
+     - Deployment does not serve internal storage paths as static files except
+       for documented export features.
+     - Public request retrieves raw internal storage, configuration, or
+       non-exported repository data.
+     - Security-critical.
+
+Resource thresholds in this model are the documented configuration defaults
+where they exist, especially backup import limits and rate limits. For
+repository size, project count, component count, and translation volume, Weblate
+does not claim a fixed universal resource ceiling independent of deployment
+capacity. *(maintainer)*
+
+Component discovery bounds repository traversal, file-mask matching, and
+detected-preset comparison work even when repository content controls the masks; see
+:ref:`component discovery limits <component-discovery-limits>`. *(maintainer)*
+
+Security properties Weblate does not provide
+--------------------------------------------
+
+Weblate does not authenticate every webhook delivery cryptographically for all
+supported forge integrations. Hook endpoints are compatibility-oriented and
+deployment-hardened rather than uniformly forge-authenticated. Reports that
+show only unauthenticated triggering within modeled effects are
+``VALID-HARDENING`` rather than ``BY-DESIGN``. *(maintainer)*
+
+Weblate does not make an unauthenticated webhook equivalent to a trusted forge
+identity. Hook processing can trigger update workflows, and generic responses
+can confirm repository registration and reveal match counts, project/component
+slugs, and API URLs, including for private projects and restricted components.
+Components managed through an authenticated integration are excluded from this
+generic behavior. Generic deliveries are not application-rate-limited or
+coalesced: repository operations are serialized for consistency, but each
+matching delivery can record a hook event and schedule an update attempt. An
+unchanged repository still requires a remote fetch before the update stops
+without merging or parsing translation files. Attribution and authenticity are
+weaker than for an authenticated user or token. *(maintainer)*
+
+User-requested background work is authorized when Weblate accepts and queues
+the request. Background tasks do not always verify the initiating user's
+permissions again when they execute. Later changes to the user's account,
+permissions, or team memberships therefore do not reliably prevent
+already-authorized work from completing. *(maintainer)*
+
+Weblate is not a sandbox for malicious administrators, malicious local
+operators, third-party add-ons, custom deployment code, VCS clients, or backup
+tools. *(maintainer)*
+
+Weblate does not guarantee that translation content is safe when copied into a
+downstream product without that product's own escaping, validation, or review.
+Translation checks and review workflows help manage localization quality and
+risk; they are not a complete downstream application security boundary.
+*(documented)* (source: :doc:`/security/localization-threat`, :doc:`/user/checks`)
+
+False friends:
+
+* Weblate permissions are application authorization, not a host sandbox. A user
+  granted VCS or project management permissions can intentionally configure
+  integrations within that role's power. *(maintainer)*
+* Webhook project matching and event parsing are not proof that the sender is
+  the legitimate forge when the integration does not authenticate the delivery.
+  *(maintainer)*
+* Translation checks detect common quality and format problems; they are not a
+  guarantee that translated strings are safe for every downstream renderer.
+  *(documented)* (source: :doc:`/user/checks`,
+  :doc:`/security/localization-threat`)
+* BorgBackup encryption protects backup archives according to Borg's design;
+  Weblate does not add a separate cryptographic guarantee for Borg internals.
+  *(documented)* (source: :doc:`/admin/backup`)
+* Rate limits reduce abuse of configured endpoints; they are not a guarantee of
+  availability under volumetric network attacks. *(maintainer)*
+
+Well-known attack classes left partly or wholly to deployment or downstream
+systems:
+
+* Phishing and credential reuse are mitigated by authentication policy and 2FA,
+  but Weblate cannot prevent users from disclosing credentials outside the
+  service. *(maintainer)*
+* Malicious translations can become XSS, format-string, command, or policy
+  problems in downstream applications that render them unsafely. *(documented)* (source: :doc:`/security/localization-threat`)
+* User-configurable outbound URL surfaces with documented private-target
+  restrictions reject internal or non-public targets by default; privileged
+  allowlists, proxies, and administrator-controlled configuration can
+  intentionally expand reachability. *(maintainer)*
+* Large repository histories, project scale, and background task volume require
+  deployment sizing and operational limits beyond Weblate's single-input
+  validation. *(maintainer)*
+
+Downstream responsibilities
+---------------------------
+
+Operators must deploy Weblate behind production-grade HTTPS with correct proxy
+headers, hostnames, request-size limits, and secure-cookie behavior.
+*(documented)* (source: :doc:`/admin/install`, :setting:`ENABLE_HTTPS`,
+:setting:`ALLOWED_HOSTS`)
+
+Operators enabling forwarded client-IP handling must trust only reverse proxies
+under their control and prevent untrusted clients from bypassing those proxies
+to reach Weblate directly. *(documented)* (source:
+:envvar:`WEBLATE_TRUSTED_PROXY_ADDRESSES`, :ref:`reverse-proxy`)
+
+Operators must assign teams, roles, project-scoped tokens, VCS credentials, and
+project management permissions according to least privilege for their
+organization. *(documented)* (source: :doc:`/admin/access`, :doc:`/api`)
+
+Operators exposing :ref:`hooks` must enable them only where needed and provide
+capacity monitoring, body-size limits, and optional source restrictions or edge
+controls appropriate for their provider traffic. They must accept the
+documented identifier disclosure and per-delivery scheduling cost or use
+authenticated integrations where available. *(maintainer)*
+
+Operators must treat private-target allowlists, proxies, and privileged
+outbound integration settings as intentional expansion of Weblate's default
+network reachability limits. *(maintainer)*
+
+Operators must keep backup import limits, API rate limits, and web rate limits
+at values that match instance capacity and exposure. *(documented)* (source: :doc:`/admin/config`)
+
+Operators must protect the Weblate data directory, configuration, backup
+credentials, generated keys, database, datastore, and local shell access as
+trusted infrastructure. *(documented)* (source: :doc:`/admin/backup`,
+:doc:`/admin/install`)
+
+Downstream product teams must treat translated strings as untrusted content in
+their own applications unless they have separately reviewed, escaped, and
+validated them for the target renderer. *(documented)* (source: :doc:`/security/localization-threat`)
+
+Known misuse patterns
 ---------------------
 
-* **Authentication & authorization:**
-    * Strong password policies, see :doc:`/security/passwords`.
-    * Enforced 2FA, see :ref:`2fa`.
-    * Robust session management.
-    * Role-based access control (RBAC) to enforce the least privilege (e.g., translators can only edit translations, not change project configs), see :doc:`/admin/access`.
-    * Integration with external identity providers (SAML, OAuth, LDAP), see :doc:`/admin/auth`.
-* **Input validation and output encoding:**
-    * Strict validation of all user inputs (forms, API requests, VCS URLs) to prevent injection attacks (SQL injection, command injection, XSS).
-    * Context-aware output encoding for all user-supplied data displayed on the web UI to prevent XSS.
-* **VCS integration security:**
-    * Principle of least privilege for VCS credentials (e.g., read-only access where possible, limited scopes for tokens).
-    * Secure storage of VCS credentials.
-    * Strict sanitization and validation of all data coming from VCS (e.g., filenames, branch names, commit messages that might be displayed).
-    * Secure execution of Git/Mercurial commands (avoiding shell execution with user-controlled input).
-* **Data protection:**
-    * Encryption of sensitive data at rest.
-    * Encryption of data in transit (TLS/SSL for all HTTP/S and VCS communication).
-    * Database hardening (the least privilege for Weblate user, strong passwords).
-* **System hardening:**
-    * Regular patching of OS, Weblate, and all dependencies.
-    * Principle of least privilege for Weblate user account on the OS.
-    * Network segmentation (e.g., separating database/Redis from public access).
-    * Use of WAF (Web Application Firewall).
-* **Logging and monitoring:**
-    * Comprehensive audit logging of all security-relevant events (logins, failed logins, permission changes, critical configuration changes, VCS operations).
-    * Centralized logging and alerting for security incidents, for example :ref:`graylog`.
-* **Secure development practices:**
-    * Code reviews with a security focus.
-    * Static Application Security Testing (SAST) and Dynamic Application Security Testing (DAST), see :doc:`/contributing/code`.
-    * Dependency vulnerability scanning, see :doc:`/security/dependencies`.
-    * Regular security audits and penetration testing.
-* **Error handling:**
-    * Generic error messages that do not reveal sensitive internal information.
+* Exposing webhook endpoints broadly, enabling project hooks, and relying on
+  webhook payloads as authenticated forge identity. This is unsafe because some
+  supported hooks are compatibility-oriented and return matching diagnostics.
+  Use deployment controls and prefer authenticated integrations where
+  available. *(maintainer)*
+* Granting workspace, project, VCS, or access-management permissions to users
+  who are trusted only as translators. This is unsafe because those permissions
+  can affect code-hosting connections, repositories, credentials, or other
+  users. Assign narrower roles. *(documented)* (source: :doc:`/admin/access`,
+  :doc:`/admin/code-hosting`)
+* Assigning site-wide permissions to roles intended for limited project or
+  helpdesk delegation. Site-wide permissions apply across the instance and are
+  not narrowed by the team's project selection. In particular, ``group.edit``
+  permits changing site-wide team scope and granting team members access to
+  private projects the manager cannot access directly, while ``user.edit``
+  permits changing team memberships and superuser status for editable accounts,
+  including the caller's own account. Delegate permissions through project or
+  workspace teams for limited scopes. *(documented)* (source:
+  :doc:`/admin/access`)
+* Sending sensitive source strings or private customer content to machine
+  translation providers without treating the provider as a data recipient. This
+  is unsafe because Weblate must transmit content to the configured service, and
+  the submitted content varies by provider and enabled feature. Configure
+  providers according to the data policy for the project. *(maintainer)*
+* Importing project backups from untrusted sources as an administrative
+  convenience. This is unsafe because backups carry project metadata,
+  translation content, and repository state. Keep import limits enabled and
+  import only backups appropriate for the target instance. *(documented)* (source: :doc:`/admin/backup`)
+* Treating Weblate translation checks as proof that downstream applications
+  cannot be attacked through translated strings. This is unsafe because the
+  downstream renderer defines the final execution context. Review and escape
+  translations in the consuming application. *(documented)* (source: :doc:`/security/localization-threat`)
+
+Known non-findings
+------------------
+
+* A report that a reachable webhook can be called without forge authentication
+  and only triggers modeled update scheduling or returns the documented
+  matching diagnostics is not ``VALID`` by itself. A finite sequence of
+  accepted requests or the absence of an application-level ``429`` response
+  does not demonstrate an availability failure. It is routed to
+  ``VALID-HARDENING`` unless it bypasses documented limits, matches unrelated
+  repositories, leaks data beyond the documented fields, causes
+  disproportionate resource consumption or sustained service degradation, or
+  has effects beyond modeled per-delivery scheduling. *(maintainer)*
+* A report that a webhook does not update a component whose repository URL only
+  shares a host or path suffix with the payload is not a vulnerability;
+  Weblate matches only exact repository URLs and documented variants.
+  *(documented)* (source: :ref:`hooks-target-matching`)
+* A report that a project manager can change repository settings, VCS
+  credentials, or project configuration is not a vulnerability when the actor
+  has the documented permission for that action. *(documented)* (source: :doc:`/admin/access`)
+* A report that source strings, translations, or project and component origin
+  from a Private or Custom project are available through shared translation
+  memory is not a vulnerability when an authorized manager explicitly enabled
+  contribution. Shared contribution publishes this data outside project access
+  controls. Restricted components remain excluded. *(documented)* (source:
+  :ref:`shared-tm`, :ref:`api-memory`)
+* A report containing private-project or restricted-component data is not a
+  vulnerability when the user has effective ``reports.view`` permission on the
+  selected parent scope. That permission intentionally authorizes the complete
+  report scope. *(documented)* (source: :doc:`/devel/reporting`,
+  :doc:`/admin/access`)
+* A report that a project administrator can directly access restricted
+  components in their project or obtain them from a complete project backup,
+  or that an add-on manager can configure a core
+  add-on to process its documented restricted descendants or cross-component
+  inputs, is not a vulnerability. These are persistent administrative
+  capabilities and do not inherit the configuring user's direct component
+  visibility. *(documented)* (source: :ref:`addons`, :ref:`projectbackup`,
+  :doc:`/admin/access`)
+* A report against third-party add-on behavior is not a Weblate core
+  vulnerability unless the report shows Weblate's permission or installation
+  boundaries are bypassed. *(maintainer)*
+* A report that a malicious local operator can read configuration, run
+  management commands, or alter files is out of model because local operators
+  are trusted infrastructure. *(maintainer)*
+* A report that an operator-supplied environment variable, container argument,
+  or mounted configuration can alter generated service configuration is not a
+  vulnerability. These are trusted deployment inputs. A CI/CD, GitOps, PaaS,
+  Helm, or other orchestration layer that lets less-trusted users set selected
+  values owns that delegation boundary and must validate the values before
+  constructing the Weblate workload. *(maintainer)*
+* A report that a downstream application renders a dangerous translation is not
+  a Weblate vulnerability unless Weblate itself violates a claimed property
+  while storing, checking, reviewing, or displaying that translation.
+  *(documented)* (source: :doc:`/security/localization-threat`)
+
+Contributor attribution is an authorization boundary within accessible projects.
+Confidential collaboration restricts system-provided attribution while retaining
+translation content and internal history. Resource-scoped attribution
+autocomplete follows this boundary independently of general directory access.
+Identity-safe regenerated translation exports remain available without attribution
+access; original files require
+attribution access. Identity-bearing reports, change downloads,
+repository access, access management, and administrator-configured integrations remain separately
+trusted disclosure paths. User-provided content and previously exported copies
+are outside this confidentiality guarantee. See :ref:`confidential-collaboration`
+for configuration and limitations. *(maintainer)*
+
+Conditions that change this model
+---------------------------------
+
+Review this model when changes affect public interfaces, authentication or
+authorization, deployment assumptions, untrusted input processing, external
+integrations, execution capabilities, or security-relevant defaults. Review
+whether the existing scope, actors, trust boundaries, assumptions, security
+properties, and triage dispositions still cover the change. *(maintainer)*
+
+Revise this model in the same change only when those elements change or leave
+a gap. This includes an unsupported component becoming supported product
+surface, a claimed security property changing, or an accepted vulnerability
+report that cannot be routed to an existing triage disposition. *(maintainer)*
+
+Features that follow existing boundaries and security properties do not need
+individual entries. Keep endpoint schemas, permission details, configuration
+instructions, implementation mechanics, and numeric limits in the relevant
+feature or administration documentation. Link to that documentation when a
+detail is needed to explain a distinct boundary, exception, or triage outcome.
+A review that confirms existing coverage requires no threat-model edit.
+*(maintainer)*
+
+Triage dispositions
+-------------------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Disposition
+     - Meaning
+     - Licensed by
+   * - ``VALID``
+     - Violates a property Weblate claims, through an in-scope actor and input.
+     - `Security properties Weblate provides`_, `Input assumptions`_,
+       `Adversary model`_
+   * - ``VALID-HARDENING``
+     - No claimed property is violated, but Weblate chooses to reduce a known
+       misuse risk, such as compatibility webhook triggering that stays within
+       modeled effects.
+     - `Known misuse patterns`_, `Security properties Weblate does not provide`_
+   * - ``OUT-OF-MODEL: trusted-input``
+     - Requires attacker control of input this model marks trusted.
+     - `Input assumptions`_
+   * - ``OUT-OF-MODEL: adversary-not-in-scope``
+     - Requires a capability this model excludes.
+     - `Adversary model`_
+   * - ``OUT-OF-MODEL: unsupported-component``
+     - Lands in third-party add-ons, generated docs, tests, local
+       customization, or another component marked out of scope.
+     - `Out of scope`_
+   * - ``OUT-OF-MODEL: non-default-build``
+     - Manifests only after deployment choices that knowingly remove a claimed
+       property.
+     - `Build-time and configuration variants`_
+   * - ``BY-DESIGN: property-disclaimed``
+     - Concerns a property Weblate explicitly does not provide.
+     - `Security properties Weblate does not provide`_
+   * - ``KNOWN-NON-FINDING``
+     - Matches a documented recurring false positive.
+     - `Known non-findings`_
+   * - ``MODEL-GAP``
+     - Cannot be cleanly routed to any disposition above.
+     - `Conditions that change this model`_

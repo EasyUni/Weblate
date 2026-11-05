@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from django.db.models import TextChoices
 from django.utils.translation import pgettext_lazy
@@ -40,6 +40,7 @@ class SettingsDict(TypedDict, total=False):
     password: str
     enable_mt: bool
     domain: str
+    component_domains: dict[str, str]
     base_url: str
     endpoint_url: str
     region: str
@@ -50,13 +51,17 @@ class SettingsDict(TypedDict, total=False):
     model: str
     persona: str
     style: str
+    language_instructions: dict[str, str]
     custom_model: str
+    max_tokens: int
     bucket_name: str
     context_vector: str
     deployment: str
     azure_endpoint: str
     source_language: SourceLanguageChoices
     _project: Project
+    _installation_id: int
+    _installation_slug: str
 
 
 class TranslationResultDict(TypedDict):
@@ -68,7 +73,9 @@ class TranslationResultDict(TypedDict):
     show_quality: NotRequired[bool]
     origin: NotRequired[str | None]
     origin_url: NotRequired[str | None]
+    origin_detail: NotRequired[str | None]
     delete_url: NotRequired[str | None]
+    context: NotRequired[str | None]
 
 
 class UnitMemoryResultDict(TypedDict, total=False):
@@ -77,5 +84,5 @@ class UnitMemoryResultDict(TypedDict, total=False):
     origin: list[BatchMachineTranslation | None]
 
 
-DownloadTranslations: TypeAlias = Iterable[TranslationResultDict]
-DownloadMultipleTranslations: TypeAlias = dict[str, list[TranslationResultDict]]
+type DownloadTranslations = Iterable[TranslationResultDict]
+type DownloadMultipleTranslations = dict[str, list[TranslationResultDict]]

@@ -11,6 +11,8 @@ instead of working through huge amount of new text just prior to release.
 
    :doc:`/devel/integration` describes basic ways to integrate your development
    with Weblate.
+   :doc:`/admin/code-hosting` lists provider-specific setup steps for common
+   code-hosting sites.
 
 This is the process:
 
@@ -19,7 +21,8 @@ This is the process:
 3. Weblate pulls changes from the VCS repository, parses translation files and updates its database, see :ref:`update-vcs`.
 4. Translators submit translations using the Weblate web interface, or upload offline changes.
 5. Once the translators are finished, Weblate commits the changes to the local repository (see :ref:`lazy-commit`).
-6. Changes are pushed back to the upstream repository (see :ref:`push-changes`).
+6. Changes are pushed back to the upstream repository (see
+   :ref:`code-hosting-push-options`).
 
 .. graphviz::
 
@@ -31,7 +34,7 @@ This is the process:
          subgraph cluster_codehosting {
             rank=same;
             graph [color=lightgrey,
-               label="Upstream code hosting",
+               label="Upstream code-hosting site",
                style=filled
             ];
 
@@ -70,7 +73,7 @@ This is the process:
 
 .. hint::
 
-   Upstream code hosting is not necessary, you can use Weblate with
+   Upstream code-hosting site is not necessary, you can use Weblate with
    :ref:`vcs-local` where there is only the repository inside Weblate.
 
 .. _update-vcs:
@@ -81,16 +84,10 @@ Updating repositories
 You should set up some way of updating backend repositories from their
 source.
 
-* Use :ref:`hooks` to integrate with most of common code hosting services:
-
-  * :ref:`github-setup`
-  * :ref:`gitlab-setup`
-  * :ref:`bitbucket-setup`
-  * :ref:`pagure-setup`
-  * :ref:`azure-setup`
-  * :ref:`gitea-setup`
-
-  You must also :ref:`project-enable_hooks` for this to work.
+* Use :ref:`hooks` to integrate with the majority of common code-hosting services, see
+  :doc:`/admin/code-hosting`. You must also :ref:`project-enable_hooks` for
+  this to work. Hook deliveries update components whose repository URL matches
+  the payload; see :ref:`hooks-target-matching`.
 
 * Manually trigger update either in the repository management or using :ref:`api` or :ref:`wlc`
 
@@ -100,6 +97,52 @@ source.
 
 Whenever Weblate updates the repository, the post-update addons will be
 triggered, see :ref:`addons`.
+
+.. _hooks-target-matching:
+
+Matching webhook targets
+++++++++++++++++++++++++
+
+Forge webhooks update components whose :ref:`component-repo` exactly matches a
+repository URL from the payload (HTTPS or SSH as reported by the forge, plus
+common variants such as a trailing slash).
+
+Generic forge webhook endpoints are compatibility interfaces, and ordinary
+repository deliveries are not cryptographically authenticated. Legacy GitHub
+App deliveries containing installation data are an exception: the generic
+GitHub endpoint verifies their signature using
+:setting:`GITHUB_LEGACY_APP_WEBHOOK_SECRET`. Repository matching does not apply
+project or component access control because webhooks also need to update private
+projects and
+:ref:`restricted components <component-restricted>`. Their JSON responses
+include diagnostic counts for repository, branch, and enabled-hook matches.
+Successful responses also include the full project/component slugs and absolute
+API URLs of updated components. Supplying a matching repository URL can
+therefore confirm that a repository is registered and reveal these identifiers.
+
+Each matching delivery records a hook event and schedules a repository update.
+Generic hook deliveries are neither application-rate-limited nor coalesced.
+Repository operations are serialized to protect repository consistency, but
+this does not bound the number of accepted deliveries or queued update attempts.
+An update of an unchanged repository still fetches the configured remote, but
+stops before merging changes or parsing translation files.
+
+Components managed through an authenticated integration are excluded from
+generic webhook matching and its diagnostic counts. Currently this applies to
+the :guilabel:`GitHub (via Weblate GitHub app)` VCS backend. These components
+receive notifications only through their dedicated tokenized and signed
+:ref:`GitHub App webhook URL <code-hosting-github-app-webhook>`. Future
+authenticated integrations are expected to use the same separation.
+
+The returned API URLs do not grant access to the components. The web interface
+and API continue to enforce normal access control, and webhook responses do not
+include repository content, translations, or credentials. Where available,
+prefer an authenticated integration such as :ref:`code-hosting-github-app-webhook`.
+
+.. versionchanged:: 2026.9
+
+   Host and path suffix fallback matching was removed. If updates stop, align
+   :ref:`component-repo` with a URL from the forge webhook payload.
 
 .. _avoid-merge-conflicts:
 
@@ -175,6 +218,179 @@ all separately:
     able to control Weblate remotely. You can also achieve this using any HTTP
     client instead of :ref:`wlc`, for example curl, see :ref:`api`.
 
+.. _repository-maintenance:
+
+Repository maintenance
+++++++++++++++++++++++
+
+The :guilabel:`Repository maintenance` view shows repository status for a
+project, component, or translation and lets privileged users run maintenance
+operations from the user interface.
+
+For shared repositories, permissions are checked on the component that owns
+the repository, even when the operation is started from a linked component.
+Users with repository permissions only on a linked component can open this view
+to see which permissions they need on the owner. Restrictions identify the
+owning component when it is accessible; otherwise, ask your project
+administrator to coordinate access with the repository owner. See
+:doc:`/admin/access` for permission scope.
+
+The same actions can also be triggered using :ref:`api` or, for the supported
+subset, :ref:`wlc`.
+
+Availability of individual actions depends on permissions, the configured
+version control system, whether pushing is configured, and whether the selected
+object can be locked.
+
+Repository actions started from this view are queued for background processing.
+For a project, Weblate processes the affected repositories sequentially in one
+task and shows its progress. Repeating the same action opens the existing task;
+a different action cannot be started for the same repository until that task
+finishes.
+
+The :guilabel:`Synchronize` and :guilabel:`Rescan` repository operations are
+queued for background processing as described above. The separate
+:guilabel:`File management` actions are available only for an individual
+translation. They rewrite that translation file and commit the result during
+the web request; they are not project-wide or component-wide operations.
+
+Operations that read repository content, such as updating, resetting, or
+rescanning, also reconcile translation files in Weblate. Added or removed
+translation files are reflected after this processing finishes. Glossary
+language synchronization and cleanup are described in
+:ref:`glossary-language-sync`.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Action
+     - What it does
+     - Typical use
+
+   * - :guilabel:`Commit`
+     - Commits pending changes stored in Weblate to the local repository.
+     - Flush pending Weblate changes before doing repository work elsewhere.
+
+   * - :guilabel:`Push`
+     - Pushes committed local repository changes to the configured upstream.
+     - Send committed translations upstream when automatic push is disabled or delayed.
+
+   * - :guilabel:`Update`
+     - Fetches upstream changes, integrates them using the component's configured :ref:`component-merge_style`, and reconciles translation files.
+     - Bring Weblate in sync with upstream using the default integration strategy.
+
+   * - :guilabel:`Update with merge`
+     - Fetches upstream changes and integrates them with an explicit merge.
+     - Override the default merge style for a single update.
+
+   * - :guilabel:`Update with rebase`
+     - Fetches upstream changes and rebases local Weblate commits on top of upstream.
+     - Keep history linear when that matches your workflow.
+
+   * - :guilabel:`Update with merge without fast-forward`
+     - Fetches upstream changes and creates an explicit merge commit even when a fast-forward would be possible.
+     - Preserve merge commits for auditing or branch-management reasons.
+
+   * - :guilabel:`Lock` / :guilabel:`Unlock`
+     - Prevents or allows translators to make further changes in Weblate.
+     - Freeze translation changes while doing repository maintenance outside Weblate.
+
+   * - :guilabel:`Discard local changes`
+     - Resets Weblate's local repository to upstream, discards local commits and pending translation changes, and reconciles translation files.
+     - Use when upstream should overwrite the local Weblate repository state.
+
+   * - :guilabel:`Reset and reapply translations`
+     - Resets Weblate's local repository to upstream, reconciles translation files, and reapplies Weblate's translations. See :ref:`manage-vcs-reset-reapply`.
+     - Recover from diverged history while keeping pending Weblate translations.
+
+   * - :guilabel:`Cleanup`
+     - Removes untracked files and stale branches from the local repository checkout.
+     - Clean up leftover files or stale repository state in Weblate's checkout.
+
+   * - :guilabel:`Synchronize`
+     - Forces Weblate to write all known translations back to the repository files.
+     - Repair cases where repository files became out of sync with the database state.
+
+   * - :guilabel:`Rescan`
+     - Re-reads translation files from the local repository into Weblate and removes translations whose files no longer match the component configuration.
+     - Import file changes after manual repository work or file creation.
+
+   * - :guilabel:`Remove duplicates`
+     - Removes repeated strings with the same identifier from one translation file.
+     - Repair duplicate strings reported by Weblate when the file contains repeated units.
+
+   * - :guilabel:`Cleanup unused`
+     - Removes strings no longer present in the base file from one translation file. The :ref:`addon-weblate.cleanup.generic` add-on can perform this automatically.
+     - Run a one-time cleanup without installing the add-on.
+
+   * - :guilabel:`Remove obsolete`
+     - Removes obsolete strings from one PO translation file.
+     - Run a one-time PO cleanup without enabling automatic obsolete string removal.
+
+For Git repositories, both reset actions affect only the configured
+:ref:`component-branch`. They do not reset or remove other local branches.
+:guilabel:`Cleanup` deletes all other local branches, including any commits
+that have not been pushed, and removes untracked files. It does not delete
+branches from the upstream repository.
+
+If you replace an upstream branch with unrelated history, switching to it in
+Weblate can fail because Weblate reuses its existing local branch and tries to
+merge or rebase it. Resetting while another branch is configured does not fix
+that inactive local branch. For example, resetting ``master`` leaves an old
+local ``dev`` branch unchanged.
+
+If no local changes on the affected branch need to be kept, configure a working
+branch, run :guilabel:`Cleanup` from :guilabel:`Repository maintenance`, and wait
+for it to finish. Then switch to the affected branch again. Weblate creates it
+afresh from upstream. If the affected branch is already configured, use
+:guilabel:`Discard local changes` to replace its local history with upstream instead.
+
+.. _manage-vcs-reset-reapply:
+
+Reset and reapply translations recovery behavior
+````````````````````````````````````````````````
+
+The :guilabel:`Reset and reapply translations` operation keeps translations from
+Weblate while resetting the local repository state to match upstream.
+
+If the Git checkout or its entire :file:`.git` directory is missing, this operation reconstructs it before
+reapplying translations. Remote repositories are cloned from the configured
+upstream branch. Local repositories are initialized with new Git metadata while
+retaining any surviving working files. Both then use the standard reapply flow.
+Symlinked checkout directories are never replaced automatically.
+
+For local repositories, reapply can recreate missing strings from the database,
+including source strings in monolingual base files, when the file format supports
+adding strings. Missing translation files can also be recreated when the format
+supports creating them or a valid template for new translations is available.
+This applies to local glossaries as well as other local components, including
+when their Git checkout is healthy. Remote reapply does not recreate strings
+removed upstream.
+
+Required files that the format cannot create must be restored from a backup.
+Weblate reports restoration failures and keeps the database translations and
+pending changes.
+
+Any surviving checkout without a :file:`.git` directory is preserved under
+:file:`DATA_DIR/repository-recovery/<component-id>/<unique-id>/`. Its location is
+written to the application log. These copies are not removed automatically;
+inspect and remove them manually after verifying recovery. Reconstruction cannot
+restore lost Git history or files and metadata that Weblate does not store.
+
+Recovery is explicit: background updates do not automatically rebuild checkouts.
+If a checkout is unexpectedly missing, first verify that the data volume is
+available to the worker performing recovery.
+Damaged Git metadata in an existing :file:`.git` directory requires manual
+inspection and repair by an instance administrator.
+
+The operation can restore pending translations only when the target language
+files still exist after the reset or when Weblate can create them for the
+component, for example using a valid :ref:`component-new_base`.
+
+If neither of these conditions is met, Weblate keeps the pending changes in its
+database and reports a recovery error instead of failing later with a generic
+parse error.
+
 .. _merge-weblate-git:
 
 Avoiding merge conflicts by focusing on Git operations
@@ -185,11 +401,26 @@ conflicts can appear when using :ref:`addon-weblate.git.squash` add-on,
 :ref:`component-merge_style` is configured to :guilabel:`Rebase`, or you are
 squashing commits outside of Weblate (for example, when merging a pull request).
 
-The reason for merge conflicts is different in this case - there are changes in
-Weblate which happened after you merged Weblate commits. This typically happens
-if merging is not automated and waits for days or weeks for a human to review
-them. Git is then sometimes no longer able to identify upstream changes as
+The reason for merge conflicts is different in this case. Weblate can have new
+local commits after you merge earlier Weblate commits upstream. This typically
+happens if merging is not automated and changes wait for days or weeks for a
+human review. Git is then sometimes no longer able to identify upstream changes as
 matching the Weblate ones and refuses to perform a rebase.
+
+Squash merging Weblate changes makes this harder to recover from. A squash
+merge creates a new commit instead of preserving the individual Weblate commits
+in the upstream history. Weblate still has the original commits in its local
+repository, and Git can no longer prove that upstream already contains them. If
+the conflict was also resolved manually, the file contents can differ from both
+repositories, so Weblate can keep failing to update even after the pull request
+was merged upstream.
+
+If upstream no longer contains Weblate commits because they were squash merged,
+updating the repository might not be enough. Use :guilabel:`Reset and reapply translations`
+from :guilabel:`Repository maintenance` to reset Weblate to upstream while
+keeping pending translations; see :ref:`manage-vcs-reset-reapply`. Use
+:guilabel:`Discard local changes` only when upstream should fully replace Weblate's
+local changes.
 
 To approach this, you either need to minimize the amount of pending changes in
 Weblate when you merge a pull request, or avoid the conflicts completely by not
@@ -197,7 +428,12 @@ squashing changes.
 
 Here are few options how to avoid that:
 
-* Do not use neither :ref:`addon-weblate.git.squash` nor squashing at merge time. This is the root cause why git doesn't recognize changes after merging.
+* Do not use :ref:`addon-weblate.git.squash` or squash merging for Weblate
+  changes. Squashing is why Git might no longer recognize the changes after
+  merging.
+* When resolving conflicts outside Weblate, merge the Weblate commits with a
+  regular merge commit and push that result upstream. Do not squash merge the
+  conflict-resolution pull request.
 * Let Weblate commit pending changes before merging. This will update the pull request with all its changes, and both repositories will be in sync.
 * Use the review features in Weblate (see :doc:`/workflows`) so that you can automatically merge GitHub pull requests after CI passes.
 * Use locking in Weblate to avoid changes while GitHub pull request is in review.
@@ -206,140 +442,49 @@ Here are few options how to avoid that:
 
    :ref:`wlc`
 
+Code-hosting notifications
+++++++++++++++++++++++++++
+
+Provider-specific app and webhook instructions for GitHub, GitLab, Bitbucket,
+Pagure, Azure Repos, Gitea, Forgejo, and Gitee are covered in
+:doc:`/admin/code-hosting`.
+
 .. _github-setup:
-
-Automatically receiving changes from GitHub
-+++++++++++++++++++++++++++++++++++++++++++
-
-Weblate comes with native support for GitHub.
-
-If you are using Hosted Weblate, the recommended approach is to install the
-`Weblate app <https://github.com/apps/weblate>`_, that way you will get the
-correct setup without having to set much up. It can also be used for pushing
-changes back.
-
-To receive notifications on every push to a GitHub repository,
-add the Weblate Webhook in the repository settings (:guilabel:`Webhooks`)
-as shown on the image below:
-
-.. image:: /images/github-settings.png
-
-The :guilabel:`Payload URL` consists of your Weblate URL appended by
-``/hooks/github/``, for example for the Hosted Weblate service, this is
-``https://hosted.weblate.org/hooks/github/``.
-
-You can leave other values at default settings (Weblate can handle both
-content types and consumes just the `push` event).
-
-.. seealso::
-
-   * :http:post:`/hooks/github/`
-   * :ref:`hosted-push`
-
-.. _bitbucket-setup:
-
-Automatically receiving changes from Bitbucket
-++++++++++++++++++++++++++++++++++++++++++++++
-
-Weblate has support for Bitbucket webhooks, add a webhook
-which triggers upon repository push, with destination to ``/hooks/bitbucket/`` URL
-on your Weblate installation (for example
-``https://hosted.weblate.org/hooks/bitbucket/``).
-
-.. image:: /images/bitbucket-settings.png
-
-.. seealso::
-
-   * :http:post:`/hooks/bitbucket/`
-   * :ref:`hosted-push`
-
 .. _gitlab-setup:
-
-Automatically receiving changes from GitLab
-+++++++++++++++++++++++++++++++++++++++++++
-
-Weblate has support for GitLab hooks, add a project webhook
-with destination to ``/hooks/gitlab/`` URL on your Weblate installation
-(for example ``https://hosted.weblate.org/hooks/gitlab/``).
-
-.. seealso::
-
-   * :http:post:`/hooks/gitlab/`
-   * :ref:`hosted-push`
-
+.. _bitbucket-setup:
 .. _pagure-setup:
-
-Automatically receiving changes from Pagure
-+++++++++++++++++++++++++++++++++++++++++++
-
-Weblate has support for Pagure hooks, add a webhook
-with destination to ``/hooks/pagure/`` URL on your Weblate installation (for
-example ``https://hosted.weblate.org/hooks/pagure/``). This can be done in
-:guilabel:`Activate Web-hooks` under :guilabel:`Project options`:
-
-.. image:: /images/pagure-webhook.png
-
-.. seealso::
-
-   * :http:post:`/hooks/pagure/`
-   * :ref:`hosted-push`
-
 .. _azure-setup:
-
-Automatically receiving changes from Azure Repos
-++++++++++++++++++++++++++++++++++++++++++++++++
-
-Weblate has support for Azure Repos webhooks, add a webhook for
-:guilabel:`Code pushed` event with destination to ``/hooks/azure/`` URL on your
-Weblate installation (for example ``https://hosted.weblate.org/hooks/azure/``).
-This can be done in :guilabel:`Service hooks` under :guilabel:`Project
-settings`.
-
-
-.. seealso::
-
-   * `Web hooks in Azure DevOps manual <https://learn.microsoft.com/en-us/azure/devops/service-hooks/services/webhooks?view=azure-devops>`_
-   * :http:post:`/hooks/azure/`
-   * :ref:`hosted-push`
-
 .. _gitea-setup:
-
-Automatically receiving changes from Gitea Repos
-++++++++++++++++++++++++++++++++++++++++++++++++
-
-Weblate has support for Gitea webhooks, add a :guilabel:`Gitea Webhook` for
-:guilabel:`Push events` event with destination to ``/hooks/gitea/`` URL on your
-Weblate installation (for example ``https://hosted.weblate.org/hooks/gitea/``).
-This can be done in :guilabel:`Webhooks` under repository :guilabel:`Settings`.
-
-.. seealso::
-
-   * `Webhooks in Gitea manual <https://docs.gitea.io/en-us/webhooks/>`_
-   * :http:post:`/hooks/gitea/`
-   * :ref:`hosted-push`
-
+.. _forgejo-setup:
 .. _gitee-setup:
 
-Automatically receiving changes from Gitee Repos
-++++++++++++++++++++++++++++++++++++++++++++++++
+Provider-specific notifications
+```````````````````````````````
 
-Weblate has support for Gitee webhooks, add a :guilabel:`WebHook` for
-:guilabel:`Push` event with destination to ``/hooks/gitee/`` URL on your
-Weblate installation (for example ``https://hosted.weblate.org/hooks/gitee/``).
-This can be done in :guilabel:`WebHooks` under repository :guilabel:`Management`.
+These legacy anchors are kept for compatibility. Current provider-specific app
+and webhook setup is documented in :doc:`/admin/code-hosting`.
 
 .. seealso::
 
-   * `Webhooks in Gitee manual <https://gitee.com/help/categories/40>`_
-   * :http:post:`/hooks/gitee/`
-   * :ref:`hosted-push`
+   * :ref:`GitHub notifications <code-hosting-github-notifications>`
+   * :ref:`GitLab notifications <code-hosting-gitlab-notifications>`
+   * :ref:`Bitbucket notifications <code-hosting-bitbucket-notifications>`
+   * :ref:`Pagure notifications <code-hosting-pagure-notifications>`
+   * :ref:`Azure Repos notifications <code-hosting-azure-repos-notifications>`
+   * :ref:`Gitea notifications <code-hosting-gitea-notifications>`
+   * :ref:`Forgejo notifications <code-hosting-forgejo-notifications>`
+   * :ref:`Gitee notifications <code-hosting-gitee-notifications>`
 
-Automatically updating repositories nightly
-+++++++++++++++++++++++++++++++++++++++++++
+.. _automatically-updating-repositories-nightly:
 
-Weblate automatically fetches remote repositories nightly to improve
-performance when merging changes later. You can optionally turn this into doing
-nightly merges as well, by enabling :setting:`AUTO_UPDATE`.
+Automatically updating repositories daily
++++++++++++++++++++++++++++++++++++++++++
+
+By default, Weblate automatically fetches remote repositories daily to improve
+performance when merging changes later. Updates are distributed throughout the
+day. Set :setting:`AUTO_UPDATE` to ``"full"`` to also merge remote changes into
+the working copy. See :setting:`AUTO_UPDATE` for scheduling details and other
+update modes.
 
 .. _push-changes:
 
@@ -347,138 +492,12 @@ Pushing changes from Weblate
 ----------------------------
 
 Each translation component can have a push URL set up (see
-:ref:`component-push`), and in that case Weblate will be able to push change to
-the remote repository. Weblate can be also be configured to automatically push
-changes on every commit (this is default, see :ref:`component-push_on_commit`).
-If you do not want changes to be pushed automatically, you can do that manually
-under :guilabel:`Repository maintenance` or using the API via :option:`wlc push`.
+:ref:`component-push`), and in that case Weblate will be able to push changes
+to the remote repository. Weblate can also be configured to automatically push
+changes on every commit, see :ref:`component-push_on_commit`.
 
-The push options differ based on the :ref:`vcs` used, more details are found in that chapter.
-
-In case you do not want direct pushes by Weblate, there is support for
-:ref:`vcs-github`, :ref:`vcs-gitlab`, :ref:`vcs-gitea`, :ref:`vcs-pagure`,
-:ref:`vcs-azure-devops` pull requests or :ref:`vcs-gerrit` reviews, you can activate these by
-choosing :guilabel:`GitHub`, :guilabel:`GitLab`, :guilabel:`Gitea`, :guilabel:`Gerrit`,
-:guilabel:`Azure DevOps`, or :guilabel:`Pagure` as :ref:`component-vcs` in :ref:`component`.
-
-Overall, following options are available with Git, Mercurial, GitHub, GitLab,
-Gitea, Pagure, Azure DevOps, Bitbucket Data Center and Bitbucket Cloud:
-
-.. list-table::
-   :header-rows: 1
-
-   * - Desired setup
-     - :ref:`component-vcs`
-     - :ref:`component-push`
-     - :ref:`component-push_branch`
-
-   * - No push
-     - :ref:`vcs-git`
-     - `empty`
-     - `empty`
-
-   * - Push directly
-     - :ref:`vcs-git`
-     - SSH URL
-     - `empty`
-
-   * - Push to separate branch
-     - :ref:`vcs-git`
-     - SSH URL
-     - Branch name
-
-   * - No push
-     - :ref:`vcs-mercurial`
-     - `empty`
-     - `empty`
-
-   * - Push directly
-     - :ref:`vcs-mercurial`
-     - SSH URL
-     - `empty`
-
-   * - Push to separate branch
-     - :ref:`vcs-mercurial`
-     - SSH URL
-     - Branch name
-
-   * - GitHub pull request from fork
-     - :ref:`vcs-github`
-     - `empty`
-     - `empty`
-
-   * - GitHub pull request from branch
-     - :ref:`vcs-github`
-     - SSH URL [#empty]_
-     - Branch name
-
-   * - GitLab merge request from fork
-     - :ref:`vcs-gitlab`
-     - `empty`
-     - `empty`
-
-   * - GitLab merge request from branch
-     - :ref:`vcs-gitlab`
-     - SSH URL [#empty]_
-     - Branch name
-
-   * - Gitea merge request from fork
-     - :ref:`vcs-gitea`
-     - `empty`
-     - `empty`
-
-   * - Gitea merge request from branch
-     - :ref:`vcs-gitea`
-     - SSH URL [#empty]_
-     - Branch name
-
-   * - Pagure merge request from fork
-     - :ref:`vcs-pagure`
-     - `empty`
-     - `empty`
-
-   * - Pagure merge request from branch
-     - :ref:`vcs-pagure`
-     - SSH URL [#empty]_
-     - Branch name
-
-   * - Azure DevOps pull request from fork
-     - :ref:`vcs-azure-devops`
-     - `empty`
-     - `empty`
-
-   * - Azure DevOps pull request from branch
-     - :ref:`vcs-azure-devops`
-     - SSH URL [#empty]_
-     - Branch name
-
-   * - Bitbucket Data Center pull request from fork
-     - :ref:`vcs-bitbucket-data-center`
-     - `empty`
-     - `empty`
-
-   * - Bitbucket Data Center pull request from branch
-     - :ref:`vcs-bitbucket-data-center`
-     - SSH URL [#empty]_
-     - Branch name
-
-   * - Bitbucket Cloud pull request from fork
-     - :ref:`vcs-bitbucket-cloud`
-     - `empty`
-     - `empty`
-
-   * - Bitbucket Cloud pull request from branch
-     - :ref:`vcs-bitbucket-cloud`
-     - SSH URL [#empty]_
-     - Branch name
-
-.. [#empty] Can be empty in case :ref:`component-repo` supports pushing.
-
-
-.. note::
-
-   You can also enable automatic pushing of changes after Weblate commits, this can be done in
-   :ref:`component-push_on_commit`.
+For the push options table and provider-specific pull, merge, and review
+request workflows, see :ref:`code-hosting-push-options`.
 
 .. seealso::
 
@@ -568,7 +587,9 @@ currently translating user in all components.
 
 Propagation preconditions:
 
-- All components have to reside in a single project (linking component is not enough).
+- Components must belong to the configured
+  :ref:`workspace propagation scope <workspace-propagation-scope>`. By default,
+  this is a single project (linking a component is not enough).
 - Enable :ref:`component-allow_translation_propagation` to automatically reuse translations for matching strings.
 - The translation propagation requires the key to be match for monolingual
   translation formats, so keep that in mind when creating translation keys.

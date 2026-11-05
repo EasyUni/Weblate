@@ -1,15 +1,23 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
 from time import sleep
+from typing import TYPE_CHECKING
 
+from django.core.management.base import CommandError
 from django.test.utils import override_settings
 
 from weblate.addons.discovery import DiscoveryAddon
+from weblate.auth.models import User
 from weblate.trans.models import Component, Project
-from weblate.trans.tasks import actual_project_removal
+from weblate.trans.tasks import project_removal
+from weblate.utils.change_origin import acting_user_context
 from weblate.utils.management.base import BaseCommand
+
+if TYPE_CHECKING:
+    from django.core.management.base import CommandParser
 
 
 class Command(BaseCommand):
@@ -17,8 +25,11 @@ class Command(BaseCommand):
 
     help = "imports demo project and components"
 
-    def add_arguments(self, parser) -> None:
+    def add_arguments(self, parser: CommandParser) -> None:
         super().add_arguments(parser)
+        parser.add_argument(
+            "--user", required=True, help="Username to record as the import actor"
+        )
         parser.add_argument(
             "--additional", type=int, default=0, help="number of additional components"
         )
@@ -29,7 +40,18 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options) -> None:
-        with override_settings(CELERY_TASK_ALWAYS_EAGER=True):
+        try:
+            user = User.objects.get(username=options["user"])
+        except User.DoesNotExist as error:
+            msg = "User does not exist!"
+            raise CommandError(msg) from error
+        if user.is_anonymous:
+            msg = "An anonymous user cannot import projects."
+            raise CommandError(msg)
+        with (
+            acting_user_context(user),
+            override_settings(CELERY_TASK_ALWAYS_EAGER=True),
+        ):
             if options["delete"]:
                 try:
                     project = Project.objects.get(slug="demo")
@@ -37,14 +59,14 @@ class Command(BaseCommand):
                     pass
                 else:
                     # Remove without creating a backup
-                    actual_project_removal(project.pk, None)
+                    project_removal.run(project.pk, user.pk, backup=False)
             # Create project
             project = Project.objects.create(
                 name="Demo", slug="demo", web="https://demo.weblate.org/"
             )
 
             # Create main component
-            component = Component.objects.create(
+            component = Component(
                 name="Gettext",
                 slug="gettext",
                 project=project,
@@ -56,9 +78,11 @@ class Command(BaseCommand):
                 ),
                 filemask="weblate/langdata/locale/*/LC_MESSAGES/django.po",
                 new_base="weblate/langdata/locale/django.pot",
+                branch="main",
                 file_format="po",
                 license="GPL-3.0-or-later",
             )
+            component.save()
             while component.in_progress():
                 self.stdout.write(
                     f"Importing base component: {component.get_progress()[0]}%"
@@ -68,6 +92,7 @@ class Command(BaseCommand):
 
             # Install discovery
             DiscoveryAddon.create(
+                acting_user=user,
                 component=component,
                 configuration={
                     "file_format": "po",
@@ -83,7 +108,7 @@ class Command(BaseCommand):
             )
 
             # Manually add Android
-            Component.objects.create(
+            android = Component(
                 name="Android",
                 slug="android",
                 project=project,
@@ -94,9 +119,10 @@ class Command(BaseCommand):
                 file_format="aresource",
                 license="GPL-3.0-or-later",
             )
+            android.save()
 
             for i in range(options["additional"]):
-                Component.objects.create(
+                additional = Component(
                     name=f"Additional {i}",
                     slug=f"additional-{i}",
                     project=project,
@@ -107,3 +133,4 @@ class Command(BaseCommand):
                     file_format="po",
                     license="GPL-3.0-or-later",
                 )
+                additional.save()

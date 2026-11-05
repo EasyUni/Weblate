@@ -4,60 +4,41 @@
 
 {% block breadcrumbs %}
   {% if project %}
-    <li>
-      <a href="{{ project.get_absolute_url }}">{{ project }}</a>
+    {% path_object_breadcrumbs project %}
+    <li class="breadcrumb-item">
+      <a href="{% url 'machinery-list' project=project.slug %}">{% translate "Translation services" %}</a>
     </li>
-    <li>
-      <a href="{% url 'machinery-list' project=project.slug %}">{% translate "Automatic suggestions" %}</a>
-    </li>
+  {% elif workspace %}
+    <li class="breadcrumb-item"><a href="{{ workspace.get_absolute_url }}">{{ workspace }}</a></li>
+    <li class="breadcrumb-item"><a href="{% url 'workspace-machinery' workspace=workspace.pk %}">{% translate "Translation services" %}</a></li>
   {% else %}
-    <li>
+    <li class="breadcrumb-item">
       <a href="{% url 'manage' %}">{% translate "Manage" %}</a>
     </li>
-    <li>
-      <a href="{% url 'manage-machinery' %}">{% translate "Automatic suggestions" %}</a>
+    <li class="breadcrumb-item">
+      <a href="{% url 'manage-machinery' %}">{% translate "Translation services" %}</a>
     </li>
   {% endif %}
 {% endblock breadcrumbs %}
 
 {% block content %}
-  <div class="panel panel-default">
-    <div class="panel-heading">
-      <h4 class="panel-title">
+  <div class="card">
+    <div class="card-header">
+      <h4 class="card-title">
         {% documentation_icon 'admin/machine' right=True %}
-        {% translate "Configured automatic suggestion services" %}
+        {% translate "Configured translation services" %}
       </h4>
     </div>
     <table class="table table-striped">
       <tbody>
         {% for service in configured_services %}
           <tr>
-            <td>{% include 'machinery/detail.html' %}</td>
-            <td class="bottom-button">
-              {% if service.is_enabled or not service.is_available %}
-                <form method="post" action="{{ service.get_absolute_url }}">
-                  {% csrf_token %}
-                  <input type="hidden" name="delete" value="1" />
-                  <button type="submit" class="btn btn-danger">{% translate "Disable" %}</button>
-                </form>
-              {% else %}
-                <form method="post" action="{{ service.get_absolute_url }}">
-                  {% csrf_token %}
-                  <input type="hidden" name="enable" value="1" />
-                  <button type="submit" class="btn btn-primary">{% translate "Enable" %}</button>
-                </form>
-              {% endif %}
-            </td>
-            <td class="bottom-button">
-              {% if service.has_settings %}
-                <a class="btn btn-primary" href="{{ service.get_absolute_url }}">{% translate "Configure" %}</a>
-              {% endif %}
-            </td>
+            <td>{% include "machinery/detail.html" with link=True %}</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
-    <div class="panel-footer">
+    <div class="card-footer">
       {% if not configured_services %}
         {% translate "There are no services currently installed." %}
       {% else %}
@@ -67,29 +48,23 @@
   </div>
 
 
-  <div class="panel panel-default">
-    <div class="panel-heading">
-      <h4 class="panel-title">
+  <div class="card">
+    <div class="card-header">
+      <h4 class="card-title">
         {% documentation_icon 'admin/machine' right=True %}
-        {% translate "Available automatic suggestion services" %}
+        {% translate "Available translation services" %}
       </h4>
     </div>
     <table class="table table-striped">
       <tbody>
         {% for service in available_services %}
           <tr>
-            <td>{% include 'machinery/detail.html' %}</td>
-            <td class="bottom-button">
-              <form method="post" action="{{ service.get_absolute_url }}">
-                {% csrf_token %}
-                <button type="submit" class="btn btn-primary" name="install" value="1">{% translate "Install" %}</button>
-              </form>
-            </td>
+            <td>{% include "machinery/detail.html" with link=True %}</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
-    <div class="panel-footer">
+    <div class="card-footer">
       {% if not available_services %}
         {% translate "Could not find any additional services." %}
       {% else %}

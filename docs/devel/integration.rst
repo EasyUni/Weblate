@@ -3,6 +3,10 @@ Integrating with Weblate
 
 .. include:: /snippets/basics.rst
 
+See :doc:`libraries` for official tools and community-maintained integrations.
+For Android translation updates without rebuilding your application, use
+:doc:`kotlin-sdk`.
+
 Importing a localization project into Weblate
 +++++++++++++++++++++++++++++++++++++++++++++
 
@@ -32,7 +36,8 @@ changes made in Weblate (see :ref:`lazy-commit`). This can be done from the user
 (in the :guilabel:`Repository maintenance`), or from the command-line using :ref:`wlc`.
 
 Pushing changes can be automated if you grant Weblate push access to your repository and
-configure :ref:`component-push` in the :ref:`component`, see :ref:`push-changes`.
+configure :ref:`component-push` in the :ref:`component`, see
+:ref:`code-hosting-push-options`.
 
 Alternatively, use :doc:`/api` to update translations
 so that they match the latest version from the upstream in your remote VCS repository.
@@ -40,7 +45,7 @@ so that they match the latest version from the upstream in your remote VCS repos
 .. seealso::
 
    * :ref:`continuous-translation`
-   * :ref:`push-changes`
+   * :ref:`code-hosting-push-options`
    * :ref:`vcs-repos`
 
 Fetching remote changes into Weblate
@@ -61,6 +66,24 @@ the translations so that they match your codebase.
 
    * :ref:`continuous-translation`
    * :ref:`vcs-repos`
+
+.. _monitoring-translation-progress:
+
+Monitoring translation progress
++++++++++++++++++++++++++++++++
+
+Use the project metrics endpoint to track translation progress from external
+integrations. It returns statistics for all visible components and languages
+in a single request and supports JSON, CSV, and OpenMetrics formats.
+
+The OpenMetrics representation can be scraped by Prometheus-compatible
+monitoring systems without polling the statistics endpoint for each
+translation.
+
+.. seealso::
+
+   * :http:get:`/api/projects/(string:project)/metrics/`
+   * :ref:`api-statistics`
 
 .. _adding-new-strings:
 
@@ -101,9 +124,13 @@ the :ref:`addon-weblate.cleanup.generic` add-on, which handles
 cleanup according to your requirements.
 
 Weblate will also not try to update bilingual files when the source changes,
-so if you need :file:`po` files to be updated from :file:`pot`, do it yourself by
-using :guilabel:`Update source strings` :ref:`upload-method`, or by using
-the :ref:`addon-weblate.gettext.msgmerge` add-on.
+so if you need :file:`po` files to be updated from :file:`pot`, you have two options:
+
+* **Automatically with an add-on** (recommended for continuous updates):
+  Install the :ref:`addon-weblate.gettext.msgmerge` add-on, which automatically
+  runs :program:`msgmerge` to update all PO files whenever the POT file changes.
+* **Manually via upload**: Use the :guilabel:`Update source strings` :ref:`upload-method`
+  to upload your POT file, which will merge it with existing translations.
 
 .. hint::
 
@@ -162,7 +189,8 @@ Managing the local VCS repository
 Weblate stores all translations in its underlying version control repository.
 It is suggested to be connected to a remote one, but internal-only setup is
 also possible. The :guilabel:`Repository maintenance` allows
-controlling this repository.
+controlling this repository. For a detailed description of the available
+actions, see :ref:`repository-maintenance`.
 
 .. hint::
 
@@ -173,5 +201,6 @@ controlling this repository.
 
 .. seealso::
 
+   * :ref:`repository-maintenance`
    * :doc:`/admin/continuous`
    * :doc:`/vcs`

@@ -1,11 +1,11 @@
 {
   "$id": "https://weblate.org/schemas/weblate-backup.schema.json",
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "definitions": {
+  "$defs": {
     "category": {
-      "$id": "#/definitions/category",
       "title": "Category",
+      "type": "object",
       "additionalProperties": false,
       "required": [
         "name",
@@ -14,7 +14,6 @@
       ],
       "properties": {
         "name": {
-          "$id": "#/definitions/category/name",
           "title": "Category name",
           "type": "string",
           "default": "",
@@ -23,7 +22,6 @@
           ]
         },
         "slug": {
-          "$id": "#/definitions/category/slug",
           "title": "Full URL slug excluding the project slug",
           "type": "string",
           "default": "",
@@ -32,15 +30,148 @@
             "my-category/my-subcategory"
           ]
         },
-        "categories": {
-          "$id": "#/definitions/category/items/category",
-          "title": "Categories",
+        "check_flags": {
+          "title": "Translation flags",
+          "type": "string",
+          "default": ""
+        },
+        "enforced_checks": {
+          "title": "Enforced checks",
           "type": "array",
-          "items": [
+          "items": {
+            "title": "Check name",
+            "type": "string"
+          },
+          "default": []
+        },
+        "license": {
+          "title": "Translation license",
+          "type": "string",
+          "default": ""
+        },
+        "agreement": {
+          "title": "Contributor agreement",
+          "type": "string",
+          "default": ""
+        },
+        "new_lang": {
+          "title": "Adding new translation",
+          "type": "string",
+          "default": ""
+        },
+        "language_code_style": {
+          "title": "Language code style",
+          "type": "string",
+          "default": ""
+        },
+        "secondary_language": {
+          "title": "Secondary language code",
+          "oneOf": [
             {
-              "$ref": "#/definitions/category"
+              "type": "string"
+            },
+            {
+              "type": "null"
             }
           ],
+          "default": null
+        },
+        "commit_message": {
+          "title": "Commit message when translating",
+          "type": "string",
+          "default": ""
+        },
+        "add_message": {
+          "title": "Commit message when adding translation",
+          "type": "string",
+          "default": ""
+        },
+        "delete_message": {
+          "title": "Commit message when removing translation",
+          "type": "string",
+          "default": ""
+        },
+        "merge_message": {
+          "title": "Commit message when merging translation",
+          "type": "string",
+          "default": ""
+        },
+        "addon_message": {
+          "title": "Commit message when add-on makes a change",
+          "type": "string",
+          "default": ""
+        },
+        "pull_message": {
+          "title": "Merge request message",
+          "type": "string",
+          "default": ""
+        },
+        "inherit_license": {
+          "title": "Inherit translation license",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_agreement": {
+          "title": "Inherit contributor agreement",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_new_lang": {
+          "title": "Inherit adding new translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_language_code_style": {
+          "title": "Inherit language code style",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_secondary_language": {
+          "title": "Inherit secondary language",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_enforced_checks": {
+          "title": "Inherit enforced checks",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_commit_message": {
+          "title": "Inherit commit message when translating",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_add_message": {
+          "title": "Inherit commit message when adding translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_delete_message": {
+          "title": "Inherit commit message when removing translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_merge_message": {
+          "title": "Inherit commit message when merging translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_addon_message": {
+          "title": "Inherit commit message when add-on makes a change",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_pull_message": {
+          "title": "Inherit merge request message",
+          "type": "boolean",
+          "default": false
+        },
+        "categories": {
+          "title": "Categories",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/category"
+          },
           "default": []
         }
       }
@@ -55,7 +186,6 @@
   ],
   "properties": {
     "metadata": {
-      "$id": "#root/metadata",
       "title": "Export metadata",
       "type": "object",
       "required": [
@@ -67,7 +197,6 @@
       "additionalProperties": false,
       "properties": {
         "version": {
-          "$id": "#root/metadata/version",
           "title": "Weblate version",
           "type": "string",
           "default": "",
@@ -76,7 +205,6 @@
           ]
         },
         "server": {
-          "$id": "#root/metadata/server",
           "title": "Server name",
           "type": "string",
           "default": "",
@@ -85,7 +213,6 @@
           ]
         },
         "domain": {
-          "$id": "#root/metadata/domain",
           "title": "Server domain",
           "type": "string",
           "format": "hostname",
@@ -95,7 +222,6 @@
           ]
         },
         "timestamp": {
-          "$id": "#root/metadata/timestamp",
           "title": "Export timestamp",
           "type": "string",
           "format": "date-time",
@@ -107,7 +233,6 @@
       }
     },
     "project": {
-      "$id": "#root/project",
       "title": "Project",
       "type": "object",
       "additionalProperties": false,
@@ -118,7 +243,6 @@
         "instructions",
         "access_control",
         "language_aliases",
-        "set_language_team",
         "use_shared_tm",
         "contribute_shared_tm",
         "translation_review",
@@ -127,7 +251,6 @@
       ],
       "properties": {
         "name": {
-          "$id": "#root/project/name",
           "title": "Project name",
           "type": "string",
           "default": "",
@@ -136,7 +259,6 @@
           ]
         },
         "slug": {
-          "$id": "#root/project/slug",
           "title": "URL slug",
           "type": "string",
           "default": "",
@@ -145,7 +267,6 @@
           ]
         },
         "web": {
-          "$id": "#root/project/web",
           "title": "",
           "anyOf": [
             {
@@ -163,13 +284,11 @@
           ]
         },
         "instructions": {
-          "$id": "#root/project/instructions",
           "title": "Translation instructions",
           "type": "string",
           "default": ""
         },
         "access_control": {
-          "$id": "#root/project/access_control",
           "title": "Access control",
           "type": "integer",
           "enum": [
@@ -183,8 +302,12 @@
             0
           ]
         },
+        "public_sharing": {
+          "title": "Public sharing",
+          "type": "boolean",
+          "default": false
+        },
         "language_aliases": {
-          "$id": "#root/project/language_aliases",
           "title": "Language aliases",
           "type": "string",
           "default": "",
@@ -193,50 +316,231 @@
           ]
         },
         "set_language_team": {
-          "$id": "#root/project/set_language_team",
           "title": "Set \"Language-Team\" header",
           "type": "boolean",
           "default": false
         },
         "use_shared_tm": {
-          "$id": "#root/project/use_shared_tm",
           "title": "Use shared translation memory",
           "type": "boolean",
           "default": false
         },
         "contribute_shared_tm": {
-          "$id": "#root/project/contribute_shared_tm",
           "title": "Contribute to shared translation memory",
           "type": "boolean",
           "default": false
         },
+        "use_workspace_tm": {
+          "title": "Use workspace translation memory",
+          "type": "boolean",
+          "default": false
+        },
+        "contribute_workspace_tm": {
+          "title": "Contribute to workspace translation memory",
+          "type": "boolean",
+          "default": false
+        },
+        "autoclean_tm": {
+          "title": "Autoclean translation memory",
+          "type": "boolean",
+          "default": false
+        },
         "translation_review": {
-          "$id": "#root/project/translation_review",
           "title": "Enable reviews",
           "type": "boolean",
           "default": false
         },
         "source_review": {
-          "$id": "#root/project/source_review",
           "title": "Enable source reviews",
           "type": "boolean",
           "default": false
         },
+        "enforced_2fa": {
+          "title": "Enforced two-factor authentication",
+          "type": "boolean",
+          "default": false
+        },
+        "commit_policy": {
+          "title": "Translation quality filter",
+          "type": "integer",
+          "enum": [
+            0,
+            20,
+            30
+          ],
+          "default": 0
+        },
         "enable_hooks": {
-          "$id": "#root/project/enable_hooks",
           "title": "Enable hooks",
+          "type": "boolean",
+          "default": false
+        },
+        "branch_discovery_component": {
+          "title": "Branch discovery source",
+          "description": "Path of the source component within the project, such as category/component.",
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "examples": [
+            "my-category/test-component"
+          ]
+        },
+        "branch_discovery_exclude": {
+          "title": "Excluded branches",
+          "type": "string",
+          "maxLength": 200,
+          "default": ""
+        },
+        "check_flags": {
+          "title": "Translation flags",
+          "type": "string",
+          "default": ""
+        },
+        "enforced_checks": {
+          "title": "Enforced checks",
+          "type": "array",
+          "items": {
+            "title": "Check name",
+            "type": "string"
+          },
+          "default": []
+        },
+        "license": {
+          "title": "Translation license",
+          "type": "string",
+          "default": ""
+        },
+        "agreement": {
+          "title": "Contributor agreement",
+          "type": "string",
+          "default": ""
+        },
+        "new_lang": {
+          "title": "Adding new translation",
+          "type": "string",
+          "default": ""
+        },
+        "language_code_style": {
+          "title": "Language code style",
+          "type": "string",
+          "default": ""
+        },
+        "secondary_language": {
+          "title": "Secondary language code",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "commit_message": {
+          "title": "Commit message when translating",
+          "type": "string",
+          "default": ""
+        },
+        "add_message": {
+          "title": "Commit message when adding translation",
+          "type": "string",
+          "default": ""
+        },
+        "delete_message": {
+          "title": "Commit message when removing translation",
+          "type": "string",
+          "default": ""
+        },
+        "merge_message": {
+          "title": "Commit message when merging translation",
+          "type": "string",
+          "default": ""
+        },
+        "addon_message": {
+          "title": "Commit message when add-on makes a change",
+          "type": "string",
+          "default": ""
+        },
+        "pull_message": {
+          "title": "Merge request message",
+          "type": "string",
+          "default": ""
+        },
+        "inherit_license": {
+          "title": "Inherit translation license",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_agreement": {
+          "title": "Inherit contributor agreement",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_new_lang": {
+          "title": "Inherit adding new translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_language_code_style": {
+          "title": "Inherit language code style",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_secondary_language": {
+          "title": "Inherit secondary language",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_enforced_checks": {
+          "title": "Inherit enforced checks",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_commit_message": {
+          "title": "Inherit commit message when translating",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_add_message": {
+          "title": "Inherit commit message when adding translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_delete_message": {
+          "title": "Inherit commit message when removing translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_merge_message": {
+          "title": "Inherit commit message when merging translation",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_addon_message": {
+          "title": "Inherit commit message when add-on makes a change",
+          "type": "boolean",
+          "default": false
+        },
+        "inherit_pull_message": {
+          "title": "Inherit merge request message",
           "type": "boolean",
           "default": false
         }
       }
     },
     "labels": {
-      "$id": "#root/labels",
       "title": "Project labels",
       "type": "array",
       "default": [],
       "items": {
-        "$id": "#root/labels/items",
         "title": "Items",
         "type": "object",
         "required": [
@@ -246,7 +550,6 @@
         "additionalProperties": false,
         "properties": {
           "name": {
-            "$id": "#root/auditlog/items/name",
             "title": "Label name",
             "type": "string",
             "default": "",
@@ -255,7 +558,6 @@
             ]
           },
           "color": {
-            "$id": "#root/auditlog/items/color",
             "title": "Color",
             "type": "string",
             "default": "",
@@ -285,21 +587,18 @@
       }
     },
     "categories": {
-      "$id": "#root/categories",
       "title": "Project Categories",
       "type": "array",
       "default": [],
       "items": {
-        "$ref": "#/definitions/category"
+        "$ref": "#/$defs/category"
       }
     },
     "teams": {
-      "$id": "#root/teams",
       "title": "Teams",
       "type": "array",
       "default": [],
       "items": {
-        "$id": "#root/teams/items",
         "title": "Team",
         "type": "object",
         "required": [
@@ -316,7 +615,6 @@
         "additionalProperties": false,
         "properties": {
           "name": {
-            "$id": "#root/teams/items/name",
             "title": "Team name",
             "type": "string",
             "default": "",
@@ -324,8 +622,11 @@
               "My Team"
             ]
           },
+          "internal": {
+            "title": "Built-in team",
+            "type": "boolean"
+          },
           "roles": {
-            "$id": "#root/teams/items/roles",
             "title": "Roles",
             "type": "array",
             "items": {
@@ -341,7 +642,6 @@
             ]
           },
           "components": {
-            "$id": "#root/teams/items/components",
             "title": "Components",
             "type": "array",
             "items": {
@@ -357,7 +657,6 @@
             ]
           },
           "language_selection": {
-            "$id": "#root/teams/items/language_selection",
             "title": "Language Selection",
             "type": "integer",
             "enum": [
@@ -367,7 +666,6 @@
             "default": 0
           },
           "languages": {
-            "$id": "#root/teams/items/languages",
             "title": "Languages",
             "type": "array",
             "items": {
@@ -383,7 +681,6 @@
             ]
           },
           "admins": {
-            "$id": "#root/teams/items/admins",
             "title": "Admins",
             "type": "array",
             "items": {
@@ -398,28 +695,59 @@
             ]
           },
           "enforced_2fa": {
-            "$id": "#root/teams/items/enforced_2fa",
             "title": "Enforced two-factor authentication",
             "type": "boolean",
             "default": false
           },
           "members": {
-            "$id": "#root/teams/items/members",
             "title": "Members",
             "type": "array",
             "items": {
-              "title": "Username",
-              "type": "string"
+              "oneOf": [
+                {
+                  "title": "Username",
+                  "type": "string"
+                },
+                {
+                  "title": "Team member",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "username",
+                    "limit_languages"
+                  ],
+                  "properties": {
+                    "username": {
+                      "title": "Username",
+                      "type": "string"
+                    },
+                    "limit_languages": {
+                      "title": "Limited languages",
+                      "type": "array",
+                      "items": {
+                        "title": "Language code",
+                        "type": "string"
+                      },
+                      "default": []
+                    }
+                  }
+                }
+              ]
             },
             "default": [],
             "examples": [
               [
-                "user-1"
+                "user-1",
+                {
+                  "username": "reviewer-cs",
+                  "limit_languages": [
+                    "cs"
+                  ]
+                }
               ]
             ]
           },
           "autogroups": {
-            "$id": "#root/teams/items/autogroups",
             "title": "Auto Groups",
             "type": "array",
             "items": {
@@ -430,6 +758,47 @@
               [
                 "^.*$"
               ]
+            ]
+          }
+        }
+      }
+    },
+    "saved_searches": {
+      "title": "Project saved searches",
+      "type": "array",
+      "default": [],
+      "items": {
+        "title": "Items",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "query",
+          "description"
+        ],
+        "properties": {
+          "name": {
+            "title": "Saved search name",
+            "type": "string",
+            "maxLength": 190,
+            "examples": [
+              "Important"
+            ]
+          },
+          "query": {
+            "title": "Search query",
+            "type": "string",
+            "examples": [
+              "priority:>100"
+            ]
+          },
+          "description": {
+            "title": "Search description",
+            "type": "string",
+            "maxLength": 250,
+            "default": "",
+            "examples": [
+              "Translate first"
             ]
           }
         }

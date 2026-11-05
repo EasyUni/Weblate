@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from typing import ClassVar
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.storage import FileSystemStorage
@@ -45,7 +47,10 @@ class Font(models.Model, UserDisplayMixin):
     )
 
     class Meta:
-        unique_together = [("family", "style", "project")]
+        required_db_vendor = "postgresql"
+        unique_together: ClassVar[list[tuple[str, str, str]]] = [
+            ("family", "style", "project")
+        ]
         verbose_name = "Font"
         verbose_name_plural = "Fonts"
 
@@ -56,11 +61,10 @@ class Font(models.Model, UserDisplayMixin):
         super().__init__(*args, **kwargs)
         self.field_errors: dict[str, list[ValidationError]] = {}
 
+    # pylint: disable-next=arguments-differ
     def save(
         self, force_insert=False, force_update=False, using=None, update_fields=None
     ) -> None:
-        from weblate.fonts.tasks import update_fonts_cache
-
         self.clean()
         super().save(
             force_insert=force_insert,
@@ -68,7 +72,6 @@ class Font(models.Model, UserDisplayMixin):
             using=using,
             update_fields=update_fields,
         )
-        update_fonts_cache.delay()
 
     def get_absolute_url(self) -> str:
         return reverse("font", kwargs={"pk": self.pk, "project": self.project.slug})
@@ -93,7 +96,7 @@ class Font(models.Model, UserDisplayMixin):
         return related.order().distinct()
 
 
-class FontGroupQuerySet(models.QuerySet):
+class FontGroupQuerySet(models.QuerySet["FontGroup", "FontGroup"]):
     def order(self):
         return self.order_by("name")
 
@@ -122,7 +125,8 @@ class FontGroup(models.Model):
     objects = FontGroupQuerySet.as_manager()
 
     class Meta:
-        unique_together = [("project", "name")]
+        required_db_vendor = "postgresql"
+        unique_together: ClassVar[list[tuple[str, str]]] = [("project", "name")]
         verbose_name = "Font group"
         verbose_name_plural = "Font groups"
 
@@ -149,9 +153,29 @@ class FontOverride(models.Model):
     )
 
     class Meta:
-        unique_together = [("group", "language")]
+        required_db_vendor = "postgresql"
+        unique_together: ClassVar[list[tuple[str, str]]] = [("group", "language")]
         verbose_name = "Font override"
         verbose_name_plural = "Font overrides"
 
     def __str__(self) -> str:
         return f"{self.group}:{self.font}:{self.language}"
+
+    def save(self, *args, **kwargs) -> None:
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def clean(self) -> None:
+        super().clean()
+        if (
+            self.group_id
+            and self.font_id
+            and self.group.project_id != self.font.project_id
+        ):
+            raise ValidationError(
+                {
+                    "font": gettext_lazy(
+                        "Font has to be in the same project as the font group."
+                    )
+                }
+            )

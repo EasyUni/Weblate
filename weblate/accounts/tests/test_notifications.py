@@ -2,44 +2,221 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Tests for notitifications."""
+"""Tests for notifications."""
 
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import timedelta
+from email import policy
+from email.parser import BytesParser
+from types import SimpleNamespace
+from typing import Never, Protocol, cast
+from unittest.mock import patch
 
 from django.conf import settings
 from django.core import mail
+from django.core.mail import EmailMessage, EmailMultiAlternatives
+from django.db.models import Manager, Model
+from django.template.loader import render_to_string
 from django.test import SimpleTestCase
 from django.test.utils import override_settings
+from django.utils import timezone
 
-from weblate.accounts.models import AuditLog, Profile, Subscription
+from weblate.accounts.models import AuditLog, Profile, Subscription, WeblateAccountsConf
 from weblate.accounts.notifications import (
+    DIGEST_MAX_ITEMS,
+    RECIPIENT_USERNAME_HEADER,
+    SUBSCRIPTION_CACHE_SIZE,
+    LastAuthorCommentNotificaton,
     MergeFailureNotification,
+    Notification,
     NotificationFrequency,
     NotificationScope,
+    PendingSuggestionsNotification,
+    RepositoryNotification,
+    TranslationActivitySummaryNotification,
+    get_email_headers,
+    get_notification_emails,
 )
 from weblate.accounts.tasks import (
+    get_digest_projects,
     notify_changes,
     notify_daily,
+    notify_digest,
+    notify_digest_batch,
     notify_monthly,
     notify_weekly,
     send_mails,
 )
-from weblate.auth.models import User
+from weblate.auth.data import SELECTION_ALL
+from weblate.auth.models import Group, Permission, Role, User
 from weblate.lang.models import Language
+from weblate.screenshots.models import Screenshot
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Announcement, Comment, Suggestion
-from weblate.trans.tests.test_views import RegistrationTestMixin, ViewTestCase
+from weblate.trans.models import (
+    Announcement,
+    Change,
+    Comment,
+    Project,
+    Suggestion,
+    Translation,
+)
+from weblate.trans.tests.test_views import (
+    FixtureComponentTestCase,
+    RegistrationTestMixin,
+    ReusableViewTestCase,
+)
+from weblate.trans.tests.utils import (
+    create_test_addon,
+    create_test_billing,
+    get_test_actor,
+)
+from weblate.utils.change_origin import acting_user_context
+from weblate.utils.icons import load_icon
+from weblate.utils.site import get_site_url
+from weblate.utils.version import USER_AGENT
+from weblate.utils.version_display import VERSION_DISPLAY_HIDE, VERSION_DISPLAY_SOFT
 
 TEMPLATES_RAISE = deepcopy(settings.TEMPLATES)
 TEMPLATES_RAISE[0]["OPTIONS"]["string_if_invalid"] = "TEMPLATE_BUG[%s]"
 
 
-@override_settings(TEMPLATES=TEMPLATES_RAISE)
-class NotificationTest(ViewTestCase, RegistrationTestMixin):
+class _Saveable(Protocol):
+    def save(self, **kwargs: object) -> None: ...
+
+
+def get_html_content(message: EmailMessage) -> str:
+    assert isinstance(message, EmailMultiAlternatives)
+    content = message.alternatives[0][0]
+    assert isinstance(content, str)
+    return content
+
+
+class LazyTranslation:
+    def __init__(self) -> None:
+        self.component = None
+        self.prefetched_language = None
+
+    @property
+    def language(self) -> Never:
+        msg = "fill_in_prefetched should inject change.language"
+        raise AssertionError(msg)
+
+    @language.setter
+    def language(self, value) -> None:
+        self.prefetched_language = value
+
+
+class LazyLanguageChange:
+    unit = None
+    screenshot = None
+    language_id = 1
+
+    def __init__(self) -> None:
+        self.translation = LazyTranslation()
+        self.component = SimpleNamespace(project=None, category=None)
+        self.project = SimpleNamespace(workspace=None)
+        self.workspace = SimpleNamespace()
+        self.category = object()
+        self.language = SimpleNamespace()
+
+
+class ChangePrefetchTest(SimpleTestCase):
+    def test_fill_in_prefetched_injects_change_language(self) -> None:
+        change = LazyLanguageChange()
+
+        Change.fill_in_prefetched(change)
+
+        self.assertIs(change.translation.prefetched_language, change.language)
+        self.assertIs(change.translation.component, change.component)
+        self.assertIs(change.component.project, change.project)
+        self.assertIs(change.component.category, change.category)
+        self.assertIs(change.project.workspace, change.workspace)
+
+    def test_preload_list_injects_change_language(self) -> None:
+        change = LazyLanguageChange()
+
+        Change.objects.preload_list([change])
+
+        self.assertIs(change.translation.prefetched_language, change.language)
+        self.assertIs(change.project.workspace, change.workspace)
+        self.assertIs(change.translation.component, change.component)
+        self.assertIs(change.component.project, change.project)
+
+
+class NotificationHeadersTest(SimpleTestCase):
+    def test_subscription_cache_is_bounded(self) -> None:
+        notification = Notification([])
+        with patch.object(notification, "filter_subscriptions", return_value=[]):
+            for project_id in range(SUBSCRIPTION_CACHE_SIZE + 1):
+                list(
+                    notification.get_subscriptions(
+                        None,
+                        cast("Project", SimpleNamespace(pk=project_id)),
+                        None,
+                        None,
+                        None,
+                    )
+                )
+
+        self.assertEqual(len(notification.subscription_cache), SUBSCRIPTION_CACHE_SIZE)
+        self.assertNotIn((0, False), notification.subscription_cache)
+
+    @override_settings(VERSION_DISPLAY=VERSION_DISPLAY_SOFT, HIDE_VERSION=False)
+    def test_soft_mode_keeps_x_mailer_version(self) -> None:
+        self.assertEqual(get_email_headers("test")["X-Mailer"], USER_AGENT)
+
+    @override_settings(VERSION_DISPLAY=VERSION_DISPLAY_HIDE, HIDE_VERSION=True)
+    def test_hide_mode_hides_x_mailer_version(self) -> None:
+        self.assertEqual(get_email_headers("test")["X-Mailer"], "Weblate")
+
+    def test_raw_notification_has_no_recipient_username(self) -> None:
+        messages = get_notification_emails(
+            None,
+            ["noreply@example.com"],
+            "activation",
+            context={"url": "/accounts/", "validity": 1},
+        )
+
+        self.assertNotIn(RECIPIENT_USERNAME_HEADER, messages[0]["headers"])
+
+    def test_activity_summary_digest_only(self) -> None:
+        choices = {
+            frequency
+            for frequency, _label in TranslationActivitySummaryNotification.get_freq_choices()
+        }
+
+        self.assertNotIn(NotificationFrequency.FREQ_INSTANT, choices)
+
+    def test_activity_summary_default_notification(self) -> None:
+        self.assertIn(
+            (
+                NotificationScope.SCOPE_WATCHED,
+                NotificationFrequency.FREQ_WEEKLY,
+                "TranslationActivitySummaryNotification",
+            ),
+            WeblateAccountsConf.DEFAULT_NOTIFICATIONS,
+        )
+        self.assertNotIn(
+            (
+                NotificationScope.SCOPE_WATCHED,
+                NotificationFrequency.FREQ_WEEKLY,
+                "NewStringNotificaton",
+            ),
+            WeblateAccountsConf.DEFAULT_NOTIFICATIONS,
+        )
+
+
+@override_settings(
+    TEMPLATES=TEMPLATES_RAISE,
+    RATELIMIT_NOTIFICATION_LIMITS=[],
+)
+class NotificationTest(ReusableViewTestCase, RegistrationTestMixin):
     def setUp(self) -> None:
         super().setUp()
+        self.automation_user = get_test_actor(self)
+        self.enterContext(acting_user_context(self.automation_user))
         self.user.email = "noreply+notify@weblate.org"
         self.user.save()
         czech = Language.objects.get(code="cs")
@@ -80,6 +257,9 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
                 notification=notification,
                 frequency=NotificationFrequency.FREQ_INSTANT,
             )
+        Subscription.objects.filter(
+            user=self.user, notification="TranslationActivitySummaryNotification"
+        ).delete()
         self.thirduser = User.objects.create_user(
             "thirduser", "noreply+third@example.org", "testpassword"
         )
@@ -90,20 +270,46 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         for i, message in enumerate(mail.outbox):
             self.assertNotIn("TEMPLATE_BUG", message.subject)
             self.assertNotIn("TEMPLATE_BUG", message.body)
-            self.assertNotIn("TEMPLATE_BUG", message.alternatives[0][0])
+            self.assertNotIn("TEMPLATE_BUG", get_html_content(message))
             if subject:
                 self.assertEqual(message.subject, subject)
             if subjects:
                 self.assertEqual(message.subject, subjects[i])
         self.assertEqual(len(mail.outbox), count)
 
+    def create_with_callbacks[ModelT: Model](
+        self, manager: Manager[ModelT], **kwargs: object
+    ) -> ModelT:
+        kwargs.setdefault("user", self.automation_user)
+        with self.captureOnCommitCallbacks(execute=True):
+            return manager.create(**kwargs)
+
+    def save_with_callbacks(self, obj: _Saveable, **kwargs: object) -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            obj.save(**kwargs)
+
+    def create_announcement(self, **kwargs: object) -> Announcement:
+        kwargs.setdefault("user", self.automation_user)
+        with self.captureOnCommitCallbacks(execute=True):
+            return Announcement.objects.create(**kwargs)
+
+    def add_component_alert(self, name: str = "PushFailure") -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(name, error="Some error")
+
     def test_notify_lock(self) -> None:
-        self.component.change_set.create(
+        self.create_with_callbacks(
+            self.component.change_set,
             action=ActionEvents.LOCK,
         )
         self.validate_notifications(1, "[Weblate] Component Test/Test was locked")
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
         mail.outbox.clear()
-        self.component.change_set.create(
+        self.create_with_callbacks(
+            self.component.change_set,
             action=ActionEvents.UNLOCK,
         )
         self.validate_notifications(1, "[Weblate] Component Test/Test was unlocked")
@@ -117,12 +323,14 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
             frequency=NotificationFrequency.FREQ_INSTANT,
             onetime=True,
         )
-        self.component.change_set.create(
+        self.create_with_callbacks(
+            self.component.change_set,
             action=ActionEvents.UNLOCK,
         )
         self.validate_notifications(1, "[Weblate] Component Test/Test was unlocked")
         mail.outbox.clear()
-        self.component.change_set.create(
+        self.create_with_callbacks(
+            self.component.change_set,
             action=ActionEvents.LOCK,
         )
         self.validate_notifications(0)
@@ -132,18 +340,19 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_license(self) -> None:
         self.component.license = "WTFPL"
-        self.component.save()
+        self.save_with_callbacks(self.component)
         self.validate_notifications(1, "[Weblate] Test/Test was re-licensed to WTFPL")
 
     def test_notify_agreement(self) -> None:
         self.component.agreement = "You have to agree."
-        self.component.save()
+        self.save_with_callbacks(self.component)
         self.validate_notifications(
             1, "[Weblate] Contributor license agreement for Test/Test was changed"
         )
 
     def test_notify_merge_failure(self) -> None:
-        change = self.component.change_set.create(
+        change = self.create_with_callbacks(
+            self.component.change_set,
             details={"error": "Failed merge", "status": "Error\nstatus"},
             action=ActionEvents.FAILED_MERGE,
         )
@@ -159,7 +368,9 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         self.validate_notifications(2, "[Weblate] Repository failure in Test/Test")
 
     def test_notify_repository(self) -> None:
-        change = self.component.change_set.create(action=ActionEvents.MERGE)
+        change = self.create_with_callbacks(
+            self.component.change_set, action=ActionEvents.MERGE
+        )
 
         # Check mail
         self.assertEqual(len(mail.outbox), 1)
@@ -171,16 +382,44 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         # Check mail
         self.validate_notifications(2, "[Weblate] Repository operation in Test/Test")
 
-    def test_notify_parse_error(self) -> None:
-        change = self.get_translation().change_set.create(
-            details={"error_message": "Failed merge", "filename": "test/file.po"},
-            action=ActionEvents.PARSE_ERROR,
+    def configure_repository_browsers(self) -> None:
+        self.component.repoweb = "https://source.example.com/{{filename}}#L{{line}}"
+        self.component.repoweb_translations = (
+            "https://translations.example.com/{{filename}}#L{{line}}"
         )
-        self.assertIn("test/file.po", change.get_details_display())
-        self.assertIn("Failed merge", change.get_details_display())
+        self.component.save(update_fields=["repoweb", "repoweb_translations"])
+
+    def trigger_parse_error(
+        self,
+        translation: Translation | None = None,
+        filename: str | None = None,
+    ) -> Change:
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.handle_parse_error(
+                ValueError("Failed parse"),
+                translation=translation,
+                filename=filename,
+                reraise=False,
+            )
+        return self.component.change_set.filter(action=ActionEvents.PARSE_ERROR).latest(
+            "pk"
+        )
+
+    def test_notify_parse_error(self) -> None:
+        self.configure_repository_browsers()
+        translation = self.get_translation()
+        change = self.trigger_parse_error(translation=translation)
+        self.assertEqual(change.translation, translation)
+        self.assertEqual(change.details["filename"], translation.filename)
+        self.assertIn(translation.filename, change.get_details_display())
+        self.assertIn("Failed parse", change.get_details_display())
 
         # Check mail
         self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(
+            f'href="https://translations.example.com/{translation.filename}#L1"',
+            get_html_content(mail.outbox[0]),
+        )
 
         # Add project owner
         self.component.project.add_user(self.anotheruser, "Administration")
@@ -189,9 +428,63 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         # Check mail
         self.validate_notifications(3, "[Weblate] Parse error in Test/Test")
 
+    def test_notify_source_parse_error(self) -> None:
+        self.configure_repository_browsers()
+        translation = self.component.source_translation
+        change = self.trigger_parse_error(translation=translation)
+        self.assertEqual(change.translation, translation)
+        self.assertEqual(change.details["filename"], translation.filename)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(
+            f'href="https://translations.example.com/{translation.filename}#L1"',
+            get_html_content(mail.outbox[0]),
+        )
+
+    def test_notify_intermediate_parse_error(self) -> None:
+        self.configure_repository_browsers()
+        self.component.intermediate = "intermediate/dev.json"
+        self.component.save(update_fields=["intermediate"])
+        change = self.trigger_parse_error(filename=self.component.intermediate)
+        self.assertIsNone(change.translation)
+        self.assertEqual(change.details["filename"], self.component.intermediate)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(
+            'href="https://translations.example.com/intermediate/dev.json#L1"',
+            get_html_content(mail.outbox[0]),
+        )
+
+    def test_notify_template_parse_error(self) -> None:
+        self.configure_repository_browsers()
+        self.component.intermediate = "intermediate/dev.json"
+        self.component.template = "intermediate/en.json"
+        self.component.save(update_fields=["intermediate", "template"])
+        change = self.trigger_parse_error(filename=self.component.template)
+        self.assertIsNone(change.translation)
+        self.assertEqual(change.details["filename"], self.component.template)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(
+            'href="https://translations.example.com/intermediate/en.json#L1"',
+            get_html_content(mail.outbox[0]),
+        )
+
+    def test_notify_parse_error_translation_browser_fallback(self) -> None:
+        self.component.repoweb = "https://source.example.com/{{filename}}#L{{line}}"
+        self.component.save(update_fields=["repoweb"])
+        translation = self.get_translation()
+        self.trigger_parse_error(translation=translation)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(
+            f'href="https://source.example.com/{translation.filename}#L1"',
+            get_html_content(mail.outbox[0]),
+        )
+
     def test_notify_new_string(self) -> None:
         unit = self.get_unit()
-        unit.change_set.create(action=ActionEvents.NEW_UNIT)
+        self.create_with_callbacks(unit.change_set, action=ActionEvents.NEW_UNIT)
 
         # Check mail
         self.validate_notifications(
@@ -200,7 +493,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_new_translation(self) -> None:
         unit = self.get_unit()
-        unit.change_set.create(
+        self.create_with_callbacks(
+            unit.change_set,
             user=self.anotheruser,
             old="",
             action=ActionEvents.CHANGE,
@@ -211,7 +505,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_approved_translation(self) -> None:
         unit = self.get_unit()
-        unit.change_set.create(
+        self.create_with_callbacks(
+            unit.change_set,
             user=self.anotheruser,
             old="",
             action=ActionEvents.APPROVE,
@@ -227,7 +522,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_new_language(self) -> None:
         anotheruser = self.anotheruser
-        change = self.component.change_set.create(
+        change = self.create_with_callbacks(
+            self.component.change_set,
             user=anotheruser,
             details={"language": "de"},
             action=ActionEvents.REQUESTED_LANGUAGE,
@@ -245,7 +541,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_new_contributor(self) -> None:
         unit = self.get_unit()
-        unit.change_set.create(
+        self.create_with_callbacks(
+            unit.change_set,
             user=self.anotheruser,
             action=ActionEvents.NEW_CONTRIBUTOR,
         )
@@ -255,7 +552,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_new_suggestion(self) -> None:
         unit = self.get_unit()
-        unit.change_set.create(
+        self.create_with_callbacks(
+            unit.change_set,
             suggestion=Suggestion.objects.create(unit=unit, target="Foo"),
             user=self.anotheruser,
             action=ActionEvents.SUGGESTION,
@@ -266,10 +564,34 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def add_comment(self, comment="Foo", language="en") -> None:
         unit = self.get_unit(language=language)
-        unit.change_set.create(
+        self.create_with_callbacks(
+            unit.change_set,
             comment=Comment.objects.create(unit=unit, comment=comment),
             user=self.thirduser,
             action=ActionEvents.COMMENT,
+        )
+
+    def create_comment_change(self, unit, user: User, comment="Foo") -> Comment:
+        comment_obj = Comment.objects.create(unit=unit, comment=comment, user=user)
+        self.create_with_callbacks(
+            unit.change_set,
+            comment=comment_obj,
+            user=user,
+            author=user,
+            action=ActionEvents.COMMENT,
+        )
+        return comment_obj
+
+    def subscribe_participation_comment(
+        self, user: User, *, watched: bool = True
+    ) -> None:
+        if watched:
+            user.profile.watched.add(self.project)
+        Subscription.objects.create(
+            user=user,
+            scope=NotificationScope.SCOPE_WATCHED,
+            notification="LastAuthorCommentNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
         )
 
     def test_notify_new_comment(self, expected=1, comment="Foo") -> None:
@@ -292,7 +614,7 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_new_comment_report(self) -> None:
         self.component.report_source_bugs = "noreply@weblate.org"
-        self.component.save()
+        self.save_with_callbacks(self.component)
         self.test_notify_new_comment(2)
 
     def test_notify_new_comment_mention(self) -> None:
@@ -306,30 +628,210 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         self.assertEqual(len(mail.outbox), 0)
         change = self.get_unit().recent_content_changes[0]
         change.user = self.anotheruser
-        change.save()
+        self.save_with_callbacks(change)
         # Notification for other user edit via  TranslatedStringNotificaton
         self.assertEqual(len(mail.outbox), 1)
         mail.outbox.clear()
 
+    def test_notify_new_comment_previous_commenter(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        unit = self.get_unit()
+        self.create_comment_change(unit, self.user, "Question")
+        mail.outbox.clear()
+
+        self.create_comment_change(unit, self.thirduser, "Answer")
+
+        self.validate_notifications(1, "[Weblate] New comment in Test/Test")
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
+
+    def test_notify_new_comment_auto_watched_commenter(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user, watched=False)
+        self.user.profile.watched.clear()
+        unit = self.get_unit()
+
+        Comment.objects.add(
+            self.get_request(self.user), unit, "Question", "translation"
+        )
+        mail.outbox.clear()
+
+        self.assertTrue(self.user.profile.watched.filter(pk=self.project.pk).exists())
+
+        self.create_comment_change(unit, self.thirduser, "Answer")
+
+        self.validate_notifications(1, "[Weblate] New comment in Test/Test")
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
+
+    def test_notify_new_comment_skips_restricted_component_without_access(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.can_access_project(self.project))
+        self.assertFalse(self.user.can_access_component(self.component))
+
+        unit = self.get_unit()
+        self.create_comment_change(unit, self.user, "Question")
+        mail.outbox.clear()
+
+        self.create_comment_change(unit, self.thirduser, "Answer")
+
+        self.validate_notifications(0)
+
+    def test_notify_new_comment_source_commenter(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        unit = self.get_unit()
+        self.create_comment_change(unit.source_unit, self.user, "Question")
+        mail.outbox.clear()
+
+        self.create_comment_change(unit, self.thirduser, "Answer")
+
+        self.validate_notifications(1, "[Weblate] New comment in Test/Test")
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
+
+    def test_notify_new_comment_own_commenter(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        unit = self.get_unit()
+        self.create_comment_change(unit, self.user, "Question")
+        mail.outbox.clear()
+
+        self.create_comment_change(unit, self.user, "Follow-up")
+
+        self.validate_notifications(0)
+
+    def test_notify_new_comment_mentioned_commenter_once(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        Subscription.objects.create(
+            user=self.user,
+            scope=NotificationScope.SCOPE_ALL,
+            notification="MentionCommentNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        unit = self.get_unit()
+        self.create_comment_change(unit, self.user, "Question")
+        mail.outbox.clear()
+
+        self.create_comment_change(
+            unit, self.thirduser, f"Answer @{self.user.username}"
+        )
+
+        self.validate_notifications(1, "[Weblate] New comment in Test/Test")
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
+
+    def test_notify_new_comment_other_translation_commenter(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        unit = self.get_unit(language="cs")
+        other_unit = self.get_unit(language="de")
+        self.create_comment_change(unit, self.user, "Question")
+        mail.outbox.clear()
+
+        self.create_comment_change(other_unit, self.thirduser, "Answer")
+        self.create_comment_change(unit.source_unit, self.thirduser, "Source answer")
+
+        self.validate_notifications(0)
+
+    def test_notify_new_comment_stale_comment_change(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        unit = self.get_unit()
+
+        self.create_with_callbacks(
+            unit.change_set,
+            user=self.thirduser,
+            author=self.thirduser,
+            action=ActionEvents.COMMENT,
+        )
+
+        self.validate_notifications(0)
+
+    def test_notify_new_comment_delayed_change_skips_later_commenter(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user)
+        self.subscribe_participation_comment(self.anotheruser)
+        unit = self.get_unit()
+        Comment.objects.create(unit=unit, comment="Question", user=self.user)
+        comment = Comment.objects.create(
+            unit=unit, comment="Answer", user=self.thirduser
+        )
+        change = self.create_with_callbacks(
+            unit.change_set,
+            comment=comment,
+            user=self.thirduser,
+            author=self.thirduser,
+            action=ActionEvents.COMMENT,
+        )
+        mail.outbox.clear()
+        Comment.objects.create(unit=unit, comment="Later", user=self.anotheruser)
+
+        users = list(
+            LastAuthorCommentNotificaton([]).get_users(
+                NotificationFrequency.FREQ_INSTANT, change
+            )
+        )
+
+        self.assertIn(self.user, users)
+        self.assertNotIn(self.anotheruser, users)
+
+    def test_notify_new_comment_suggestion_author(self) -> None:
+        Subscription.objects.all().delete()
+        self.subscribe_participation_comment(self.user, watched=False)
+        self.user.profile.watched.clear()
+        unit = self.get_unit()
+
+        Suggestion.objects.add(
+            unit, ["Suggestion"], self.get_request(self.user), user=self.user
+        )
+        mail.outbox.clear()
+
+        self.assertTrue(self.user.profile.watched.filter(pk=self.project.pk).exists())
+
+        self.create_comment_change(unit, self.thirduser, "Answer")
+
+        self.validate_notifications(1, "[Weblate] New comment in Test/Test")
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
+
     def test_notify_new_component(self) -> None:
-        self.component.change_set.create(action=ActionEvents.CREATE_COMPONENT)
+        self.create_with_callbacks(
+            self.component.change_set, action=ActionEvents.CREATE_COMPONENT
+        )
         self.validate_notifications(1, "[Weblate] New translation component Test/Test")
 
     def test_notify_new_announcement(self) -> None:
-        Announcement.objects.create(
+        self.create_announcement(
             component=self.component,
             message="Hello word",
             notify=False,
         )
         self.validate_notifications(0)
-        Announcement.objects.create(
+        self.create_announcement(
             component=self.component,
             message="Hello word",
             notify=True,
         )
         self.validate_notifications(1, "[Weblate] New announcement on Test")
         mail.outbox.clear()
-        Announcement.objects.create(
+        self.create_announcement(
             component=self.component,
             language=Language.objects.get(code="cs"),
             message="Hello word",
@@ -337,7 +839,7 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         )
         self.validate_notifications(1, "[Weblate] New announcement on Test")
         mail.outbox.clear()
-        Announcement.objects.create(
+        self.create_announcement(
             component=self.component,
             language=Language.objects.get(code="de"),
             message="Hello word",
@@ -345,7 +847,7 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         )
         self.validate_notifications(0)
         mail.outbox.clear()
-        Announcement.objects.create(
+        self.create_announcement(
             message="Hello global word",
             notify=True,
         )
@@ -356,7 +858,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_component_translated(self) -> None:
         unit = self.get_unit()
-        unit.translation.component.change_set.create(
+        self.create_with_callbacks(
+            unit.translation.component.change_set,
             user=self.anotheruser,
             old="",
             action=ActionEvents.COMPLETED_COMPONENT,
@@ -370,7 +873,8 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_language_translated(self) -> None:
         unit = self.get_unit(language="cs")
-        unit.translation.change_set.create(
+        self.create_with_callbacks(
+            unit.translation.change_set,
             user=self.anotheruser,
             action=ActionEvents.COMPLETE,
         )
@@ -379,7 +883,7 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_alert(self) -> None:
         self.component.project.add_user(self.user, "Administration")
-        self.component.add_alert("PushFailure", error="Some error")
+        self.add_component_alert()
         self.validate_notifications(
             2,
             subjects=[
@@ -388,9 +892,31 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
             ],
         )
 
+    def test_notify_alert_includes_documentation(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(
+                "UpdateFailure",
+                error={
+                    "code": "repository_url_backend_unsupported",
+                    "retcode": 0,
+                },
+                diagnoses=[],
+            )
+        alert = self.component.alert_set.get(name="UpdateFailure")
+        alert_message = next(
+            message
+            for message in mail.outbox
+            if message.subject == "[Weblate] New alert on Test/Test"
+        )
+
+        self.assertIn(
+            alert.get_documentation_url(self.user), get_html_content(alert_message)
+        )
+
     def test_notify_admin(self) -> None:
         def trigger_alert(expected_count: int) -> None:
-            self.component.add_alert("PushFailure", error="Some error")
+            self.add_component_alert()
             self.validate_notifications(expected_count)
             self.component.delete_alert("PushFailure")
             mail.outbox.clear()
@@ -415,12 +941,482 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         self.component.project.remove_user(self.user)
         trigger_alert(0)
 
+    def test_notify_actionable_alerts_only(self) -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("UnusedScreenshot")
+        self.validate_notifications(0)
+        self.component.delete_alert("UnusedScreenshot")
+
+        self.component.project.add_user(self.user, "Administration")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("UnusedScreenshot")
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+        mail.outbox.clear()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("MissingScreenshots")
+        self.validate_notifications(0)
+
+    def test_notify_unused_screenshot_links_to_screenshot(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        with self.captureOnCommitCallbacks(execute=True):
+            screenshot = Screenshot.objects.create(
+                name="Unassigned screenshot",
+                image="screenshots/test.png",
+                translation=self.component.source_translation,
+            )
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+        self.assertIn(
+            f'href="{get_site_url(screenshot.get_absolute_url())}"',
+            get_html_content(mail.outbox[0]),
+        )
+
+    def test_notify_reopened_alert(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("BrokenBrowserURL", link="http://a", error="first")
+        mail.outbox.clear()
+        alert = self.component.alert_set.get(name="BrokenBrowserURL")
+        alert.dismiss(self.user, "Known issue")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(
+                "BrokenBrowserURL", link="http://b", error="different"
+            )
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+        self.assertIn("Reopened alert", mail.outbox[0].body)
+
+    def test_notify_project_wide_alert(self) -> None:
+        role = Role.objects.create(name="Project settings maintainer")
+        role.permissions.add(Permission.objects.get(codename="project.edit"))
+        group = Group.objects.create(name="Project settings maintainers")
+        group.roles.add(role)
+        group.projects.add(self.component.project)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("project.edit", self.component.project))
+        self.assertTrue(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("BrokenProjectURL", error="failure")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_deduplicate_project_wide_warning(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        second_component = self.create_link_existing()
+        mail.outbox.clear()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("MissingTranslationInstructions")
+            second_component.add_alert("MissingTranslationInstructions")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_standalone_project_wide_new_alert(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("MissingTranslationInstructions")
+        self.component.change_set.filter(
+            action=ActionEvents.ALERT,
+            alert__name="MissingTranslationInstructions",
+        ).update(timestamp=timezone.now() - timedelta(minutes=10))
+        second_component = self.create_link_existing()
+        mail.outbox.clear()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            second_component.add_alert("MissingTranslationInstructions")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test2")
+
+    def test_notify_standalone_project_wide_reopen(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        second_component = self.create_link_existing()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("BrokenProjectURL", error="failure")
+            second_component.add_alert("BrokenProjectURL", error="failure")
+        mail.outbox.clear()
+        alert = second_component.alert_set.get(name="BrokenProjectURL")
+        alert.dismiss(self.user, "Known issue")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            second_component.add_alert("BrokenProjectURL", error="different failure")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test2")
+        self.assertIn("Reopened alert", mail.outbox[0].body)
+
+    def test_deduplicate_project_wide_reopens(self) -> None:
+        self.component.project.add_user(self.user, "Administration")
+        second_component = self.create_link_existing()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("BrokenProjectURL", error="failure")
+            second_component.add_alert("BrokenProjectURL", error="failure")
+        mail.outbox.clear()
+        self.component.alert_set.get(name="BrokenProjectURL").dismiss(
+            self.user, "Known issue"
+        )
+        second_component.alert_set.get(name="BrokenProjectURL").dismiss(
+            self.user, "Known issue"
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("BrokenProjectURL", error="different failure")
+            second_component.add_alert("BrokenProjectURL", error="different failure")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_component_scoped_maintainer(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Component settings maintainer")
+        role.permissions.add(Permission.objects.get(codename="component.edit"))
+        group = Group.objects.create(name="Component settings maintainers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("project.edit", self.component.project))
+        self.assertTrue(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(
+                "BrokenBrowserURL", link="http://example.com", error="broken"
+            )
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_repository_maintainer(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Repository maintainer")
+        role.permissions.add(Permission.objects.get(codename="vcs.update"))
+        group = Group.objects.create(name="Repository maintainers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+        self.assertTrue(self.user.has_perm("meta:vcs.status", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("RepositoryOutdated")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_screenshot_maintainer(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Screenshot maintainer")
+        role.permissions.add(Permission.objects.get(codename="screenshot.delete"))
+        group = Group.objects.create(name="Screenshot maintainers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+        self.assertTrue(self.user.has_perm("screenshot.delete", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("UnusedScreenshot")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_project_addon_maintainer(self) -> None:
+        role = Role.objects.create(name="Project add-on maintainer")
+        role.permissions.add(Permission.objects.get(codename="project.edit"))
+        group = Group.objects.create(name="Project add-on maintainers")
+        group.roles.add(role)
+        group.projects.add(self.component.project)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("project.edit", self.component.project))
+        self.assertTrue(self.user.has_perm("component.edit", self.component))
+        addon = create_test_addon(
+            acting_user=get_test_actor(self),
+            project=self.component.project,
+            name="weblate.gettext.msgmerge",
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(
+                "MsgmergeAddonError",
+                occurrences=[
+                    {
+                        "addon": "weblate.gettext.msgmerge",
+                        "addon_id": str(addon.pk),
+                        "command": "msgmerge",
+                        "error": "failure",
+                    }
+                ],
+            )
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_site_addon_manager(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Site add-on manager")
+        role.permissions.add(Permission.objects.get(codename="management.addons"))
+        group = Group.objects.create(name="Site add-on managers")
+        group.roles.add(role)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("management.addons"))
+        self.assertFalse(self.user.has_perm("management.use"))
+        msgmerge = create_test_addon(
+            acting_user=get_test_actor(self), name="weblate.gettext.msgmerge"
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(
+                "MsgmergeAddonError",
+                occurrences=[
+                    {
+                        "addon": msgmerge.name,
+                        "addon_id": str(msgmerge.pk),
+                        "command": "msgmerge",
+                        "error": "failure",
+                    }
+                ],
+            )
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+        mail.outbox.clear()
+        create_test_addon(
+            acting_user=get_test_actor(self), name="weblate.gettext.xgettext"
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("ExtractPotMissingMsgmerge")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_component_maintainer_does_not_own_project_addon_alert(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Component-only add-on maintainer")
+        role.permissions.add(Permission.objects.get(codename="component.edit"))
+        group = Group.objects.create(name="Component-only add-on maintainers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("component.edit", self.component))
+        self.assertFalse(self.user.has_perm("project.edit", self.component.project))
+        project_addon = create_test_addon(
+            acting_user=get_test_actor(self),
+            project=self.component.project,
+            name="weblate.gettext.msgmerge",
+        )
+        create_test_addon(
+            acting_user=get_test_actor(self),
+            component=self.component,
+            name="weblate.gettext.msgmerge",
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert(
+                "MsgmergeAddonError",
+                occurrences=[
+                    {
+                        "addon": "weblate.gettext.msgmerge",
+                        "addon_id": str(project_addon.pk),
+                        "command": "msgmerge",
+                        "error": "failure",
+                    }
+                ],
+            )
+
+        self.validate_notifications(0)
+
+    def test_notify_billing_owner(self) -> None:
+        billing = create_test_billing(self.user)
+        billing.add_project(self.component.project)
+        workspace = billing.workspace
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_PROJECT,
+            project=self.component.project,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("workspace.edit", workspace))
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("BillingLimit")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_duplicate_string_cleanup_maintainer(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Duplicate string cleanup maintainer")
+        role.permissions.add(Permission.objects.get(codename="vcs.reset"))
+        group = Group.objects.create(name="Duplicate string cleanup maintainers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("vcs.reset", self.component))
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("DuplicateString", occurrences=[])
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_glossary_language_manager(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Glossary language manager")
+        role.permissions.add(Permission.objects.get(codename="translation.delete"))
+        group = Group.objects.create(name="Glossary language managers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("translation.delete", self.component))
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("UnusedGlossaryLanguage", occurrences=[])
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_source_editor_about_unused_enforced_check(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Enforced check source editor")
+        role.permissions.add(Permission.objects.get(codename="source.edit"))
+        group = Group.objects.create(name="Enforced check source editors")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("source.edit", self.component))
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("UnusedEnforcedCheck")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_project_addon_owner_for_component_extractor(self) -> None:
+        role = Role.objects.create(name="Project extractor add-on owner")
+        role.permissions.add(Permission.objects.get(codename="project.edit"))
+        group = Group.objects.create(name="Project extractor add-on owners")
+        group.roles.add(role)
+        group.projects.add(self.component.project)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("project.edit", self.component.project))
+        self.assertTrue(self.user.has_perm("component.edit", self.component))
+        create_test_addon(
+            acting_user=get_test_actor(self),
+            component=self.component,
+            name="weblate.gettext.xgettext",
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("ExtractPotMissingMsgmerge")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_language_manager_about_ambiguous_language(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Language definition maintainer")
+        role.permissions.add(Permission.objects.get(codename="language.edit"))
+        group = Group.objects.create(name="Language definition maintainers")
+        group.roles.add(role)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("language.edit"))
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("AmbiguousLanguage")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
+    def test_notify_source_editor_about_safe_html(self) -> None:
+        self.user.subscription_set.filter(notification="NewAlertNotificaton").delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_COMPONENT,
+            component=self.component,
+            notification="NewAlertNotificaton",
+            frequency=NotificationFrequency.FREQ_INSTANT,
+        )
+        role = Role.objects.create(name="Source editor")
+        role.permissions.add(Permission.objects.get(codename="source.edit"))
+        group = Group.objects.create(name="Source editors")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("component.edit", self.component))
+        self.assertTrue(self.user.has_perm("source.edit", self.component))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.add_alert("MissingSafeHTMLFlag")
+
+        self.validate_notifications(1, "[Weblate] New alert on Test/Test")
+
     def test_notify_alert_ignore(self) -> None:
         self.component.project.add_user(self.user, "Administration")
         # Create linked component, this triggers missing license alert
         self.create_link_existing()
         mail.outbox.clear()
-        self.component.add_alert("PushFailure", error="Some error")
+        self.add_component_alert()
         self.validate_notifications(
             3,
             subjects=[
@@ -432,11 +1428,16 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
 
     def test_notify_account(self) -> None:
         request = self.get_request()
-        AuditLog.objects.create(request.user, request, "password")
+        with self.captureOnCommitCallbacks(execute=True):
+            AuditLog.objects.create(request.user, request, "password")
         self.assertEqual(len(mail.outbox), 1)
         self.assert_notify_mailbox(mail.outbox[0])
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
         # Verify site root expansion in email
-        content = mail.outbox[0].alternatives[0][0]
+        content = get_html_content(mail.outbox[0])
         self.assertNotIn('href="/', content)
         # Shortened address is used
         self.assertIn("<td>127.0.0.0</td>", content)
@@ -445,10 +1446,11 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         self.user.profile.language = "cs"
         self.user.profile.save()
         request = self.get_request()
-        AuditLog.objects.create(request.user, request, "password")
+        with self.captureOnCommitCallbacks(execute=True):
+            AuditLog.objects.create(request.user, request, "password")
         self.assertEqual(len(mail.outbox), 1)
         # There is just one (html) alternative
-        content = mail.outbox[0].alternatives[0][0]
+        content = get_html_content(mail.outbox[0])
         self.assertIn('lang="cs"', content)
         self.assertIn("změněno", content)
 
@@ -464,6 +1466,7 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
             notification__in=("MergeFailureNotification", "NewTranslationNotificaton"),
         ).update(frequency=frequency)
         self.component.change_set.create(
+            user=get_test_actor(self),
             details={
                 "error": "Failed merge",
                 "status": "Error\nstatus",
@@ -478,7 +1481,7 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         # Trigger notification
         notify()
         self.validate_notifications(1, f"[Weblate] Digest: {subj}")
-        content = mail.outbox[0].alternatives[0][0]
+        content = get_html_content(mail.outbox[0])
         self.assertNotIn('img src="/', content)
 
     def test_digest_weekly(self) -> None:
@@ -487,11 +1490,442 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
     def test_digest_monthly(self) -> None:
         self.test_digest(NotificationFrequency.FREQ_MONTHLY, notify_monthly)
 
+    def test_digest_recipient_header(self) -> None:
+        self.test_digest()
+        self.assertEqual(
+            mail.outbox[0].extra_headers[RECIPIENT_USERNAME_HEADER],
+            self.user.username,
+        )
+
+    def test_digest_collection_is_bounded(self) -> None:
+        self.user.subscription_set.filter(
+            notification=RepositoryNotification.get_name()
+        ).delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_WATCHED,
+            notification=RepositoryNotification.get_name(),
+            frequency=NotificationFrequency.FREQ_DAILY,
+        )
+        changes = Change.objects.bulk_create(
+            [
+                Change(
+                    user=self.automation_user,
+                    action=ActionEvents.COMMIT,
+                    project=self.project,
+                    component=self.component,
+                    workspace=self.project.workspace,
+                )
+                for _unused in range(DIGEST_MAX_ITEMS + 1)
+            ]
+        )
+        queryset = (
+            Change.objects.filter(pk__in=[change.pk for change in changes])
+            .order_by("-timestamp", "-pk")
+            .prefetch_for_render()
+        )
+        notification = RepositoryNotification([])
+
+        with patch.object(notification, "send_digest") as send_digest:
+            notification.notify_digest(NotificationFrequency.FREQ_DAILY, queryset)
+
+        self.assertIsNone(
+            queryset._result_cache  # ruff: ignore[private-member-access]
+        )
+        self.assertEqual(send_digest.call_count, 1)
+        digest_changes = send_digest.call_args.kwargs["changes"]
+        self.assertEqual(len(digest_changes), DIGEST_MAX_ITEMS)
+        self.assertEqual(
+            [change.pk for change in digest_changes],
+            [change.pk for change in reversed(changes[1:])],
+        )
+        self.assertTrue(send_digest.call_args.kwargs["overlimit"])
+
+    def test_digest_groups_subscription_queries_by_project(self) -> None:
+        self.user.subscription_set.filter(
+            notification=RepositoryNotification.get_name()
+        ).delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_ALL,
+            notification=RepositoryNotification.get_name(),
+            frequency=NotificationFrequency.FREQ_DAILY,
+        )
+        projects = Project.objects.bulk_create(
+            [
+                Project(
+                    name=f"Subscription cache project {index}",
+                    slug=f"subscription-cache-project-{index}",
+                    web="https://example.com/",
+                )
+                for index in range(SUBSCRIPTION_CACHE_SIZE + 1)
+            ]
+        )
+        changes = Change.objects.bulk_create(
+            [
+                Change(
+                    user=self.automation_user,
+                    action=ActionEvents.COMMIT,
+                    project=project,
+                )
+                for _round in range(2)
+                for project in projects
+            ]
+        )
+        queryset = Change.objects.filter(pk__in=[change.pk for change in changes])
+        notification = RepositoryNotification([])
+
+        with (
+            patch.object(
+                notification,
+                "filter_subscriptions",
+                wraps=notification.filter_subscriptions,
+            ) as filter_subscriptions,
+            patch.object(notification, "send_digest"),
+        ):
+            notification.notify_digest(NotificationFrequency.FREQ_DAILY, queryset)
+
+        self.assertEqual(filter_subscriptions.call_count, len(projects))
+
+    def test_digest_batch_combines_projects(self) -> None:
+        self.user.subscription_set.filter(
+            notification=RepositoryNotification.get_name()
+        ).delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_ALL,
+            notification=RepositoryNotification.get_name(),
+            frequency=NotificationFrequency.FREQ_DAILY,
+        )
+        second_project = Project.objects.create(
+            name="Second notification project",
+            slug="second-notification-project",
+            web="https://example.com/",
+        )
+        changes = Change.objects.bulk_create(
+            [
+                Change(
+                    user=self.automation_user,
+                    action=ActionEvents.COMMIT,
+                    project=self.project,
+                ),
+                Change(
+                    user=self.automation_user,
+                    action=ActionEvents.COMMIT,
+                    project=second_project,
+                ),
+            ]
+        )
+        until = timezone.now() + timedelta(seconds=1)
+
+        with patch.object(RepositoryNotification, "send_digest") as send_digest:
+            notify_digest_batch(
+                RepositoryNotification.get_name(),
+                NotificationFrequency.FREQ_DAILY,
+                (until - timedelta(days=1)).isoformat(),
+                until.isoformat(),
+                [self.user.pk],
+            )
+
+        send_digest.assert_called_once()
+        self.assertTrue(
+            {change.pk for change in changes}.issubset(
+                {change.pk for change in send_digest.call_args.kwargs["changes"]}
+            )
+        )
+
+    @override_settings(RATELIMIT_NOTIFICATION_LIMITS=[(3, 120)])
+    def test_digest_batch_enforces_rate_limit(self) -> None:
+        self.user.subscription_set.filter(
+            notification=RepositoryNotification.get_name()
+        ).delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_ALL,
+            notification=RepositoryNotification.get_name(),
+            frequency=NotificationFrequency.FREQ_DAILY,
+        )
+        projects = [self.project]
+        projects.extend(
+            Project.objects.create(
+                name=f"Rate limit project {index}",
+                slug=f"rate-limit-project-{index}",
+                web="https://example.com/",
+            )
+            for index in range(3)
+        )
+        Change.objects.bulk_create(
+            [
+                Change(
+                    user=self.automation_user,
+                    action=ActionEvents.COMMIT,
+                    project=project,
+                )
+                for project in projects
+            ]
+        )
+        until = timezone.now() + timedelta(seconds=1)
+
+        with (
+            patch("weblate.accounts.notifications.rate_limit_notify") as limiter,
+            patch("weblate.accounts.tasks.queue_mails") as queue,
+        ):
+            limiter.return_value = (False, "")
+            notify_digest_batch(
+                RepositoryNotification.get_name(),
+                NotificationFrequency.FREQ_DAILY,
+                (until - timedelta(days=1)).isoformat(),
+                until.isoformat(),
+                [self.user.pk],
+            )
+
+        limiter.assert_called_once_with(self.user.email)
+        queue.assert_called_once()
+
+    def test_digest_projects_resolve_admin_scope(self) -> None:
+        self.user.subscription_set.filter(
+            notification=RepositoryNotification.get_name()
+        ).delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_ADMIN,
+            notification=RepositoryNotification.get_name(),
+            frequency=NotificationFrequency.FREQ_DAILY,
+        )
+        self.project.add_user(self.user, "Administration")
+        Project.objects.create(
+            name="Unadministered notification project",
+            slug="unadministered-notification-project",
+            web="https://example.com/",
+        )
+        Change.objects.create(
+            user=get_test_actor(self),
+            action=ActionEvents.COMMIT,
+            project=self.project,
+        )
+        until = timezone.now() + timedelta(seconds=1)
+
+        self.assertQuerySetEqual(
+            get_digest_projects(
+                RepositoryNotification,
+                NotificationFrequency.FREQ_DAILY,
+                since=until - timedelta(days=1),
+                until=until,
+            ),
+            [self.project],
+            ordered=False,
+        )
+
+    def test_summary_collection_is_not_bounded(self) -> None:
+        translations = [
+            SimpleNamespace(pk=translation_id, component=self.component)
+            for translation_id in range(DIGEST_MAX_ITEMS + 1)
+        ]
+        notification = PendingSuggestionsNotification([])
+        with (
+            patch(
+                "weblate.accounts.notifications.iter_prefetch_stats",
+                return_value=translations,
+            ),
+            patch.object(notification, "get_count", return_value=1),
+            patch.object(notification, "get_users", return_value=[self.user]),
+            patch.object(notification, "send_digest") as send_digest,
+        ):
+            notification.notify_summary(NotificationFrequency.FREQ_DAILY)
+
+        self.assertEqual(send_digest.call_count, 1)
+        self.assertEqual(
+            len(send_digest.call_args.kwargs["summaries"]), DIGEST_MAX_ITEMS + 1
+        )
+        self.assertFalse(send_digest.call_args.kwargs["overlimit"])
+        self.assertEqual(
+            send_digest.call_args.kwargs["extracontext"]["total_count"],
+            DIGEST_MAX_ITEMS + 1,
+        )
+
+    def test_activity_summary_collection_is_not_bounded(self) -> None:
+        translations = [
+            SimpleNamespace(
+                pk=translation_id,
+                stats=SimpleNamespace(todo=0),
+                get_translate_url=lambda: "https://example.com/translate/",
+            )
+            for translation_id in range(DIGEST_MAX_ITEMS + 1)
+        ]
+        rows = [
+            {
+                "project_id": self.project.pk,
+                "translation_id": translation.pk,
+                "action": ActionEvents.CHANGE,
+                "user_id": None,
+                "count": 1,
+            }
+            for translation in translations
+        ]
+        notification = TranslationActivitySummaryNotification([])
+        with (
+            patch.object(
+                TranslationActivitySummaryNotification,
+                "get_activity_change_rows",
+                return_value=SimpleNamespace(
+                    # ruff: ignore[unused-lambda-argument]
+                    iterator=lambda chunk_size: iter(rows)
+                ),
+            ),
+            patch(
+                "weblate.accounts.notifications.prefetch_stats",
+                return_value=translations,
+            ),
+            patch.object(
+                notification, "get_activity_summary_users", return_value=[self.user]
+            ),
+            patch.object(notification, "send_digest") as send_digest,
+        ):
+            notification.notify_activity_summary(
+                NotificationFrequency.FREQ_WEEKLY,
+                since=timezone.now() - timedelta(weeks=1),
+                until=timezone.now(),
+            )
+
+        self.assertEqual(send_digest.call_count, 1)
+        self.assertEqual(
+            len(send_digest.call_args.kwargs["summaries"]), DIGEST_MAX_ITEMS + 1
+        )
+        self.assertFalse(send_digest.call_args.kwargs["overlimit"])
+        self.assertEqual(
+            send_digest.call_args.kwargs["extracontext"]["total_count"],
+            DIGEST_MAX_ITEMS + 1,
+        )
+
+    def test_digest_coordinator_batches_users(self) -> None:
+        Subscription.objects.all().delete()
+        users = [self.user, self.anotheruser, self.thirduser]
+        Subscription.objects.bulk_create(
+            [
+                Subscription(
+                    user=user,
+                    scope=NotificationScope.SCOPE_ALL,
+                    notification=RepositoryNotification.get_name(),
+                    frequency=NotificationFrequency.FREQ_DAILY,
+                )
+                for user in users
+            ]
+        )
+
+        with (
+            patch("weblate.accounts.notifications.DIGEST_USER_BATCH_SIZE", 2),
+            patch("weblate.accounts.tasks.notify_digest_batch.delay") as delay_digest,
+        ):
+            notify_digest("notify_daily")
+
+        self.assertEqual(delay_digest.call_count, 2)
+        user_batches = [call.args[4] for call in delay_digest.call_args_list]
+        self.assertEqual([len(batch) for batch in user_batches], [2, 1])
+        self.assertCountEqual(
+            [user_id for batch in user_batches for user_id in batch],
+            [user.pk for user in users],
+        )
+        windows = {(call.args[2], call.args[3]) for call in delay_digest.call_args_list}
+        self.assertEqual(len(windows), 1)
+
+    def test_summary_coordinator_scans_once(self) -> None:
+        Subscription.objects.all().delete()
+        for user in (self.user, self.anotheruser, self.thirduser):
+            user.subscription_set.create(
+                scope=NotificationScope.SCOPE_ALL,
+                notification=PendingSuggestionsNotification.get_name(),
+                frequency=NotificationFrequency.FREQ_DAILY,
+            )
+
+        with (
+            patch("weblate.accounts.notifications.DIGEST_USER_BATCH_SIZE", 2),
+            patch("weblate.accounts.tasks.notify_digest_batch.delay") as delay_digest,
+        ):
+            notify_digest("notify_daily")
+
+        delay_digest.assert_called_once()
+        self.assertIsNone(delay_digest.call_args.args[4])
+
     def test_digest_new_lang(self) -> None:
         self.test_digest(
             change=ActionEvents.REQUESTED_LANGUAGE,
             subj="New language was added or requested",
         )
+
+    def test_translation_activity_summary(self) -> None:
+        self.user.subscription_set.all().delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_WATCHED,
+            notification="TranslationActivitySummaryNotification",
+            frequency=NotificationFrequency.FREQ_WEEKLY,
+        )
+        unit = self.get_unit()
+        unit.change_set.create(user=get_test_actor(self), action=ActionEvents.NEW_UNIT)
+        unit.change_set.create(
+            user=get_test_actor(self), action=ActionEvents.SOURCE_CHANGE
+        )
+        unit.change_set.create(user=self.anotheruser, action=ActionEvents.CHANGE)
+        unit.change_set.create(user=self.anotheruser, action=ActionEvents.APPROVE)
+        unit.change_set.create(user=self.anotheruser, action=ActionEvents.MARKED_EDIT)
+
+        self.assertEqual(len(mail.outbox), 0)
+
+        notify_weekly()
+
+        self.validate_notifications(1, "[Weblate] Translation activity summary")
+        content = get_html_content(mail.outbox[0])
+        self.assertIn("Translation activity in this period", content)
+        self.assertIn("Test/Test — Czech", content)
+        self.assertIn("change_action%3Astring-added", content)
+        self.assertIn("change_action%3Asource-string-changed", content)
+        self.assertIn("change_action%3Atranslation-changed", content)
+        self.assertIn("change_action%3Atranslation-approved", content)
+        self.assertIn("change_action%3Amarked-for-edit", content)
+        self.assertIn("state%3A%3Ctranslated", content)
+        self.assertNotIn("Hello, world", content)
+
+    def test_translation_activity_summary_skips_restricted_component(self) -> None:
+        self.user.subscription_set.all().delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_WATCHED,
+            notification="TranslationActivitySummaryNotification",
+            frequency=NotificationFrequency.FREQ_WEEKLY,
+        )
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.can_access_project(self.project))
+        self.assertFalse(self.user.can_access_component(self.component))
+
+        unit = self.get_unit()
+        unit.change_set.create(user=get_test_actor(self), action=ActionEvents.NEW_UNIT)
+
+        notify_weekly()
+
+        self.validate_notifications(0)
+
+    def test_translation_activity_summary_restricted_component_access(self) -> None:
+        self.user.subscription_set.all().delete()
+        self.user.subscription_set.create(
+            scope=NotificationScope.SCOPE_WATCHED,
+            notification="TranslationActivitySummaryNotification",
+            frequency=NotificationFrequency.FREQ_WEEKLY,
+        )
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        component_group = Group.objects.create(
+            name="Restricted component access", language_selection=SELECTION_ALL
+        )
+        component_group.roles.add(Role.objects.get(name="Power user"))
+        component_group.components.add(self.component)
+        self.user.groups.add(component_group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.can_access_component(self.component))
+
+        unit = self.get_unit()
+        unit.change_set.create(user=get_test_actor(self), action=ActionEvents.NEW_UNIT)
+
+        notify_weekly()
+
+        self.validate_notifications(1, "[Weblate] Translation activity summary")
+        content = get_html_content(mail.outbox[0])
+        self.assertIn("Test/Test — Czech", content)
+        self.assertIn("change_action%3Astring-added", content)
 
     def test_reminder(
         self,
@@ -528,12 +1962,17 @@ class NotificationTest(ViewTestCase, RegistrationTestMixin):
         )
 
 
-class SubscriptionTest(ViewTestCase):
+class SubscriptionTest(FixtureComponentTestCase):
     notification = MergeFailureNotification
 
-    def get_users(self, frequency):
+    def get_users(
+        self,
+        frequency,
+        action: ActionEvents = ActionEvents.FAILED_MERGE,
+    ):
         change = self.component.change_set.create(
-            action=ActionEvents.FAILED_MERGE,
+            user=get_test_actor(self),
+            action=action,
             details={"error": "error", "status": "status"},
         )
         notification = self.notification([])
@@ -603,6 +2042,33 @@ class SubscriptionTest(ViewTestCase):
         self.assertEqual(len(self.get_users(NotificationFrequency.FREQ_WEEKLY)), 0)
         self.assertEqual(len(self.get_users(NotificationFrequency.FREQ_MONTHLY)), 0)
 
+    def test_skip_failed_push_for_push_maintainer(self) -> None:
+        self.user.profile.watched.add(self.project)
+        self.user.subscription_set.all().delete()
+        for notification in (self.notification.get_name(), "NewAlertNotificaton"):
+            self.user.subscription_set.create(
+                scope=NotificationScope.SCOPE_WATCHED,
+                notification=notification,
+                frequency=NotificationFrequency.FREQ_INSTANT,
+            )
+        role = Role.objects.create(name="Push maintainer")
+        role.permissions.add(Permission.objects.get(codename="vcs.push"))
+        group = Group.objects.create(name="Push maintainers")
+        group.roles.add(role)
+        group.components.add(self.component)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        self.assertEqual(
+            len(
+                self.get_users(
+                    NotificationFrequency.FREQ_INSTANT,
+                    ActionEvents.FAILED_PUSH,
+                )
+            ),
+            0,
+        )
+
     def test_all_scope(self) -> None:
         self.user.subscription_set.all().delete()
         self.assertEqual(len(self.get_users(NotificationFrequency.FREQ_INSTANT)), 0)
@@ -637,10 +2103,106 @@ class SubscriptionTest(ViewTestCase):
             notification="NewAlertNotificaton",
             frequency=NotificationFrequency.FREQ_INSTANT,
         )
+        # Non-maintainers do not receive generic alert notifications, so that
+        # subscription must not suppress the specific merge-failure notification.
+        self.assertEqual(len(self.get_users(NotificationFrequency.FREQ_INSTANT)), 1)
+
+        # Maintainers receive the generic alert notification, which supersedes
+        # the specific merge-failure notification.
+        self.component.project.add_user(self.user, "Administration")
         self.assertEqual(len(self.get_users(NotificationFrequency.FREQ_INSTANT)), 0)
 
 
 class SendMailsTest(SimpleTestCase):
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+    def test_inline_images(self) -> None:
+        subject = "Překlad změněn"
+        body = render_to_string(
+            "mail/base.html", {"subject": subject, "LANGUAGE_CODE": "cs"}
+        )
+        headers = {
+            "Auto-Submitted": "auto-generated",
+            "List-Unsubscribe": "<https://example.com/unsubscribe>",
+        }
+        send_mails(
+            [
+                {
+                    "address": address,
+                    "subject": subject,
+                    "body": body,
+                    "headers": headers,
+                }
+                for address in ("first@example.com", "second@example.com")
+            ]
+        )
+        self.assertEqual(len(mail.outbox), 2)
+        previous_ids: set[str] = set()
+        for address, outgoing in zip(
+            ("first@example.com", "second@example.com"), mail.outbox, strict=True
+        ):
+            serialized = outgoing.message(policy=policy.SMTP).as_bytes()
+            message = BytesParser(policy=policy.default).parsebytes(serialized)
+            self.assertEqual(
+                message["Subject"], settings.EMAIL_SUBJECT_PREFIX + subject
+            )
+            self.assertEqual(message["To"], address)
+            for name, value in headers.items():
+                self.assertEqual(message[name], value)
+            self.assertEqual(message.get_content_type(), "multipart/alternative")
+            plain, related = message.iter_parts()
+            self.assertEqual(plain.get_content_type(), "text/plain")
+            plain_text = plain.get_content()
+            self.assertIn(subject, plain_text)
+            self.assertIn(
+                "Weblate, the libre continuous localization system. "
+                "(https://weblate.org/)",
+                plain_text,
+            )
+            self.assertNotIn("**", plain_text)
+            self.assertNotIn("cid:email-logo", plain_text)
+            self.assertEqual(related.get_content_type(), "multipart/related")
+            self.assertEqual(related.get_param("type"), "text/html")
+            html, *images = related.iter_parts()
+            self.assertEqual(html.get_content_type(), "text/html")
+            self.assertIn(subject, html.get_content())
+            self.assertEqual(len(images), 2)
+            content_ids = set()
+            expected_html = body
+            for name, image in zip(
+                ("email-logo.png", "email-logo-footer.png"), images, strict=True
+            ):
+                self.assertEqual(image.get_content_type(), "image/png")
+                self.assertEqual(image.get_content_disposition(), "inline")
+                self.assertEqual(image.get_filename(), name)
+                self.assertEqual(image["Content-Transfer-Encoding"], "base64")
+                self.assertEqual(
+                    image.get_payload(decode=True), load_icon(name, auto_prefix=False)
+                )
+                cid = image["Content-ID"]
+                self.assertTrue(cid.startswith("<") and cid.endswith(">"))
+                self.assertIn(f"cid:{cid[1:-1]}", html.get_content())
+                self.assertNotIn(f"cid:{name}@cid.weblate.org", html.get_content())
+                expected_html = expected_html.replace(
+                    f"cid:{name}@cid.weblate.org", f"cid:{cid[1:-1]}"
+                )
+                content_ids.add(cid)
+            self.assertEqual(
+                html.get_content().replace("\r\n", "\n").rstrip("\n"),
+                expected_html.rstrip("\n"),
+            )
+            self.assertEqual(len(content_ids), 2)
+            self.assertTrue(content_ids.isdisjoint(previous_ids))
+            previous_ids.update(content_ids)
+            repeated = outgoing.message(policy=policy.SMTP)
+            self.assertEqual(
+                [part.get_content_type() for part in repeated.walk()],
+                [part.get_content_type() for part in message.walk()],
+            )
+            self.assertEqual(
+                {part["Content-ID"] for part in repeated.walk() if part["Content-ID"]},
+                content_ids,
+            )
+
     @override_settings(
         EMAIL_HOST="nonexisting.weblate.org",
         EMAIL_BACKEND="django.core.mail.backends.smtp.EmailBackend",

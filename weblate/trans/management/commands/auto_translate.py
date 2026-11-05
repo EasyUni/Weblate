@@ -4,13 +4,19 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from django.core.management.base import CommandError
 
 from weblate.auth.models import User
-from weblate.machinery.models import MACHINERY
+from weblate.machinery.base import MACHINERY_DEFAULT_THRESHOLD
+from weblate.machinery.models import MACHINERY, resolve_installation
 from weblate.trans.autotranslate import AutoTranslate
-from weblate.trans.management.commands import WeblateTranslationCommand
 from weblate.trans.models import Component
+from weblate.utils.management.base import WeblateTranslationCommand
+
+if TYPE_CHECKING:
+    from django.core.management.base import CommandParser
 
 
 class Command(WeblateTranslationCommand):
@@ -18,7 +24,7 @@ class Command(WeblateTranslationCommand):
 
     help = "performs automatic translation based on other components"
 
-    def add_arguments(self, parser) -> None:
+    def add_arguments(self, parser: CommandParser) -> None:
         super().add_arguments(parser)
         parser.add_argument(
             "--user", default="anonymous", help=("User performing the change")
@@ -49,7 +55,7 @@ class Command(WeblateTranslationCommand):
         )
         parser.add_argument(
             "--threshold",
-            default=80,
+            default=MACHINERY_DEFAULT_THRESHOLD,
             type=int,
             help=("Set machine translation threshold"),
         )
@@ -70,20 +76,24 @@ class Command(WeblateTranslationCommand):
             msg = "User does not exist!"
             raise CommandError(msg) from error
 
-        source = None
+        source_component_id: int | None = None
         if options["source"]:
             try:
                 component = Component.objects.get_by_path(options["source"])
             except Component.DoesNotExist as error:
                 msg = "No matching source component found!"
                 raise CommandError(msg) from error
-            source = component.id
+            source_component_id = component.id
 
         if options["mt"]:
             for translator in options["mt"]:
-                if translator not in MACHINERY:
+                if translator.partition(":")[0] not in MACHINERY:
                     msg = f"Machine translation {translator} is not available"
                     raise CommandError(msg)
+                try:
+                    resolve_installation(translator, translation.component.project)
+                except ValueError as error:
+                    raise CommandError(str(error)) from error
 
         if options["mode"] not in {"translate", "fuzzy", "suggest"}:
             msg = "Invalid translation mode specified!"
@@ -105,8 +115,14 @@ class Command(WeblateTranslationCommand):
 
         message = auto.perform(
             auto_source="mt" if options["mt"] else "others",
-            source=source,
+            source_component_ids=(
+                [source_component_id] if source_component_id is not None else None
+            ),
             engines=options["mt"],
             threshold=options["threshold"],
         )
+        if auto.busy:
+            raise CommandError(auto.failure_message)
         self.stdout.write(message)
+        for warning in auto.get_warnings():
+            self.stdout.write(warning)

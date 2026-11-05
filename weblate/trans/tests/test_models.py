@@ -4,93 +4,126 @@
 
 """Test for translation models."""
 
+from __future__ import annotations
+
+import importlib
 import os
+from contextlib import ExitStack
 from datetime import timedelta
-from unittest.mock import patch
+from itertools import product
+from time import monotonic
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from unittest.mock import Mock, patch
 
+from asgiref.sync import async_to_sync
+from django.apps import apps
 from django.contrib.staticfiles.testing import StaticLiveServerTestCase
-from django.core.management.color import no_style
-from django.db import connection, transaction
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.db import DatabaseError, connection, transaction
+from django.db.models.signals import post_save
 from django.test import TestCase
-from django.test.utils import override_settings
+from django.test.client import RequestFactory
+from django.test.utils import CaptureQueriesContext, override_settings
 from django.utils import timezone
+from django.utils.translation import activate
+from translate.storage.base import ParseError
+from translate.storage.fluent import FluentContentError
 
-from weblate.auth.models import Group, User
+from weblate.auth.models import Group, User, get_anonymous
 from weblate.checks.models import Check
 from weblate.formats.base import UnitNotFoundError
-from weblate.lang.models import Language, Plural
+from weblate.glossary.models import (
+    clear_glossary_automaton_cache,
+    get_glossary_automaton,
+)
+from weblate.lang.models import Language
 from weblate.trans.actions import ActionEvents
-from weblate.trans.exceptions import SuggestionSimilarToTranslationError
+from weblate.trans.exceptions import (
+    FailedCommitError,
+    FileParseError,
+    SuggestionSimilarToTranslationError,
+    SuggestionTooLongError,
+)
 from weblate.trans.models import (
     Announcement,
     AutoComponentList,
+    Category,
     Change,
     Comment,
     Component,
     ComponentList,
+    Label,
     PendingUnitChange,
     Project,
     Suggestion,
+    SuggestionAddResult,
     Translation,
     Unit,
     Vote,
+    WorkflowSetting,
 )
+from weblate.trans.models.change import ChangeQuerySet
+from weblate.trans.models.component import ComponentLink
 from weblate.trans.models.project import CommitPolicyChoices
+from weblate.trans.models.unit import UNIT_METADATA_UPDATE_FIELDS, UnitQuerySet
+from weblate.trans.removal import RemovalBatch
+from weblate.trans.tasks import project_removal
 from weblate.trans.tests.utils import (
     RepoTestMixin,
     create_another_user,
     create_test_user,
+    fixup_languages_seq,
+    get_optional_path,
+    get_test_actor,
 )
-from weblate.utils.django_hacks import immediate_on_commit, immediate_on_commit_leave
+from weblate.trans.util import join_plural
+from weblate.trans.validators import get_translation_text_max_length
 from weblate.utils.files import remove_tree
-from weblate.utils.state import STATE_APPROVED, STATE_FUZZY, STATE_TRANSLATED
+from weblate.utils.state import (
+    STATE_APPROVED,
+    STATE_FUZZY,
+    STATE_NEEDS_CHECKING,
+    STATE_NEEDS_REWRITING,
+    STATE_READONLY,
+    STATE_TRANSLATED,
+    StringState,
+)
+from weblate.utils.stats import (
+    CategoryLanguage,
+    GlobalStats,
+    ProjectLanguage,
+    TranslationStats,
+)
+from weblate.utils.version import GIT_VERSION
+from weblate.workspaces.models import Workspace
 
-
-def fixup_languages_seq() -> None:
-    # Reset sequence for Language and Plural objects as
-    # we're manipulating with them in FixtureTestCase.setUpTestData
-    # and that seems to affect sequence for other tests as well
-    # on some PostgreSQL versions (probably sequence is not rolled back
-    # in a transaction).
-    commands = connection.ops.sequence_reset_sql(no_style(), [Language, Plural])
-    if commands:
-        with connection.cursor() as cursor:
-            for sql in commands:
-                cursor.execute(sql)
-    # Invalidate object cache for languages
-    Language.objects.flush_object_cache()
+if TYPE_CHECKING:
+    from weblate.formats.base import TranslationFormat
+    from weblate.utils.stats import UnitSnapshot
 
 
 class BaseTestCase(TestCase):
+    def setUp(self) -> None:
+        # Ensure we're using English
+        activate("en")
+        super().setUp()
+
     @classmethod
     def setUpTestData(cls) -> None:
         fixup_languages_seq()
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        immediate_on_commit(cls)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        super().tearDownClass()
-        immediate_on_commit_leave(cls)
 
 
 class BaseLiveServerTestCase(StaticLiveServerTestCase):
+    def setUp(self) -> None:
+        # Ensure we're using English
+        activate("en")
+        super().setUp()
+
     @classmethod
     def setUpTestData(cls) -> None:
         fixup_languages_seq()
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        immediate_on_commit(cls)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        super().tearDownClass()
-        immediate_on_commit_leave(cls)
 
 
 class RepoTestCase(BaseTestCase, RepoTestMixin):
@@ -98,6 +131,373 @@ class RepoTestCase(BaseTestCase, RepoTestMixin):
 
     def setUp(self) -> None:
         self.clone_test_repos()
+        super().setUp()
+
+
+class SourceChangeCommitTest(RepoTestCase):
+    def test_imported_json_source_change(self) -> None:
+        self.check_imported_source_change(self.create_json_mono(), storable=False)
+
+    def test_imported_po_source_change(self) -> None:
+        self.check_imported_source_change(self.create_po_mono(), storable=True)
+
+    def check_imported_source_change(
+        self, component: Component, *, storable: bool
+    ) -> None:
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one translation unit.")
+        unit.translate(create_another_user(), "Překlad", STATE_TRANSLATED)
+        component.commit_pending("test", None)
+        source = component.source_translation
+        source_unit = unit.source_unit
+        original_source = source_unit.target
+        editor = create_test_user()
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes()
+
+        changes = [(f"{original_source} changed", STATE_NEEDS_REWRITING)]
+        if not storable:
+            changes.append((original_source, STATE_TRANSLATED))
+        for target, state in changes:
+            with self.subTest(state=state):
+                source.drop_store_cache()
+                backend = source.store.find_unit(
+                    source_unit.context, source_unit.source
+                )[0]
+                backend.set_target(target)
+                source.store.save()
+                source.drop_store_cache()
+                component.unload_sources()
+                source.check_sync(force=True, author=editor)
+                translation.drop_store_cache()
+                translation.check_sync(force=True, author=editor)
+                unit.refresh_from_db()
+                self.assertEqual(unit.state, state)
+                if storable:
+                    self.assertEqual(unit.pending_changes.get().author, editor)
+                component.commit_pending("test", None)
+                self.assertFalse(unit.pending_changes.exists())
+                if not storable:
+                    self.assertEqual(filename.read_bytes(), original)
+
+    def test_unstorable_needs_editing_does_not_touch_file(self) -> None:
+        component = self.create_json_mono()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one translation unit.")
+
+        unit.translate(create_another_user(), "Překlad", STATE_TRANSLATED)
+        component.commit_pending("test", None)
+
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes().rstrip(b"\n")
+        filename.write_bytes(original)
+        with component.repository.lock:
+            component.repository.commit(
+                "Remove trailing newline", files=[translation.filename]
+            )
+        translation.drop_store_cache()
+        translation.store_hash()
+
+        editor = create_test_user()
+        source_unit = unit.source_unit
+        original_source = source_unit.target
+        source_unit.translate(editor, f"{source_unit.target} changed", STATE_TRANSLATED)
+
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
+        component.commit_pending("test", None)
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertEqual(filename.read_bytes(), original)
+
+        source_unit.translate(editor, original_source, STATE_TRANSLATED)
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+        component.commit_pending("test", None)
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertEqual(filename.read_bytes(), original)
+
+    def test_upstream_source_change_does_not_credit_source_editor(self) -> None:
+        component = self.create_po_mono()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one translation unit.")
+        source = component.source_translation
+        source_unit = unit.source_unit
+        source_editor = create_test_user()
+        translator = create_another_user()
+        source_unit.translate(
+            source_editor, f"{source_unit.target} edited", STATE_TRANSLATED
+        )
+        component.commit_pending("test", None)
+        unit.refresh_from_db()
+        unit.translate(translator, "Překlad", STATE_TRANSLATED)
+        component.commit_pending("test", None)
+
+        # Upstream source change parsed without any author.
+        source_unit.refresh_from_db()
+        backend = source.store.find_unit(source_unit.context, source_unit.source)[0]
+        backend.set_target(f"{source_unit.target} upstream")
+        source.store.save()
+        source.drop_store_cache()
+        component.unload_sources()
+        source.check_sync(force=True)
+        translation.drop_store_cache()
+        translation.check_sync(force=True)
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
+        self.assertEqual(unit.pending_changes.get().author, translator)
+
+    def test_storable_needs_editing_uses_source_editor_as_author(self) -> None:
+        component = self.create_po_mono()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one translation unit.")
+
+        previous_author = create_another_user()
+        unit.translate(previous_author, f"{unit.target} changed", STATE_TRANSLATED)
+        component.commit_pending("test", None)
+        previous_revisions = set(component.repository.get_outgoing_revisions())
+
+        editor = create_test_user()
+        source_unit = unit.source_unit
+        source_unit.translate(editor, f"{source_unit.target} changed", STATE_TRANSLATED)
+        component.commit_pending("test", None)
+
+        target_revisions = [
+            revision
+            for revision in set(component.repository.get_outgoing_revisions())
+            - previous_revisions
+            if translation.filename
+            in component.repository.list_changed_files(f"{revision}^!")
+        ]
+        self.assertEqual(len(target_revisions), 1)
+        commit = component.repository.get_revision_info(target_revisions[0])
+        self.assertEqual(commit["author"], editor.get_author_name())
+
+
+class StateChangeCommitTest(RepoTestCase):
+    def test_subtitle_edit_is_committed(self) -> None:
+        component = self.create_srt()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!")
+        filename = get_optional_path(translation.get_filename())
+        revisions = set(component.repository.get_outgoing_revisions())
+        user = create_test_user()
+
+        unit.translate(user, "Edited subtitle", STATE_TRANSLATED)
+        self.assertTrue(unit.pending_changes.exists())
+        component.commit_pending("test", None)
+
+        self.assertIn("Edited subtitle", filename.read_text(encoding="utf-8"))
+        committed = set(component.repository.get_outgoing_revisions()) - revisions
+        self.assertEqual(len(committed), 1)
+        revision = committed.pop()
+        self.assertIn(
+            translation.filename,
+            component.repository.list_changed_files(f"{revision}^!"),
+        )
+        self.assertEqual(
+            component.repository.get_revision_info(revision)["author"],
+            user.get_author_name(),
+        )
+        translation.drop_store_cache()
+        backend, add = translation.store.find_unit(unit.context, unit.source)
+        self.assertFalse(add)
+        self.assertEqual(backend.target, "Edited subtitle")
+        self.assertFalse(unit.pending_changes.exists())
+
+    def prepare_unit(self, component: Component) -> Unit:
+        component.project.translation_review = True
+        component.project.save()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one translation unit.")
+        unit.translate(create_test_user(), "Překlad", STATE_TRANSLATED)
+        component.commit_pending("test", None)
+        return unit
+
+    def test_json_state_changes_preserve_file(self) -> None:
+        unit = self.prepare_unit(self.create_json_mono())
+        translation = unit.translation
+        component = translation.component
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes().rstrip(b"\n")
+        filename.write_bytes(original)
+        with component.repository.lock:
+            component.repository.commit(
+                "Remove trailing newline", files=[translation.filename]
+            )
+        translation.drop_store_cache()
+        translation.store_hash()
+        revisions = set(component.repository.get_outgoing_revisions())
+        user = create_another_user()
+        for state in (STATE_APPROVED, STATE_NEEDS_REWRITING, STATE_TRANSLATED):
+            with self.subTest(state=state):
+                unit.translate(user, unit.target, state)
+                with (
+                    patch(
+                        "weblate.trans.models.translation.vcs_pre_commit.send"
+                    ) as pre_commit,
+                    patch(
+                        "weblate.trans.models.component.vcs_post_commit.send"
+                    ) as post_commit,
+                ):
+                    component.commit_pending("test", None)
+                # Add-ons still see the change, but nothing is committed.
+                pre_commit.assert_called_once()
+                post_commit.assert_not_called()
+                unit.refresh_from_db()
+                self.assertEqual(unit.state, state)
+                self.assertFalse(unit.pending_changes.exists())
+                self.assertNotIn("disk_state", unit.details)
+                self.assertEqual(filename.read_bytes(), original)
+                self.assertEqual(
+                    set(component.repository.get_outgoing_revisions()), revisions
+                )
+
+    def test_po_approval_preserves_file_and_headers(self) -> None:
+        unit = self.prepare_unit(self.create_po_mono())
+        translation = unit.translation
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes()
+        unit.translate(create_another_user(), unit.target, STATE_APPROVED)
+        translation.component.commit_pending("test", None)
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertEqual(filename.read_bytes(), original)
+
+    def test_po_approval_clears_fuzzy(self) -> None:
+        unit = self.prepare_unit(self.create_po_mono())
+        translation = unit.translation
+        user = create_another_user()
+        unit.translate(user, unit.target, STATE_FUZZY)
+        translation.commit_pending("test", None)
+        self.assertTrue(
+            translation.store.find_unit(unit.context, unit.source)[0].is_fuzzy()
+        )
+        unit.translate(user, unit.target, STATE_APPROVED)
+        translation.commit_pending("test", None)
+        translation.drop_store_cache()
+        self.assertFalse(
+            translation.store.find_unit(unit.context, unit.source)[0].is_fuzzy()
+        )
+        self.assertFalse(unit.pending_changes.exists())
+
+    def test_xliff_approval_is_stored(self) -> None:
+        unit = self.prepare_unit(self.create_xliff())
+        translation = unit.translation
+        unit.translate(create_another_user(), unit.target, STATE_APPROVED)
+        translation.commit_pending("test", None)
+        self.assertTrue(
+            translation.store.find_unit(unit.context, unit.source)[0].is_approved()
+        )
+        self.assertFalse(unit.pending_changes.exists())
+
+    def test_po_retry_commits_already_written_edit(self) -> None:
+        unit = self.prepare_unit(self.create_po_mono())
+        translation = unit.translation
+        component = translation.component
+        revisions = set(component.repository.get_outgoing_revisions())
+        unit.translate(create_another_user(), "Retried translation", STATE_TRANSLATED)
+        # Simulate an earlier attempt which wrote the file but failed to commit.
+        unit.refresh_from_db()
+        backend = translation.store.find_unit(unit.context, unit.source)[0]
+        backend.set_target(unit.target)
+        translation.store.save()
+        translation.drop_store_cache()
+        self.assertTrue(component.repository.needs_commit([translation.filename]))
+
+        component.commit_pending("test", None)
+
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertFalse(component.repository.needs_commit([translation.filename]))
+        self.assertEqual(
+            len(set(component.repository.get_outgoing_revisions()) - revisions), 1
+        )
+
+    def test_po_reverted_edit_preserves_file(self) -> None:
+        unit = self.prepare_unit(self.create_po_mono())
+        translation = unit.translation
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes()
+        user = create_another_user()
+        target = unit.target
+        unit.translate(user, "Temporary translation", STATE_TRANSLATED)
+        unit.translate(user, target, STATE_TRANSLATED)
+        translation.commit_pending("test", None)
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertEqual(filename.read_bytes(), original)
+
+    def test_json_approval_releases_pending_content(self) -> None:
+        self.check_json_commit_policy(
+            CommitPolicyChoices.APPROVED_ONLY, STATE_TRANSLATED, STATE_APPROVED
+        )
+
+    def test_json_finished_translation_releases_pending_content(self) -> None:
+        self.check_json_commit_policy(
+            CommitPolicyChoices.WITHOUT_NEEDS_EDITING, STATE_FUZZY, STATE_TRANSLATED
+        )
+
+    def check_json_commit_policy(
+        self, policy: int, initial_state: StringState, final_state: StringState
+    ) -> None:
+        unit = self.prepare_unit(self.create_json_mono())
+        translation = unit.translation
+        project = translation.component.project
+        project.commit_policy = policy
+        project.save()
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes()
+        user = create_another_user()
+        unit.translate(user, "New translation\n", initial_state)
+        translation.commit_pending("test", None)
+        self.assertTrue(unit.pending_changes.exists())
+        self.assertEqual(filename.read_bytes(), original)
+        unit.translate(create_another_user("reviewer"), unit.target, final_state)
+        translation.commit_pending("test", None)
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertEqual(
+            translation.store.find_unit(unit.context, unit.source)[0].target,
+            "New translation\n",
+        )
+
+    def test_json_automatic_marker_preserves_file(self) -> None:
+        unit = self.prepare_unit(self.create_json_mono())
+        translation = unit.translation
+        filename = get_optional_path(translation.get_filename())
+        original = filename.read_bytes()
+        unit.translate(
+            create_another_user(),
+            unit.target,
+            STATE_TRANSLATED,
+            change_action=ActionEvents.AUTO,
+        )
+        translation.commit_pending("test", None)
+        unit.refresh_from_db()
+        self.assertTrue(unit.automatically_translated)
+        self.assertFalse(unit.pending_changes.exists())
+        self.assertEqual(filename.read_bytes(), original)
+
+    def test_xliff_automatic_marker_is_stored(self) -> None:
+        unit = self.prepare_unit(self.create_xliff_auto())
+        translation = unit.translation
+        user = create_another_user()
+        for action, expected in ((ActionEvents.AUTO, True), (None, False)):
+            with self.subTest(automatically_translated=expected):
+                unit.translate(
+                    user, unit.target, STATE_TRANSLATED, change_action=action
+                )
+                translation.commit_pending("test", None)
+                translation.drop_store_cache()
+                backend = translation.store.find_unit(unit.context, unit.source)[0]
+                self.assertEqual(backend.is_automatically_translated(), expected)
+                self.assertFalse(unit.pending_changes.exists())
 
 
 class ProjectTest(RepoTestCase):
@@ -143,6 +543,191 @@ class ProjectTest(RepoTestCase):
         project.delete()
         self.assertFalse(os.path.exists(project.full_path))
 
+    def test_web_restriction_allowlist(self) -> None:
+        with override_settings(
+            PROJECT_WEB_RESTRICT_HOST={"example.com"},
+            PROJECT_WEB_RESTRICT_ALLOWLIST={"trusted-project"},
+            PROJECT_WEB_RESTRICT_PRIVATE=False,
+        ):
+            project = Project(
+                name="Trusted",
+                slug="trusted-project",
+                web="https://example.com/",
+            )
+            self.assertIsNone(project.full_clean())
+
+            blocked = Project(
+                name="Blocked",
+                slug="blocked-project",
+                web="https://example.com/",
+            )
+            with self.assertRaises(ValidationError):
+                blocked.full_clean()
+
+    def test_glossary_automaton_cache_invalidation(self) -> None:
+        project = self.create_project()
+        glossaries = [
+            SimpleNamespace(glossary_sources=["hello"], glossary_sources_key="test")
+        ]
+        clear_glossary_automaton_cache()
+        cache.delete(project.glossary_automaton_cache_key)
+
+        with (
+            patch.object(Project, "glossaries", glossaries),
+            patch("weblate.trans.models.component.prefetch_glossary_terms") as prefetch,
+        ):
+            first = get_glossary_automaton(project)
+            second = get_glossary_automaton(project)
+            self.assertIs(first, second)
+            self.assertEqual(prefetch.call_count, 1)
+
+            project.invalidate_glossary_cache()
+            third = get_glossary_automaton(project)
+            self.assertIsNot(first, third)
+            self.assertEqual(prefetch.call_count, 2)
+
+    def test_glossary_automaton_cache_version_avoids_recreated_key_collision(
+        self,
+    ) -> None:
+        project = self.create_project()
+        glossaries = [
+            SimpleNamespace(glossary_sources=["hello"], glossary_sources_key="test")
+        ]
+        clear_glossary_automaton_cache()
+        cache.delete(project.glossary_automaton_cache_key)
+
+        with (
+            patch.object(Project, "glossaries", glossaries),
+            patch(
+                "weblate.trans.models.project.time",
+                time_ns=Mock(side_effect=[100, 200]),
+            ),
+            patch("weblate.trans.models.component.prefetch_glossary_terms") as prefetch,
+        ):
+            first = get_glossary_automaton(project)
+            cache.delete(project.glossary_automaton_cache_key)
+
+            second = get_glossary_automaton(project)
+
+        self.assertIsNot(first, second)
+        self.assertEqual(prefetch.call_count, 2)
+
+    def test_project_removal_batches_linked_alert_updates(self) -> None:
+        self.component = self.create_po()
+        project = self.create_project(name="Other", slug="other")
+        self.project = project
+        linked = self.create_link_existing(
+            name="Linked A",
+            slug="linked-a",
+        )
+        second = self.create_link_existing(
+            name="Linked B",
+            slug="linked-b",
+        )
+
+        with (
+            patch.object(Component, "update_alerts", autospec=True) as update_alerts,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            project_removal.run(project.pk, None, backup=False)
+
+        self.assertFalse(
+            Component.objects.filter(pk__in=[linked.pk, second.pk]).exists()
+        )
+        update_alerts.assert_called_once_with(self.component)
+
+    def test_project_removal_batches_parent_stats_updates(self) -> None:
+        project = self.create_project(name="Other", slug="other")
+        self.create_po(project=project, name="Category A", slug="category-a")
+        self.create_po(project=project, name="Category B", slug="category-b")
+
+        collected: list[set[str]] = []
+        executed: list[str] = []
+        original_flush = RemovalBatch.flush
+
+        def record_flush(batch_self: RemovalBatch) -> None:
+            collected.append(set(batch_self.stats_to_update))
+            with ExitStack() as stack:
+                for stats in batch_self.stats_to_update.values():
+                    stack.enter_context(
+                        patch.object(
+                            stats,
+                            "update_stats",
+                            side_effect=lambda stats=stats: executed.append(
+                                stats.cache_key
+                            ),
+                        )
+                    )
+                original_flush(batch_self)
+
+        with (
+            patch.object(
+                RemovalBatch, "flush", autospec=True, side_effect=record_flush
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            project_removal.run(project.pk, None, backup=False)
+
+        self.assertEqual(1, len(collected))
+        self.assertTrue(
+            {project.stats.cache_key, GlobalStats().cache_key}.issubset(collected[0])
+        )
+        self.assertEqual(collected[0], set(executed))
+        self.assertEqual(len(executed), len(set(executed)))
+
+    def test_project_removal_updates_surviving_project_before_global(
+        self,
+    ) -> None:
+        surviving_component = self.create_po()
+        surviving_project = surviving_component.project
+
+        project = self.create_project(name="Other", slug="other")
+        main = self.create_po(project=project, name="Main", slug="main")
+
+        self.component = main
+        self.project = surviving_project
+        linked = self.create_link_existing(
+            name="Linked A",
+            slug="linked-a",
+        )
+        second = self.create_link_existing(
+            name="Linked B",
+            slug="linked-b",
+        )
+
+        executed: list[str] = []
+        original_flush = RemovalBatch.flush
+
+        def record_flush(batch_self: RemovalBatch) -> None:
+            with ExitStack() as stack:
+                for stats in batch_self.stats_to_update.values():
+                    stack.enter_context(
+                        patch.object(
+                            stats,
+                            "update_stats",
+                            side_effect=lambda stats=stats: executed.append(
+                                stats.cache_key
+                            ),
+                        )
+                    )
+                original_flush(batch_self)
+
+        with (
+            patch.object(
+                RemovalBatch, "flush", autospec=True, side_effect=record_flush
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            project_removal.run(project.pk, None, backup=False)
+
+        self.assertFalse(
+            Component.objects.filter(pk__in=[main.pk, linked.pk, second.pk]).exists()
+        )
+        self.assertLess(
+            executed.index(surviving_project.stats.cache_key),
+            executed.index(GlobalStats().cache_key),
+        )
+
     def test_delete_votes(self) -> None:
         with transaction.atomic():
             component = self.create_po(
@@ -151,14 +736,15 @@ class ProjectTest(RepoTestCase):
             user = create_test_user()
             translation = component.translation_set.get(language_code="cs")
             unit = translation.unit_set.get(source="Hello, world!\n")
-            suggestion = Suggestion.objects.add(unit, ["Test"], None)
+            suggestion, _ = Suggestion.objects.add(unit, ["Test"], None)
             Vote.objects.create(suggestion=suggestion, value=Vote.POSITIVE, user=user)
         component.project.delete()
 
     def test_add_suggestion_validation(self) -> None:
         with transaction.atomic():
             component = self.create_po(
-                suggestion_voting=True, suggestion_autoaccept=True
+                suggestion_voting=True,
+                suggestion_autoaccept=2,
             )
             user = create_test_user()
             another_user = create_another_user()
@@ -177,28 +763,87 @@ class ProjectTest(RepoTestCase):
                     raise_exception=True,
                 )
 
-            # check that same operation doesn't raise an error if raise_exception=False but returns false
-            self.assertFalse(
+            # check that same operation doesn't raise an error if raise_exception=Fal   se
+            _, result = Suggestion.objects.add(
+                unit,
+                ["Translation of unit"],
+                None,
+                user=another_user,
+                raise_exception=False,
+            )
+            self.assertEqual(result, SuggestionAddResult.SIMILAR)
+
+            too_long_target = "x" * (get_translation_text_max_length(unit) + 1)
+            with self.assertRaises(SuggestionTooLongError):
                 Suggestion.objects.add(
                     unit,
-                    ["Translation of unit"],
+                    [too_long_target],
                     None,
                     user=another_user,
-                    raise_exception=False,
+                    raise_exception=True,
                 )
+            _, result = Suggestion.objects.add(
+                unit,
+                [too_long_target],
+                None,
+                user=another_user,
+                raise_exception=False,
             )
+            self.assertEqual(result, SuggestionAddResult.TOO_LONG)
+
+            max_length = get_translation_text_max_length(unit)
+            long_segments = ["x" * (max_length // 2 + 1)] * 2
+            _, result = Suggestion.objects.add(
+                unit,
+                long_segments,
+                None,
+                user=another_user,
+                raise_exception=False,
+            )
+            self.assertEqual(result, SuggestionAddResult.TOO_LONG)
+
+            unit.extra_flags = "max-length:*"
+            unit.save(update_fields=["extra_flags"])
+            unit = Unit.objects.get(pk=unit.pk)
+            suggestion, result = Suggestion.objects.add(
+                unit,
+                ["Invalid flag suggestion"],
+                None,
+                user=another_user,
+                raise_exception=True,
+            )
+            self.assertIsNotNone(suggestion)
+            self.assertEqual(result, SuggestionAddResult.CREATED)
 
             # check that user submitting suggestion twice doesn't create duplicated suggestions
-            suggestion = Suggestion.objects.add(
+            suggestion, result = Suggestion.objects.add(
                 unit, ["New suggestion"], None, user=another_user, raise_exception=True
             )
             suggestion_count = Suggestion.objects.count()
-            self.assertTrue(bool(suggestion))
-            suggestion = Suggestion.objects.add(
+            self.assertIsNotNone(suggestion)
+            self.assertEqual(result, SuggestionAddResult.CREATED)
+            _, result = Suggestion.objects.add(
                 unit, ["New suggestion"], None, user=another_user, raise_exception=True
             )
-            self.assertFalse(suggestion)
+            self.assertEqual(result, SuggestionAddResult.DUPLICATE)
+            self.assertIsNotNone(suggestion)
             self.assertEqual(suggestion_count, Suggestion.objects.count())
+
+            # check that another user creating similar suggestion upvotes existing
+            factory = RequestFactory()
+            request = factory.get("/")
+            request.user = user
+            request.session = {}
+            suggestion, result = Suggestion.objects.add(
+                unit,
+                ["New suggestion"],
+                request,
+                vote=True,
+                user=user,
+                raise_exception=True,
+            )
+            self.assertEqual(result, SuggestionAddResult.VOTED)
+            self.assertEqual(suggestion.get_num_votes(), 1)
 
     def test_delete_all(self) -> None:
         project = self.create_project()
@@ -214,9 +859,29 @@ class ProjectTest(RepoTestCase):
         # Create project
         project = self.create_project()
 
+        self.assertEqual(
+            {"Administration"},
+            set(project.defined_groups.values_list("name", flat=True)),
+        )
+
         # Enable ACL
         project.access_control = Project.ACCESS_PRIVATE
         project.save()
+        self.assertEqual(
+            {
+                "Administration",
+                "Automatic translation",
+                "Bulk editing",
+                "Glossary",
+                "Languages",
+                "Memory",
+                "Screenshots",
+                "Sources",
+                "Translate",
+                "VCS",
+            },
+            set(project.defined_groups.values_list("name", flat=True)),
+        )
 
         # Check user does not have access
         self.assertFalse(user.can_access_project(project))
@@ -230,9 +895,197 @@ class ProjectTest(RepoTestCase):
         # We now should have access
         self.assertTrue(user.can_access_project(project))
 
+        project.translation_review = True
+        project.save()
+
+        self.assertEqual(
+            {
+                "Administration",
+                "Automatic translation",
+                "Bulk editing",
+                "Glossary",
+                "Languages",
+                "Memory",
+                "Review",
+                "Screenshots",
+                "Sources",
+                "Translate",
+                "VCS",
+            },
+            set(project.defined_groups.values_list("name", flat=True)),
+        )
+
 
 class TranslationTest(RepoTestCase):
     """Translation testing."""
+
+    def test_pending_commit_reuses_translation(self) -> None:
+        component = self.create_component()
+        self.check_pending_commit_queries(component, "cs")
+
+    def test_pending_source_commit_reuses_translation(self) -> None:
+        component = self.create_po_mono()
+        self.check_pending_commit_queries(component, "en")
+
+    def test_pending_plural_commit_reuses_translation(self) -> None:
+        component = self.create_po_mono()
+        translation = component.translation_set.get(language_code="cs")
+        self.assertTrue(any(unit.is_plural for unit in translation.unit_set.all()))
+        self.check_pending_commit_queries(component, "cs")
+
+    def test_pending_linked_commit_reuses_translation(self) -> None:
+        component = self.create_link()
+        self.assertIsNotNone(component.linked_component_id)
+        self.check_pending_commit_queries(component, "cs")
+
+    def check_pending_commit_queries(
+        self, component: Component, language_code: str
+    ) -> None:
+        translation = component.translation_set.get(language_code=language_code)
+        user = create_test_user()
+        units = list(translation.unit_set.order_by("pk"))
+        self.assertGreater(len(units), 1)
+        original_update_units = Translation.update_units
+        queries: list[str] = []
+        saved = Mock()
+        translation_id = translation.pk
+
+        def update_units(
+            current: Translation,
+            changes: list[PendingUnitChange],
+            store: TranslationFormat,
+            author_name: str,
+            *,
+            recovery_changes: list[PendingUnitChange] | None = None,
+        ) -> tuple[dict[int, bool], bool]:
+            if current.pk != translation_id:
+                return original_update_units(
+                    current,
+                    changes,
+                    store,
+                    author_name,
+                    recovery_changes=recovery_changes,
+                )
+            post_save.connect(saved, sender=Unit, weak=False)
+            try:
+                with CaptureQueriesContext(connection) as captured:
+                    result = original_update_units(
+                        current,
+                        changes,
+                        store,
+                        author_name,
+                        recovery_changes=recovery_changes,
+                    )
+            finally:
+                post_save.disconnect(saved, sender=Unit)
+            queries.extend(query["sql"] for query in captured.captured_queries)
+            return result
+
+        for count in (1, len(units)):
+            with self.subTest(count=count):
+                expected = {}
+                for unit in units[:count]:
+                    target = f"Pending {count} {unit.pk}"
+                    if unit.is_plural:
+                        target = join_plural(
+                            [
+                                f"{target} {index}"
+                                for index in range(translation.plural.number)
+                            ]
+                        )
+                    unit.translate(user, target, STATE_TRANSLATED)
+                    expected[unit.pk] = unit.target
+                    if translation.is_source:
+                        # Source PO files store the source language's plural forms.
+                        expected[unit.pk] = join_plural(
+                            unit.get_target_plurals(
+                                plurals=component.get_source_plural().number
+                            )
+                        )
+
+                # Reload to exercise the commit path without fixture relation caches.
+                translation = Translation.objects.get(pk=translation.pk)
+                saved.reset_mock()
+                queries.clear()
+
+                with patch.object(Translation, "update_units", update_units):
+                    self.assertTrue(translation.commit_pending("test", user))
+
+                self.assertEqual(
+                    sum(sql.startswith('UPDATE "trans_unit"') for sql in queries),
+                    count,
+                )
+                for table in (
+                    "trans_translation",
+                    "trans_component",
+                    "trans_project",
+                    "lang_language",
+                    "lang_plural",
+                    "addons_addon",
+                ):
+                    self.assertLessEqual(
+                        sum(
+                            sql.startswith("SELECT") and f'FROM "{table}"' in sql
+                            for sql in queries
+                        ),
+                        1,
+                        table,
+                    )
+                self.assertEqual(saved.call_count, count)
+                commit_translation = (
+                    saved.call_args_list[0].kwargs["instance"].translation
+                )
+                for call in saved.call_args_list:
+                    self.assertFalse(call.kwargs["created"])
+                    self.assertEqual(call.kwargs["instance"].translation, translation)
+                    self.assertIs(
+                        call.kwargs["instance"].translation, commit_translation
+                    )
+                self.assertFalse(
+                    PendingUnitChange.objects.for_translation(
+                        translation, apply_filters=False
+                    ).exists()
+                )
+                translation.drop_store_cache()
+                for unit in units[:count]:
+                    stored, _ = translation.store.find_unit(unit.context, unit.source)
+                    self.assertEqual(stored.target, expected[unit.pk])
+                    unit.refresh_from_db()
+                    self.assertNotIn("disk_state", unit.details)
+
+    def test_store_translate_parse_error_is_not_reported(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+
+        with (
+            patch.object(translation, "load_store", side_effect=ParseError("invalid")),
+            patch("weblate.trans.models.translation.report_error") as report_error,
+            self.assertRaises(FileParseError),
+        ):
+            # pylint: disable-next=pointless-statement
+            translation.store  # ruff: ignore[useless-expression]
+
+        report_error.assert_not_called()
+
+    def test_store_unexpected_error_is_reported(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+
+        with (
+            patch.object(
+                translation, "load_store", side_effect=ValueError("unexpected")
+            ),
+            patch("weblate.trans.models.translation.report_error") as report_error,
+            self.assertRaises(FileParseError),
+        ):
+            # pylint: disable-next=pointless-statement
+            translation.store  # ruff: ignore[useless-expression]
+
+        report_error.assert_called_once_with(
+            "Translation parse error",
+            project=component.project,
+            print_tb=True,
+        )
 
     def test_basic(self) -> None:
         component = self.create_component()
@@ -250,6 +1103,311 @@ class TranslationTest(RepoTestCase):
         self.assertEqual(translation.stats.fuzzy, 0)
         self.assertEqual(translation.stats.all_words, 19)
 
+    def test_metadata_only_updates_are_batched(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        source_translation = component.source_translation
+        target_units = list(translation.unit_set.order_by("pk"))
+        source_units = list(source_translation.unit_set.order_by("pk"))
+        original_num_words = {
+            unit.pk: unit.num_words for unit in [*target_units, *source_units]
+        }
+        original_last_updated = max(
+            unit.last_updated for unit in [*target_units, *source_units]
+        )
+        hello = translation.unit_set.get(source="Hello, world!\n")
+        thanks = translation.unit_set.get(source="Thank you for using Weblate.")
+        hello_position = hello.position
+        thanks_position = thanks.position
+
+        filename = get_optional_path(translation.get_filename())
+        store = translation.store
+        hello_store_unit = next(
+            unit for unit in store.content_units if unit.source == hello.source
+        )
+        thanks_store_unit = next(
+            unit for unit in store.content_units if unit.source == thanks.source
+        )
+        hello_index = store.store.units.index(hello_store_unit.unit)
+        thanks_index = store.store.units.index(thanks_store_unit.unit)
+        store.store.units[hello_index], store.store.units[thanks_index] = (
+            store.store.units[thanks_index],
+            store.store.units[hello_index],
+        )
+        store.save()
+        filename.write_text(
+            filename.read_text(encoding="utf-8").replace("#: main.c:", "#: moved.c:"),
+            encoding="utf-8",
+        )
+        translation.drop_store_cache()
+        component.unload_sources()
+
+        unit_post_save = Mock()
+        post_save.connect(unit_post_save, sender=Unit, weak=False)
+        self.addCleanup(post_save.disconnect, unit_post_save, sender=Unit)
+        with CaptureQueriesContext(connection) as queries:
+            self.assertTrue(translation.check_sync(force=True))
+
+        unit_update_queries = [
+            query["sql"]
+            for query in queries.captured_queries
+            if query["sql"].startswith('UPDATE "trans_unit"')
+        ]
+        self.assertEqual(len(unit_update_queries), 1)
+
+        updated_units = list(
+            Unit.objects.filter(pk__in=original_num_words).order_by("pk")
+        )
+        self.assertTrue(updated_units)
+        self.assertTrue(
+            all(unit.location.startswith("moved.c:") for unit in updated_units)
+        )
+        self.assertTrue(
+            all(unit.num_words == original_num_words[unit.pk] for unit in updated_units)
+        )
+        self.assertTrue(
+            all(unit.last_updated > original_last_updated for unit in updated_units)
+        )
+        self.assertEqual(len({unit.last_updated for unit in updated_units}), 1)
+        self.assertEqual(
+            {
+                call.kwargs["instance"].pk
+                for call in unit_post_save.call_args_list
+                if not call.kwargs["created"]
+            },
+            set(original_num_words),
+        )
+        hello.refresh_from_db()
+        thanks.refresh_from_db()
+        self.assertEqual(hello.position, thanks_position)
+        self.assertEqual(thanks.position, hello_position)
+
+    def test_content_and_metadata_updates_use_separate_paths(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        hello = translation.unit_set.get(source="Hello, world!\n")
+        original_num_words = hello.num_words
+
+        filename = get_optional_path(translation.get_filename())
+        content = filename.read_text(encoding="utf-8")
+        content = content.replace("#: main.c:", "#: moved.c:")
+        content = content.replace(
+            'msgid "Hello, world!\\n"\nmsgstr ""',
+            'msgid "Hello, world!\\n"\nmsgstr "Nazdar světe!\\n"',
+        )
+        filename.write_text(content, encoding="utf-8")
+        translation.drop_store_cache()
+        component.unload_sources()
+
+        with CaptureQueriesContext(connection) as queries:
+            self.assertTrue(translation.check_sync(force=True))
+
+        hello.refresh_from_db()
+        self.assertEqual(hello.target, "Nazdar světe!\n")
+
+        unit_update_queries = [
+            query["sql"]
+            for query in queries.captured_queries
+            if query["sql"].startswith('UPDATE "trans_unit"')
+        ]
+        self.assertEqual(len(unit_update_queries), 2)
+
+        self.assertEqual(hello.num_words, original_num_words)
+        self.assertTrue(hello.location.startswith("moved.c:"))
+        self.assertFalse(PendingUnitChange.objects.filter(unit=hello).exists())
+
+    def test_metadata_batches_finish_before_notifications_and_roll_back_together(
+        self,
+    ) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        filename = get_optional_path(translation.get_filename())
+        additions = "\n".join(
+            f'#: main.c:{1000 + index}\nmsgid "Metadata batch {index}"\nmsgstr ""\n'
+            for index in range(251 - translation.unit_set.count())
+        )
+        filename.write_text(
+            filename.read_text(encoding="utf-8") + additions, encoding="utf-8"
+        )
+        translation.drop_store_cache()
+        component.unload_sources()
+        actor = get_test_actor(self)
+        self.assertTrue(translation.check_sync(force=True, author=actor))
+        units = Unit.objects.filter(
+            translation__in=[translation, component.source_translation]
+        )
+        before = {row["id"]: row for row in units.values()}
+        self.assertEqual(len(before), 502)
+        filename.write_text(
+            filename.read_text(encoding="utf-8").replace("#: main.c:", "#: moved.c:"),
+            encoding="utf-8",
+        )
+        translation.drop_store_cache()
+        component.unload_sources()
+        write_batch = UnitQuerySet._bulk_update_values  # ruff: ignore[private-member-access]
+        batches: list[int] = []
+
+        def fail_final_batch(
+            queryset: UnitQuerySet, batch: list[Unit], fields: tuple[str, ...]
+        ) -> None:
+            self.assertEqual(queryset.db, translation._state.db)  # ruff: ignore[private-member-access]
+            self.assertEqual(fields, UNIT_METADATA_UPDATE_FIELDS)
+            batches.append(len(batch))
+            if len(batches) == 2:
+                self.assertEqual(
+                    units.filter(location__startswith="moved.c:").count(), 500
+                )
+                msg = "Metadata write failed"
+                raise DatabaseError(msg)
+            write_batch(queryset, batch, fields)
+
+        notifications = Mock()
+        post_save.connect(notifications, sender=Unit, weak=False)
+        self.addCleanup(post_save.disconnect, notifications, sender=Unit)
+        with (
+            patch.object(
+                UnitQuerySet,
+                "_bulk_update_values",
+                autospec=True,
+                side_effect=fail_final_batch,
+            ),
+            self.assertRaisesMessage(DatabaseError, "Metadata write failed"),
+        ):
+            translation.check_sync(force=True, author=actor)
+        self.assertEqual(batches, [500, 2])
+        notifications.assert_not_called()
+        self.assertEqual({row["id"]: row for row in units.values()}, before)
+        post_save.disconnect(notifications, sender=Unit)
+        translation.drop_store_cache()
+        component.unload_sources()
+        seen: list[int] = []
+
+        def after_save(sender: type[Unit], instance: Unit, **kwargs: object) -> None:
+            if not seen:
+                self.assertEqual(
+                    units.filter(location__startswith="moved.c:").count(), len(before)
+                )
+            self.assertFalse(kwargs["created"])
+            self.assertFalse(kwargs["raw"])
+            self.assertEqual(kwargs["using"], connection.alias)
+            self.assertEqual(
+                kwargs["update_fields"], frozenset(UNIT_METADATA_UPDATE_FIELDS)
+            )
+            seen.append(instance.pk)
+
+        post_save.connect(after_save, sender=Unit)
+        self.addCleanup(post_save.disconnect, after_save, sender=Unit)
+        with CaptureQueriesContext(connection) as queries:
+            self.assertTrue(translation.check_sync(force=True, author=actor))
+        updates = [
+            query["sql"]
+            for query in queries
+            if query["sql"].startswith('UPDATE "trans_unit"')
+        ]
+        self.assertEqual(len(updates), 2)
+        self.assertCountEqual(seen, before)
+        rows = list(units.values())
+        self.assertEqual(len({row["last_updated"] for row in rows}), 1)
+        for row in rows:
+            for name in ("target", "source", "state", "original_state", "num_words"):
+                self.assertEqual(row[name], before[row["id"]][name])
+
+    def test_metadata_writer_persists_only_prepared_fields(self) -> None:
+        component = self.create_component()
+        unit = component.translation_set.get(language_code="cs").unit_set.get(
+            source="Hello, world!\n"
+        )
+        before = {
+            name: getattr(unit, name)
+            for name in ("state", "original_state", "num_words")
+        }
+        expected = {
+            "details": {"quoted": "český 'text'; --", "nested": [None, True]},
+            "source": "Prepared source",
+            "target": "Prepared target",
+            "location": "metadata.c:42",
+            "note": "Prepared note",
+            "position": 123,
+            "automatically_translated": True,
+            "flags": "read-only",
+            "last_updated": timezone.now(),
+        }
+        for name, value in expected.items():
+            setattr(unit, name, value)
+        with self.assertNumQueries(1):
+            Unit.objects.using(connection.alias)._bulk_update_values(  # ruff: ignore[private-member-access]
+                [unit], UNIT_METADATA_UPDATE_FIELDS
+            )
+        unit.refresh_from_db()
+        self.assertEqual({name: getattr(unit, name) for name in expected}, expected)
+        self.assertEqual({name: getattr(unit, name) for name in before}, before)
+
+    def test_metadata_update_preserves_pending_explanation(self) -> None:
+        component = self.create_tbx()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="address bar")
+        explanation = "Pending explanation"
+        unit.update_explanation(explanation, create_test_user())
+
+        store = translation.store
+        store.store.units.reverse()
+        store.save()
+        translation.drop_store_cache()
+        component.unload_sources()
+
+        self.assertTrue(translation.check_sync(force=True))
+
+        unit.refresh_from_db()
+        pending = PendingUnitChange.objects.get(unit=unit)
+        self.assertEqual(unit.explanation, explanation)
+        self.assertEqual(pending.explanation, explanation)
+
+    def test_source_translation_heals_managed_readonly_flag(self) -> None:
+        component = self.create_component()
+        source = component.source_translation
+        source.check_flags = "strict-same"
+        source.save(update_fields=["check_flags"])
+
+        component = Component.objects.get(pk=component.pk)
+        source = component.source_translation
+
+        self.assertEqual(source.check_flags, "read-only, strict-same")
+
+    def test_source_translation_sync_invalidates_flag_caches(self) -> None:
+        component = self.create_component()
+        source = component.source_translation
+        source.check_flags = "strict-same"
+        source.save(update_fields=["check_flags"])
+        source = Translation.objects.get(pk=source.pk)
+
+        self.assertFalse(source.is_readonly)
+        self.assertNotIn("read-only", source.all_flags)
+
+        source.sync_readonly_check_flag(save=False)
+
+        self.assertTrue(source.is_readonly)
+        self.assertIn("read-only", source.all_flags)
+
+    def test_commit_pending_skips_translation_without_filename(self) -> None:
+        component = self.create_component()
+        source = component.source_translation
+        user = create_test_user()
+        unit = source.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one source unit.")
+        PendingUnitChange.store_unit_change(unit=unit, author=user)
+        self.assertEqual(source.count_pending_units, 1)
+
+        with patch("weblate.trans.models.translation.report_message") as report_message:
+            self.assertTrue(component.commit_pending("test", None))
+
+        report_message.assert_called_once_with(
+            "Attempted to commit translation without filename",
+            project=component.project,
+            extra_log=f"translation={source.full_slug}, pending_changes=1",
+        )
+        self.assertEqual(source.count_pending_units, 0)
+
     def test_validation(self) -> None:
         """Translation validation."""
         component = self.create_component()
@@ -262,13 +1420,272 @@ class TranslationTest(RepoTestCase):
         translation = component.translation_set.get(language_code="cs")
         self.assertEqual(translation.stats.all, 4)
         self.assertEqual(translation.stats.all_words, 19)
-        translation.unit_set.all().delete()
-        translation.invalidate_cache()
+        with self.captureOnCommitCallbacks(execute=True):
+            translation.unit_set.all().delete()
+            translation.invalidate_cache()
         self.assertEqual(translation.stats.all, 0)
         self.assertEqual(translation.stats.all_words, 0)
 
+    def test_stats_with_parallel_unit_relations(self) -> None:
+        """Independent unit relations should not multiply statistics rows."""
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one unit.")
+        translation.unit_set.exclude(pk=unit.pk).delete()
+        unit.state = STATE_APPROVED
+        unit.save(update_fields=["state"])
+
+        Check.objects.filter(unit=unit).delete()
+        Check.objects.create(unit=unit, name="same", dismissed=False)
+        Check.objects.create(unit=unit, name="ellipsis", dismissed=True)
+        Suggestion.objects.create(unit=unit, target="First suggestion")
+        Suggestion.objects.create(unit=unit, target="Second suggestion")
+        Comment.objects.create(unit=unit, comment="First comment")
+        Comment.objects.create(unit=unit, comment="Second comment")
+        Comment.objects.create(unit=unit, comment="Resolved comment", resolved=True)
+        labels = [
+            Label.objects.create(
+                project=component.project, name=f"Label {index}", color="red"
+            )
+            for index in range(2)
+        ]
+        unit.source_unit.labels.add(*labels)
+
+        translation.stats.delete()
+        translation = Translation.objects.get(pk=translation.pk)
+        self.assertEqual(translation.stats.all, 1)
+        self.assertEqual(translation.stats.approved, 1)
+        self.assertEqual(translation.stats.allchecks, 1)
+        self.assertEqual(translation.stats.dismissed_checks, 1)
+        self.assertEqual(translation.stats.suggestions, 1)
+        self.assertEqual(translation.stats.approved_suggestions, 1)
+        self.assertEqual(translation.stats.comments, 1)
+        self.assertEqual(translation.stats.unlabeled, 0)
+
+    def test_stats_query_uses_relation_subqueries(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        translation.stats.delete()
+        translation = Translation.objects.get(pk=translation.pk)
+
+        with CaptureQueriesContext(connection) as queries:
+            self.assertGreater(translation.stats.all, 0)
+
+        unit_queries = [
+            query["sql"]
+            for query in queries.captured_queries
+            if 'FROM "trans_unit"' in query["sql"]
+            and 'FROM "checks_check"' in query["sql"]
+        ]
+        self.assertEqual(len(unit_queries), 1)
+        unit_query = unit_queries[0]
+        self.assertNotIn("COALESCE", unit_query.upper())
+        self.assertNotIn('JOIN "trans_unit"', unit_query)
+        self.assertNotIn('JOIN "trans_translation"', unit_query)
+        self.assertNotIn('JOIN "trans_component"', unit_query)
+        for table in (
+            "checks_check",
+            "trans_suggestion",
+            "trans_comment",
+            "trans_unit_labels",
+        ):
+            self.assertIn(f'FROM "{table}"', unit_query)
+            self.assertNotIn(f'JOIN "{table}"', unit_query)
+
+    def test_grouped_stats_match_unit_buckets(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        translation.unit_set.all().delete()
+        label = component.project.label_set.create(name="Grouped", color="red")
+        units: list[Unit] = []
+        snapshots: list[UnitSnapshot] = []
+        expected = dict.fromkeys(TranslationStats.UNIT_DELTA_KEYS, 0)
+        for state in StringState:
+            for flags in range(32):
+                # Different sizes in the same group catch accidental multiplication
+                # of word/character sums by the number of strings.
+                for source, words in (("", 0), ("Žluťoučký 🐈", 2), ("one\x1emany", 3)):
+                    snapshot: UnitSnapshot = {
+                        "state": state,
+                        "num_words": words,
+                        "num_chars": len(source),
+                        "active_checks_count": flags & 1,
+                        "dismissed_checks_count": flags & 2,
+                        "suggestion_count": flags & 4,
+                        "label_count": flags & 8,
+                        "comment_count": flags & 16,
+                    }
+                    snapshots.append(snapshot)
+                    for key, value in TranslationStats.snapshot_to_bucket(
+                        snapshot
+                    ).items():
+                        expected[key] += value
+                    units.append(
+                        Unit(
+                            translation=translation,
+                            id_hash=len(units),
+                            position=len(units),
+                            source=source,
+                            num_words=words,
+                            state=state,
+                        )
+                    )
+        Unit.objects.bulk_create(units)
+        for unit in units:
+            unit.source_unit = unit
+        Unit.objects.bulk_update(units, ["source_unit"])
+        checks = []
+        suggestions = []
+        comments = []
+        labels = []
+        for unit, snapshot in zip(units, snapshots, strict=True):
+            for dismissed, present in (
+                (False, snapshot["active_checks_count"]),
+                (True, snapshot["dismissed_checks_count"]),
+            ):
+                if present:
+                    checks.append(
+                        Check(
+                            unit=unit,
+                            name="ellipsis" if dismissed else "same",
+                            dismissed=dismissed,
+                        )
+                    )
+            if snapshot["suggestion_count"]:
+                suggestions.append(Suggestion(unit=unit, target="Suggestion"))
+            if snapshot["comment_count"]:
+                comments.append(Comment(unit=unit, comment="Comment"))
+            if snapshot["label_count"]:
+                labels.append(Unit.labels.through(unit_id=unit.pk, label_id=label.pk))
+        Check.objects.bulk_create(checks)
+        Suggestion.objects.bulk_create(suggestions)
+        Comment.objects.bulk_create(comments)
+        Unit.labels.through.objects.bulk_create(labels)
+
+        stats = TranslationStats(translation)
+        stats.calculate_basic()
+        self.assertEqual({key: stats.aggregate_get(key) for key in expected}, expected)
+
+    def test_detail_stats_save_without_updating_parents(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        component.project.label_set.create(name="Detail", color="red")
+        for lazy, eager, (name, method), direct in product(
+            (False, True),
+            (False, True),
+            (("check:same", "calculate_checks"), ("label:Detail", "calculate_labels")),
+            (False, True),
+        ):
+            with (
+                self.subTest(lazy=lazy, eager=eager, name=name, direct=direct),
+                override_settings(STATS_LAZY=lazy, CELERY_TASK_ALWAYS_EAGER=eager),
+            ):
+                stats = TranslationStats(translation)
+                stats.clear()
+                stats.calculate_basic()
+                stats.save(update_parents=False)
+                stats = TranslationStats(translation)
+                with (
+                    patch.object(stats, "save", wraps=stats.save) as save,
+                    patch.object(stats, "update_parents") as parents,
+                    patch(
+                        "weblate.utils.tasks.update_translation_stats_parents.delay_on_commit"
+                    ) as task,
+                    self.captureOnCommitCallbacks(execute=True),
+                ):
+                    if direct:
+                        getattr(stats, method)()
+                    else:
+                        getattr(stats, name)
+                    save.assert_called_once_with(update_parents=False)
+                    with self.assertNumQueries(0):
+                        getattr(stats, name)
+                    save.assert_called_once()
+                parents.assert_not_called()
+                task.assert_not_called()
+
+    def test_basic_stats_miss_still_updates_parents(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy), override_settings(STATS_LAZY=lazy):
+                stats = TranslationStats(translation)
+                stats.delete()
+                with (
+                    patch.object(stats, "save", wraps=stats.save) as save,
+                    patch.object(stats, "update_parents") as parents,
+                    self.captureOnCommitCallbacks(execute=True),
+                ):
+                    self.assertGreater(stats.all, 0)
+                save.assert_called_once_with()
+                parents.assert_called_once_with()
+
+    def test_parent_details_are_lazy_and_invalidated(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        category = Category.objects.create(
+            project=component.project, name="Details", slug="details"
+        )
+        Component.objects.filter(pk=component.pk).update(category=category)
+        component.refresh_from_db()
+        unit = translation.unit_set.first()
+        if unit is None:
+            self.fail("Expected at least one unit")
+        label = component.project.label_set.create(name="Detail", color="red")
+        for lazy in (False, True):
+            # Czech must be calculated last so its timestamp matches the component's.
+            # Reusing stale aggregate children would then skip parent invalidation.
+            with (
+                self.subTest(lazy=lazy),
+                override_settings(STATS_LAZY=lazy),
+                patch(
+                    "weblate.utils.stats.ComponentStats.get_child_objects",
+                    side_effect=lambda: component.translation_set.order_by(
+                        "-language_code"
+                    ),
+                ),
+            ):
+                with self.captureOnCommitCallbacks(execute=True):
+                    Check.objects.filter(unit__translation=translation).delete()
+                    Check.objects.create(unit=unit, name="same", dismissed=False)
+                    unit.source_unit.labels.add(label)
+                scopes = (
+                    ProjectLanguage(component.project, translation.language),
+                    CategoryLanguage(category, translation.language),
+                )
+                for scope in scopes:
+                    self.assertGreater(scope.stats.all, 0)
+                with (
+                    patch(
+                        "weblate.utils.stats.TranslationStats.update_parents"
+                    ) as parents,
+                    self.captureOnCommitCallbacks(execute=True),
+                ):
+                    for scope in scopes:
+                        self.assertEqual(getattr(scope.stats, "check:same"), 1)
+                        self.assertEqual(getattr(scope.stats, "label:Detail"), 1)
+                parents.assert_not_called()
+
+                with self.captureOnCommitCallbacks(execute=True):
+                    Check.objects.filter(unit=unit, name="same").delete()
+                    unit.source_unit.labels.remove(label)
+                for scope in scopes:
+                    scope.stats.force_load()
+                    self.assertEqual(getattr(scope.stats, "check:same"), 0)
+                    self.assertEqual(getattr(scope.stats, "label:Detail"), 0)
+                for scope in (
+                    ProjectLanguage(component.project, translation.language),
+                    CategoryLanguage(category, translation.language),
+                ):
+                    self.assertEqual(getattr(scope.stats, "check:same"), 0)
+                    self.assertEqual(getattr(scope.stats, "label:Detail"), 0)
+
     def test_commit_grouping(self) -> None:
         component = self.create_component()
+        component.file_format_params = {"po_contributor_comments": "spdx"}
+        component.save(update_fields=["file_format_params"])
         translation = component.translation_set.get(language_code="cs")
         user = create_test_user()
         start_rev = component.repository.last_revision
@@ -290,20 +1707,63 @@ class TranslationTest(RepoTestCase):
         self.assertEqual(start_rev, component.repository.last_revision)
         self.assertEqual(translation.count_pending_units, 4)
 
-        with patch.object(
-            translation.store, "find_unit", side_effect=UnitNotFoundError("test error")
-        ):
-            # Check failure in committing pending changes retains them in db
-            # use _commit_pending, patching won't work if the Translation object
-            # is loaded from the db
-            translation._commit_pending("test", None)  # noqa: SLF001
-            self.assertEqual(translation.count_pending_units, 4)
-
         # Commit pending changes
         translation.commit_pending("test", None)
         self.assertNotEqual(start_rev, component.repository.last_revision)
         self.assertEqual(component.repository.count_outgoing(), count)
         self.assertEqual(translation.count_pending_units, 0)
+
+        notes = translation.store.store.header().getnotes("translator")
+        self.assertGreaterEqual(notes.count("SPDX-FileCopyrightText:"), count)
+        for unit in [units[2], units[3]]:
+            self.assertIn(f"User {unit.pk} <{unit.pk}@example.com>", notes)
+
+    def test_contributor_comments_direct_commit(self) -> None:
+        component = self.create_component()
+        component.file_format_params = {"po_contributor_comments": "spdx"}
+        component.save(update_fields=["file_format_params"])
+        translation = component.translation_set.get(language_code="cs")
+        user = create_test_user()
+        with patch.object(translation, "log_info") as log_info:
+            translation.git_commit(user, "Jane <jane@example.com>", log_author=user)
+        log_info.assert_any_call(
+            "committed %s as %s", translation.filenames, user.username
+        )
+        notes = translation.store.store.header().getnotes("translator")
+        self.assertIn("SPDX-FileCopyrightText:", notes)
+        self.assertIn("Jane <jane@example.com>", notes)
+        self.assertEqual(translation.revision, translation.get_git_blob_hash())
+
+    def test_commit_log_uses_id_for_email_username(self) -> None:
+        component = self.create_component()
+        component.file_format_params = {"po_contributor_comments": "spdx"}
+        component.save(update_fields=["file_format_params"])
+        translation = component.translation_set.get(language_code="cs")
+        user = create_test_user()
+        user.username = user.email
+        user.save(update_fields=["username"])
+
+        with patch.object(translation, "log_info") as log_info:
+            translation.git_commit(user, user.get_author_name(), log_author=user)
+
+        log_info.assert_any_call(
+            "committed %s as %s", translation.filenames, f"<User:{user.pk}>"
+        )
+        self.assertNotIn(user.email, str(log_info.call_args_list))
+
+    def test_removal_log_uses_id_for_email_username(self) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        filenames = translation.filenames
+        user = create_test_user()
+        user.username = user.email
+        user.save(update_fields=["username"])
+
+        with patch.object(translation, "log_info") as log_info:
+            translation.remove(user)
+
+        log_info.assert_any_call("removing %s as %s", filenames, f"<User:{user.pk}>")
+        self.assertNotIn(user.email, str(log_info.call_args_list))
 
     def test_group_changes_by_author(self) -> None:
         component = self.create_component()
@@ -311,7 +1771,7 @@ class TranslationTest(RepoTestCase):
         user1 = create_test_user()
         user2 = create_another_user()
 
-        units = list(translation.unit_set.all())
+        units = list(translation.unit_set.order_by("pk"))
         units[0].translate(user1, "test1", STATE_TRANSLATED)
         units[1].translate(user2, "test2", STATE_TRANSLATED)
         units[2].translate(user1, "test3", STATE_TRANSLATED)
@@ -324,7 +1784,8 @@ class TranslationTest(RepoTestCase):
         all_changes = list(
             PendingUnitChange.objects.for_translation(translation).order_by("timestamp")
         )
-        groups = Translation._group_changes_by_author(all_changes)  # noqa: SLF001
+        # ruff: ignore[private-member-access]
+        groups = Translation._group_changes_by_author(all_changes)
         self.assertEqual(len(groups), 3)
 
         author, changes = groups[0]
@@ -341,6 +1802,23 @@ class TranslationTest(RepoTestCase):
         self.assertEqual(author, user2)
         self.assertEqual(len(changes), 1)
         self.assertEqual([c.unit for c in changes], [units[3]])
+
+        self.assertTrue(translation.commit_pending("test", user1))
+        self.assertEqual(component.repository.count_outgoing(), 3)
+        self.assertCountEqual(
+            [
+                component.repository.get_revision_info(revision)["author"]
+                for revision in component.repository.get_outgoing_revisions()
+            ],
+            [user1.get_author_name(), user2.get_author_name(), user2.get_author_name()],
+        )
+        self.assertFalse(
+            PendingUnitChange.objects.for_translation(translation).exists()
+        )
+        translation.drop_store_cache()
+        for unit in units:
+            stored, _ = translation.store.find_unit(unit.context, unit.source)
+            self.assertEqual(stored.target, unit.target)
 
     def test_group_changes_by_author_single_author(self) -> None:
         """Test that multiple changes to a unit by single author are grouped."""
@@ -360,7 +1838,8 @@ class TranslationTest(RepoTestCase):
         all_changes = list(
             PendingUnitChange.objects.for_translation(translation).order_by("timestamp")
         )
-        groups = Translation._group_changes_by_author(all_changes)  # noqa: SLF001
+        # ruff: ignore[private-member-access]
+        groups = Translation._group_changes_by_author(all_changes)
         self.assertEqual(len(groups), 1)
 
         author, changes = groups[0]
@@ -370,7 +1849,7 @@ class TranslationTest(RepoTestCase):
             [units[0], units[1], units[2], units[1], units[3]],
         )
 
-    def test_commit_explanation(self):
+    def test_commit_explanation(self) -> None:
         user = create_test_user()
         component = self.create_tbx()
 
@@ -396,14 +1875,45 @@ class TranslationTest(RepoTestCase):
         # only adds pending change for target unit's translation file
         self.assertEqual(PendingUnitChange.objects.count(), 1)
 
-    def test_commit_policy(self):
+    def test_commit_without_language_reviews(self) -> None:
         component = self.create_component()
+        project = component.project
+        user = create_test_user()
+        project.commit_policy = CommitPolicyChoices.APPROVED_ONLY
+        project.translation_review = True
+        project.save()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        unit.translate(user, "Reviewed language", STATE_TRANSLATED)
+        translation.commit_pending("test", None)
+        self.assertTrue(PendingUnitChange.objects.filter(unit=unit).exists())
+
+        WorkflowSetting.objects.create(
+            project=project,
+            language=translation.language,
+            translation_review=False,
+        )
+        translation = Translation.objects.get(pk=translation.pk)
+        unit = translation.unit_set.get(pk=unit.pk)
+        unit.translate(user, "Language without reviews\n", STATE_FUZZY)
+        translation.commit_pending("test", None)
+        self.assertFalse(PendingUnitChange.objects.filter(unit=unit).exists())
+        translation = Translation.objects.get(pk=translation.pk)
+        stored, _ = translation.store.find_unit(unit.context, unit.source)
+        self.assertEqual(stored.target, "Language without reviews\n")
+        self.assertTrue(stored.is_fuzzy())
+
+    def test_commit_policy(self) -> None:
+        component = self.create_xliff()
         translation = component.translation_set.get(language_code="cs")
         user = create_test_user()
 
         project = component.project
         project.commit_policy = CommitPolicyChoices.APPROVED_ONLY
+        project.translation_review = True
         project.save()
+
+        self.assertIn("approved", project.get_commit_policy_description())
 
         unit1 = translation.unit_set.get(source="Hello, world!\n")
         unit1.translate(user, "Unit 1 - Test 1", STATE_TRANSLATED)
@@ -415,12 +1925,14 @@ class TranslationTest(RepoTestCase):
         unit2.translate(user, "Unit 2 - Test 1", STATE_FUZZY)
 
         unit3 = translation.unit_set.get(
-            source="Try Weblate at <https://demo.weblate.org/>!\n"
+            source="Try Weblate at &lt;https://demo.weblate.org/&gt;!\n"
         )
         unit3.translate(user, "Unit 3 - Test 1", STATE_TRANSLATED)
 
         self.assertEqual(PendingUnitChange.objects.count(), 6)
-        changes = list(PendingUnitChange.objects.for_translation(translation))
+        changes = list(
+            PendingUnitChange.objects.for_translation(translation).order_by("timestamp")
+        )
         self.assertEqual(len(changes), 3)
         self.assertTrue(all(p.unit == unit1 for p in changes))
         self.assertEqual(
@@ -430,10 +1942,19 @@ class TranslationTest(RepoTestCase):
         component.commit_pending("test", None)
         self.assertEqual(PendingUnitChange.objects.count(), 3)
 
+        translation = component.translation_set.get(language_code="cs")
+        ttk_unit1, _ = translation.store.find_unit(unit1.context, unit1.source)
+        self.assertEqual(ttk_unit1.target, "Unit 1 - Test 3\n")
+        self.assertTrue(ttk_unit1.is_approved())
+
         project.commit_policy = CommitPolicyChoices.WITHOUT_NEEDS_EDITING
         project.save()
 
-        changes = list(PendingUnitChange.objects.for_translation(translation))
+        self.assertIn("needing editing", project.get_commit_policy_description())
+
+        changes = list(
+            PendingUnitChange.objects.for_translation(translation).order_by("timestamp")
+        )
         self.assertEqual(len(changes), 1)
         self.assertTrue(all(p.unit == unit3 for p in changes))
         self.assertEqual([STATE_TRANSLATED], [p.state for p in changes])
@@ -444,11 +1965,355 @@ class TranslationTest(RepoTestCase):
         project.commit_policy = CommitPolicyChoices.ALL
         project.save()
 
-        changes = list(PendingUnitChange.objects.for_translation(translation))
+        self.assertEqual("", project.get_commit_policy_description())
+
+        changes = list(
+            PendingUnitChange.objects.for_translation(translation).order_by("timestamp")
+        )
         self.assertEqual(len(changes), 2)
         self.assertEqual([STATE_FUZZY, STATE_FUZZY], [p.state for p in changes])
         component.commit_pending("test", None)
+
         self.assertEqual(PendingUnitChange.objects.count(), 0)
+
+        translation = component.translation_set.get(language_code="cs")
+        ttk_unit1, _ = translation.store.find_unit(unit1.context, unit1.source)
+        self.assertEqual(ttk_unit1.target, "Unit 1 - Test 4\n")
+        self.assertTrue(ttk_unit1.is_fuzzy())
+
+    def test_commit_retry_unit_not_found(self) -> None:
+        """Test retry logic for units failing due to UnitFoundError works correctly."""
+        user = create_test_user()
+        component = self.create_po_new_base()
+
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        ttk_unit, _ = translation.store.find_unit(unit.context, unit.source)
+        translation.store.remove_unit(ttk_unit.unit)
+
+        unit.translate(user, "Ahoj Země!\n", STATE_TRANSLATED)
+
+        self.assertEqual(translation.count_pending_units, 1)
+        component.commit_pending("test", None)
+        # failed unit, ineligible for commit doesn't count in pending units
+        self.assertEqual(translation.count_pending_units, 0)
+
+        change = PendingUnitChange.objects.get(unit=unit)
+        self.assertIn("last_failed", change.metadata)
+        self.assertEqual(change.metadata["failed_revision"], translation.revision)
+        self.assertEqual(change.metadata["weblate_version"], GIT_VERSION)
+        self.assertEqual(change.metadata["blocking_unit"], True)
+
+        unit.translate(user, "Ahoj Vesmíre!\n", STATE_TRANSLATED)
+        # blocking failed change makes future changes to same unit ineligible for commit
+        self.assertEqual(translation.count_pending_units, 0)
+
+        # add back missing unit and update revision to make changes eligible for commit
+        translation.store.new_unit(unit.context, unit.get_source_plurals())
+        translation.store.save()
+        translation.store_hash()
+
+        self.assertEqual(translation.count_pending_units, 1)
+        component.commit_pending("test", None)
+        self.assertEqual(PendingUnitChange.objects.count(), 0)
+
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        self.assertEqual(unit.target, "Ahoj Vesmíre!\n")
+
+    def test_commit_retry_unit_ttk_failure(self) -> None:
+        """Test retry logic for units failing due to TTK failure works correctly."""
+        user = create_test_user()
+        component = self.create_ftl()
+        project = component.project
+        project.commit_policy = CommitPolicyChoices.APPROVED_ONLY
+        project.translation_review = True
+        project.save()
+
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+        unit.translate(user, "Ahoj, ${ jméno }!", STATE_APPROVED)
+
+        self.assertEqual(translation.count_pending_units, 1)
+
+        component.commit_pending("test", None)
+
+        # failed unit, ineligible for commit doesn't count in pending units
+        self.assertEqual(translation.count_pending_units, 0)
+
+        change = PendingUnitChange.objects.get(unit=unit)
+        self.assertIn("last_failed", change.metadata)
+        self.assertEqual(change.metadata["failed_revision"], translation.revision)
+        self.assertEqual(change.metadata["weblate_version"], GIT_VERSION)
+        self.assertEqual(change.metadata["blocking_unit"], False)
+
+        unit.translate(user, "Ahoj, ${ name }!", STATE_APPROVED)
+
+        # this change is not expected to be applied as it is in translated
+        # state only. it is here to ensure that changes newer than the last
+        # successful change for the unit are not deleted.
+        unit.translate(user, "Ahoj ${ name }", STATE_TRANSLATED)
+        self.assertEqual(PendingUnitChange.objects.count(), 3)
+
+        # failed change is not blocking so future changes can be committed
+        changes = list(PendingUnitChange.objects.for_translation(translation))
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].target, "Ahoj, ${ name }!")
+        self.assertEqual(changes[0].metadata, {"actor_id": user.pk})
+
+        component.commit_pending("test", None)
+
+        # when successful changes to a unit are applied, pending changes for the unit
+        # earlier than the last successful change are removed
+        self.assertEqual(PendingUnitChange.objects.count(), 1)
+
+        ttk_unit, _ = translation.store.find_unit(unit.context, "Hello, ${ name }!")
+        self.assertEqual(ttk_unit.target, "Ahoj, ${ name }!")
+
+    def check_failed_pending_actor(self, *, missing: bool, batch: bool = False) -> None:
+        uploader = create_test_user()
+        author = create_another_user()
+        later_uploader = get_test_actor(self)
+        component = self.create_ftl()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+        unit.is_batch_update = batch
+        for actor, target in (
+            (uploader, "First ${ name }"),
+            (later_uploader, "Second ${ name }"),
+        ):
+            unit.translate(
+                actor, target, STATE_TRANSLATED, author=author, propagate=False
+            )
+        if batch:
+            translation.store_update_changes()
+        pending = list(
+            PendingUnitChange.objects.filter(unit=unit).order_by("timestamp", "pk")
+        )
+        self.assertEqual(
+            [change.get_actor() for change in pending], [uploader, later_uploader]
+        )
+        self.assertEqual([change.author for change in pending], [author, author])
+        target = (
+            "find_or_restore_pending_store_unit"
+            if missing
+            else "update_pending_store_unit"
+        )
+        error = (
+            UnitNotFoundError() if missing else ValueError("Cannot write translation")
+        )
+        with (
+            patch.object(Translation, target, side_effect=error),
+            patch("weblate.trans.models.change.report_message") as report,
+        ):
+            component.commit_pending("test", None)
+        report.assert_not_called()
+        self.assertCountEqual(
+            unit.change_set.filter(action=ActionEvents.SAVE_FAILED).values_list(
+                "user_id", "author_id"
+            ),
+            ((uploader.pk, author.pk), (later_uploader.pk, author.pk)),
+        )
+
+    def test_failed_pending_write_preserves_initiating_users(self) -> None:
+        self.check_failed_pending_actor(missing=False)
+
+    def test_missing_pending_string_preserves_initiating_users(self) -> None:
+        self.check_failed_pending_actor(missing=True)
+
+    def test_failed_batch_pending_write_preserves_initiating_users(self) -> None:
+        self.check_failed_pending_actor(missing=False, batch=True)
+
+    def test_failed_pending_write_preserves_anonymous_actor(self) -> None:
+        author = create_test_user()
+        component = self.create_ftl()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+        unit.translate(
+            get_anonymous(),
+            "Anonymous ${ name }",
+            STATE_TRANSLATED,
+            author=author,
+            propagate=False,
+        )
+        pending = PendingUnitChange.objects.get(unit=unit)
+        with patch("weblate.trans.models.change.report_message") as report:
+            translation._store_failed_unit_update(  # ruff: ignore[private-member-access]
+                unit, pending, ValueError("Cannot write")
+            )
+        report.assert_not_called()
+        failure = unit.change_set.get(action=ActionEvents.SAVE_FAILED)
+        self.assertIsNone(failure.user_id)
+        self.assertEqual(failure.author, author)
+
+    def test_failed_pending_write_reports_missing_actor(self) -> None:
+        user = create_test_user()
+        component = self.create_ftl()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+        unit.translate(user, "Pending ${ name }", STATE_TRANSLATED, propagate=False)
+        pending = PendingUnitChange.objects.get(unit=unit)
+        pending.metadata.pop("actor_id")
+        with (
+            patch("weblate.trans.models.change.report_message") as report,
+            self.assertWarnsRegex(
+                RuntimeWarning, "History entry created without a user"
+            ),
+        ):
+            translation._store_failed_unit_update(  # ruff: ignore[private-member-access]
+                unit, pending, ValueError("Cannot write")
+            )
+        report.assert_called_once()
+        failure = unit.change_set.get(action=ActionEvents.SAVE_FAILED)
+        self.assertIsNone(failure.user_id)
+        self.assertEqual(failure.author, user)
+
+    def test_commit_retry_unit_fluent_content_error_uses_handled_logging(self) -> None:
+        """Dedicated Fluent content errors should be logged locally, not reported."""
+        user = create_test_user()
+        component = self.create_ftl()
+
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+        unit.translate(user, "Ahoj, ${ name }!", STATE_APPROVED)
+
+        fluent_error = FluentContentError(
+            'Error in source of FluentUnit "hello":\nsynthetic fluent content error'
+        )
+        with (
+            patch(
+                "weblate.formats.ttkit.FluentUnit.set_target",
+                side_effect=fluent_error,
+            ),
+            patch("weblate.trans.models.translation.log_handled_exception") as mock_log,
+            patch("weblate.trans.models.translation.report_error") as mock_report,
+        ):
+            component.commit_pending("test", None)
+
+        mock_log.assert_called_once()
+        mock_report.assert_not_called()
+
+        change = PendingUnitChange.objects.get(unit=unit)
+        self.assertIn("last_failed", change.metadata)
+        self.assertEqual(change.metadata["failed_revision"], translation.revision)
+        self.assertEqual(change.metadata["weblate_version"], GIT_VERSION)
+        self.assertEqual(change.metadata["blocking_unit"], False)
+        self.assertIn(
+            "synthetic fluent content error",
+            unit.change_set.filter(action=ActionEvents.SAVE_FAILED)
+            .latest("timestamp")
+            .target,
+        )
+
+    def test_fluent_hostile_translation_is_handled(self) -> None:
+        """Hostile content must not stall or fail a save or a commit."""
+        user = create_test_user()
+        component = self.create_ftl()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+
+        select = "{ $x ->\n    [a] A\n   *[b] B\n} "
+        started = monotonic()
+        unit.translate(user, select * 38, STATE_APPROVED)
+        self.assertLess(monotonic() - started, 30)
+        self.assertIn("fluent-references", unit.all_checks_names)
+
+        # Exceeds the recursion limit of the parser.
+        payload = "{" * 300 + '"x"' + "}" * 300
+        unit = translation.unit_set.get(pk=unit.pk)
+        unit.translate(user, payload, STATE_APPROVED)
+        self.assertIn("fluent-target-syntax", unit.all_checks_names)
+
+        for check in unit.all_checks:
+            self.assertTrue(check.get_description())
+
+        with (
+            patch("weblate.trans.models.translation.log_handled_exception") as mock_log,
+            patch("weblate.trans.models.translation.report_error") as mock_report,
+        ):
+            component.commit_pending("test", None)
+        mock_log.assert_called_once()
+        mock_report.assert_not_called()
+        self.assertIsNotNone(translation.store)
+
+    def test_commit_retry_unit_unexpected_error_reports(self) -> None:
+        """Unexpected unit update errors should continue to go through report_error."""
+        user = create_test_user()
+        component = self.create_ftl()
+
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+        unit.translate(user, "Ahoj, ${ name }!", STATE_APPROVED)
+
+        with (
+            patch(
+                "weblate.formats.ttkit.FluentUnit.set_target",
+                side_effect=ValueError("unexpected failure"),
+            ),
+            patch("weblate.trans.models.translation.log_handled_exception") as mock_log,
+            patch("weblate.trans.models.translation.report_error") as mock_report,
+        ):
+            component.commit_pending("test", None)
+
+        mock_log.assert_not_called()
+        mock_report.assert_called_once()
+
+        change = PendingUnitChange.objects.get(unit=unit)
+        self.assertIn("last_failed", change.metadata)
+        self.assertEqual(change.metadata["failed_revision"], translation.revision)
+        self.assertEqual(change.metadata["weblate_version"], GIT_VERSION)
+        self.assertEqual(change.metadata["blocking_unit"], False)
+        self.assertIn(
+            "unexpected failure",
+            unit.change_set.filter(action=ActionEvents.SAVE_FAILED)
+            .latest("timestamp")
+            .target,
+        )
+
+    def test_commit_serialization_error(self) -> None:
+        """Serialization errors should be exposed as commit errors."""
+        user = create_test_user()
+        component = self._create_component(
+            "i18next", "i18next/*.json", "i18next/en.json"
+        )
+        translation = component.source_translation
+        filename = get_optional_path(translation.get_filename())
+        original_content = filename.read_bytes()
+        unit = translation.unit_set.get(source="Hello")
+        unit.translate(user, "Updated hello", STATE_TRANSLATED)
+
+        pending_count = PendingUnitChange.objects.count()
+        serialization_error = TypeError("'str' object does not support item assignment")
+        with (
+            patch(
+                "weblate.formats.ttkit.I18NextFormat.save",
+                side_effect=serialization_error,
+            ),
+            self.assertRaises(FailedCommitError) as context,
+        ):
+            component.commit_pending("test", None)
+
+        self.assertIs(context.exception.__cause__, serialization_error)
+        self.assertEqual(str(context.exception), str(serialization_error))
+        self.assertEqual(PendingUnitChange.objects.count(), pending_count)
+        self.assertEqual(filename.read_bytes(), original_content)
+
+    def test_commit_successful_deletes_failed_changes(self) -> None:
+        """Test that failed changes are deleted when a subsequent successful change to the unit is applied."""
+        user = create_test_user()
+        component = self.create_ftl()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, ${ name }!")
+
+        unit.translate(user, "Ahoj, ${ jméno }!", STATE_TRANSLATED)
+        unit.translate(user, "Ahoj, ${ name }!", STATE_TRANSLATED)
+        self.assertEqual(translation.count_pending_units, 1)
+
+        component.commit_pending("test", None)
+
+        # second change applied and first deleted as a result
+        self.assertEqual(translation.count_pending_units, 0)
+        ttk_unit, _ = translation.store.find_unit(unit.context, "Hello, ${ name }!")
+        self.assertEqual(ttk_unit.target, "Ahoj, ${ name }!")
 
 
 class ComponentListTest(RepoTestCase):
@@ -487,11 +2352,61 @@ class ComponentListTest(RepoTestCase):
         )
         self.assertEqual(clist.components.count(), 0)
 
+    def test_auto_timeout(self) -> None:
+        clist = ComponentList.objects.create(name="Name", slug="slug")
+        AutoComponentList.objects.create(
+            project_match="^.*$", component_match="^.*$", componentlist=clist
+        )
+        with patch(
+            "weblate.trans.models.componentlist.regex_match",
+            side_effect=TimeoutError,
+        ):
+            self.create_component()
+        self.assertEqual(clist.components.count(), 0)
+
+    def test_source_review(self) -> None:
+        component = self.create_json_intermediate()
+
+        source = component.translation_set.get(language_code="en")
+        unit = source.unit_set.get(source="Hello world!\n")
+
+        translation_unit = unit.unit_set.get(translation__language__code="cs")
+        self.assertEqual(translation_unit.state, STATE_TRANSLATED)
+
+        unit.translate(get_test_actor(self), "Hello, world!\n", STATE_NEEDS_CHECKING)
+
+        translation_unit = unit.unit_set.get(translation__language__code="en")
+        self.assertEqual(translation_unit.state, STATE_NEEDS_CHECKING)
+
+        # Verify the state after editing
+        translation_unit = unit.unit_set.get(translation__language__code="cs")
+        self.assertEqual(translation_unit.state, STATE_READONLY)
+
+        # Commit changes to the repository
+        component.commit_pending("test", None)
+
+        # Verify the state after reset
+        component.do_file_scan()
+        translation_unit = unit.unit_set.get(translation__language__code="cs")
+        self.assertEqual(translation_unit.state, STATE_READONLY)
+
+        # Set source back to translated - translation should be restored
+        unit.translate(get_test_actor(self), "Hello, world!\n", STATE_TRANSLATED)
+        translation_unit = unit.unit_set.get(translation__language__code="cs")
+        self.assertNotEqual(translation_unit.state, STATE_READONLY)
+
+        # Verify state survives commit + file scan roundtrip
+        component.commit_pending("test", None)
+        component.do_file_scan()
+        translation_unit = unit.unit_set.get(translation__language__code="cs")
+        self.assertNotEqual(translation_unit.state, STATE_READONLY)
+
 
 class ModelTestCase(RepoTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.component = self.create_component()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component = self.create_component()
 
 
 class SourceUnitTest(ModelTestCase):
@@ -515,17 +2430,72 @@ class SourceUnitTest(ModelTestCase):
     def test_check_flags(self) -> None:
         """Setting of Source check_flags changes checks for related units."""
         self.assertEqual(Check.objects.count(), 3)
-        check = Check.objects.all()[0]
+        check = Check.objects.filter(name="same")[0]
         unit = check.unit
+        # reload component to clear stats cache
+        self.component = unit.translation.component
         self.assertEqual(self.component.stats.allchecks, 3)
         source = unit.source_unit
         source.extra_flags = f"ignore-{check.name}"
-        source.save()
+        with self.captureOnCommitCallbacks(execute=True):
+            source.save()
         self.assertEqual(Check.objects.count(), 0)
         self.assertEqual(Component.objects.get(pk=self.component.pk).stats.allchecks, 0)
 
 
 class UnitTest(ModelTestCase):
+    def test_all_comments_prefetch(self) -> None:
+        unit = Unit.objects.filter(translation__language_code="cs")[0]
+        source = unit.source_unit
+        project = self.component.project
+        comments = [
+            Comment.objects.create(unit=comment_unit, comment=f"Comment {index}")
+            for comment_unit in (unit, source)
+            for index in range(3)
+        ]
+
+        for current_unit in (unit, source):
+            with self.subTest(is_source=current_unit.is_source):
+                fetched = list(current_unit.all_comments)
+                self.assertCountEqual(fetched, comments)
+                with self.assertNumQueries(0):
+                    for comment in fetched:
+                        translation = comment.unit.translation
+                        self.assertEqual(translation.component, self.component)
+                        self.assertEqual(translation.component.project, project)
+                        self.assertIn(translation.language.code, ("cs", "en"))
+
+    def test_prefetch_api(self) -> None:
+        unit = Unit.objects.filter(translation__language_code="cs").first()
+        if unit is None:
+            self.fail("Expected a unit in test fixture.")
+
+        user = create_test_user()
+        Comment.objects.create(unit=unit, comment="Comment")
+        Suggestion.objects.create(unit=unit, target="Suggestion", user=user)
+        PendingUnitChange.objects.create(unit=unit, author=user)
+
+        expected = (
+            unit.check_set.filter(dismissed=False).exists(),
+            unit.comment_set.filter(resolved=False).exists(),
+            unit.suggestion_set.exists(),
+            unit.pending_changes.exists(),
+        )
+        with self.assertNumQueries(6):
+            unit = Unit.objects.filter(pk=unit.pk).prefetch_api().get()
+
+        with self.assertNumQueries(0):
+            self.assertEqual(
+                (
+                    unit.has_failing_check,
+                    unit.has_comment,
+                    unit.has_suggestion,
+                    unit.has_pending_changes,
+                ),
+                expected,
+            )
+            list(unit.labels.all())
+
     def test_newlines(self) -> None:
         user = create_test_user()
         unit = Unit.objects.filter(
@@ -535,7 +2505,8 @@ class UnitTest(ModelTestCase):
         self.assertEqual(unit.target, "new\nstring\n")
         # New object to clear all_flags cache
         unit = Unit.objects.get(pk=unit.pk)
-        unit.flags = "dos-eol"
+        unit.translation.component.file_format_params["dos_eol"] = True
+        unit.translation.component.save()
         unit.translate(user, "new\nstring", STATE_TRANSLATED)
         self.assertEqual(unit.target, "new\r\nstring\r\n")
         unit.translate(user, "other\r\nstring", STATE_TRANSLATED)
@@ -603,6 +2574,57 @@ class UnitTest(ModelTestCase):
         ).order_by_request({"sort_by": "position,timestamp"}, None)
         self.assertEqual(multiple_ordered_unit.count(), 4)
 
+    def test_order_by_request_language_scope_orders_by_component(self) -> None:
+        category = Category.objects.create(
+            name="Docs", slug="docs", project=self.component.project
+        )
+        Component.objects.filter(pk=self.component.pk).update(
+            category=category, priority=120
+        )
+        high_component = self.create_po(
+            category=category,
+            name="High",
+            locked=True,
+            priority=80,
+            project=self.component.project,
+        )
+        language = Language.objects.get(code="cs")
+        high_translation = high_component.translation_set.get(language=language)
+        high_units = list(high_translation.unit_set.order_by("position"))
+        low_units = list(
+            self.component.translation_set.get(language=language).unit_set.order_by(
+                "position"
+            )
+        )
+        high_priority_unit = high_units[-1]
+        Unit.objects.filter(pk=high_priority_unit.pk).update(priority=200)
+
+        expected_ids = [
+            *(unit.pk for unit in low_units),
+            high_priority_unit.pk,
+            *(unit.pk for unit in high_units if unit.pk != high_priority_unit.pk),
+        ]
+
+        scopes = [
+            ProjectLanguage(self.component.project, language),
+            CategoryLanguage(category, language),
+        ]
+        for scope in scopes:
+            for form_data in (
+                {},
+                {"sort_by": "component,-priority"},
+                {"sort_by": "-component,-priority"},
+            ):
+                ordered_ids = list(
+                    Unit.objects.filter(
+                        translation__component__in=(self.component, high_component),
+                        translation__language=language,
+                    )
+                    .order_by_request(form_data, scope)
+                    .values_list("pk", flat=True)
+                )
+                self.assertEqual(ordered_ids, expected_ids)
+
     def test_get_max_length_no_pk(self) -> None:
         unit = Unit.objects.filter(translation__language_code="cs")[0]
         unit.pk = False
@@ -634,27 +2656,124 @@ class UnitTest(ModelTestCase):
         unit.source = "My test source"
         self.assertEqual(unit.get_max_length(), 10000)
 
+    def test_batch_update_defers_change_and_pending_change(self) -> None:
+        """Change objects are deferred to update_changes list when is_batch_update=True."""
+        user = create_test_user()
+        unit = Unit.objects.filter(
+            translation__language_code="cs", source="Hello, world!\n"
+        )[0]
+        PendingUnitChange.objects.filter(unit=unit).delete()
+        initial_count = Change.objects.count()
+
+        unit.is_batch_update = True
+        unit.translate(user, "Nazdar svete!\n", STATE_TRANSLATED)
+
+        # Change and PendingUnitChange should NOT be in DB yet
+        self.assertEqual(Change.objects.count(), initial_count)
+        self.assertFalse(PendingUnitChange.objects.filter(unit=unit).exists())
+
+        # But should be in the deferred list on the translation
+        self.assertEqual(len(unit.translation.update_changes), 1)
+        self.assertEqual(len(unit.translation.pending_unit_changes), 1)
+
+        # After flush, it should be in DB and the list cleared
+        unit.translation.store_update_changes()
+        self.assertEqual(Change.objects.count(), initial_count + 1)
+        self.assertEqual(len(unit.translation.update_changes), 0)
+        self.assertTrue(PendingUnitChange.objects.filter(unit=unit).exists())
+        self.assertEqual(len(unit.translation.pending_unit_changes), 0)
+
 
 class AnnouncementTest(ModelTestCase):
     """Test(s) for Announcement model."""
 
     def setUp(self) -> None:
         super().setUp()
+        self.user = get_test_actor(self)
+        self.second_project = self.create_project("Other", "other")
+        self.czech = Language.objects.get(code="cs")
+        self.german = Language.objects.get(code="de")
         Announcement.objects.create(
-            language=Language.objects.get(code="cs"), message="test cs"
+            user=self.user, language=self.czech, message="test cs"
         )
         Announcement.objects.create(
-            language=Language.objects.get(code="de"), message="test de"
+            user=self.user, language=self.german, message="test de"
         )
         Announcement.objects.create(
-            project=self.component.project, message="test project"
+            user=self.user,
+            project=self.second_project,
+            language=self.czech,
+            message="test other cs",
         )
         Announcement.objects.create(
+            user=self.user, project=self.component.project, message="test project"
+        )
+        Announcement.objects.create(
+            user=self.user,
+            project=self.component.project,
+            language=self.czech,
+            message="test project cs",
+        )
+        Announcement.objects.create(
+            user=self.user,
+            project=self.component.project,
+            language=self.german,
+            message="test project de",
+        )
+        Announcement.objects.create(
+            user=self.user,
             component=self.component,
             project=self.component.project,
             message="test component",
         )
-        Announcement.objects.create(message="test global")
+        Announcement.objects.create(user=self.user, message="test global")
+
+    def test_async_create_with_foreign_key_ids(self) -> None:
+        category = self.create_category(self.component.project)
+
+        async def create_announcements():
+            category_announcement = await Announcement.objects.acreate(
+                user=self.user,
+                category_id=category.pk,
+                language_id=self.czech.pk,
+                message="async category",
+            )
+            component_announcement = await Announcement.objects.acreate(
+                user=self.user,
+                project_id=self.component.project_id,
+                component_id=self.component.pk,
+                language_id=self.czech.pk,
+                message="async component",
+            )
+            return category_announcement, component_announcement
+
+        category_announcement, component_announcement = async_to_sync(
+            create_announcements
+        )()
+
+        self.assertIsNone(category_announcement.project_id)
+        category_change = Change.objects.get(announcement=category_announcement)
+        self.assertEqual(category_change.project_id, category.project_id)
+        self.assertEqual(category_change.category_id, category.pk)
+        self.assertEqual(category_change.language_id, self.czech.pk)
+
+        component_change = Change.objects.get(announcement=component_announcement)
+        self.assertEqual(component_change.project_id, self.component.project_id)
+        self.assertEqual(component_change.component_id, self.component.pk)
+        self.assertEqual(component_change.language_id, self.czech.pk)
+
+    def test_change_creation_uses_write_database(self) -> None:
+        def route_read(model: type[object], **_hints: object) -> str | None:
+            if model is Change:
+                return "unavailable_read_replica"
+            return None
+
+        with patch("django.db.router.db_for_read", side_effect=route_read):
+            announcement = Announcement.objects.create(
+                user=self.user, message="routed change"
+            )
+
+        self.assertTrue(Change.objects.filter(announcement=announcement).exists())
 
     def verify_filter(self, messages, count, message=None) -> None:
         """Verify whether messages have given count and first contains string."""
@@ -672,31 +2791,213 @@ class AnnouncementTest(ModelTestCase):
             "test project",
         )
 
+    def test_contextfilter_project_language(self) -> None:
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    project=self.component.project,
+                    language=self.czech,
+                )
+            ],
+            ["test project", "test project cs"],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    project=self.component.project,
+                    language=self.german,
+                )
+            ],
+            ["test project", "test project de"],
+        )
+
+    def test_contextfilter_category(self) -> None:
+        category = self.create_category(self.component.project)
+        self.component.category = category
+        self.component.save(update_fields=["category"])
+        other_component = self.create_po(project=self.component.project, name="Other")
+        Announcement.objects.create(
+            user=self.user,
+            category=category,
+            message="test category",
+        )
+        Announcement.objects.create(
+            user=self.user,
+            category=category,
+            language=self.czech,
+            message="test category cs",
+        )
+        Announcement.objects.create(
+            user=self.user,
+            category=category,
+            language=self.german,
+            message="test category de",
+        )
+
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    project=self.component.project
+                )
+            ],
+            ["test project"],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=self.component,
+                    language=self.czech,
+                )
+            ],
+            [
+                "test cs",
+                "test project",
+                "test project cs",
+                "test component",
+                "test category",
+                "test category cs",
+            ],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=self.component,
+                    language=self.german,
+                )
+            ],
+            [
+                "test de",
+                "test project",
+                "test project de",
+                "test component",
+                "test category",
+                "test category de",
+            ],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    category=category
+                )
+            ],
+            ["test project", "test category"],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=self.component
+                )
+            ],
+            ["test project", "test component", "test category"],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=other_component
+                )
+            ],
+            ["test project"],
+        )
+
+    def test_contextfilter_category_language(self) -> None:
+        parent = Category.objects.create(
+            project=self.component.project, name="Parent", slug="parent"
+        )
+        category = self.create_category(self.component.project, category=parent)
+        sibling = Category.objects.create(
+            project=self.component.project, name="Sibling", slug="sibling"
+        )
+        child = self.create_category(self.component.project, category=category)
+        foreign = self.create_category(self.second_project)
+        for scope in (parent, category, sibling, child, foreign):
+            for language in (None, self.czech, self.german):
+                Announcement.objects.create(
+                    user=self.user,
+                    category=scope,
+                    language=language,
+                    message=f"category {scope.pk} {language}",
+                )
+        Announcement.objects.create(
+            user=self.user,
+            category=category,
+            language=self.czech,
+            expiry=timezone.now().date() - timedelta(days=1),
+            message="expired category announcement",
+        )
+        Announcement.objects.create(
+            user=self.user,
+            project=self.component.project,
+            component=self.component,
+            language=self.czech,
+            message="component language announcement",
+        )
+
+        for language in (None, self.czech, self.german):
+            with self.subTest(language=language):
+                expected = ["test project"]
+                if language:
+                    expected.append(f"test project {language.code}")
+                expected.extend(
+                    f"category {scope.pk} {scope_language}"
+                    for scope in (parent, category)
+                    for scope_language in ((None, language) if language else (None,))
+                )
+                announcements = Announcement.objects.context_filter(
+                    category=category, language=language
+                )
+                self.assertCountEqual(
+                    [announcement.message for announcement in announcements], expected
+                )
+                ids = [announcement.pk for announcement in announcements]
+                self.assertEqual(ids, sorted(ids))
+
     def test_contextfilter_component(self) -> None:
-        self.verify_filter(
-            Announcement.objects.context_filter(component=self.component), 2
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=self.component
+                )
+            ],
+            ["test project", "test component"],
         )
 
     def test_contextfilter_translation(self) -> None:
-        self.verify_filter(
-            Announcement.objects.context_filter(
-                component=self.component, language=Language.objects.get(code="cs")
-            ),
-            3,
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=self.component, language=self.czech
+                )
+            ],
+            ["test cs", "test project", "test project cs", "test component"],
+        )
+        self.assertCountEqual(
+            [
+                announcement.message
+                for announcement in Announcement.objects.context_filter(
+                    component=self.component, language=self.german
+                )
+            ],
+            ["test de", "test project", "test project de", "test component"],
         )
 
     def test_contextfilter_language(self) -> None:
         self.verify_filter(
-            Announcement.objects.context_filter(
-                language=Language.objects.get(code="cs")
-            ),
+            Announcement.objects.context_filter(language=self.czech),
             1,
             "test cs",
         )
         self.verify_filter(
-            Announcement.objects.context_filter(
-                language=Language.objects.get(code="de")
-            ),
+            Announcement.objects.context_filter(language=self.german),
             1,
             "test de",
         )
@@ -705,10 +3006,299 @@ class AnnouncementTest(ModelTestCase):
 class ChangeTest(ModelTestCase):
     """Test(s) for Change model."""
 
+    def test_recent_uses_limited_identifier_query(self) -> None:
+        Change.objects.all().delete()
+        changes = [
+            self.component.change_set.create(
+                user=get_test_actor(self), action=ActionEvents.LOCK
+            )
+            for _ in range(3)
+        ]
+        queryset = self.component.change_set.prefetch_for_render()
+
+        with CaptureQueriesContext(connection) as queries:
+            recent = queryset.recent(count=2)
+
+        self.assertEqual(
+            [change.pk for change in recent], [changes[2].pk, changes[1].pk]
+        )
+        candidate_sql = queries[0]["sql"]
+        self.assertIn("LIMIT 2", candidate_sql)
+        self.assertNotIn("trans_comment", candidate_sql)
+        self.assertNotIn("trans_suggestion", candidate_sql)
+
+    def test_recent_skips_changes_deleted_before_hydration(self) -> None:
+        Change.objects.all().delete()
+        changes = [
+            self.component.change_set.create(
+                user=get_test_actor(self), action=ActionEvents.LOCK
+            )
+            for _ in range(3)
+        ]
+        original_prefetch = ChangeQuerySet.prefetch_for_render
+
+        def delete_change_before_prefetch(
+            queryset: ChangeQuerySet,
+        ) -> ChangeQuerySet:
+            Change.objects.filter(pk=changes[1].pk).delete()
+            return original_prefetch(queryset)
+
+        with patch.object(
+            ChangeQuerySet,
+            "prefetch_for_render",
+            delete_change_before_prefetch,
+        ):
+            recent = self.component.change_set.recent(count=2)
+
+        self.assertEqual([change.pk for change in recent], [changes[2].pk])
+
+    def test_category_changes_exclude_inaccessible_linked_project(self) -> None:
+        source_project = self.component.project
+        source_project.access_control = Project.ACCESS_PRIVATE
+        source_project.save(update_fields=["access_control"])
+        target_project = Project.objects.create(
+            name="Category history target",
+            slug="category-history-target",
+        )
+        category = Category.objects.create(
+            name="Category history",
+            slug="category-history",
+            project=target_project,
+        )
+        ComponentLink.objects.create(
+            component=self.component,
+            project=target_project,
+            category=category,
+        )
+        user = User.objects.create_user(
+            "category-history",
+            "category-history@example.com",
+            "category-history",
+        )
+        language = self.component.translation_set.get(language_code="cs").language
+        visible_change = Change.objects.create(
+            user=get_test_actor(self),
+            action=ActionEvents.RENAME_CATEGORY,
+            project=target_project,
+            category=category,
+            language=language,
+        )
+        hidden_change = self.component.change_set.create(
+            user=get_test_actor(self),
+            action=ActionEvents.LOCK,
+            language=language,
+        )
+
+        self.assertTrue(user.can_access_project(target_project))
+        self.assertFalse(user.can_access_project(source_project))
+
+        changes = Change.objects.last_changes(
+            user,
+            category=category,
+            language=language,
+        )
+
+        self.assertIn(visible_change, changes)
+        self.assertNotIn(hidden_change, changes)
+
+    def test_fixup_references_inherits_project_workspace(self) -> None:
+        workspace = Workspace.objects.create(name="Change workspace")
+        Project.objects.filter(pk=self.component.project_id).update(workspace=workspace)
+
+        project = Project.objects.get(pk=self.component.project_id)
+        component = Component.objects.select_related("project__workspace").get(
+            pk=self.component.pk
+        )
+        translation = Translation.objects.select_related(
+            "component__project__workspace", "language"
+        ).get(component=component, language_code="cs")
+        unit = Unit.objects.select_related(
+            "translation__component__project__workspace",
+            "translation__language",
+        ).filter(translation=translation)[0]
+
+        for change in (
+            Change(project=project),
+            Change(component=component),
+            Change(translation=translation),
+            Change(unit=unit),
+        ):
+            self.assertEqual(change.workspace_id, workspace.pk)
+
+    def test_existing_change_keeps_workspace_after_project_move(self) -> None:
+        original = Workspace.objects.create(name="Original change workspace")
+        target = Workspace.objects.create(name="Target change workspace")
+        project = self.component.project
+        Project.objects.filter(pk=project.pk).update(workspace=original)
+        project.refresh_from_db()
+
+        change = Change.objects.create(
+            user=get_test_actor(self),
+            project=project,
+            action=ActionEvents.CREATE_PROJECT,
+        )
+
+        project.workspace = target
+        project.save(update_fields=["workspace"])
+        change.refresh_from_db()
+
+        self.assertEqual(change.workspace_id, original.pk)
+
+    def test_workspace_last_changes_includes_project_changes_for_superuser(
+        self,
+    ) -> None:
+        workspace = Workspace.objects.create(name="Change workspace")
+        project = self.component.project
+        Project.objects.filter(pk=project.pk).update(workspace=workspace)
+        project.refresh_from_db()
+        user = User.objects.create_user("history", "history@example.com", "history")
+        user.is_superuser = True
+        user.save(update_fields=["is_superuser"])
+
+        workspace_change = Change.objects.create(
+            user=get_test_actor(self),
+            workspace=workspace,
+            action=ActionEvents.CREATE_PROJECT,
+        )
+        project_change = Change.objects.create(
+            user=get_test_actor(self),
+            project=project,
+            action=ActionEvents.LOCK,
+        )
+
+        changes = Change.objects.last_changes(user, workspace=workspace)
+
+        self.assertIn(workspace_change, changes)
+        self.assertIn(project_change, changes)
+
+    def test_change_workspace_backfill_migration(self) -> None:
+        migration = importlib.import_module(
+            "weblate.trans.migrations.0088_change_workspace_backfill"
+        )
+        workspace = Workspace.objects.create(name="Backfilled change workspace")
+        existing = Workspace.objects.create(name="Existing change workspace")
+        project = self.component.project
+        Project.objects.filter(pk=project.pk).update(workspace=workspace)
+        project.refresh_from_db()
+        Change.objects.all().delete()
+
+        backfilled = Change.objects.create(
+            user=get_test_actor(self),
+            project=project,
+            action=ActionEvents.CREATE_PROJECT,
+        )
+        kept = Change.objects.create(
+            user=get_test_actor(self),
+            project=project,
+            action=ActionEvents.LOCK,
+        )
+        standalone = Change.objects.create(
+            user=get_test_actor(self), action=ActionEvents.CREATE_PROJECT
+        )
+        standalone_project = self.create_project(
+            name="Standalone backfill project",
+            slug="standalone-backfill-project",
+        )
+        standalone_project_change = Change.objects.create(
+            user=get_test_actor(self),
+            project=standalone_project,
+            action=ActionEvents.CREATE_PROJECT,
+        )
+        Change.objects.filter(pk=backfilled.pk).update(workspace=None)
+        Change.objects.filter(pk=kept.pk).update(workspace=existing)
+
+        migration.backfill_change_workspace(apps, None)
+
+        backfilled.refresh_from_db()
+        kept.refresh_from_db()
+        standalone.refresh_from_db()
+        standalone_project_change.refresh_from_db()
+        self.assertEqual(backfilled.workspace_id, workspace.pk)
+        self.assertEqual(kept.workspace_id, existing.pk)
+        self.assertIsNone(standalone.workspace_id)
+        self.assertIsNone(standalone_project_change.workspace_id)
+
+    def test_repository_redirect_credentials_migration(self) -> None:
+        migration = importlib.import_module(
+            "weblate.trans.migrations.0099_sanitize_repository_redirect_credentials"
+        )
+        affected = Change.objects.create(
+            user=get_test_actor(self),
+            component=self.component,
+            action=ActionEvents.COMPONENT_SETTING_CHANGE,
+            target="repo",
+            details={
+                "field": "repo",
+                "old": "https://old-secret:@git.example/owner/repo",
+                "target": "https://new-secret:@git.example/owner/repo.git",
+                "automatic": True,
+                "reason": "http_redirect",
+            },
+        )
+        affected_push = Change.objects.create(
+            user=get_test_actor(self),
+            component=self.component,
+            action=ActionEvents.COMPONENT_SETTING_CHANGE,
+            target="push",
+            details={
+                "field": "push",
+                "old": "https://old-push-secret:@git.example/owner/repo",
+                "target": "https://new-push-secret:@git.example/owner/repo.git",
+                "automatic": True,
+                "reason": "http_redirect",
+            },
+        )
+        unaffected = Change.objects.create(
+            user=get_test_actor(self),
+            component=self.component,
+            action=ActionEvents.COMPONENT_SETTING_CHANGE,
+            target="repo",
+            details={
+                "field": "repo",
+                "old": "https://kept-secret:@git.example/owner/repo",
+                "target": "https://kept-secret:@git.example/owner/repo.git",
+                "reason": "manual",
+            },
+        )
+
+        migration.sanitize_repository_redirect_credentials(
+            apps, SimpleNamespace(connection=connection)
+        )
+
+        affected.refresh_from_db()
+        affected_push.refresh_from_db()
+        unaffected.refresh_from_db()
+        self.assertEqual(
+            affected.details,
+            {
+                "field": "repo",
+                "old": "https://git.example/owner/repo",
+                "target": "https://git.example/owner/repo.git",
+                "automatic": True,
+                "reason": "http_redirect",
+                "change_origin": {"scope": "system"},
+            },
+        )
+        self.assertEqual(
+            affected_push.details,
+            {
+                "field": "push",
+                "old": "https://git.example/owner/repo",
+                "target": "https://git.example/owner/repo.git",
+                "automatic": True,
+                "reason": "http_redirect",
+                "change_origin": {"scope": "system"},
+            },
+        )
+        self.assertIn("kept-secret", unaffected.details["old"])
+
     def test_day_filtering(self) -> None:
         Change.objects.all().delete()
         for days_since in range(3):
-            change = Change.objects.create(action=ActionEvents.CREATE_PROJECT)
+            change = Change.objects.create(
+                user=get_test_actor(self),
+                action=ActionEvents.CREATE_PROJECT,
+            )
             change.timestamp -= timedelta(days=days_since)
             change.save()
 
@@ -735,3 +3325,293 @@ class ChangeTest(ModelTestCase):
             Change.objects.since_day(timezone.now() - timedelta(days=1)).count(),
             2,
         )
+
+
+class PendingUnitChangeTest(RepoTestCase):
+    """Test(s) for PendingUnitChange model."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.user = create_test_user()
+        self.component = self.create_component()
+        self.project = self.component.project
+        self.component2 = self.create_json_mono(
+            name="Component 2", project=self.project
+        )
+        self.other_project = self.create_project("Other", "other")
+        self.component3 = self.create_android(
+            name="Component 3", project=self.other_project
+        )
+
+    def test_find_committable_components_basic(self) -> None:
+        """Test find_committable_components returns components with old enough changes."""
+        self.component.commit_pending_age = 1
+        self.component.save()
+
+        self.component3.commit_pending_age = 3
+        self.component3.save()
+
+        translation = self.component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        unit.translate(self.user, "Nazdar svete!\n", STATE_TRANSLATED)
+
+        translation3 = self.component3.translation_set.get(language_code="cs")
+        unit3 = translation3.unit_set.get(source="Orangutan has %d banana.\n")
+        unit3.translate(self.user, "Orangutan má %d banánů.\n", STATE_TRANSLATED)
+
+        components = PendingUnitChange.objects.find_committable_components()
+        self.assertEqual(set(components.values_list("pk", flat=True)), set())
+
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=2))
+        components = PendingUnitChange.objects.find_committable_components()
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)), {self.component.pk}
+        )
+
+        components = PendingUnitChange.objects.find_committable_components(hours=1)
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)),
+            {self.component.pk, self.component3.pk},
+        )
+
+        components = PendingUnitChange.objects.find_committable_components(
+            pks=[self.component.pk], hours=1
+        )
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)), {self.component.pk}
+        )
+
+    def test_find_committable_components_uses_linked_component_age(self) -> None:
+        self.component.commit_pending_age = 3
+        self.component.save(update_fields=["commit_pending_age"])
+
+        linked_component = self.create_link_existing(
+            name="Component linked age", slug="component-linked-age"
+        )
+        linked_component.commit_pending_age = 1
+        linked_component.save(update_fields=["commit_pending_age"])
+
+        translation = linked_component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.first()
+        self.assertIsNotNone(unit)
+        if unit is None:
+            self.fail("Expected a unit in linked component test fixture.")
+        unit.translate(self.user, "Linked component age test", STATE_TRANSLATED)
+
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=2))
+        components = PendingUnitChange.objects.find_committable_components()
+        self.assertEqual(set(components.values_list("pk", flat=True)), set())
+
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=4))
+        components = PendingUnitChange.objects.find_committable_components()
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)), {self.component.pk}
+        )
+
+    def test_has_pending_changes_uses_prefetched_relation(self) -> None:
+        translation = self.component.translation_set.get(language_code="cs")
+        pending_unit = translation.unit_set.get(source="Hello, world!\n")
+        pending_unit.translate(self.user, "Nazdar svete!\n", STATE_TRANSLATED)
+
+        clean_unit = translation.unit_set.exclude(pk=pending_unit.pk).first()
+        if clean_unit is None:
+            self.fail("Expected a unit without pending changes in test fixture.")
+
+        prefetched_units = {
+            unit.pk: unit
+            for unit in translation.unit_set.filter(
+                pk__in=(pending_unit.pk, clean_unit.pk)
+            ).prefetch_related("pending_changes")
+        }
+
+        with self.assertNumQueries(0):
+            self.assertTrue(prefetched_units[pending_unit.pk].has_pending_changes)
+            self.assertFalse(prefetched_units[clean_unit.pk].has_pending_changes)
+
+    def test_find_committable_components_with_commit_policy(self) -> None:
+        """Test find_committable_components respects commit policies."""
+        self.project.commit_policy = CommitPolicyChoices.WITHOUT_NEEDS_EDITING
+        self.project.save()
+
+        self.other_project.commit_policy = CommitPolicyChoices.APPROVED_ONLY
+        self.other_project.translation_review = True
+        self.other_project.save()
+
+        translation = self.component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        unit.translate(self.user, "Nazdar svete!\n", STATE_FUZZY)
+
+        translation2 = self.component2.translation_set.get(language_code="cs")
+        unit2 = translation2.unit_set.get(source="Hello, world!\n")
+        unit2.translate(self.user, "Nazdar svete!\n", STATE_TRANSLATED)
+
+        translation3 = self.component3.translation_set.get(language_code="cs")
+        unit3 = translation3.unit_set.get(source="Orangutan has %d banana.\n")
+        unit3.translate(self.user, "Orangutan má %d banánů.\n", STATE_TRANSLATED)
+
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=2))
+
+        components = PendingUnitChange.objects.find_committable_components(hours=1)
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)), {self.component2.pk}
+        )
+
+        unit.translate(self.user, "Nazdar svete!\n", STATE_TRANSLATED)
+        unit3.translate(self.user, "Orangutan má %d banánů.\n", STATE_APPROVED)
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=2))
+
+        components = PendingUnitChange.objects.find_committable_components(hours=1)
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)),
+            {self.component.pk, self.component2.pk, self.component3.pk},
+        )
+
+    def test_find_committable_components_with_retry_filter(self) -> None:
+        """Test find_committable_components applies retry eligibility filter."""
+        translation = self.component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+        unit.translate(self.user, "Nazdar svete!\n", STATE_TRANSLATED)
+
+        pending_change = unit.pending_changes.first()
+        pending_change.metadata = {
+            "last_failed": timezone.now().isoformat(),
+            "failed_revision": translation.revision,
+            "weblate_version": GIT_VERSION,
+        }
+        pending_change.save()
+
+        translation3 = self.component3.translation_set.get(language_code="cs")
+        unit3 = translation3.unit_set.get(source="Orangutan has %d banana.\n")
+        unit3.translate(self.user, "Orangutan má %á banánů.\n", STATE_TRANSLATED)
+        pending_change3 = unit3.pending_changes.first()
+        pending_change3.metadata = {
+            "last_failed": timezone.now().isoformat(),
+            "failed_revision": translation3.revision,
+            "weblate_version": GIT_VERSION,
+            "blocking_unit": True,
+        }
+        pending_change3.save()
+
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=2))
+
+        components = PendingUnitChange.objects.find_committable_components(hours=1)
+        self.assertEqual(set(components.values_list("pk", flat=True)), set())
+
+        pending_change.metadata["last_failed"] = (
+            timezone.now() - timedelta(days=8)
+        ).isoformat()
+        pending_change.save()
+
+        unit3.translate(self.user, "Orangutan má %d banánů.\n", STATE_TRANSLATED)
+        PendingUnitChange.objects.update(timestamp=timezone.now() - timedelta(hours=2))
+
+        # component 1 is now findable because the change failed to apply more than a week ago
+        # component 3 is now findable because the blocking_unit filter is not applied here
+        components = PendingUnitChange.objects.find_committable_components(hours=1)
+        self.assertEqual(
+            set(components.values_list("pk", flat=True)),
+            {self.component.pk, self.component3.pk},
+        )
+
+
+class AutomaticallyTranslatedFromFileTest(RepoTestCase):
+    def test_xliff_state_qualifier_loaded_to_database(self) -> None:
+        component = self.create_xliff_auto()
+        translation = component.translation_set.get(language_code="cs")
+        user = create_test_user()
+
+        file_content = get_optional_path(translation.get_filename()).read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(file_content.count('state-qualifier="leveraged-mt"'), 1)
+        self.assertEqual(file_content.count('state-qualifier="mt-suggestion"'), 1)
+
+        self.assertTrue(
+            translation.unit_set.get(source="Hello").automatically_translated
+        )
+
+        world_unit = translation.unit_set.get(source="World")
+        self.assertTrue(world_unit.automatically_translated)
+        world_unit.translate(
+            user=user, new_target=world_unit.target, new_state=STATE_TRANSLATED
+        )
+        self.assertFalse(world_unit.automatically_translated)
+
+        car_unit = translation.unit_set.get(source="Car")
+        self.assertFalse(car_unit.automatically_translated)
+        car_unit.translate(
+            user=user,
+            new_target="Automobil",
+            new_state=STATE_TRANSLATED,
+            change_action=ActionEvents.AUTO,
+        )
+        self.assertTrue(car_unit.automatically_translated)
+
+        translation.commit_pending("test", None)
+
+        file_content = get_optional_path(translation.get_filename()).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Automobil", file_content)
+        self.assertEqual(file_content.count('state-qualifier="leveraged-mt"'), 2)
+        self.assertEqual(file_content.count('state-qualifier="mt-suggestion"'), 0)
+
+    def test_xliff_file_sync_gets_automatically_translated_from_file(self) -> None:
+        component = self.create_xliff_auto()
+        translation = component.translation_set.get(language_code="cs")
+
+        car_unit = translation.unit_set.get(source="Car")
+        self.assertFalse(car_unit.automatically_translated)
+
+        file_content = get_optional_path(translation.get_filename()).read_text(
+            encoding="utf-8"
+        )
+        modified_content = file_content.replace(
+            "<target>Auto</target>",
+            '<target state-qualifier="leveraged-mt">Auto</target>',
+        )
+        get_optional_path(translation.get_filename()).write_text(
+            modified_content, encoding="utf-8"
+        )
+
+        translation = component.translation_set.get(language_code="cs")
+        translation.check_sync(force=True)
+
+        car_unit = translation.unit_set.get(source="Car")
+        self.assertTrue(car_unit.automatically_translated)
+
+
+class FuzzySubstatePreservationTest(RepoTestCase):
+    """Test that fuzzy sub-states are preserved across file syncs."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.user = create_test_user()
+
+    def _test_fuzzy_substate_preserved_after_sync(self, substate) -> None:
+        component = self.create_component()
+        translation = component.translation_set.get(language_code="cs")
+        unit = translation.unit_set.get(source="Hello, world!\n")
+
+        unit.translate(self.user, "Ahoj světe!\n", substate)
+        self.assertEqual(unit.state, substate)
+
+        translation.commit_pending("test", None)
+
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, substate)
+        self.assertNotIn("disk_state", unit.details)
+
+        # Trigger check_sync to simulate repository parsing due to another change
+        translation = component.translation_set.get(language_code="cs")
+        translation.check_sync(force=True)
+
+        # The fuzzy sub-state should be preserved, not changed to STATE_FUZZY
+        unit.refresh_from_db()
+        self.assertEqual(unit.state, substate)
+
+    def test_needs_rewriting_preserved_after_sync(self) -> None:
+        self._test_fuzzy_substate_preserved_after_sync(STATE_NEEDS_REWRITING)
+
+    def test_needs_checking_preserved_after_sync(self) -> None:
+        self._test_fuzzy_substate_preserved_after_sync(STATE_NEEDS_CHECKING)

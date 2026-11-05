@@ -27,7 +27,7 @@ Installation
 
 .. hint::
 
-   Git exporter is turned on in our official Docker image. To turn it of, use:
+   Git exporter is turned on in our official Docker image. To turn it off, use:
 
    .. code-block:: sh
 
@@ -56,9 +56,11 @@ requires an API token which can be obtained in your
 
     git clone 'https://user:KEY@example.org/git/weblate/main/'
 
+.. include:: /snippets/git-export-lfs-note.rst
+
 .. hint::
 
-   By default members or :guilabel:`Users` group and anonymous user have access
+   By default members of :guilabel:`Users` group and anonymous user have access
    to the repositories for public projects via :guilabel:`Access repository`
    and :guilabel:`Power user` roles.
 
@@ -105,18 +107,24 @@ After installation you can control billing in the admin interface. Users with
 billing enabled will get new :guilabel:`Billing` tab in their
 :ref:`user-profile`.
 
-The billing module additionally allows project admins to create new projects
-and components without being superusers (see :ref:`adding-projects`). This is
+Superusers can view the 20 most recent billing audit entries on the billing
+detail page. Select :guilabel:`View all` in the :guilabel:`Audit log` section
+to browse older entries using the pagination controls.
+
+The billing module additionally allows users to create new projects and
+components without being superusers (see :ref:`adding-projects`). This is
 possible when following conditions are met:
 
 * The billing is in its configured limits (any overusage results in blocking
   of project/component creation) and paid (if its price is non zero)
-* The user is admin of existing project with billing or user is owner of
-  billing (the latter is necessary when creating new billing for users to be
-  able to import new projects).
+* The user has :guilabel:`Add projects to workspace` permission for the
+  workspace covered by the billing plan.
 
-Upon project creation user is able to choose which billing should be charged
-for the project in case he has access to more of them.
+Upon project creation user is able to choose which workspace should contain the
+project. Projects created in a workspace with billing count against the billing
+plan assigned to that workspace. Users with the :guilabel:`Edit workspace
+settings` permission can view and pay the billing plan; billing notification
+e-mails are sent to these users. See :ref:`workspace-billing` for details.
 
 
 .. _legal:
@@ -134,18 +142,31 @@ following templates in the documents:
    Privacy policy document
 :file:`legal/documents/summary.html`
    Short overview of the terms of service and privacy policy
+:file:`legal/documents/contracts.html`
+   Subcontractor information
 
-On changing the terms of service documents, please adjust
-:setting:`LEGAL_TOS_DATE` so that users are forced to agree with the updated
+The legal module embeds these templates inside Weblate. Set :setting:`LEGAL_URL`
+or :setting:`PRIVACY_URL` to use externally hosted documents. Configured URLs
+take priority in the footer, sign-in pages, legal pages, and confirmation page.
+The default terms and privacy templates link to the configured URL instead of
+showing their placeholder text. Without a configured URL, Weblate links to a
+visible internal legal page. When no terms link is available, the confirmation
+page embeds :file:`legal/documents/tos.html`.
+
+On changing the terms of service or privacy policy, adjust
+:setting:`LEGAL_TOS_DATE` when users should be forced to agree with the updated
 documents.
 
 .. note::
 
-    Legal documents for the Hosted Weblate service are available in this Git repository
+    Legal documents for the Hosted Weblate service operated by Weblate s.r.o.
+    are available in this Git repository:
     <https://github.com/WeblateOrg/wllegal/tree/main/wllegal/templates/legal/documents>.
 
-    Most likely these will not be directly usable to you, but might come in handy
-    as a starting point if adjusted to meet your needs.
+    The bundled terms of service and related legal documents are specific to
+    services operated by Weblate s.r.o. They can serve as an implementation
+    example, but should not be used as a basis for legal documents of other
+    services.
 
 Installation
 ++++++++++++
@@ -160,12 +181,20 @@ Installation
     # Optional:
 
     # Social auth pipeline to confirm TOS upon registration/subsequent sign in
-    SOCIAL_AUTH_PIPELINE += ("weblate.legal.pipeline.tos_confirm",)
+    SOCIAL_AUTH_PIPELINE = list(SOCIAL_AUTH_PIPELINE)
+    SOCIAL_AUTH_PIPELINE.insert(
+        SOCIAL_AUTH_PIPELINE.index("weblate.accounts.pipeline.second_factor") + 1,
+        "weblate.legal.pipeline.tos_confirm",
+    )
 
     # Middleware to enforce TOS confirmation of signed in users
     MIDDLEWARE += [
         "weblate.legal.middleware.RequireTOSMiddleware",
     ]
+
+Insert terms confirmation after two-factor authentication and before team
+synchronization so that logins awaiting terms acceptance do not change team
+memberships.
 
 2. Run the database migration to optionally install additional database structures for the module:
 
@@ -173,12 +202,94 @@ Installation
 
     weblate migrate
 
-3. Edit the legal documents in the :file:`weblate/legal/templates/legal/` folder to match your service.
+3. Provide legal document templates matching your service, as described in
+   :ref:`legal-customization`.
+
+.. hint::
+
+   In Docker deployments, enable the legal module using
+   :envvar:`WEBLATE_LEGAL_INTEGRATION` instead of editing
+   :file:`settings.py`. Use ``tos-confirm`` to enable the legal module and
+   legal document confirmation enforcement, or ``wllegal`` to additionally
+   load the hosted legal document templates used by services operated by
+   Weblate s.r.o. These templates are not intended for general use. To provide
+   your own templates in Docker, place them in
+   :file:`/app/data/python/customize/templates/legal/documents`, see
+   :ref:`docker-static-override`.
+
+   Recreate the Docker container after changing environment variables, for
+   example using :program:`docker compose up -d`. Restarting an existing
+   container does not apply changed environment values.
 
 Usage
 +++++
 
-After installation and editing, the legal documents are shown in the Weblate UI.
+After installation and customization, the legal documents are shown in the Weblate UI.
+
+The legal document templates are regular Django templates. Text is translated
+only when you use Django translation tags such as ``{% translate %}`` or
+``{% blocktranslate %}``; plain HTML text is shown as written.
+
+Legal pages and the sign-in and registration overview provide ``terms_url`` and
+``privacy_url`` variables for linking to the terms of service and privacy
+policy documents.
+
+.. _legal-customization:
+
+Customizing legal documents and styles
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Provide your own legal documents by overriding these templates in a
+:ref:`custom-module`:
+
+* :file:`templates/legal/documents/tos.html`
+* :file:`templates/legal/documents/privacy.html`
+* :file:`templates/legal/documents/summary.html`
+* :file:`templates/legal/documents/contracts.html`
+* :file:`templates/legal/styles.html`
+* :file:`static/weblate_customization/legal.css`
+
+Place the customization app before ``weblate.legal`` and any other app
+providing legal template overrides in :setting:`django:INSTALLED_APPS` so that
+Django selects its templates. Only templates you provide are overridden; the
+remaining legal templates continue to use the defaults from later apps.
+
+The :file:`legal/styles.html` template is included in the HTML head of every
+legal page. Use it to load a stylesheet from your customization app:
+
+.. code-block:: django
+
+   {% load static %}
+
+   <link rel="stylesheet" href="{% static 'weblate_customization/legal.css' %}" />
+
+Run :samp:`weblate collectstatic --noinput` after adding or changing the static
+file.
+
+In Docker deployments, place document templates in
+:file:`/app/data/python/customize/templates/legal/documents`,
+:file:`styles.html` in
+:file:`/app/data/python/customize/templates/legal/styles.html`, and the
+stylesheet in :file:`/app/data/python/customize/static/legal.css`. The
+stylesheet template then uses ``{% static 'legal.css' %}``. Restart the
+container to apply the changes, see :ref:`docker-static-override`.
+
+By default, legal document wrappers use the ``tos`` CSS class. Weblate does not
+attach any styling to this class; target it from your custom stylesheet, or set
+:setting:`LEGAL_DOCUMENT_CSS_CLASS` to another class matching your document
+markup. Set the setting to an empty string if no wrapper class is needed.
+
+Use :setting:`LEGAL_HIDDEN_DOCUMENTS` to hide legal pages from the legal menu.
+Hidden pages return a 404 response when requested directly. If ``terms`` or
+``privacy`` is hidden, its configured external URL remains available for links
+elsewhere. Without an external URL, the link is omitted.
+
+To use externally hosted legal documents with legal confirmation, set
+:setting:`LEGAL_URL` and :setting:`PRIVACY_URL`. Hide the internal pages as well
+if they should not appear in the legal menu. The confirmation page links to
+the external documents and requires one agreement covering both. If ``privacy``
+is hidden and no :setting:`PRIVACY_URL` is set, the confirmation covers only
+the terms of service.
 
 .. _avatars:
 
@@ -200,34 +311,64 @@ Weblate currently supports:
    * :setting:`AVATAR_URL_PREFIX`
    * :setting:`ENABLE_AVATARS`
 
-.. _spam-protection:
+.. _cdn-server-security:
 
-Spam protection
----------------
+Localization CDN
+----------------
 
-You can protect against spamming by users by using the `Akismet
-<https://akismet.com/>`_ service.
+The :ref:`addon-weblate.cdn.cdnjs` and :ref:`addon-weblate.cdn.files` add-ons
+write files to :setting:`LOCALIZE_CDN_PATH`; Weblate does not serve them.
+Configure the web server or CDN serving :setting:`LOCALIZE_CDN_URL` as a
+public, read-only static file host.
 
-1. Install the `akismet` Python module (this is already included in the official Docker image).
-2. Obtain the Akismet API key.
-3. Store it as :setting:`AKISMET_API_KEY` or :envvar:`WEBLATE_AKISMET_API_KEY` in Docker.
+Treat every published CDN file as public. The add-on specific UUID in the URL
+is not an access-control mechanism. Do not enable CDN add-ons for components
+that contain private strings, unreleased product text, customer data, internal
+URLs, API examples, repository paths, translator comments, or file-format
+metadata that should not be exposed.
 
-Following content is sent to Akismet for checking:
+The :ref:`addon-weblate.cdn.files` add-on publishes raw translation files in
+formats supported by Weblate. Some formats can be interpreted by browsers or
+other clients as HTML, SVG, XML, JavaScript, YAML, or application-specific
+configuration. Serve the CDN from a dedicated domain that is separate from
+Weblate and from the application consuming the translations. Do not share
+authentication cookies with the CDN domain.
 
-* Suggestions from unauthenticated users
-* Project and component descriptions and links
+Recommended server configuration:
 
-.. note::
+* Serve only the directory configured by :setting:`LOCALIZE_CDN_PATH`; do not
+  expose Weblate repositories, backups, media, configuration, or the whole data
+  directory.
+* Disable directory listing.
+* Deny access to :file:`.kotlin-sdk-staging` and all its contents. The Kotlin
+  SDK add-on uses this directory for temporary preparation, not publication.
+  Apply this restriction before enabling the add-on, including when a CDN
+  copies files from the origin directory.
+* Use HTTPS and make the CDN host read-only from the web server.
+* Send :http:header:`X-Content-Type-Options` with ``nosniff``.
+* Configure conservative MIME types. Serve unknown translation formats as
+  :mimetype:`text/plain` or :mimetype:`application/octet-stream`; only serve
+  :file:`weblate.js` as JavaScript.
+* For raw translation formats that are not intended to be rendered in a
+  browser, consider adding :http:header:`Content-Disposition` with
+  ``attachment``.
+* Configure ``Access-Control-Allow-Origin`` only for sites that need browser
+  access to the files.
+* Set cache lifetimes that match your update expectations, and purge CDN caches
+  when stale translations must disappear quickly.
 
-   This (among other things) relies on IP address of the client, please see
-   :ref:`reverse-proxy` for properly configuring that.
+The following nginx snippet serves only the configured CDN directory and
+applies conservative defaults for raw translation files:
+
+.. literalinclude:: ../../weblate/examples/weblate.nginx.cdn.conf
+   :language: nginx
+   :caption: weblate/examples/weblate.nginx.cdn.conf
 
 .. seealso::
 
-    * :ref:`reverse-proxy`
-    * :setting:`AKISMET_API_KEY`
-    * :envvar:`WEBLATE_AKISMET_API_KEY`
-
+   * :ref:`weblate-cdn`
+   * :setting:`LOCALIZE_CDN_URL`
+   * :setting:`LOCALIZE_CDN_PATH`
 
 .. _gpg-sign:
 
@@ -275,36 +416,62 @@ Rate limiting
 
       The rate limiting no longer applies to signed in superusers.
 
-Several operations in Weblate are rate limited. At most
-:setting:`RATELIMIT_ATTEMPTS` attempts are allowed within :setting:`RATELIMIT_WINDOW` seconds.
-The user is then blocked for :setting:`RATELIMIT_LOCKOUT`. There are also settings specific to scopes, for example ``RATELIMIT_CONTACT_ATTEMPTS`` or ``RATELIMIT_TRANSLATE_ATTEMPTS``. The table below is a full list of available scopes.
+Several operations in Weblate are rate limited. Rate limits are evaluated
+independently for each scope. At most :setting:`RATELIMIT_ATTEMPTS` attempts are
+allowed within :setting:`RATELIMIT_WINDOW` seconds in one scope. That scope is
+then blocked for :setting:`RATELIMIT_LOCKOUT`; Weblate does not turn this into a
+sitewide temporary IP ban. Exceeding one scope, such as ``TRANSLATE`` or
+``SEARCH``, does not by itself block unrelated scopes such as ``LOGIN`` or
+``SECOND_FACTOR``. There are also settings specific to scopes, for example
+``RATELIMIT_CONTACT_ATTEMPTS`` or ``RATELIMIT_TRANSLATE_ATTEMPTS``. The table
+below is a full list of available scopes.
 
 The following operations are subject to rate limiting:
 
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Name                              | Scope              | Allowed attempts | Ratelimit window | Lockout period |
-+===================================+====================+==================+==================+================+
-| Registration                      | ``REGISTRATION``   | 5                | 300              | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Sending message to admins         | ``MESSAGE``        | 2                | 300              | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Password authentication on sign-in| ``LOGIN``          | 5                | 300              | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Second-factor authentication      | ``SECOND_FACTOR``  | 5                | 300              | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Sitewide search                   | ``SEARCH``         | 6                | 60               | 60             |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Translating                       | ``TRANSLATE``      | 30               | 60               | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Adding to glossary                | ``GLOSSARY``       | 30               | 60               | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Starting translation into a new   | ``LANGUAGE``       | 2                | 300              | 600            |
-| language                          |                    |                  |                  |                |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
-| Creating new project              | ``PROJECT``        | 5                | 600              | 600            |
-+-----------------------------------+--------------------+------------------+------------------+----------------+
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Name                               | Scope                  | Allowed attempts | Ratelimit window | Lockout period |
++====================================+========================+==================+==================+================+
+| Registration                       | ``REGISTRATION``       | 5                | 300              | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Sending message to admins          | ``MESSAGE``            | 2                | 300              | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Password authentication on sign-in | ``LOGIN``              | 5                | 300              | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Password reset                     | ``PASSWORD_RESET``     | 5                | 300              | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Second-factor authentication       | ``SECOND_FACTOR``      | 5                | 300              | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Sitewide search                    | ``SEARCH``             | 6                | 60               | 60             |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Screenshot image text suggestions  | ``OCR``                | 6                | 60               | 60             |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Translating                        | ``TRANSLATE``          | 30               | 60               | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Adding to glossary                 | ``GLOSSARY``           | 30               | 60               | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Starting translation into a new    | ``LANGUAGE``           | 2                | 300              | 600            |
+| language                           |                        |                  |                  |                |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Creating new project               | ``PROJECT``            | 5                | 600              | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Connecting a GitHub account        | ``GITHUB_SETUP``       | 100              | 3600             | 600            |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Loading component branches         | ``COMPONENT_BRANCHES`` | 30               | 60               | 60             |
++------------------------------------+------------------------+------------------+------------------+----------------+
+| Rendering a Markdown preview       | ``MARKDOWN_PREVIEW``   | 60               | 60               | 60             |
++------------------------------------+------------------------+------------------+------------------+----------------+
 
-The rate limiting is based on sessions when user is signed in and on IP address if not.
+Within each scope, the rate limiting is based on sessions when user is signed in
+and on IP address if not.
+
+Strict enforcement across concurrent workers requires a cache backend with
+atomic increment and decrement operations. The standard :ref:`production-cache`
+configuration using Valkey or Redis provides these operations.
+
+For signed-in users, Weblate records the first rejected request during each
+active scope lockout in the :ref:`audit-log`, including the scope and request
+path. Repeated rejections during the same lockout do not create additional
+audit-log entries.
 
 If a user fails to sign in :setting:`AUTH_LOCK_ATTEMPTS` times, password authentication will be turned off on the account until having gone through the process of having its password reset.
 
@@ -317,19 +484,3 @@ The API has separate rate limiting settings, see :ref:`api-rate`.
    * :ref:`user-rate`
    * :ref:`reverse-proxy`
    * :ref:`api-rate`
-
-.. _fedora-messaging:
-
-Fedora Messaging integration
-----------------------------
-
-Fedora Messaging is AMQP-based publisher for all changes happening in Weblate.
-You can hook additional services on changes happening in Weblate using this.
-
-The Fedora Messaging integration is available as a separate Python module
-``weblate-fedora-messaging``. Please see
-<https://github.com/WeblateOrg/fedora_messaging/> for setup instructions.
-
-.. seealso::
-
-   :ref:`schema-messaging`

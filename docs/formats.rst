@@ -8,8 +8,8 @@ different and provides a different set of capabilities.
 
 .. hint::
 
-    When choosing a file format for your application, it's better to stick some
-    well established format in the toolkit/platform you use. This way your
+    When choosing a file format for your application, it's better to stick to some
+    well-established format in the toolkit/platform you use. This way your
     translators can additionally use whatever tools they are used to, and will more
     likely contribute to your project.
 
@@ -31,335 +31,8 @@ format (JSON, YAML, properties) or file encoding, so please verify that
 Translation types capabilities
 ------------------------------
 
-.. list-table:: Capabilities of all supported formats
-   :header-rows: 1
-
-   * - Format
-     - Linguality [#m]_
-     - Plurals [#p]_
-     - Descriptions [#n]_
-     - Context [#c]_
-     - Location [#l]_
-     - Flags [#f]_
-     - Additional states [#a]_
-   * - :ref:`gettext`
-     - bilingual
-     - yes
-     - yes
-     - yes
-     - yes
-     - yes [#po]_
-     - needs editing
-   * - :ref:`mono_gettext`
-     - mono
-     - yes
-     - yes
-     - yes
-     - yes
-     - yes [#po]_
-     - needs editing
-   * - :ref:`xliff`
-     - both
-     - yes
-     - yes
-     - yes
-     - yes
-     - yes
-     - needs editing, approved
-   * - :ref:`javaprop`
-     - both
-     - no
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`mi18n-lang`
-     - mono
-     - no
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`gwt`
-     - mono
-     - yes
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`joomla`
-     - mono
-     - no
-     - yes
-     - no
-     - yes
-     - no
-     -
-   * - :ref:`qtling`
-     - both
-     - yes
-     - yes
-     - no
-     - yes
-     - yes
-     - needs editing
-   * - :ref:`aresource`
-     - mono
-     - yes
-     - yes [#x]_
-     - no
-     - no
-     - yes
-     -
-   * - :ref:`apple`
-     - both
-     - no
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`php`
-     - mono
-     - no [#lp]_
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`json`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`js-i18next`
-     - mono
-     - yes
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`go-i18n-json`
-     - mono
-     - yes
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`gotext-json`
-     - mono
-     - yes
-     - yes
-     - no
-     - yes
-     - no
-     -
-   * - :ref:`arb`
-     - mono
-     - yes
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`webex`
-     - mono
-     - yes
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`dotnet`
-     - mono
-     - no
-     - yes
-     - no
-     - no
-     - yes
-     -
-   * - :ref:`resourcedict`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - yes
-     -
-   * - :ref:`csv`
-     - both
-     - no
-     - yes
-     - yes
-     - yes
-     - no
-     - needs editing
-   * - :ref:`yaml`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`ryaml`
-     - mono
-     - yes
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`dtd`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`flatxml`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - yes
-     -
-   * - :ref:`winrc`
-     - mono
-     - no
-     - yes
-     - no
-     - no
-     - no
-     -
-   * - :ref:`xlsx`
-     - mono
-     - no
-     - yes
-     - yes
-     - yes
-     - no
-     - needs editing
-   * - :ref:`appstore`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`subtitles`
-     - mono
-     - no
-     - no
-     - no
-     - yes
-     - no
-     -
-   * - :ref:`html`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`markdown`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`odf`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`idml`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`ini`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`islu`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`tbx`
-     - bilingual
-     - no
-     - yes
-     - yes
-     - no
-     - yes
-     -
-   * - :ref:`txt`
-     - mono
-     - no
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`stringsdict`
-     - mono
-     - yes
-     - no
-     - no
-     - no
-     - no
-     -
-   * - :ref:`fluent`
-     - mono
-     - no [#fp]_
-     - yes
-     - no
-     - no
-     - no
-     -
-
-.. [#m] See :ref:`bimono`
-.. [#p] See :ref:`format-plurals`
-.. [#n] See :ref:`format-description`
-.. [#c] See :ref:`format-context`
-.. [#l] See :ref:`format-location`
-.. [#a] See :ref:`format-states`
-.. [#x] XML comment placed before the ``<string>`` element, parsed as a source string description.
-.. [#f] See :ref:`format-flags`.
-.. [#po] The gettext type comments are used as flags.
-.. [#lp] The plurals are supported only for Laravel which uses in string syntax to define them, see `Localization in Laravel`_.
-.. [#fp] Plurals are handled in the syntax of the strings and not exposed as plurals in Weblate.
-
-.. _Localization in Laravel: https://laravel.com/docs/localization
+Please refer to the documentation page of each individual file format
+for information about which features are supported in that format.
 
 .. _bimono:
 
@@ -437,8 +110,8 @@ interface, see :ref:`custom-checks`).
 
 This feature is modelled on flags in :ref:`gettext`.
 
-Additionally, for all XML based format, the flags are extracted from the
-non-standard attribute ``weblate-flags``. Additionally ``max-length:N`` is
+Additionally, XML-based formats that support flags extract them from the
+non-standard attribute ``weblate-flags``. The ``max-length:N`` flag is also
 supported through the ``maxwidth`` `attribute
 <https://docs.oasis-open.org/xliff/v1.2/os/xliff-core.html#maxwidth>`_ as
 defined in the XLIFF standard, see :ref:`xliff-flags`.
@@ -472,11 +145,44 @@ Plurals are necessary to properly localize strings with variable count. The
 rules depend on a target language and many formats follow CLDR specification
 for that.
 
+Plural support in the supported features table means Weblate can represent
+plural strings for the format. Some formats need existing plural metadata or a
+specific variant, and cannot create new plural strings unless that is natively
+supported by the format.
+
 .. hint::
 
    Pluralizing strings need proper support from the application framework as
    well. Choose native format of your platform such as :ref:`gettext`,
    :ref:`aresource` or :ref:`stringsdict`.
+
+.. _format-multivalue:
+
+Multivalue formats
+++++++++++++++++++
+
+Multivalue formats, such as :ref:`multivalue-csv` and :ref:`tbx`, store independent
+source and target alternatives within one string. These alternatives have no
+one-to-one pairing, and their counts do not follow grammatical plural rules.
+
+Source checks inspect every source alternative. Target checks compare each
+target alternative with the source alternatives.
+A target passes when it matches any source alternative, independently of their
+order or the languages' grammatical plural forms. The :guilabel:`Unchanged
+translation` check instead reports targets identical to any source alternative,
+subject to its usual exemptions. Automatic fixes are applied only when all
+source alternatives produce the same correction.
+
+:ref:`Machine translation suggestions <machine-translation>` translate each
+source alternative independently. Automatic machine translation supports strings
+with one source alternative and at most one target alternative; it skips strings
+with multiple alternatives to preserve them. Translation service glossaries can
+use all alternatives. Automatic :ref:`translation-memory` contributions skip strings
+with multiple alternatives.
+
+LLM translation services use only strings with one source alternative and one
+target alternative as examples of previous translations. They omit existing
+translation context for strings with multiple alternatives.
 
 .. _read-only-strings:
 
@@ -488,12 +194,20 @@ can not be edited in Weblate. This feature is natively supported by few formats
 (:ref:`xliff` and :ref:`aresource`), but can be emulated in others by adding a
 ``read-only`` flag, see :ref:`custom-checks`.
 
+.. _obsolete-strings:
+
+Removing obsolete strings
++++++++++++++++++++++++++
+
+Some file formats can store obsolete strings. Weblate can remove these obsolete
+strings from formats that support this operation.
+
 
 Supporting other formats
 ------------------------
 
 Most formats supported by `translate-toolkit`_ which support serializing can be
-easily supported, but they did not (yet) received any testing. In most cases,
+easily supported, but they did not (yet) receive any testing. In most cases,
 an additional thin layer is needed in Weblate to hide differences in behavior
 of different storages.
 
@@ -514,6 +228,22 @@ File format parameters
 
 File format parameters provide a way to configure settings related to the file format.
 They are configured at component level and allow you to customize how file parsing and serialization are handled.
+
+For supported XML formats, ``xml_utf8_bom`` controls the UTF-8 byte order mark:
+``preserve`` keeps the input file's BOM, ``include`` always writes it, and
+``omit`` removes it. The default is ``preserve``; new files without a template
+omit the BOM. Other encodings are unchanged.
+
+The ``xml_encoding_case`` parameter selects ``uppercase`` or ``lowercase``
+encoding names in the XML declaration, such as ``UTF-8`` or ``utf-8``.
+The default, ``default``, uses the format's native casing.
+
+The ``xml_final_newline`` parameter controls the newline after the complete XML
+document, including any trailing comments or processing instructions. Choose
+``include`` for exactly one final line ending, or ``omit`` for none.
+The default, ``default``, leaves the format's behavior unchanged. Explicit
+inclusion uses the serializer's line-ending style, falling back to LF when the
+output contains no line endings. Translation-content whitespace is unchanged.
 
 
 List of file format parameters

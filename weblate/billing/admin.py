@@ -12,7 +12,13 @@ from django.utils.translation import gettext_lazy
 
 from weblate.wladmin.models import WeblateModelAdmin
 
-from .models import Billing, Invoice, Plan
+from .models import (
+    Billing,
+    BillingEvent,
+    Invoice,
+    Plan,
+    get_plan_change_log_details,
+)
 
 if TYPE_CHECKING:
     from weblate.auth.models import AuthenticatedHttpRequest
@@ -23,6 +29,7 @@ class PlanAdmin(WeblateModelAdmin):
     list_display = (
         "name",
         "price",
+        "yearly_price",
         "limit_hosted_strings",
         "limit_strings",
         "limit_languages",
@@ -34,20 +41,19 @@ class PlanAdmin(WeblateModelAdmin):
         "public",
         "change_access_control",
     )
-    ordering = ["name"]
-    prepopulated_fields = {"slug": ("name",)}
-    list_filter = ["public", "change_access_control"]
-
-
-def format_user(obj) -> str:
-    return f"{obj.username}: {obj.full_name} <{obj.email}>"
+    ordering = ("name",)
+    # ruff: ignore[mutable-class-default]
+    prepopulated_fields = {
+        "slug": ("name",),
+    }
+    list_filter = ("public", "change_access_control")
 
 
 @admin.register(Billing)
 class BillingAdmin(WeblateModelAdmin):
     list_display = (
         "list_projects",
-        "list_owners",
+        "workspace",
         "plan",
         "state",
         "removal",
@@ -65,11 +71,10 @@ class BillingAdmin(WeblateModelAdmin):
         "last_invoice",
     )
     list_filter = ("plan", "state", "paid", "in_limits")
-    search_fields = ("projects__name", "owners__email")
-    autocomplete_fields = ("projects", "owners")
+    search_fields = ("workspace__projects__name", "workspace__name", "customer_name")
 
     def get_queryset(self, request: AuthenticatedHttpRequest):
-        return super().get_queryset(request).prefetch_related("projects", "owners")
+        return super().get_queryset(request).prefetch()
 
     @admin.display(description=gettext_lazy("Projects"))
     def list_projects(self, obj):
@@ -77,14 +82,18 @@ class BillingAdmin(WeblateModelAdmin):
             return "none projects associated"
         return ",".join(project.name for project in obj.all_projects)
 
-    @admin.display(description=gettext_lazy("Owners"))
-    def list_owners(self, obj):
-        return ",".join(owner.full_name for owner in obj.owners.all())
-
-    def get_form(self, request: AuthenticatedHttpRequest, obj=None, **kwargs):
-        form = super().get_form(request, obj, **kwargs)
-        form.base_fields["owners"].label_from_instance = format_user
-        return form
+    def save_model(self, request, obj, form, change) -> None:
+        old_plan = None
+        if change:
+            old_plan = Billing.objects.select_related("plan").get(pk=obj.pk).plan
+        super().save_model(request, obj, form, change)
+        if old_plan is not None and old_plan.pk != obj.plan_id:
+            obj.billinglog_set.create(
+                event=BillingEvent.PLAN_CHANGED,
+                summary=f"Changed to {obj.plan}",
+                details=get_plan_change_log_details(old_plan, obj.plan),
+                user=request.user,
+            )
 
     def save_related(
         self, request: AuthenticatedHttpRequest, form, formsets, change
@@ -92,10 +101,12 @@ class BillingAdmin(WeblateModelAdmin):
         super().save_related(request, form, formsets, change)
         obj = form.instance
         # Add owners as admin if there is none
-        for project in obj.projects.all():
+        for project in obj.get_projects_queryset():
             group = project.defined_groups.get(name="Administration")
             if not group.user_set.exists():
-                for user in obj.owners.all():
+                for user in obj.workspace.users_with_permission(
+                    "workspace.edit_members"
+                ):
                     user.add_team(request, group)
 
 
@@ -104,10 +115,9 @@ class InvoiceAdmin(WeblateModelAdmin):
     list_display = ("billing", "start", "end", "amount", "currency", "ref")
     list_filter = (
         "currency",
-        ("billing__projects", RelatedOnlyFieldListFilter),
-        ("billing__owners", RelatedOnlyFieldListFilter),
+        ("billing__workspace__projects", RelatedOnlyFieldListFilter),
     )
-    search_fields = ("billing__projects__name", "ref", "note")
+    search_fields = ("billing__workspace__projects__name", "ref", "note")
     date_hierarchy = "end"
-    ordering = ["billing", "-start"]
+    ordering = ("billing", "-start")
     autocomplete_fields = ("billing",)

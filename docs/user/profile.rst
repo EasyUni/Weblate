@@ -60,7 +60,9 @@ User profile
 The user profile is accessible by clicking your user icon in the top-right of the top menu,
 then the :guilabel:`Settings` menu.
 
-The user profile contains your preferences. Name and e-mail address is used in VCS commits, so keep this info accurate.
+The settings tabs separate account and commit identity, public profile information,
+preferences, security, and developer access. Name and e-mail address are used in
+VCS commits, so keep this info accurate.
 
 
 .. note::
@@ -86,7 +88,7 @@ Translated languages
 ++++++++++++++++++++
 
 Choose which languages you prefer to translate, and they will be offered on the
-main page of watched projects, so that you have easier access to these all translations
+main page of watched projects, so that you have easier access to all these translations
 in each of those languages.
 
 .. image:: /screenshots/your-translations.webp
@@ -118,6 +120,19 @@ Theme
 +++++
 
 Choose whether Weblate follows system settings for dark or light theme, or choose one of them manually.
+
+Table columns
++++++++++++++
+
+By default, Weblate hides some columns in listings (languages,
+components, projects, …) when the browser window is too narrow to fit them.
+Enable :guilabel:`Show all columns in lists using horizontal scrolling` to keep
+all columns instead and scroll the table horizontally when needed.
+
+Use :guilabel:`Visible columns in lists` to choose which statistics columns
+are shown in the listings. This way you can hide numbers you are not
+interested in, or make room for additional ones such as :guilabel:`Total
+strings`.
 
 Default dashboard view
 ++++++++++++++++++++++
@@ -156,7 +171,7 @@ Special characters
 
 Additional special characters to include in the :ref:`visual-keyboard`.
 
-.. _subscriptions:
+.. _notifications:
 
 Notifications
 -------------
@@ -170,12 +185,25 @@ example about new strings to translate), while some trigger at component level
 (for example merge errors). These two groups of notifications are visually
 separated in the settings.
 
+The :guilabel:`Translation activity summary` notification is digest-only and
+summarizes added, updated, translated, approved, needs editing, and unfinished
+strings.
+
+Each periodic notification e-mail contains entries from all matching projects.
+Listings of individual changes contain up to 100 entries and indicate when
+additional entries were omitted, while grouped summaries are not limited.
+
 You can toggle notifications for watched projects and administered projects and it
 can be further tweaked (or muted) per project and component. Visit the component
 overview page and select appropriate choice from the :guilabel:`Watching` menu.
 
+Project and component notification subscriptions are automatically removed when
+you lose access to their targets. Cleanup runs hourly for a different group of
+users, checking every user once daily. Subscriptions are retained during temporary
+project blocks or while two-factor authentication requirements are unmet.
+
 In case :guilabel:`Automatically watch projects on contribution` is enabled you
-will automatically start watching projects upon translating a string. The
+will automatically start watching projects upon contributing to them. The
 default value depends on :setting:`DEFAULT_AUTO_WATCH`.
 
 .. note::
@@ -187,6 +215,35 @@ default value depends on :setting:`DEFAULT_AUTO_WATCH`.
     Sending out notifications is limited, you will not receive more than 1000
     e-mails per day. Any further notifications for you will be discarded.
 
+Open :guilabel:`Notification diagnostics` from your notification settings to
+inspect your own subscriptions. Administrators with management access and
+permission to edit users can open the same page for another user from that
+user's :guilabel:`Edit` tab. The :guilabel:`Overview` tab includes watched
+projects, notification languages, and subscriptions grouped by scope and target.
+In the :guilabel:`Diagnostics` tab, enter an object path such as
+``project/category/component/cs``. Project and category paths summarize inherited
+project settings and exceptions across all accessible
+components. Equivalent component settings are grouped together, with counts and
+up to five example links to inspect individual components. Component paths show
+effective settings and language restrictions; translation paths check the selected
+language specifically. Broad summaries do not enumerate individual translations.
+Summaries are limited to 200 accessible components and 10 original projects
+(including the selected project). For larger scopes, choose a smaller category,
+a component, or a translation; partial summaries are not shown.
+Lists of more than five watched projects or notification languages show counts
+instead of individual links.
+
+Only events with a matching subscription are shown, including disabled
+subscriptions and subscriptions blocked by language or account conditions.
+Event conditions and overridden subscriptions are shown directly. Subscription
+links highlight the matching row in the :guilabel:`Overview` tab. Component
+example links open diagnostics for that component. Shared components use
+subscriptions from their original project.
+
+The diagnostics check eligibility without sending e-mail. Notifications that
+depend on event details, such as mentions or alerts, are marked as conditional.
+Actual delivery also depends on the event author, digest content, and rate limits.
+
 .. image:: /screenshots/profile-subscriptions.webp
 
 .. _profile-account:
@@ -194,52 +251,129 @@ default value depends on :setting:`DEFAULT_AUTO_WATCH`.
 Account
 -------
 
-The :guilabel:`Account` tab lets you set up basic account details,
-connect various services you can use to sign in into Weblate, completely
-remove your account, or download your user data (see :ref:`schema-userdata`).
+The :guilabel:`Account` tab contains your username, name, account e-mail, and
+commit identity. You can verify another e-mail address here. The account
+management section at the bottom lets you export your user data (see
+:ref:`schema-userdata`), import settings, or remove your account.
 
-The private commit e-mail will be used instead of your account e-mail in version
-control commits. Use this to avoid leaking your real e-mail there. Be aware
-that using different e-mail can disconnect your contributions on other servers
+When you add an e-mail address, verification instructions are sent to the new
+address. If the new address already belongs to another account, that mailbox
+receives guidance on recovering access instead of a verification link. Sign out
+before recovering the other account.
+Contact support, when available, for help moving an address between accounts.
+The browser displays the same confirmation page in both cases to avoid
+disclosing whether an account exists.
+
+Account e-mail addresses match without regard to ASCII letter case. Non-ASCII
+characters must match exactly when signing in or resetting a password.
+
+You can import settings from a user data file on the :guilabel:`Account` tab.
+Compatible language, editor, dashboard, watched-project, and public-profile
+settings replace the corresponding settings on this server. Unavailable values
+are skipped and shown after import. The file must be no larger than 50 MB.
+Contribution counts, activity history,
+username, and account e-mail are not imported.
+
+Personal :ref:`saved-searches` from the file are added to your existing ones;
+a saved search with the same name is replaced.
+
+General notification settings and commit identity choices can be imported
+separately by selecting the corresponding options. Both are off by default.
+An imported commit e-mail unknown to this account is replaced with the current
+site's generated private address. If private addresses are disabled, the unknown
+address is skipped and your existing choice is preserved.
+Imported public e-mail addresses must be known to the current account. Both
+public and commit e-mail addresses must pass the current site's e-mail validation.
+Project- and component-specific and one-time notification rules are included
+in the export but not imported.
+
+The :guilabel:`Commit e-mail` and :guilabel:`Commit name` settings let you choose
+private identities instead of your account e-mail and name in version control
+commits. Use these to avoid publishing your real e-mail and name there. Be aware
+that using a different e-mail can disconnect your contributions on other servers
 (for example your contributions will no longer link to your profile on GitHub).
-The private e-mail can be turned on site-wide using
-:setting:`PRIVATE_COMMIT_EMAIL_OPT_IN`.
+Administrators can make private identities the default by setting
+:setting:`PRIVATE_COMMIT_EMAIL_OPT_IN` and :setting:`PRIVATE_COMMIT_NAME_OPT_IN`
+to ``False``. Your explicit choices override these defaults.
 
+.. seealso::
 
-.. note::
+   :doc:`/admin/privacy`
 
-   The list of services depends on your Weblate configuration, but can be made to
-   include popular sites such as GitLab, GitHub, Google, Facebook, or Bitbucket or other
-   OAuth 2.0 providers.
+Changes to these settings affect future commits. Names and e-mail addresses
+already recorded in repository history remain unchanged.
 
-.. image:: /screenshots/authentication.webp
+.. image:: /screenshots/profile-account.webp
 
 .. _profile:
 
-Profile
--------
+Public profile
+--------------
 
 All of the fields on this page are optional and can be deleted at any time, and
 by filling them out, you're giving us consent to share this data wherever your
 user profile appears.
 
+Public profile URLs, such as :guilabel:`Website URL`, :guilabel:`Contact URL`,
+:guilabel:`Fediverse URL`, and :guilabel:`Code site URL`, should point to a
+website, contact, or profile page. Obvious direct file download links can be
+rejected, and public profile links show a warning before leaving Weblate where
+possible.
+
+The :guilabel:`Code site URL` should use common code-hosting profile paths,
+such as ``/username`` or ``/~username``; existing repository-style links such
+as ``/username/project`` or ``/group/subgroup/project`` are also accepted. The
+:guilabel:`Fediverse URL`
+should use common profile paths, such as ``/username``, ``/@username``,
+``/web/@username``, ``/users/username``, ``/accounts/username``,
+``/channel/username``, ``/profile/username``, ``/u/username``, or
+``/people/identifier``.
+
 Avatar can be shown for each user (depending on :setting:`ENABLE_AVATARS`).
 These images are obtained using https://gravatar.com/.
+
+.. seealso::
+
+   :doc:`/admin/privacy`
+
+.. _profile-security:
+
+Security
+--------
+
+The :guilabel:`Security` tab manages your password, connected sign-in identities,
+and two-factor authentication. Security keys, authenticator apps, and recovery
+codes each show their current status and management actions.
+
+.. image:: /screenshots/authentication.webp
+
+.. note::
+
+   The list of sign-in services depends on your Weblate configuration, but can
+   include sites such as GitLab, GitHub, Google, Facebook, or Bitbucket and other
+   OAuth 2.0 providers.
+
+Previously connected services remain listed after an administrator removes their
+authentication backend. You can still use :guilabel:`Disconnect` to remove their
+sign-in identities from your account.
 
 Licenses
 --------
 
-API access
-----------
+Developer settings
+------------------
 
-You can get or reset your API access token here.
+You can get or reset your API access token and view usage examples here. Use
+:guilabel:`Manage code-hosting connections` for integrations with workspaces you
+administer. These connections are separate from the sign-in identities in
+:guilabel:`Security`.
 
 .. _audit-log:
 
-Audit log
----------
+Activity
+--------
 
-Audit log keeps track of the actions performed with your account. It logs IP
+The audit log keeps track of the actions performed with your account. It logs IP
 address and browser for every important action with your account. The critical
 actions also trigger a notification to a primary e-mail address.
 

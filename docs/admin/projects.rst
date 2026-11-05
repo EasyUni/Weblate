@@ -42,6 +42,11 @@ created. It is always permitted for users with the :guilabel:`Add new projects`
 permission, and if your instance uses billing (e.g. like
 https://hosted.weblate.org/ see :ref:`billing`), you can also create those
 based on your plans allowance from the user account that manages billing.
+Projects can also be created in a workspace by users who have the
+:guilabel:`Add projects to workspace` permission in that workspace. Creating a
+project without selecting a workspace requires the site-wide
+:guilabel:`Add new projects` permission. See
+:ref:`workspace-project-creation` for details.
 
 .. hint::
 
@@ -61,6 +66,8 @@ After creating the project, you are taken directly to the project page:
 
 .. image:: /screenshots/user-add-project-done.webp
 
+.. _adding-components:
+
 Creating a new translation component can be initiated via a single click there.
 The process of creating a component is multi-staged and automatically detects most
 translation parameters. There are several approaches to creating component:
@@ -71,6 +78,8 @@ From existing component
     Creates additional component to existing one by choosing different files.
 Additional branch
     Creates additional component to existing one, just for different branch.
+    Select a component to load its available remote branches. If loading fails,
+    use :guilabel:`Retry` to try again.
 Upload translations files
     Upload translation files to Weblate in case you do not have version control
     or do not want to integrate it with Weblate. You can later update the
@@ -90,6 +99,9 @@ First you need to fill in name and repository location:
 On the next page, you are presented with a list of discovered translatable resources:
 
 .. image:: /screenshots/user-add-component-discovery.webp
+
+If discovery reaches a resource limit, Weblate warns that the list might be
+incomplete. You can configure missing translation files manually.
 
 As a last step, you review the translation component info and fill in optional details:
 
@@ -148,7 +160,9 @@ This is a required parameter unless turned off by :setting:`WEBSITE_REQUIRED`.
 .. seealso::
 
    * :setting:`PROJECT_WEB_RESTRICT_HOST`
+   * :setting:`PROJECT_WEB_RESTRICT_ALLOWLIST`
    * :setting:`PROJECT_WEB_RESTRICT_NUMERIC`
+   * :setting:`PROJECT_WEB_RESTRICT_PRIVATE`
    * :setting:`PROJECT_WEB_RESTRICT_RE`
 
 .. _project-instructions:
@@ -159,13 +173,34 @@ Translation instructions
 Text describing localization process in the project, and any other information
 useful for translators. Markdown can be used for text formatting or inserting links.
 
-.. _project-set_language_team:
+Good translation instructions explain how contributors should submit
+translations, what review they should expect, how they can report problems with
+source strings, and where translations can be tested or when they are released.
 
-Set "Language-Team" header
-++++++++++++++++++++++++++
+.. _project-license:
 
-Whether Weblate should manage the ``Language-Team`` header (this is a
-:ref:`gettext` only feature right now).
+Translation license
++++++++++++++++++++
+
+Default translation license for components in this project.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+   * :ref:`component-license`
+
+.. _project-agreement:
+
+Contributor license agreement
++++++++++++++++++++++++++++++
+
+Default contributor license agreement for components in this project. Markdown
+can be used for text formatting or inserting links.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+   * :ref:`component-agreement`
 
 .. _project-use_shared_tm:
 
@@ -191,18 +226,41 @@ The default value can be changed by :setting:`DEFAULT_SHARED_TM`.
 
     This option is unavailable on Hosted Weblate, it is toggled together with :ref:`project-use_shared_tm`.
 
-.. _project-autoclean_tm:
+.. _project-use-workspace-tm:
 
-Autoclean translation memory
-+++++++++++++++++++++++++++++
+Use workspace translation memory
+++++++++++++++++++++++++++++++++
 
-.. versionadded:: 5.13
+Whether to use translation memory shared by projects in the same workspace,
+see :ref:`memory-scopes` for more details. The workspace has to allow workspace
+translation memory as well.
 
-Whether to automatically remove outdated and obsolete entries from translation memory.
+.. _project-contribute-workspace-tm:
+
+Contribute to workspace translation memory
+++++++++++++++++++++++++++++++++++++++++++
+
+Whether to contribute translations to the translation memory shared by
+projects in the same workspace. The workspace has to allow contribution as
+well.
 
 .. note::
 
-   This does not affect manually uploaded memory entries.
+    This option is unavailable on Hosted Weblate, it is toggled together with :ref:`project-use-workspace-tm`.
+
+.. _project-autoclean_tm:
+
+Autoclean translation memory
+++++++++++++++++++++++++++++
+
+.. versionadded:: 5.13
+
+Whether to replace older automatically created translation memory entries when a
+translation becomes active.
+
+Matching is based on the same source string, component, context, and
+source/target language pair. Uploaded translation memory files are not
+affected.
 
 .. seealso::
 
@@ -217,6 +275,34 @@ Access control
 Configure per project access control, see :ref:`acl` for more details.
 
 The default value can be changed by :setting:`DEFAULT_ACCESS_CONTROL`.
+
+.. _project-public_sharing:
+
+Public sharing
+++++++++++++++
+
+Allow anonymous access to the project's engage pages and rendered status
+widgets. This setting applies to :guilabel:`Private` and :guilabel:`Custom`
+projects; :guilabel:`Public` and :guilabel:`Protected` projects are always
+publicly shareable.
+
+Public sharing exposes project and component names, including restricted
+components, together with translation statistics, languages, and progress. It
+does not grant access to project pages, translations, repositories, or the API.
+
+Changing this setting has no immediate effect while the project is
+:guilabel:`Public` or :guilabel:`Protected`, but the stored value is retained
+and applies if the project is later changed to :guilabel:`Private` or
+:guilabel:`Custom`. Sitemaps for project, component, and translation pages only
+include pages that are directly accessible anonymously. Engage sitemaps follow
+the public sharing setting.
+
+Changing this setting requires the :guilabel:`Manage project access`
+permission. The status widget configuration page continues to use normal
+project access control.
+
+When :setting:`REQUIRE_LOGIN` is enabled, :setting:`PUBLIC_ENGAGE` must also be
+enabled for anonymous access to engage pages and sitemaps.
 
 .. _project-enforced_2fa:
 
@@ -237,7 +323,8 @@ Enable review workflow for translations, see :ref:`reviews`.
 
 .. seealso::
 
-   :ref:`workflow-customization`
+   * :setting:`DEFAULT_TRANSLATION_REVIEW`
+   * :ref:`workflow-customization`
 
 .. _project-source_review:
 
@@ -248,13 +335,14 @@ Enable review workflow for source strings, see :ref:`source-reviews`.
 
 .. seealso::
 
+   * :setting:`DEFAULT_SOURCE_REVIEW`
    * :ref:`report-source`
    * :ref:`user-comments`
 
 .. _project-commit_policy:
 
-Commit Policy
-+++++++++++++
+Translation quality filter
+++++++++++++++++++++++++++
 
 .. versionadded:: 5.13
 
@@ -265,10 +353,39 @@ supports the following options:
 * **Commit all translations regardless of quality**: All translations will be committed,
   including those marked as needing editing or not reviewed.
 * **Skip translations marked as needing editing**: Only translations that don't have the
-  "needs editing" flag will be committed.
+  "needs editing", "needs rewriting" or "needs checking" state will be committed.
 * **Only include approved translations**: Only translations that have been approved by a
   reviewer will be committed. This option requires :ref:`project-translation_review`
   to be enabled.
+
+The approved-only policy applies only to translations with reviews enabled.
+Languages with reviews disabled through :ref:`workflow-customization` commit all
+translations, including those marked as needing editing. Source strings follow
+the same rule using :ref:`project-source_review`.
+
+Components linked to a repository in another project follow their own project's
+commit policy.
+
+If the editor shows “Only approved translations are written to the translation
+file.” or “Approval is required before this translation can be written to the
+translation file.”, the quality filter prevents writing the translation to the
+file until it is approved. This notice does not confirm that your current edit
+was saved; resolve any validation errors before leaving the editor. The project
+policy description qualifies this as “For languages with reviews enabled, only
+approved translations are written to the translation file.” Having permission
+to approve translations does not automatically approve your edits.
+
+For a language that does not use reviews, open its page in the project and
+choose :guilabel:`Settings`. Enable :guilabel:`Customize translation workflow for
+this language in this project`, then turn :guilabel:`Enable reviews` off. This
+requires permission to edit project settings. See :ref:`workflow-customization`.
+With the approved-only policy, this makes all translation states eligible for
+writing to files for that language, including those needing editing.
+
+If reviews are needed, users with both review and bulk-edit permissions can use
+:ref:`bulk-edit` to approve existing translations they have reviewed. Eligibility
+for writing to a translation file does not mean the change is immediately
+committed or pushed; see :ref:`lazy-commit` and :ref:`component-push_on_commit`.
 
 
 .. _project-enable_hooks:
@@ -301,6 +418,10 @@ Multiple mappings to be separated by comma: ``en_GB:en,en_US:en``
 
 Using non standard code: ``ia_FOO:ia``
 
+The mapped language code must resolve to an existing language or be a valid
+code for a new language. The source code can use non-standard naming from the
+translation files.
+
 .. hint::
 
    The language codes are mapped when matching the translation files and the
@@ -312,6 +433,33 @@ Using non standard code: ``ia_FOO:ia``
    * :ref:`adding-translation`
    * :ref:`language-code`
    * :ref:`language-parsing-codes`
+
+.. _project-new-lang:
+
+Adding new translation
+++++++++++++++++++++++
+
+Default behavior for requests to create new translations in components in this
+project.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+   * :ref:`component-new_lang`
+   * :ref:`workflow-language-restrictions`
+
+.. _project-language-code-style:
+
+Language code style
++++++++++++++++++++
+
+Default language code style for translations created by Weblate in components
+in this project.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+   * :ref:`component-language_code_style`
 
 .. _project-secondary_language:
 
@@ -326,6 +474,7 @@ Optionally, it can be also used as a source for the machine translation.
 
 .. seealso::
 
+   * :ref:`workspace-inherited-settings`
    * :ref:`secondary-languages`
    * :ref:`mt-sources`
 
@@ -337,6 +486,40 @@ Translation flags
 .. versionadded:: 5.11
 
 Customization of quality checks and other Weblate behavior, see :ref:`custom-checks`.
+
+Workspace, project, component, and translation flags are merged.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+
+.. _project-commit-message:
+.. _project-add-message:
+.. _project-delete-message:
+.. _project-merge-message:
+.. _project-addon-message:
+.. _project-pull-message:
+
+Commit, add, delete, merge, add-on, and merge request messages
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Default commit and merge request message templates for components in this
+project.
+
+The default values can be changed by :setting:`DEFAULT_ADD_MESSAGE`,
+:setting:`DEFAULT_ADDON_MESSAGE`, :setting:`DEFAULT_COMMIT_MESSAGE`,
+:setting:`DEFAULT_DELETE_MESSAGE`, :setting:`DEFAULT_MERGE_MESSAGE`,
+:setting:`DEFAULT_PULL_MESSAGE`.
+
+The built-in defaults follow Conventional Commits and include
+Weblate links where available. Use :guilabel:`Restore site default` next to a
+message editor to restore the current installation default for that message;
+for inherited values, this also disables inheritance for that message.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+   * :ref:`markup`
 
 
 .. _component:
@@ -401,7 +584,24 @@ VCS to use, see :ref:`vcs` for details.
 
 .. seealso::
 
-   :ref:`push-changes`
+   :ref:`code-hosting-push-options`
+
+.. _component-vcs_params:
+
+Version control parameters
+++++++++++++++++++++++++++
+
+Parameters tuning how Weblate interacts with the repository, for example
+whether to force push or to open pull requests. Only parameters applicable to
+the selected :ref:`component-vcs` are shown, see also :ref:`vcs_params`.
+
+.. note::
+
+   The settings form silently drops parameters which do not apply to the
+   selected version control system, but the REST API rejects them. When
+   changing :ref:`component-vcs` over the API, clear or replace ``vcs_params``
+   in the same request. The same applies to
+   :ref:`component-file_format_params` and :ref:`component-file_format`.
 
 .. _component-repo:
 
@@ -427,14 +627,15 @@ Repository push URL
 
 Repository URL used for pushing. The behavior of this depends on
 :ref:`component-vcs`, and this is in more detail covered in
-:ref:`push-changes`.
+:ref:`code-hosting-push-options`.
 
 For linked repositories, this is not used and setting from linked component applies.
 
 .. seealso::
 
    See :ref:`vcs-repos` for more details on how to specify a repository URL and
-   :ref:`push-changes` for more details on pushing changes from Weblate.
+   :ref:`code-hosting-push-options` for more details on pushing changes from
+   Weblate.
 
 .. _component-repoweb:
 
@@ -451,6 +652,28 @@ In case your paths are relative to different folder (path contains ``..``), you
 might want to strip leading directory by ``parentdir`` filter (see
 :ref:`markup`):
 ``https://github.com/WeblateOrg/hello/blob/{{branch}}/{{filename|parentdir}}#L{{line}}``
+
+.. seealso::
+
+   * :setting:`PROJECT_WEB_RESTRICT_PRIVATE`
+
+.. _component-repoweb-translations:
+
+Repository browser for translations
++++++++++++++++++++++++++++++++++++
+
+URL of repository browser used to display translation files. When empty, the
+:ref:`component-repoweb` URL will be used as a fallback. This is useful when
+source-code files and translation files are hosted in different repositories.
+It applies to all translation files, including source-language, intermediate,
+template, and target files. You can use :ref:`markup`.
+
+For example on GitHub, use something like:
+``https://github.com/WeblateOrg/translations/blob/{{branch}}/{{filename}}#L{{line}}``
+
+.. seealso::
+
+   * :setting:`PROJECT_WEB_RESTRICT_PRIVATE`
 
 .. _component-git_export:
 
@@ -469,7 +692,7 @@ Repository branch
 
 Which branch to checkout from the VCS, and where to look for translations.
 
-For linked repositories, this is not used and setting from linked component applies.
+.. include:: /snippets/linked-repository-setting.rst
 
 .. _component-push_branch:
 
@@ -478,16 +701,22 @@ Push branch
 
 Branch for pushing changes, leave empty to use :ref:`component-branch`.
 
-For linked repositories, this is not used and setting from linked component applies.
+.. include:: /snippets/linked-repository-setting.rst
 
 .. note::
 
-   This is currently only supported for Git, GitLab and GitHub, it is ignored
-   for other VCS integrations.
+   This setting is ignored for Mercurial and Subversion.
+
+   For Gerrit, this selects the target branch for the review request. Leave it
+   empty to review against :ref:`component-branch`. Use the short branch name,
+   not ``refs/heads/<branch>`` or ``refs/for/<branch>``. Gerrit push options
+   can be appended after ``%`` in either setting, for example
+   ``main%topic=l10n``; Gerrit interprets them as the configured Weblate Gerrit
+   account.
 
 .. seealso::
 
-   :ref:`push-changes`
+   :ref:`code-hosting-push-options`
 
 .. _component-filemask:
 
@@ -542,6 +771,13 @@ This means any PNG images under docs in component_A can be discovered and update
 So, if you want to update ``image1.png``, the new screenshot you provide should be named ``image1.png``,
 matching the existing ``filename``, and stored under ``component_A/docs/``.
 
+For Android projects using Fastlane metadata, a source-language screenshot mask
+can point to the metadata screenshot folder, for example
+``fastlane/metadata/android/en-US/images/phoneScreenshots/*.png``. Weblate will
+discover matching screenshots on repository update. The discovered screenshots
+still need to be associated with source strings in the screenshot management
+interface; use image text recognition or source string search there to assign them in bulk.
+
 .. _component-template:
 
 Monolingual base language file
@@ -581,6 +817,15 @@ When set, the source strings are based on this file, but all other languages
 are based on :ref:`component-template`. In case the string is not translated
 into the source language, translating to other languages is prohibited. This
 provides :ref:`source-quality-gateway`.
+
+The intermediate file can match an existing language file. While it is configured
+as intermediate, Weblate does not list it as a regular language in the component
+language list. Clearing this setting makes the file appear as a regular language
+again on the next component scan.
+
+Target strings can become read-only while the intermediate file is configured.
+This happens for strings where the matching source string in the
+:ref:`component-template` is not translated yet.
 
 .. seealso::
 
@@ -623,6 +868,13 @@ File format
 
 Translation file format, see also :ref:`formats`.
 
+.. _component-file_format_params:
+
+File format parameters
+++++++++++++++++++++++
+
+Parameters used to configure how translation files are processed, see also :ref:`file_format_params`.
+
 .. _component-report_source_bugs:
 
 Source string bug reporting address
@@ -634,14 +886,46 @@ notification about any source string comments made in Weblate.
 With the :ref:`gettext` format, this address is also saved by Weblate in the
 :mailheader:`Report-Msgid-Bugs-To` header of the file.
 
+.. _component-hide_glossary_matches:
+
+Do not show glossary matches
+++++++++++++++++++++++++++++
+
+Hides the glossary panel and its matches in the translation editor for this component.
+When enabled, glossary suggestions for this component are not computed, and the Glossary
+panel (including its “Add term to glossary” action) is hidden in the editor.
+
+.. note::
+
+   Glossary self-references are always excluded from matches even when this option is disabled.
+
+.. seealso::
+
+   * :ref:`glossary`
+   * :ref:`component-is_glossary`
+
+.. _component-contribute_project_tm:
+
+Contribute to project translation memory
+++++++++++++++++++++++++++++++++++++++++
+
+Controls whether translations from this component are added to the project
+translation memory.
+
+.. seealso::
+
+   :doc:`memory`
+
 .. _component-allow_translation_propagation:
 
 Allow translation propagation
 +++++++++++++++++++++++++++++
 
 You can turn off propagation of translations to this component from other
-components within same project. This really depends on what you are
-translating, sometimes it's desirable to have make use of a translation more than once.
+components within the configured
+:ref:`workspace propagation scope <workspace-propagation-scope>`. By default,
+propagation stays within the same project. This depends on what you are
+translating; sometimes it is desirable to reuse a translation more than once.
 
 It's usually a good idea to turn this off for monolingual translations, unless
 you are using the same IDs across the whole project.
@@ -692,12 +976,23 @@ Translation flags
 
 Customization of quality checks and other Weblate behavior, see :ref:`custom-checks`.
 
+Workspace, project, component, and translation flags are merged.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+
 .. _component-enforced_checks:
 
 Enforced checks
 +++++++++++++++
 
 List of checks which can not be dismissed.
+
+This setting can be inherited from the workspace, project, or category (see
+:ref:`workspace-inherited-settings`). When a new enforced check is inherited,
+existing failing translations are reverted to the :guilabel:`Needs editing`
+state in the background.
 
 .. seealso::
 
@@ -710,6 +1005,10 @@ Translation license
 
 License of the translation (does not need to be the same as the source code license).
 
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+
 .. _component-agreement:
 
 Contributor license agreement
@@ -719,6 +1018,10 @@ Contributor license agreement which needs to be approved before a user can
 translate this component.
 
 Markdown can be used for text formatting or inserting links.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
 
 .. _component-new_lang:
 
@@ -738,6 +1041,11 @@ Point to translation instructions URL
 Create new language file
     User can select language and Weblate automatically creates the file for it
     and translation can begin.
+Create existing project languages; contact maintainers for new languages
+    Users can create translations for languages already used as target languages
+    in another non-glossary component in the project. Other languages are requested
+    from maintainers, who approve them by creating the first target translation.
+    See :ref:`workflow-language-restrictions` for eligibility and API behavior.
 Disable adding new translations
     There will be no option for user to start new translation.
 
@@ -749,8 +1057,10 @@ Disable adding new translations
 
 .. seealso::
 
+   * :ref:`workspace-inherited-settings`
    * :ref:`adding-translation`
    * :ref:`component-new_base`
+   * :ref:`workflow-language-restrictions`
 
 .. _component-manage_units:
 
@@ -760,8 +1070,9 @@ Manage strings
 .. versionadded:: 4.5
 
 Configures whether users in Weblate will be allowed to add new strings and
-remove existing ones. Adjust this to match your localization workflow - how the
-new strings are supposed to be introduced.
+remove existing ones. It also enables :ref:`editing source strings and keys
+<edit-source>` in supported formats. Adjust this to match your localization
+workflow — how strings are introduced and maintained.
 
 For bilingual formats, the strings are typically extracted from the source code
 (for example by using :program:`xgettext`) and adding new strings in Weblate
@@ -835,6 +1146,7 @@ Linux style, lower cased
 
 .. seealso::
 
+   * :ref:`workspace-inherited-settings`
    * :ref:`adding-translation`
    * :ref:`language-code`
    * :ref:`language-parsing-codes`
@@ -855,8 +1167,8 @@ Rebase
    Rebasing can cause you trouble in case of complicated merges, so carefully
    consider whether or not you want to enable them.
 
-   You might need to enable force pushing by choosing :ref:`vcs-git-force-push`
-   as :ref:`component-vcs`, especially when pushing to a different branch.
+   You might need to turn on :ref:`force pushing <vcs-git-force-push>` in
+   :ref:`component-vcs_params`, especially when pushing to a different branch.
 
 Merge
    Upstream repository changes are merged into Weblate one. This setting utilizes
@@ -887,6 +1199,15 @@ The default value can be changed by :setting:`DEFAULT_ADD_MESSAGE`,
 :setting:`DEFAULT_DELETE_MESSAGE`, :setting:`DEFAULT_MERGE_MESSAGE`,
 :setting:`DEFAULT_PULL_MESSAGE`.
 
+The built-in defaults follow Conventional Commits and include
+Weblate links where available. Use :guilabel:`Restore site default` next to a
+message editor to restore the current installation default for that message;
+for inherited values, this also disables inheritance for that message.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+
 .. _component-push_on_commit:
 
 Push on commit
@@ -898,6 +1219,32 @@ changes to its underlying repository (see :ref:`lazy-commit`). To actually
 enable pushing :guilabel:`Repository push URL` has to be configured as
 well.
 
+.. include:: /snippets/linked-repository-setting.rst
+
+.. _component-push_on_update:
+
+Push on update
+++++++++++++++
+
+.. versionadded:: 2026.10
+
+Whether Weblate pushes after updating the repository from upstream, even when
+the update did not commit any translations. This applies only when
+:ref:`component-push_on_commit` is enabled.
+
+Turn this off to avoid pushes, and the CI runs they trigger, caused only by
+upstream changes. This is useful when Weblate's pull requests are
+squash-merged, so its commits never appear upstream. Translations committed
+during the update are still pushed.
+
+Commits made by the update, such as merge commits with the
+:ref:`component-merge_style` set to merge, are then pushed with the next
+translation commit. On quiet projects they can accumulate and trigger the
+alert about unpushed changes, see :setting:`REPOSITORY_ALERT_THRESHOLD`.
+Using rebase avoids most of them.
+
+.. include:: /snippets/linked-repository-setting.rst
+
 .. _component-commit_pending_age:
 
 Age of changes to commit
@@ -907,6 +1254,8 @@ Sets how old (in hours) changes have to be before they are committed by
 background task or the :wladmin:`commit_pending` management command. All
 changes in a component are committed once there is at least one change
 older than this period.
+
+.. include:: /snippets/linked-repository-setting.rst
 
 The default value can be changed by :setting:`COMMIT_PENDING_HOURS`.
 
@@ -926,6 +1275,8 @@ This avoids adding another conflicts, which would have to be resolved manually.
 
 The component will be automatically unlocked once there are no repository
 errors left.
+
+.. include:: /snippets/linked-repository-setting.rst
 
 .. _component-source_language:
 
@@ -954,6 +1305,10 @@ Language filter
 Regular expression used to filter the translation when scanning for file mask.
 It can be used to limit the list of languages managed by Weblate.
 
+The filter also applies when creating a new translation file. In this case,
+it checks the language code generated according to
+:ref:`component-language_code_style`.
+
 .. note::
 
     You need to list language codes as they appear in the filename.
@@ -973,6 +1328,10 @@ Some examples of filtering:
 +-------------------------------+-----------------------+
 | Include all files (default)   | ``^[^.]+$``           |
 +-------------------------------+-----------------------+
+
+.. seealso::
+
+   :ref:`workflow-language-restrictions`
 
 
 .. _component-key_filter:
@@ -1032,19 +1391,20 @@ Additional language to show together with the source language while translating.
 
 Optionally, it can be also used as a source for the machine translation.
 
-.. hint::
+.. note::
 
-   This setting is inherited from the project if left empty.
+   This setting can be inherited from the project.
 
 .. seealso::
 
+   * :ref:`workspace-inherited-settings`
    * :ref:`secondary-languages`
    * :ref:`mt-sources`
 
 .. _component-priority:
 
 Priority
-+++++++++
+++++++++
 
 Components with higher priority are offered first to translators.
 
@@ -1057,24 +1417,51 @@ Components with higher priority are offered first to translators.
 Restricted access
 +++++++++++++++++
 
-.. include:: /snippets/not-hosted.rst
+.. note::
+
+   On Hosted Weblate, this requires a billing plan which permits private
+   projects.
 
 By default the component is visible to anybody who has access to the project,
 even if the person can not perform any changes in the component. This makes it
 easier to keep translation consistency within the project.
 
-Restricting access at a component, or component-list level takes over
-access permission to a component, regardless of project-level permissions.
-You will have to grant access to it explicitly. This can be done through
-granting access to a new user group and putting users in it,
-or using the default `custom` or `private` access control groups.
+Restricting access at a component or component-list level requires an explicit
+grant for ordinary users, regardless of their project-level permissions.
+Grant access by creating a user group and adding users to it, or by using the
+default `custom` or `private` access control groups.
 
 The default value can be changed in :setting:`DEFAULT_RESTRICTED_COMPONENT`.
 
+Restricted access controls visibility of component pages, translations, API
+reads, and translation memory for users without component access or
+:guilabel:`Edit project settings` permission. Project administrators with that
+permission can open and manage every component in their project, including
+restricted ones. Editing strings, reviewing translations, downloading files,
+and other actions still require their respective permissions from a team scoped
+to the component or a component list containing it. Project-scoped action
+permissions do not apply to restricted components, including for project
+administrators.
+
+Administrative features can access restricted components within their
+documented scope. Project backups contain all project components. Project and
+category add-ons process restricted components in their configured scope.
+Component add-ons can also use cross-component inputs documented by the
+add-on. Grant management permissions only to users trusted with these effects.
+See :ref:`perm-check` and :ref:`addons`.
+
 .. hint::
 
-   This applies to project admins as well — please ensure you will not
-   loose access to the component after toggling the status.
+   Project administrators with :guilabel:`Edit project settings` permission
+   retain access after restricting a component. Other users need an explicit
+   component grant to keep direct access.
+
+Restricted components do not contribute new entries to :ref:`shared-tm`.
+Project and workspace translation memory entries attributed to an existing
+restricted component follow the component restriction. Unattributed legacy
+entries follow the access rules of their translation memory scope. On Hosted
+Weblate, shared translation memory and restricted components can not be enabled
+in the same project.
 
 .. _component-links:
 
@@ -1111,9 +1498,17 @@ Glossaries are best for:
 
    Glossaries are not for regular translations—they are for managing terms only.
 
+Weblate automatically adds missing glossary languages for languages used in the
+project. See :ref:`glossary-language-sync` for details.
+
 You can configure how it will be listed using :ref:`component-glossary_color`.
 
 The glossary will be accessible in all projects defined by :ref:`component-links`.
+
+A restricted component is not used as a glossary in its own project or in
+projects where it is shared. Weblate displays a diagnostic when both settings
+are enabled so that you can either remove restricted access or disable
+:guilabel:`Use as a glossary` without changing the component automatically.
 
 It is recommended to enable :ref:`component-manage_units` on glossaries in
 order to allow adding new words to them.
@@ -1140,6 +1535,25 @@ Category
 
 Categories are there to give structure to components within a project. You can
 nest them to achieve a more complex structure.
+
+.. _category-settings:
+
+Category settings
++++++++++++++++++
+
+Categories can override the same inherited settings as projects and components,
+including translation license, contributor agreement, adding new translations,
+secondary language, translation flags, and commit messages.
+
+Nested categories inherit from their parent category by default. Top-level
+categories inherit from the project. Components in a category inherit from that
+category by default.
+
+.. seealso::
+
+   * :ref:`workspace-inherited-settings`
+   * :ref:`project-license`
+   * :ref:`component-license`
 
 .. _markup:
 
@@ -1196,6 +1610,11 @@ The following variables are available in the component templates:
     Author of current commit, available only in the commit scope.
 ``{{ addon_name }}``
     Name of currently executed add-on, available only in the add-on commit message.
+
+The :ref:`Statistics generator <addon-weblate.generate.generate>` additionally
+supports a collection of languages and their statistics in component mode.
+Use the ``json`` or ``python`` filter to serialize template values into JSON or
+Python literals, including the necessary quoting and escaping.
 
 The following variables are available in the repository browser or editor templates:
 
@@ -1277,7 +1696,7 @@ resource limitations of your server.
 * Additional CPU cores might help improve performance of background tasks (see :ref:`celery`).
 
 Disable unneeded checks
-+++++++++++++++++++++++++
++++++++++++++++++++++++
 
 Some quality checks can be quite expensive, and if not needed,
 can save you some time during import if omitted. See :setting:`CHECK_LIST` for

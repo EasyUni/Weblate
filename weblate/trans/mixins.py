@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import os
-from typing import ClassVar, NoReturn
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar, Protocol, cast
 
 from django.core.exceptions import ValidationError
 from django.urls import reverse
@@ -15,14 +16,58 @@ from django.utils.translation import gettext
 from weblate.accounts.avatar import get_user_display
 from weblate.logger import LOGGER
 from weblate.utils.data import data_dir
+from weblate.utils.files import remove_tree
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from uuid import UUID
+
+    from django.contrib.auth.models import AnonymousUser
+    from django.db.models import Model
+
+    from weblate.auth.models import User
+    from weblate.trans.models import Category, Component, Project
+
+
+class _HasUser(Protocol):
+    @property
+    def user(self) -> User | None: ...
+
+
+class _HasOptionalId(Protocol):
+    @property
+    def id(self) -> int | UUID | None: ...
+
+
+class _HasComponentCategoryAttrs(Protocol):
+    @property
+    def category(self) -> Category | None: ...
+
+    @property
+    def project(self) -> Project: ...
+
+    @property
+    def id(self) -> int | None: ...
+
+    @property
+    def slug(self) -> str: ...
+
+    @property
+    def name(self) -> str: ...
+
+    def _clean_unique_together(self, field: str, msg: str, lookup: str) -> None: ...
+
+
+class URLPathObject(Protocol):
+    def get_url_path(self) -> Sequence[str]: ...
 
 
 class BaseURLMixin:
-    def get_url_path(self) -> NoReturn:
+    def get_url_path(self) -> Sequence[str]:
         raise NotImplementedError
 
     @cached_property
-    def full_slug(self):
+    def full_slug(self) -> str:
         return "/".join(self.get_url_path())
 
 
@@ -36,46 +81,103 @@ class URLMixin(BaseURLMixin):
 class LoggerMixin(BaseURLMixin):
     """Mixin for models with logging."""
 
-    def log_hook(self, level: str, msg: str, *args) -> None:
+    def log_hook(
+        self,
+        level: str,
+        msg: str,
+        *args,
+        sensitive: bool = False,
+        public_message: str | None = None,
+        dependencies: tuple[Component, ...] = (),
+    ) -> None:
         return
 
     def log_debug(self, msg, *args):
         self.log_hook("DEBUG", msg, *args)
         return LOGGER.debug(f"{self.full_slug}: {msg}", *args)
 
-    def log_info(self, msg, *args):
-        self.log_hook("INFO", msg, *args)
+    def log_info(
+        self,
+        msg,
+        *args,
+        sensitive: bool = False,
+        public_message: str | None = None,
+        dependencies: tuple[Component, ...] = (),
+    ):
+        self.log_hook(
+            "INFO",
+            msg,
+            *args,
+            sensitive=sensitive,
+            public_message=public_message,
+            dependencies=dependencies,
+        )
         return LOGGER.info(f"{self.full_slug}: {msg}", *args)
 
-    def log_warning(self, msg, *args):
-        self.log_hook("WARNING", msg, *args)
+    def log_warning(
+        self,
+        msg,
+        *args,
+        sensitive: bool = False,
+        public_message: str | None = None,
+        dependencies: tuple[Component, ...] = (),
+    ):
+        self.log_hook(
+            "WARNING",
+            msg,
+            *args,
+            sensitive=sensitive,
+            public_message=public_message,
+            dependencies=dependencies,
+        )
         return LOGGER.warning(f"{self.full_slug}: {msg}", *args)
 
-    def log_error(self, msg, *args):
-        self.log_hook("ERROR", msg, *args)
+    def log_error(
+        self,
+        msg,
+        *args,
+        sensitive: bool = True,
+        public_message: str | None = None,
+        dependencies: tuple[Component, ...] = (),
+    ):
+        self.log_hook(
+            "ERROR",
+            msg,
+            *args,
+            sensitive=sensitive,
+            public_message=public_message,
+            dependencies=dependencies,
+        )
         return LOGGER.error(f"{self.full_slug}: {msg}", *args)
 
 
 class PathMixin(LoggerMixin, URLMixin):
     """Mixin for models with path manipulations."""
 
-    def _get_path(self):
+    def _get_path(self) -> str:
         """Actual calculation of path."""
-        return os.path.join(data_dir("vcs"), *self.get_url_path())
+        root = Path(data_dir("vcs")).resolve()
+        path = root.joinpath(*self.get_url_path()).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            msg = f"Object path escapes the VCS directory: {path}"
+            raise ValueError(msg) from error
+        return path.as_posix()
 
     @cached_property
-    def full_path(self):
+    def full_path(self) -> str:
         return self._get_path()
 
     def invalidate_path_cache(self) -> None:
         if "full_path" in self.__dict__:
             del self.__dict__["full_path"]
 
-    def check_rename(self, old, validate=False) -> None:
+    def check_rename(self, old, validate=False) -> bool:
         """Detect slug changes and possibly renames underlying directory."""
         # No moving for links
         if getattr(self, "is_repo_link", False) or getattr(old, "is_repo_link", False):
-            return
+            return False
 
         old_path = old.full_path
         # Invalidate path cache (otherwise we would still get old path)
@@ -87,36 +189,78 @@ class PathMixin(LoggerMixin, URLMixin):
                 # Patch using old path for validation
                 # the actual rename happens only on save
                 self.__dict__["full_path"] = old_path
-                return
+                return True
 
-            self.log_info("path changed from %s to %s", old_path, new_path)
-            if os.path.exists(old_path) and not os.path.exists(new_path):
-                self.log_info('renaming "%s" to "%s"', old_path, new_path)
-                os.rename(old_path, new_path)
+            self.log_info(
+                "path changed from %s to %s",
+                old_path,
+                new_path,
+                sensitive=True,
+                public_message="Updating repository storage path.",
+            )
+            if os.path.exists(old_path):
+                self.log_info(
+                    'renaming "%s" to "%s"', old_path, new_path, sensitive=True
+                )
+                new_parent = os.path.dirname(new_path)
+                if not os.path.exists(new_parent):
+                    os.makedirs(new_parent)
+                if os.path.lexists(new_path):
+                    self.log_info(
+                        'removing stale target "%s"', new_path, sensitive=True
+                    )
+                    if os.path.isdir(new_path) and not os.path.islink(new_path):
+                        remove_tree(new_path)
+                    else:
+                        os.unlink(new_path)
+                try:
+                    os.rename(old_path, new_path)
+                except FileNotFoundError:
+                    if os.path.exists(old_path) or not os.path.exists(new_path):
+                        raise
+                    self.log_info(
+                        'source path "%s" disappeared during rename',
+                        old_path,
+                        sensitive=True,
+                    )
+            return True
+        return False
 
-    def create_path(self) -> None:
-        """Create filesystem directory for storing data."""
+    def create_path(self) -> bool:
+        """Create the data directory and report whether this call created it."""
         path = self.full_path
         if not os.path.exists(path):
             os.makedirs(path)
+            return True
+        return False
 
 
 class UserDisplayMixin:
-    def get_user_display(self, icon: bool = True):
-        return get_user_display(self.user, icon, link=True)
+    def get_user_display(
+        self: _HasUser, icon: bool = True, *, viewer: User | AnonymousUser | None = None
+    ):
+        from weblate.accounts.visibility import can_view_contributor  # ruff: ignore[import-outside-top-level]
 
-    def get_user_text_display(self):
-        return get_user_display(self.user, icon=False, link=True)
+        if not can_view_contributor(viewer, cast("Model", self)):
+            return gettext("Contributor")
+        return get_user_display(self.user, icon, link=True, viewer=viewer)
+
+    def get_user_text_display(
+        self: _HasUser, *, viewer: User | AnonymousUser | None = None
+    ):
+        return UserDisplayMixin.get_user_display(self, icon=False, viewer=viewer)
 
 
 class CacheKeyMixin:
     @cached_property
-    def cache_key(self) -> str:
+    def cache_key(self: _HasOptionalId) -> str:
         return f"{self.__class__.__name__}-{self.id}"
 
 
 class ComponentCategoryMixin:
-    def _clean_unique_together(self, field: str, msg: str, lookup: str) -> None:
+    def _clean_unique_together(
+        self: _HasComponentCategoryAttrs, field: str, msg: str, lookup: str
+    ) -> None:
         if self.category:
             matching_components = self.category.component_set.filter(**{field: lookup})
             matching_categories = self.category.category_set.filter(**{field: lookup})
@@ -137,7 +281,7 @@ class ComponentCategoryMixin:
         if matching_categories.exists() or matching_components.exists():
             raise ValidationError({field: msg})
 
-    def clean_unique_together(self) -> None:
+    def clean_unique_together(self: _HasComponentCategoryAttrs) -> None:
         self._clean_unique_together(
             "slug",
             gettext(

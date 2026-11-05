@@ -2,18 +2,45 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-from django.test import TestCase
+from unittest.mock import patch
+
+from django.test import SimpleTestCase, TestCase
 
 from weblate.auth.models import User
-from weblate.utils.markdown import get_mention_users, render_markdown
+from weblate.utils.markdown import MAX_MENTION_USERS, get_mention_users, render_markdown
 
 
-class MarkdownTestCase(TestCase):
+class MarkdownTestCase(SimpleTestCase):
+    def test_get_mentions_deduplicated_and_limited(self) -> None:
+        mentions = ["@Duplicate", "@DUPLICATE", "@duplicate"]
+        mentions.extend(f"@user{index}" for index in range(MAX_MENTION_USERS))
+
+        with patch("weblate.utils.markdown.User.objects.filter") as filter_mock:
+            get_mention_users(" ".join(mentions))
+
+        filter_mock.assert_called_once()
+        query = filter_mock.call_args.args[0]
+        self.assertEqual(
+            query.children,
+            [
+                ("username", "Duplicate"),
+                *(
+                    ("username", f"user{index}")
+                    for index in range(MAX_MENTION_USERS - 1)
+                ),
+            ],
+        )
+
     def test_link(self) -> None:
         self.assertEqual(
             '<p><a rel="ugc" target="_blank" '
             'href="https://weblate.org/">link</a></p>\n',
             render_markdown("[link](https://weblate.org/)"),
+        )
+        self.assertEqual(
+            '<p><a rel="ugc" target="_blank" href="https://e.com/%22%20'
+            'onclick=%22alert(1)">link</a></p>\n',
+            render_markdown('[link](<https://e.com/" onclick="alert(1)>)'),
         )
 
     def test_js(self) -> None:
@@ -47,6 +74,20 @@ class MarkdownTestCase(TestCase):
         self.assertEqual(
             "<p>foo<strong>bar</strong>baz</p>\n", render_markdown("foo**bar**baz")
         )
+
+    def test_parser_failure_fallback(self) -> None:
+        with (
+            patch(
+                "weblate.utils.markdown.mistletoe.Document",
+                side_effect=IndexError("string index out of range"),
+            ),
+            patch("weblate.utils.markdown.report_error") as report_error,
+        ):
+            self.assertEqual(
+                "<p>**markdown**<br>&lt;script&gt;</p>",
+                render_markdown("**markdown**\n<script>"),
+            )
+        report_error.assert_called_once_with("Markdown rendering failed")
 
     def test_autolink(self) -> None:
         self.assertEqual(
@@ -82,6 +123,12 @@ class MarkdownTestCase(TestCase):
             "<p>&lt;mailto:email@incomplete&gt;</p>\n",
             render_markdown("<mailto:email@incomplete>"),
         )
+        self.assertHTMLEqual(
+            '<p><a rel="ugc" target="_blank" href="https://doomwiki.org/wiki/Chex_Quest_cheat_codes#:~:text=davidbrus">https://doomwiki.org/wiki/Chex_Quest_cheat_codes#:~:text=davidbrus</a></p>',
+            render_markdown(
+                "https://doomwiki.org/wiki/Chex_Quest_cheat_codes#:~:text=davidbrus"
+            ),
+        )
 
     def test_image(self) -> None:
         self.assertEqual(
@@ -100,6 +147,16 @@ class MarkdownTestCase(TestCase):
             render_markdown("![title](https://valid.link)"),
         )
         self.assertEqual(
+            '<p><img src="https://e.com/%22%20onerror=%22alert(1)" '
+            'alt="title" /></p>\n',
+            render_markdown('![title](<https://e.com/" onerror="alert(1)>)'),
+        )
+        self.assertEqual(
+            '<p><img src="https://valid.link" alt="ti &quot;tle" '
+            'title="quot&quot;ed" /></p>\n',
+            render_markdown("![ti \"tle](https://valid.link 'quot\"ed')"),
+        )
+        self.assertEqual(
             "<p>![](ftp://invalid.link)</p>\n",
             render_markdown("![title](ftp://invalid.link)"),
         )
@@ -108,6 +165,18 @@ class MarkdownTestCase(TestCase):
         self.assertEqual(
             '<p>This is <a rel="ugc" target="_blank" href="https://weblate.org">https://weblate.org</a></p>\n',
             render_markdown("This is https://weblate.org"),
+        )
+        self.assertEqual(
+            '<p>This is <a rel="ugc" target="_blank" href="https://example.com/">https://example.com/</a></p>\n',
+            render_markdown("This is https://example.com/"),
+        )
+        self.assertEqual(
+            '<p>This is <a rel="ugc" target="_blank" href="https://example.com">https://example.com</a>)</p>\n',
+            render_markdown("This is https://example.com)"),
+        )
+        self.assertEqual(
+            '<p>This is <a rel="ugc" target="_blank" href="https://example.com">https://example.com</a>).</p>\n',
+            render_markdown("This is https://example.com)."),
         )
 
     def test_plain_link_underscore(self) -> None:
@@ -129,9 +198,17 @@ class MarkdownMentionTestCase(TestCase):
     def test_mention(self) -> None:
         User.objects.create(username="testuser", full_name="Full Name")
         self.assertEqual(
-            '<p><strong><a rel="ugc" target="_blank" href="/user/testuser/" '
-            'title="Full Name">@testuser</a></strong> really?</p>\n',
+            '<p><strong><bdi><a rel="ugc" target="_blank" href="/user/testuser/" '
+            'title="Full Name">@testuser</a></bdi></strong> really?</p>\n',
             render_markdown("@testuser really?"),
+        )
+
+    def test_mention_rtl(self) -> None:
+        User.objects.create(username="testuser", full_name="Full Name")
+        self.assertEqual(
+            '<p><strong><bdi><a rel="ugc" target="_blank" href="/user/testuser/" '
+            'title="Full Name">@testuser</a></bdi></strong> مرحبا</p>\n',
+            render_markdown("@testuser مرحبا"),
         )
 
     def test_get_mentions(self) -> None:
@@ -146,7 +223,7 @@ class MarkdownMentionTestCase(TestCase):
         )
 
     def test_get_mentions_case_insensitive(self) -> None:
-        user = User.objects.create(username="testuser", full_name="Full Name")
+        user = User.objects.create(username="TestUser", full_name="Full Name")
         self.assertEqual(
             {user.pk},
             set(
@@ -154,6 +231,13 @@ class MarkdownMentionTestCase(TestCase):
                     "pk", flat=True
                 )
             ),
+        )
+
+    def test_get_mentions_preserves_unicode_spelling(self) -> None:
+        user = User.objects.create(username="İ", full_name="Full Name")
+        self.assertEqual(
+            {user.pk},
+            set(get_mention_users("@İ").values_list("pk", flat=True)),
         )
 
     def test_get_mentions_non_mention(self) -> None:

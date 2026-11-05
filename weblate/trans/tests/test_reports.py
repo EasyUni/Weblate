@@ -2,15 +2,48 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import patch
 
 from django.urls import reverse
 from django.utils import timezone
 
-from weblate.auth.models import User
-from weblate.trans.tests.test_views import ViewTestCase
+from weblate.auth.models import Group, Permission, Role, User
+from weblate.memory.models import Memory, MemoryScope
+from weblate.trans.actions import ActionEvents
+from weblate.trans.forms import (
+    MIN_COST_ESTIMATE_TM_THRESHOLD,
+    CountsReportsForm,
+    get_report_language_choices,
+)
+from weblate.trans.models import (
+    Category,
+    Change,
+    Comment,
+    PendingUnitChange,
+    Project,
+    Report,
+    Suggestion,
+    Unit,
+    WorkflowSetting,
+)
+from weblate.trans.models.component import ComponentLink
+from weblate.trans.tests.test_views import ReusableViewTestCase
 from weblate.trans.tests.utils import TESTPASSWORD
-from weblate.trans.views.reports import generate_counts, generate_credits
+from weblate.trans.views.reports import (
+    generate_cost_estimate,
+    generate_counts,
+    generate_credits,
+)
+from weblate.utils.state import (
+    STATE_APPROVED,
+    STATE_EMPTY,
+    STATE_FUZZY,
+    STATE_TRANSLATED,
+)
 
 COUNTS_DATA = [
     {
@@ -44,7 +77,7 @@ COUNTS_DATA = [
 ]
 
 
-class BaseReportsTest(ViewTestCase):
+class BaseReportsTest(ReusableViewTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.user.is_superuser = True
@@ -57,6 +90,65 @@ class BaseReportsTest(ViewTestCase):
 
     def add_change(self) -> None:
         self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+
+    def generate_count_data(
+        self, counting_mode: str = CountsReportsForm.COUNTING_MODE_UNIQUE
+    ):
+        now = timezone.now()
+        return generate_counts(
+            None,
+            now - timedelta(days=1),
+            now + timedelta(days=1),
+            "",
+            "date_joined",
+            "ascending",
+            counting_mode,
+            component=self.component,
+        )
+
+    def get_cost_rates(self):
+        return {
+            "rate_new": Decimal(100),
+            "rate_needs_editing": Decimal(50),
+            "rate_tm_100": Decimal(0),
+            "rate_tm_fuzzy": Decimal(50),
+            "rate_repetition": Decimal(0),
+        }
+
+    def generate_cost_data(
+        self,
+        *,
+        q: str = "state:<translated",
+        threshold: int = 80,
+        entity=None,
+    ):
+        return generate_cost_estimate(
+            self.user,
+            "",
+            q,
+            Decimal("0.10"),
+            threshold,
+            self.get_cost_rates(),
+            self.component if entity is None else entity,
+        )
+
+    def add_memory(self, source: str) -> None:
+        Memory.objects.create(
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            source=source,
+            target="Translation memory result",
+            origin="test",
+            legacy_project=self.project,
+            status=Memory.STATUS_ACTIVE,
+        )
+
+    def move_component_to_child_category(self) -> Category:
+        parent = self.create_category(project=self.project)
+        child = self.create_category(project=self.project, category=parent)
+        self.component.category = child
+        self.component.save(update_fields=["category"])
+        return parent
 
 
 class ReportsTest(BaseReportsTest):
@@ -122,6 +214,66 @@ class ReportsTest(BaseReportsTest):
         self.edit_unit("Hello, world!\n", "Nazdar svete2!\n")
         self.test_credits_one(expected_count=2)
 
+    def test_credits_include_child_category_components(self) -> None:
+        parent = self.move_component_to_child_category()
+        self.add_change()
+
+        data = generate_credits(
+            None,
+            timezone.now() - timedelta(days=1),
+            timezone.now() + timedelta(days=1),
+            "cs",
+            parent,
+            "date_joined",
+            "ascending",
+        )
+
+        self.assertEqual(
+            data,
+            [
+                {
+                    "Czech": [
+                        {
+                            "email": "weblate@example.org",
+                            "full_name": "Weblate <b>Test</b>",
+                            "username": "testuser",
+                            "change_count": 1,
+                            "date_joined": self.user.date_joined.isoformat(),
+                        }
+                    ]
+                }
+            ],
+        )
+
+    def test_category_reports_exclude_linked_components(self) -> None:
+        project = Project.objects.create(
+            name="Linked report project",
+            slug="linked-report-project",
+        )
+        category = self.create_category(project=project)
+        ComponentLink.objects.create(
+            component=self.component,
+            project=project,
+            category=category,
+        )
+        self.add_change()
+
+        credit_data = generate_credits(
+            None,
+            timezone.now() - timedelta(days=1),
+            timezone.now() + timedelta(days=1),
+            "",
+            category,
+            "date_joined",
+            "ascending",
+        )
+        costs = self.generate_cost_data(entity=category)
+        language_choices = get_report_language_choices({"category": category})
+
+        self.assertEqual(credit_data, [])
+        self.assertEqual(costs["total"]["count"], 0)
+        self.assertEqual(len(language_choices), 1)
+
     def test_counts_one(self) -> None:
         self.add_change()
         data = generate_counts(
@@ -145,10 +297,460 @@ class ReportsTest(BaseReportsTest):
         )
         self.assertEqual(data, self.counts_data)
 
+    def test_counts_large_history_distance(self) -> None:
+        Change.objects.all().delete()
+        Change.objects.create(
+            unit=self.get_unit("Hello, world!\n"),
+            user=self.user,
+            author=self.user,
+            action=ActionEvents.CHANGE,
+            old="a" * 100_000,
+            target="b" * 100_000,
+        )
+        with patch(
+            "weblate.trans.models.change.DamerauLevenshtein.distance",
+            side_effect=AssertionError("Unbounded exact distance calculation"),
+        ):
+            data = self.generate_count_data()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["edits"], 100_000)
+        self.assertEqual(data[0]["edits_edit"], 100_000)
+
+    def test_counts_include_child_category_components(self) -> None:
+        parent = self.move_component_to_child_category()
+        self.add_change()
+
+        data = generate_counts(
+            None,
+            timezone.now() - timedelta(days=1),
+            timezone.now() + timedelta(days=1),
+            "cs",
+            "date_joined",
+            "ascending",
+            category=parent,
+        )
+
+        self.assertEqual(data, self.counts_data)
+
+    def test_counts_unique_repeated_edits(self) -> None:
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+        self.edit_unit("Hello, world!\n", "Nazdar svete 2!\n")
+        self.edit_unit("Hello, world!\n", "Nazdar svete 3!\n")
+
+        data = self.generate_count_data()
+
+        self.assertEqual(data[0]["count"], 2)
+        self.assertEqual(data[0]["count_new"], 1)
+        self.assertEqual(data[0]["count_edit"], 1)
+        self.assertEqual(data[0]["words"], 4)
+        self.assertEqual(data[0]["words_new"], 2)
+        self.assertEqual(data[0]["words_edit"], 2)
+
+    def test_counts_all_repeated_edits(self) -> None:
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+        self.edit_unit("Hello, world!\n", "Nazdar svete 2!\n")
+        self.edit_unit("Hello, world!\n", "Nazdar svete 3!\n")
+
+        data = self.generate_count_data(CountsReportsForm.COUNTING_MODE_ALL)
+
+        self.assertEqual(data[0]["count"], 3)
+        self.assertEqual(data[0]["count_new"], 1)
+        self.assertEqual(data[0]["count_edit"], 2)
+        self.assertEqual(data[0]["words"], 6)
+        self.assertEqual(data[0]["words_new"], 2)
+        self.assertEqual(data[0]["words_edit"], 4)
+
+    def test_counts_unique_repeated_approvals(self) -> None:
+        user = User.objects.create(
+            username="approvalbase",
+            email="approval-base@example.org",
+            password=TESTPASSWORD,
+            full_name="Approval Base",
+        )
+        self.change_unit("Nazdar svete!\n", user=user)
+        self.change_unit("Nazdar svete 2!\n", user=self.user, state=STATE_APPROVED)
+        self.change_unit("Nazdar svete 3!\n", user=self.user, state=STATE_APPROVED)
+
+        data = generate_counts(
+            self.user,
+            timezone.now() - timedelta(days=1),
+            timezone.now() + timedelta(days=1),
+            "",
+            "date_joined",
+            "ascending",
+            component=self.component,
+        )
+
+        self.assertEqual(data[0]["count"], 1)
+        self.assertEqual(data[0]["count_approve"], 1)
+        self.assertEqual(data[0]["words"], 2)
+        self.assertEqual(data[0]["words_approve"], 2)
+
+    def test_counts_unique_per_user(self) -> None:
+        user = User.objects.create(
+            username="uniqueuser",
+            email="unique-user@example.org",
+            password=TESTPASSWORD,
+            full_name="Unique User",
+        )
+        self.change_unit("Nazdar svete!\n", user=self.user)
+        self.change_unit("Nazdar svete 2!\n", user=self.user)
+        self.change_unit("Nazdar svete 3!\n", user=user)
+        self.change_unit("Nazdar svete 4!\n", user=user)
+
+        data = {item["email"]: item for item in self.generate_count_data()}
+
+        self.assertEqual(data[self.user.email]["count"], 2)
+        self.assertEqual(data[self.user.email]["count_new"], 1)
+        self.assertEqual(data[self.user.email]["count_edit"], 1)
+        self.assertEqual(data[user.email]["count"], 1)
+        self.assertEqual(data[user.email]["count_edit"], 1)
+
+    def test_cost_author_filters_use_report_authorization(self) -> None:
+        self.user.is_superuser = False
+        self.user.save(update_fields=["is_superuser"])
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.save(update_fields=["access_control"])
+        self.project.add_user(self.user, "Administration")
+        permission = Permission.objects.get(codename="contribution.view_author")
+        for role in Role.objects.filter(permissions=permission):
+            role.permissions.remove(permission)
+        self.user.clear_permissions_cache()
+        unit = self.get_unit("Thank you for using Weblate.")
+        self.assertTrue(self.user.has_perm("reports.view", self.component))
+        self.assertFalse(
+            self.user.has_perm("contribution.view_author", unit.translation)
+        )
+        Change.objects.create(
+            unit=unit,
+            user=self.user,
+            author=self.user,
+            action=ActionEvents.CHANGE,
+            target="Report edit",
+        )
+        Suggestion.objects.create(unit=unit, user=self.user, target="Report suggestion")
+        Comment.objects.create(unit=unit, user=self.user, comment="Report comment")
+        Comment.objects.create(
+            unit=unit.source_unit, user=self.user, comment="Source comment"
+        )
+        for field in (
+            "changed_by",
+            "suggestion_author",
+            "comment_author",
+            "source_comment_author",
+        ):
+            query = f"id:{unit.pk} {field}:{self.user.username}"
+            with self.subTest(field=field):
+                self.assertFalse(
+                    Unit.objects.filter(pk=unit.pk)
+                    .search(query, user=self.user)
+                    .exists()
+                )
+                data = self.generate_cost_data(q=query)
+                self.assertEqual(sum(bucket["count"] for bucket in data["buckets"]), 1)
+
+    def test_cost_estimate_exact_memory(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        self.add_memory(unit.source)
+
+        data = self.generate_cost_data()
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+
+        self.assertEqual(buckets["tm_100"]["count"], 1)
+        self.assertEqual(buckets["tm_100"]["words"], unit.num_words)
+        self.assertEqual(buckets["tm_100"]["cost"], "0")
+
+    def test_cost_estimate_restricted_component_memory(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        self.add_memory(unit.source)
+        Memory.objects.get(source=unit.source).scopes.update(
+            source_component=self.component
+        )
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.is_superuser = False
+        self.user.save(update_fields=["is_superuser"])
+        role = Role.objects.create(name="Restricted component reports")
+        role.permissions.add(Permission.objects.get(codename="reports.view"))
+        group = Group.objects.create(name="Restricted component report viewers")
+        group.roles.add(role)
+        group.projects.add(self.project)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("reports.view", self.project))
+        self.assertFalse(self.user.has_perm("project.edit", self.project))
+        self.assertFalse(self.user.can_access_component(self.component))
+
+        data = self.generate_cost_data(entity=self.project)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+
+        self.assertEqual(buckets["tm_100"]["count"], 1)
+        self.assertEqual(buckets["tm_100"]["words"], unit.num_words)
+
+    def test_cost_estimate_excludes_unrelated_restricted_memory(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        self.project.use_shared_tm = True
+        self.project.save(update_fields=["use_shared_tm"])
+        other_project = self.create_project(
+            name="Other memory project",
+            slug="other-memory-project",
+            contribute_shared_tm=True,
+        )
+        other_component = self.create_po(
+            project=other_project,
+            name="Other memory component",
+        )
+        other_component.restricted = True
+        other_component.save(update_fields=["restricted"])
+        memory = Memory.objects.create(
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            source=unit.source,
+            target="Unrelated restricted memory result",
+            origin=other_component.full_slug,
+            status=Memory.STATUS_ACTIVE,
+        )
+        MemoryScope.objects.create(
+            memory=memory,
+            scope=MemoryScope.SCOPE_SHARED,
+            source_project=other_project,
+            source_component=other_component,
+        )
+        self.user.is_superuser = False
+        self.user.save(update_fields=["is_superuser"])
+        self.user.groups.add(Group.objects.get(name="Managers"))
+        self.user.clear_permissions_cache()
+
+        data = self.generate_cost_data(entity=self.project)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+
+        self.assertEqual(buckets["tm_100"]["count"], 0)
+
+    def test_cost_estimate_fuzzy_memory(self) -> None:
+        self.add_memory("Thank you for using Weblate!")
+
+        data = self.generate_cost_data(threshold=MIN_COST_ESTIMATE_TM_THRESHOLD)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+
+        self.assertEqual(buckets["tm_fuzzy"]["count"], 1)
+        self.assertEqual(buckets["tm_100"]["count"], 0)
+
+    def test_cost_estimate_needs_editing(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_FUZZY)
+
+        data = self.generate_cost_data()
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+
+        self.assertEqual(buckets["needs_editing"]["count"], 1)
+
+    def test_contribution_characters_use_effective_source(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        parent = self.component.translation_set.get(language_code="de").unit_set.get(
+            id_hash=unit.id_hash
+        )
+        parent.translate(
+            self.user,
+            "A longer source with a different character count",
+            STATE_TRANSLATED,
+        )
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=unit.translation.language,
+            source_language=parent.translation.language,
+        )
+        before = {item["email"]: item for item in self.generate_count_data()}
+        unit.refresh_from_db()
+        unit.translate(self.user, "Child translation", STATE_TRANSLATED)
+        after = {item["email"]: item for item in self.generate_count_data()}
+        self.assertEqual(
+            after[self.user.email]["chars"] - before[self.user.email]["chars"],
+            len(parent.target),
+        )
+
+    def test_contribution_counts_preserve_legacy_source(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        start = timezone.now()
+        unit.translate(self.user, "Child translation", STATE_TRANSLATED)
+        end = timezone.now()
+        before = generate_counts(
+            self.user, start, end, "", "date_joined", "ascending", unit=unit
+        )
+        parent = self.component.translation_set.get(language_code="de").unit_set.get(
+            id_hash=unit.id_hash
+        )
+        parent.translate(self.user, "Short source", STATE_TRANSLATED)
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=unit.translation.language,
+            source_language=parent.translation.language,
+        )
+        parent.translate(
+            self.user, "A much longer source with many more words", STATE_TRANSLATED
+        )
+        after = generate_counts(
+            self.user, start, end, "", "date_joined", "ascending", unit=unit
+        )
+        self.assertEqual(after, before)
+        self.assertEqual(after[0]["chars"], len(unit.source))
+        self.assertEqual(after[0]["words"], 5)
+
+    def test_contribution_counts_preserve_source_snapshot(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        parent = self.component.translation_set.get(language_code="de").unit_set.get(
+            id_hash=unit.id_hash
+        )
+        parent.translate(self.user, "Short source", STATE_TRANSLATED)
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=unit.translation.language,
+            source_language=parent.translation.language,
+        )
+        start = timezone.now()
+        unit.refresh_from_db()
+        unit.translate(self.user, "Child translation", STATE_TRANSLATED)
+        end = timezone.now()
+        expected_chars = len(parent.target)
+        parent.translate(
+            self.user, "A much longer source with many more words", STATE_TRANSLATED
+        )
+        counts = generate_counts(
+            self.user, start, end, "", "date_joined", "ascending", unit=unit
+        )
+        self.assertEqual(len(counts), 1)
+        self.assertEqual(counts[0]["count"], 1)
+        self.assertEqual(counts[0]["chars"], expected_chars)
+        self.assertEqual(counts[0]["words"], 2)
+
+    def test_cost_repetitions_use_effective_source(self) -> None:
+        other = self.create_po(project=self.project, name="Other")
+        unit = self.get_unit("Thank you for using Weblate.")
+        other_unit = other.translation_set.get(
+            language=unit.translation.language
+        ).unit_set.get(id_hash=unit.id_hash)
+        parent = self.component.translation_set.get(language_code="de").unit_set.get(
+            id_hash=unit.id_hash
+        )
+        other_parent = other.translation_set.get(language_code="de").unit_set.get(
+            id_hash=unit.id_hash
+        )
+        parent.translate(
+            self.user, "First German source", STATE_TRANSLATED, propagate=False
+        )
+        other_parent.translate(
+            self.user, "Different German source", STATE_TRANSLATED, propagate=False
+        )
+        Unit.objects.filter(pk__in=[unit.pk, other_unit.pk]).update(
+            target="", state=STATE_EMPTY
+        )
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=unit.translation.language,
+            source_language=parent.translation.language,
+        )
+        query = f"id:{unit.pk} OR id:{other_unit.pk}"
+        data = self.generate_cost_data(entity=self.project, q=query)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+        self.assertEqual(buckets["repetition"]["count"], 0)
+        self.assertEqual(buckets["new"]["count"], 2)
+        self.assertEqual(
+            buckets["new"]["chars"], len(parent.target) + len(other_parent.target)
+        )
+        other_parent.translate(
+            self.user, parent.target, STATE_TRANSLATED, propagate=False
+        )
+        Unit.objects.filter(pk=other_unit.pk).update(
+            id_hash=other_unit.id_hash + 1, source="Distinct canonical source"
+        )
+        data = self.generate_cost_data(entity=self.project, q=query)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+        self.assertEqual(buckets["repetition"]["count"], 1)
+        self.assertEqual(buckets["new"]["count"], 1)
+        Unit.objects.filter(pk=other_unit.pk).update(context="Different meaning")
+        data = self.generate_cost_data(entity=self.project, q=query)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+        self.assertEqual(buckets["repetition"]["count"], 0)
+        self.assertEqual(buckets["new"]["count"], 2)
+
+    def test_cost_estimate_repetition_precedes_memory(self) -> None:
+        unit = self.get_unit("Thank you for using Weblate.")
+        self.add_memory(unit.source)
+        self.create_po(project=self.project, name="Other")
+
+        data = self.generate_cost_data(entity=self.project)
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+
+        self.assertEqual(buckets["tm_100"]["count"], 1)
+        self.assertGreaterEqual(buckets["repetition"]["count"], 1)
+
+    def test_cost_estimate_includes_child_category_components(self) -> None:
+        parent = self.move_component_to_child_category()
+
+        data = self.generate_cost_data(entity=parent)
+
+        self.assertGreater(data["total"]["count"], 0)
+
+    def test_cost_estimate_plural_match_uses_weakest_form(self) -> None:
+        def fake_fetch_machinery_matches(*, units, threshold, **kwargs):
+            result = {}
+            for unit in units:
+                if unit.source.startswith("Orangutan"):
+                    unit.machinery = {
+                        "quality": [100, 0 if threshold == 100 else 80],
+                        "translation": ["", ""],
+                        "origin": [None, None],
+                    }
+                    result[unit.id] = unit.machinery
+            return result
+
+        with patch(
+            "weblate.trans.views.reports.fetch_machinery_matches",
+            side_effect=fake_fetch_machinery_matches,
+        ):
+            data = self.generate_cost_data()
+
+        buckets = {bucket["slug"]: bucket for bucket in data["buckets"]}
+        self.assertEqual(buckets["tm_100"]["count"], 0)
+        self.assertGreater(buckets["tm_fuzzy"]["count"], 0)
+
+    def test_cost_estimate_does_not_modify_units(self) -> None:
+        unit_targets = {
+            pk: (target, state)
+            for pk, target, state in Unit.objects.filter(
+                translation=self.translation
+            ).values_list("pk", "target", "state")
+        }
+        change_count = Change.objects.count()
+        pending_count = PendingUnitChange.objects.count()
+        suggestion_count = Suggestion.objects.count()
+
+        self.generate_cost_data()
+
+        self.assertEqual(
+            {
+                pk: (target, state)
+                for pk, target, state in Unit.objects.filter(
+                    translation=self.translation
+                ).values_list("pk", "target", "state")
+            },
+            unit_targets,
+        )
+        self.assertEqual(Change.objects.count(), change_count)
+        self.assertEqual(PendingUnitChange.objects.count(), pending_count)
+        self.assertEqual(Suggestion.objects.count(), suggestion_count)
+
 
 class ReportsComponentTest(BaseReportsTest):
     def get_kwargs(self):
         return {"path": self.component.get_url_path()}
+
+    def post_report(self, url, params, style="json", follow=False):
+        existing = set(Report.objects.values_list("pk", flat=True))
+        response = self.client.post(url, params, follow=follow)
+        report = Report.objects.exclude(pk__in=existing).first()
+        if report is None:
+            return response
+        return self.client.get(reverse(f"api:report-{style}", args=[report.pk]))
 
     def get_credits(self, style, follow=False, **kwargs):
         self.add_change()
@@ -159,8 +761,8 @@ class ReportsComponentTest(BaseReportsTest):
             "sort_order": "descending",
         }
         params.update(kwargs)
-        return self.client.post(
-            reverse("credits", kwargs=self.get_kwargs()), params, follow=follow
+        return self.post_report(
+            reverse("credits", kwargs=self.get_kwargs()), params, style, follow
         )
 
     def test_credits_view_json(self) -> None:
@@ -218,25 +820,21 @@ class ReportsComponentTest(BaseReportsTest):
     def test_credits_invalid_start(self) -> None:
         end = timezone.now()
         start = end - timedelta(days=30)
-        period = "{}invalid - {}".format(
-            start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y")
-        )
+        period = f"{start.strftime('%m/%d/%Y')}invalid - {end.strftime('%m/%d/%Y')}"
         response = self.get_credits("json", period=period, follow=True)
         self.assertContains(response, "Error in parameter period: Invalid date!")
 
     def test_credits_invalid_end(self) -> None:
         end = timezone.now()
         start = end - timedelta(days=30)
-        period = "{} - {}invalid".format(
-            start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y")
-        )
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}invalid"
         response = self.get_credits("json", period=period, follow=True)
         self.assertContains(response, "Error in parameter period: Invalid date!")
 
     def test_credits_inverse_daterange(self) -> None:
         start = timezone.now()
         end = start - timedelta(days=1)
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_credits("json", period=period, follow=True)
         self.assertContains(
             response,
@@ -252,8 +850,25 @@ class ReportsComponentTest(BaseReportsTest):
             "sort_order": "descending",
         }
         params.update(kwargs)
-        return self.client.post(
-            reverse("counts", kwargs=self.get_kwargs()), params, follow=follow
+        return self.post_report(
+            reverse("counts", kwargs=self.get_kwargs()), params, style, follow
+        )
+
+    def get_costs(self, style, follow=False, **kwargs):
+        params = {
+            "style": style,
+            "q": "state:<translated",
+            "base_rate": "0.10",
+            "tm_threshold": "80",
+            "rate_new": "100",
+            "rate_needs_editing": "50",
+            "rate_tm_100": "0",
+            "rate_tm_fuzzy": "50",
+            "rate_repetition": "0",
+        }
+        params.update(kwargs)
+        return self.post_report(
+            reverse("costs", kwargs=self.get_kwargs()), params, style, follow
         )
 
     def test_counts_view_json(self) -> None:
@@ -261,10 +876,46 @@ class ReportsComponentTest(BaseReportsTest):
         self.assertEqual(response.status_code, 200)
         self.assertJSONEqual(response.content.decode(), self.counts_data)
 
+    def test_costs_view_json(self) -> None:
+        response = self.get_costs("json")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["base_rate"], "0.1")
+        self.assertEqual(data["threshold"], 80)
+        self.assertEqual(
+            [bucket["slug"] for bucket in data["buckets"]],
+            ["repetition", "tm_100", "tm_fuzzy", "needs_editing", "new"],
+        )
+
+    def test_costs_view_html(self) -> None:
+        response = self.get_costs("html")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "New strings")
+        self.assertContains(response, "Total")
+
+    def test_costs_requires_report_permission(self) -> None:
+        self.user.is_superuser = False
+        self.user.save(update_fields=["is_superuser"])
+        response = self.get_costs("json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_costs_invalid_threshold(self) -> None:
+        response = self.get_costs("json", tm_threshold="200", follow=True)
+        self.assertContains(
+            response,
+            "Error in parameter tm_threshold: Ensure this value is less than or equal to 100.",
+        )
+
+        response = self.get_costs("json", tm_threshold="1", follow=True)
+        self.assertContains(
+            response,
+            "Error in parameter tm_threshold: Ensure this value is greater than or equal to 75.",
+        )
+
     def test_counts_view_30days(self) -> None:
         end = timezone.now()
         start = end - timedelta(days=30)
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period)
         self.assertEqual(response.status_code, 200)
         self.assertJSONEqual(response.content.decode(), self.counts_data)
@@ -273,7 +924,7 @@ class ReportsComponentTest(BaseReportsTest):
         end = timezone.now().replace(day=1) + timedelta(days=31)
         end = end.replace(day=1) - timedelta(days=1)
         start = end.replace(day=1)
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period)
         self.assertEqual(response.status_code, 200)
         self.assertJSONEqual(response.content.decode(), self.counts_data)
@@ -281,25 +932,29 @@ class ReportsComponentTest(BaseReportsTest):
     def test_counts_view_month(self) -> None:
         end = timezone.now().replace(day=1) - timedelta(days=1)
         start = end.replace(day=1)
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period)
         self.assertEqual(response.status_code, 200)
         self.assertJSONEqual(response.content.decode(), [])
 
     def test_counts_view_year(self) -> None:
         year = timezone.now().year - 1
-        end = timezone.make_aware(datetime(year, 12, 31))  # noqa: DTZ001
-        start = timezone.make_aware(datetime(year, 1, 1))  # noqa: DTZ001
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        # ruff: ignore[call-datetime-without-tzinfo]
+        end = timezone.make_aware(datetime(year, 12, 31))
+        # ruff: ignore[call-datetime-without-tzinfo]
+        start = timezone.make_aware(datetime(year, 1, 1))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period)
         self.assertEqual(response.status_code, 200)
         self.assertJSONEqual(response.content.decode(), [])
 
     def test_counts_view_this_year(self) -> None:
         year = timezone.now().year
-        end = timezone.make_aware(datetime(year, 12, 31))  # noqa: DTZ001
-        start = timezone.make_aware(datetime(year, 1, 1))  # noqa: DTZ001
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        # ruff: ignore[call-datetime-without-tzinfo]
+        end = timezone.make_aware(datetime(year, 12, 31))
+        # ruff: ignore[call-datetime-without-tzinfo]
+        start = timezone.make_aware(datetime(year, 1, 1))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period)
         self.assertEqual(response.status_code, 200)
         self.assertJSONEqual(response.content.decode(), self.counts_data)
@@ -390,25 +1045,21 @@ class ReportsComponentTest(BaseReportsTest):
     def test_counts_invalid_start(self) -> None:
         end = timezone.now()
         start = end - timedelta(days=30)
-        period = "{}invalid - {}".format(
-            start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y")
-        )
+        period = f"{start.strftime('%m/%d/%Y')}invalid - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period, follow=True)
         self.assertContains(response, "Error in parameter period: Invalid date!")
 
     def test_counts_invalid_end(self) -> None:
         end = timezone.now()
         start = end - timedelta(days=30)
-        period = "{} - {}invalid".format(
-            start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y")
-        )
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}invalid"
         response = self.get_counts("json", period=period, follow=True)
         self.assertContains(response, "Error in parameter period: Invalid date!")
 
     def test_counts_inverse_daterange(self) -> None:
         start = timezone.now()
         end = start - timedelta(days=1)
-        period = "{} - {}".format(start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
+        period = f"{start.strftime('%m/%d/%Y')} - {end.strftime('%m/%d/%Y')}"
         response = self.get_counts("json", period=period, follow=True)
         self.assertContains(
             response,
@@ -427,6 +1078,13 @@ class ReportsComponentTest(BaseReportsTest):
         self.assertContains(
             response,
             "Error in parameter sort_by: Select a valid choice. - is not one of the available choices.",
+        )
+
+    def test_counts_invalid_counting_mode(self) -> None:
+        response = self.get_counts("json", counting_mode="-", follow=True)
+        self.assertContains(
+            response,
+            "Error in parameter counting_mode: Select a valid choice. - is not one of the available choices.",
         )
 
     def create_test_sort_data(self) -> None:
@@ -556,9 +1214,13 @@ class ReportsComponentTest(BaseReportsTest):
         }
 
         url = reverse("counts", kwargs=self.get_kwargs())
-        params = {"style": "json", "period": "01/01/2000 - 01/01/2100"}
+        params = {
+            "style": "json",
+            "period": "01/01/2000 - 01/01/2100",
+            "counting_mode": CountsReportsForm.COUNTING_MODE_ALL,
+        }
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "count", "sort_order": "descending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -567,7 +1229,7 @@ class ReportsComponentTest(BaseReportsTest):
             [expected_count2, expected_count1, expected_count3],
         )
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "count", "sort_order": "ascending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -576,7 +1238,7 @@ class ReportsComponentTest(BaseReportsTest):
             [expected_count3, expected_count1, expected_count2],
         )
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "date_joined", "sort_order": "ascending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -585,7 +1247,7 @@ class ReportsComponentTest(BaseReportsTest):
             [expected_count1, expected_count2, expected_count3],
         )
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "date_joined", "sort_order": "descending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -593,6 +1255,38 @@ class ReportsComponentTest(BaseReportsTest):
             response.content.decode(),
             [expected_count3, expected_count2, expected_count1],
         )
+
+    def test_counts_sorting_unique(self) -> None:
+        user1 = User.objects.create(
+            username="unique_sort_user1",
+            email="unique-sort-1@example.org",
+            password=TESTPASSWORD,
+            full_name="Unique Sort 1",
+        )
+        user2 = User.objects.create(
+            username="unique_sort_user2",
+            email="unique-sort-2@example.org",
+            password=TESTPASSWORD,
+            full_name="Unique Sort 2",
+        )
+        self.change_unit("Nazdar svete!\n", user=user1)
+        self.change_unit("Nazdar svete 2!\n", user=user1)
+        self.change_unit("Nazdar svete 3!\n", user=user2)
+
+        response = self.post_report(
+            reverse("counts", kwargs=self.get_kwargs()),
+            {
+                "style": "json",
+                "period": "01/01/2000 - 01/01/2100",
+                "sort_by": "count",
+                "sort_order": "descending",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual([item["email"] for item in data], [user1.email, user2.email])
+        self.assertEqual([item["count"] for item in data], [2, 1])
 
     def test_credits_sorting(self) -> None:
         self.create_test_sort_data()
@@ -621,7 +1315,7 @@ class ReportsComponentTest(BaseReportsTest):
         url = reverse("credits", kwargs=self.get_kwargs())
         params = {"style": "json", "period": "01/01/2000 - 01/01/2100"}
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "count", "sort_order": "descending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -630,7 +1324,7 @@ class ReportsComponentTest(BaseReportsTest):
             [{"Czech": [expected_credit2, expected_credit1, expected_credit3]}],
         )
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "count", "sort_order": "ascending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -639,7 +1333,7 @@ class ReportsComponentTest(BaseReportsTest):
             [{"Czech": [expected_credit3, expected_credit1, expected_credit2]}],
         )
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "date_joined", "sort_order": "ascending"}
         )
         self.assertEqual(response.status_code, 200)
@@ -648,7 +1342,7 @@ class ReportsComponentTest(BaseReportsTest):
             [{"Czech": [expected_credit1, expected_credit2, expected_credit3]}],
         )
 
-        response = self.client.post(
+        response = self.post_report(
             url, {**params, "sort_by": "date_joined", "sort_order": "descending"}
         )
         self.assertEqual(response.status_code, 200)

@@ -1,4 +1,5 @@
 
+.. _properties:
 .. _javaprop:
 
 Java properties
@@ -31,6 +32,8 @@ all others encode characters directly either in UTF-8 or UTF-16.
    * :ref:`addon-weblate.properties.sort`
    * :ref:`addon-weblate.cleanup.generic`
 
+.. include:: /snippets/format-features/properties-features.rst
+
 Weblate configuration
 +++++++++++++++++++++
 
@@ -43,5 +46,7 @@ Weblate configuration
 +--------------------------------+----------------------------------+
 | Template for new translations  | `Empty`                          |
 +--------------------------------+----------------------------------+
-| File format                    | `Java Properties (ISO-8859-1)`   |
+| File format                    | `Java Properties`                |
++--------------------------------+----------------------------------+
+| File encoding                  | `ISO-8859-1`                     |
 +--------------------------------+----------------------------------+

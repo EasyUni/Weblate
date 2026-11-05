@@ -29,24 +29,24 @@ The table of contents in the sidebar should let you easily access the documentat
 for your topic of interest. You can also use the search function in the top-left corner.
 
 First time here?
------------------
+----------------
 Read the :doc:`user/basic` to get an overview of what Weblate does.
 
 Joining a translation project
-------------------------------
-If you would like to contribute to a project as a translator, read about :doc:`user/translating`.
+-----------------------------
+If you would like to contribute to a project as a translator, start with :ref:`translator-start`, then explore :doc:`user/translating`.
 
 Starting a translation project
--------------------------------
+------------------------------
 For starting your own project on our cloud service Hosted Weblate, refer to :doc:`admin/projects`.
 For self-hosting your own Weblate clone, read our :doc:`admin/install`.
 
 FAQ
-----
+---
 Check our :doc:`faq`.
 
 Community
-----------
+---------
 Learn more about :ref:`contributing`.
 
 .. toctree::
@@ -74,18 +74,21 @@ Learn more about :ref:`contributing`.
     :hidden:
 
     devel/starting
+    devel/migration
     devel/integration
     devel/gettext
     devel/mobile
     devel/sphinx
     devel/html
-    devel/third-party
+    devel/libraries
+    devel/kotlin-sdk
     devel/alerts
     devel/community
     devel/translations
     devel/review
     devel/share
     devel/reporting
+    devel/success-stories
 
 
 .. toctree::
@@ -99,14 +102,18 @@ Learn more about :ref:`contributing`.
     admin/backup
     admin/auth
     admin/access
+    admin/privacy
+    admin/workspaces
     admin/projects
     admin/languages
     admin/continuous
+    admin/code-hosting
     admin/licensing
     admin/translating
     admin/checks
     admin/machine
     admin/addons
+    admin/automation
     admin/memory
     admin/config
     admin/sample
@@ -117,7 +124,6 @@ Learn more about :ref:`contributing`.
     admin/customize
     admin/admin
     admin/support
-    legal
 
 .. toctree::
     :caption: Contributor docs
@@ -138,7 +144,9 @@ Learn more about :ref:`contributing`.
     contributing/schemas
     contributing/release
     contributing/modules
+    contributing/submodules
     contributing/about
+    contributing/code_of_conduct
     contributing/license
     contributing/trademark
 
@@ -148,13 +156,21 @@ Learn more about :ref:`contributing`.
    :hidden:
 
    security/index
+   security/product-information
+   security/governance
+   security/releases
+   security/release-artifacts
    security/dependencies
    security/issues
+   security/incident-reporting
    security/incident-response-plan
    security/passwords
    security/disaster-recovery-plan
    security/threat-model
    security/privacy-compliance
+   security/us-compliance
+   security/localization-threat
+   security/data-residency
 
 .. toctree::
    :caption: File formats
@@ -171,6 +187,7 @@ Learn more about :ref:`contributing`.
     :hidden:
 
     changes
+    changes/v5
     changes/v4
     changes/v3
     changes/v2

@@ -1,12 +1,10 @@
 {% extends "base.html" %}
 
-{% load i18n icons static %}
+{% load i18n icons static translations %}
 
 {% block breadcrumbs %}
-  <li>
-    <a href="{{ object.get_absolute_url }}">{{ object }}</a>
-  </li>
-  <li>
+  {% path_object_breadcrumbs object %}
+  <li class="breadcrumb-item">
     <a href="{% url "widgets" path=object.get_url_path %}">{% translate "Widgets" %}</a>
   </li>
 {% endblock breadcrumbs %}
@@ -75,17 +73,14 @@
       <div class="widget-card p-3">
         <h4>{% translate "Live Preview" %}</h4>
         <div class="preview-box" id="preview">
-          <img id="widget-image"
-               src="data:,"
-               alt="{% translate "Translation status" %}"
-               style="max-width: 500px" />
+          <img id="widget-image" src="data:," alt="" style="max-width: 500px" />
         </div>
       </div>
 
       <div class="widget-card p-3">
         <button id="embed-code-copy-button"
                 type="button"
-                class="btn btn-link btn-xs pull-right flip"
+                class="btn btn-link btn-xs float-end"
                 data-clipboard-value=""
                 data-clipboard-message="{% translate "Embed code copied to clipboard." %}"
                 title="{% translate "Copy to clipboard" %}">{% icon "copy.svg" %}</button>
@@ -99,5 +94,5 @@
 {% endblock content %}
 
 {% block extra_script %}
-  <script defer data-cfasync="false" src="{% static "js/widgets.js" %}{{ cache_param }}"></script>
+  <script defer src="{% static "js/widgets.js" %}"></script>
 {% endblock extra_script %}

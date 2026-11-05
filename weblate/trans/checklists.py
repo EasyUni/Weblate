@@ -5,52 +5,81 @@
 from __future__ import annotations
 
 from collections import UserList
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
+from urllib.parse import quote
 
 from django.utils.functional import cached_property
+from django.utils.translation import gettext_lazy
 
 from weblate.checks.models import CHECKS
 from weblate.trans.filter import FILTERS
 
 if TYPE_CHECKING:
+    from django_stubs_ext import StrOrPromise
+
     from weblate.trans.models.project import Project
     from weblate.utils.stats import BaseStats
 
 
 class TranslationProtocol(Protocol):
-    project: Project
+    project: Project | None
     stats: BaseStats
     enable_review: bool
     is_readonly: bool
     is_source: bool
 
+    def get_translate_url(self) -> str: ...
+
+
+class EngageTask(NamedTuple):
+    url: str
+    label: StrOrPromise
+    total: int
+
 
 class TranslationChecklistMixin:
     @cached_property
+    def list_engage_tasks(self: TranslationProtocol) -> EngageChecklist:
+        """Return list of non-empty task buckets for the engage page."""
+        result = EngageChecklist(self.get_translate_url())
+
+        result.add_if(self.stats, "nottranslated", gettext_lazy("Untranslated"))
+        result.add_if(self.stats, "translated_checks", gettext_lazy("Failing checks"))
+        result.add_if(
+            self.stats,
+            "suggestions",
+            gettext_lazy("Suggestions pending"),
+            "suggestions",
+        )
+        result.add_if(self.stats, "fuzzy", gettext_lazy("Needs editing"))
+        if self.enable_review:
+            result.add_if(self.stats, "unapproved", gettext_lazy("Needs review"))
+
+        return result
+
+    @cached_property
     def list_translation_checks(self: TranslationProtocol) -> TranslationChecklist:
         """Return list of failing checks on current translation."""
-        result = TranslationChecklist()
+        result = TranslationChecklist(enable_review=self.enable_review)
 
         # All strings
         result.add(self.stats, "all", "")
 
-        result.add_if(
-            self.stats, "readonly", "primary" if self.enable_review else "success"
-        )
+        result.add_if(self.stats, "readonly", "")
 
         if not self.is_readonly:
             if self.enable_review:
-                result.add_if(self.stats, "approved", "primary")
+                result.add_if(self.stats, "approved", "")
 
             # Count of translated strings
-            result.add_if(self.stats, "translated", "success")
+            result.add_if(self.stats, "translated", "")
 
             # To approve
             if self.enable_review:
-                result.add_if(self.stats, "unapproved", "success")
+                result.add_if(self.stats, "unapproved", "")
 
                 # Approved with suggestions
-                result.add_if(self.stats, "approved_suggestions", "primary")
+                result.add_if(self.stats, "approved_suggestions", "")
 
             # Unfinished strings
             result.add_if(self.stats, "todo", "")
@@ -84,7 +113,7 @@ class TranslationChecklistMixin:
         result.add_if(self.stats, "comments", "")
 
         # Include labels
-        labels = self.project.label_set.order_by("name")
+        labels = self.project.label_set.order() if self.project is not None else []
         if labels:
             has_label = False
             for label in labels:
@@ -96,11 +125,19 @@ class TranslationChecklistMixin:
             if has_label:
                 result.add_if(self.stats, "unlabeled", "")
 
+        result.sort(
+            key=lambda item: FILTERS.get_filter_order(result.filter_ids[item[0]])
+        )
         return result
 
 
 class TranslationChecklist(UserList):
     """Simple list wrapper for translation checklist."""
+
+    def __init__(self, *, enable_review: bool = False) -> None:
+        super().__init__()
+        self.enable_review = enable_review
+        self.filter_ids: dict[str, str] = {}
 
     def add_if(self, stats, name, level) -> bool:
         """Add to list if there are matches."""
@@ -111,6 +148,9 @@ class TranslationChecklist(UserList):
 
     def add(self, stats, name, level) -> None:
         """Add item to the list."""
+        self.filter_ids[FILTERS.get_filter_query(name)] = name
+        if not name.startswith("label:"):
+            level = FILTERS.get_filter_color(name, enable_review=self.enable_review)
         self.append(
             (
                 FILTERS.get_filter_query(name),
@@ -121,3 +161,25 @@ class TranslationChecklist(UserList):
                 getattr(stats, f"{name}_chars"),
             )
         )
+
+
+class EngageChecklist(UserList):
+    """Simple list wrapper for engage page tasks."""
+
+    def __init__(self, translate_url: str) -> None:
+        super().__init__()
+        self.translate_url = translate_url
+
+    def add_if(self, stats, name, label, fragment: str = "") -> bool:
+        """Add to list if there are matches."""
+        count = getattr(stats, name)
+        if count <= 0:
+            return False
+
+        query = quote(FILTERS.get_filter_query(name), safe=":=")
+        url = f"{self.translate_url}?q={query}"
+        if fragment:
+            url = f"{url}#{fragment}"
+
+        self.append(EngageTask(url, label, count))
+        return True

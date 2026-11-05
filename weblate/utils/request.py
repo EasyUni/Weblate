@@ -33,6 +33,7 @@ def get_user_agent(request: HttpRequest | None, max_length: int = 200) -> str:
         return ""
 
     # Lazily import as this is expensive
+    # ruff: ignore[import-outside-top-level]
     import user_agents
 
     uaobj = user_agents.parse(raw)

@@ -7,13 +7,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from django.apps import AppConfig
-from django.core.checks import CheckMessage, Info, register
+from django.core.checks import Info, register
 
 from weblate.utils.checks import weblate_check
 from weblate.wladmin.sites import patch_admin_site
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+
+    from django.core.checks import CheckMessage
 
 patch_admin_site()
 
@@ -29,8 +31,9 @@ def check_backups(
     *,
     app_configs: Sequence[AppConfig] | None,
     databases: Sequence[str] | None,
-    **kwargs,
+    **kwargs: object,
 ) -> Iterable[CheckMessage]:
+    # ruff: ignore[import-outside-top-level]
     from weblate.wladmin.models import BackupService
 
     errors = []
@@ -44,21 +47,20 @@ def check_backups(
             )
         )
     for service in BackupService.objects.filter(enabled=True):
-        try:
-            last_obj = service.last_logs[0]
-            last_event = last_obj.event
-            last_log = last_obj.log
-        except IndexError:
-            last_event = "error"
-            last_log = "missing"
-        if last_event == "error":
-            errors.append(
-                weblate_check(
-                    "weblate.C029",
-                    f"There was error while performing backups: {last_log}",
-                )
+        current_error = service.current_error
+        if current_error is not None:
+            last_log = current_error.log
+        elif not service.has_repository_logs:
+            last_log = "backup was never triggered"
+        else:
+            continue
+        errors.append(
+            weblate_check(
+                "weblate.C029",
+                f"There was error while performing backups: {last_log}",
             )
-            break
+        )
+        break
 
     return errors
 
@@ -68,8 +70,9 @@ def check_support(
     *,
     app_configs: Sequence[AppConfig] | None,
     databases: Sequence[str] | None,
-    **kwargs,
+    **kwargs: object,
 ) -> Iterable[CheckMessage]:
+    # ruff: ignore[import-outside-top-level]
     from weblate.wladmin.models import SupportStatus
 
     support_status = SupportStatus.objects.get_current()
@@ -79,5 +82,27 @@ def check_support(
         weblate_check(
             "weblate.C041",
             f"Your support subscription has expired on {support_status.expiry.date().isoformat()}. Please renew it at https://weblate.org/user/ or contact Weblate care.",
+        )
+    ]
+
+
+@register(deploy=True)
+def check_account_security(**kwargs: object) -> Iterable[CheckMessage]:
+    from django.core.checks import Warning as DjangoWarning  # ruff: ignore[import-outside-top-level]
+    from django.db import connection  # ruff: ignore[import-outside-top-level]
+
+    from weblate.wladmin.models import SecurityFinding  # ruff: ignore[import-outside-top-level]
+
+    # Deployment checks can run before an upgrade has created the table.
+    if "wladmin_securityfinding" not in connection.introspection.table_names():
+        return []
+    count = SecurityFinding.objects.filter(status="open").count()
+    if not count:
+        return []
+    return [
+        weblate_check(
+            "weblate.W052",
+            f"There are {count} open account security findings. Review /manage/users/security/.",
+            DjangoWarning,
         )
     ]

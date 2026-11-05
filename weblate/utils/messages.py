@@ -10,19 +10,21 @@ It also ignories messages without request object (for example from CLI).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from django.contrib.messages import add_message as django_add_message
 from django.contrib.messages import constants
-from django.http import HttpRequest
 
 if TYPE_CHECKING:
-    from weblate.auth.models import HttpRequest
+    from celery.result import AsyncResult
+    from django.http import HttpRequest
+
+    from weblate.auth.models import User
 
 
-def get_request(request: HttpRequest):
+def get_request(request: object) -> HttpRequest:
     """Return Django request object even for DRF requests."""
-    return getattr(request, "_request", request)
+    return cast("HttpRequest", getattr(request, "_request", request))
 
 
 def add_message(
@@ -39,6 +41,45 @@ def add_message(
             extra_tags=extra_tags,
             fail_silently=True,
         )
+
+
+def store_task_completion_message(
+    request: object, task: AsyncResult, *, result: object = None
+) -> None:
+    """Store an explicitly opted-in task completion message in the session."""
+    from weblate.utils.celery import sanitize_task_result  # ruff: ignore[import-outside-top-level]
+
+    request = get_request(request)
+    session_key = f"task-completion-message-{task.id}"
+    if request.session.get(session_key):
+        return
+
+    if result is None:
+        result = sanitize_task_result(task.id, task.result, cast("User", request.user))
+    if not isinstance(result, dict):
+        return
+
+    completion_message = result.get("completion_message")
+    if not isinstance(completion_message, dict):
+        return
+
+    text = completion_message.get("text")
+    if not text:
+        return
+
+    message_levels = {
+        "error": constants.ERROR,
+        "info": constants.INFO,
+        "warning": constants.WARNING,
+    }
+    message_level = completion_message.get("level")
+    level = (
+        message_levels.get(message_level, constants.SUCCESS)
+        if isinstance(message_level, str)
+        else constants.SUCCESS
+    )
+    add_message(request, level, str(text))
+    request.session[session_key] = True
 
 
 def debug(
@@ -86,7 +127,7 @@ def error(
     add_message(request, constants.ERROR, message, extra_tags)
 
 
-def get_message_kind(tags):
+def get_message_kind(tags: str) -> str:
     if "error" in tags:
         return "danger"
     for tag in ["info", "success", "warning", "danger"]:

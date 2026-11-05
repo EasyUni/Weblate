@@ -2,13 +2,17 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
 from crispy_forms.helper import FormHelper
 from django import forms
 from django.forms.widgets import MultiWidget
 from django.utils.translation import gettext_lazy
 
 from weblate.accounts.forms import EmailField
+from weblate.utils.validators import DomainOrIPValidator
 from weblate.wladmin.models import BackupService
+from weblate.workspaces.models import Workspace
 
 
 class ActivateForm(forms.Form):
@@ -24,18 +28,30 @@ class ActivateForm(forms.Form):
 
 class SSHAddForm(forms.Form):
     host = forms.CharField(
-        label=gettext_lazy("Hostname"), required=True, max_length=400
+        label=gettext_lazy("Hostname"),
+        required=True,
+        max_length=400,
+        validators=[DomainOrIPValidator()],
     )
     port = forms.IntegerField(
-        label=gettext_lazy("Port"), required=False, min_value=1, max_value=65535
+        label=gettext_lazy("Port"),
+        required=False,
+        min_value=1,
+        max_value=65535,
+        help_text=gettext_lazy("Keep blank for using the default SSH port."),
+    )
+    fingerprint = forms.CharField(
+        label=gettext_lazy("Fingerprint"),
+        required=False,
+        help_text=gettext_lazy(
+            "Fingerprint of key to add. Keep blank to add all keys offered by the host."
+        ),
     )
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.helper = FormHelper(self)
         self.helper.form_tag = False
-        self.helper.form_class = "form-inline"
-        self.helper.field_template = "bootstrap3/layout/inline_field.html"
 
 
 class TestMailForm(forms.Form):
@@ -50,6 +66,17 @@ class BackupForm(forms.ModelForm):
     class Meta:
         model = BackupService
         fields = ("repository",)
+
+
+class WorkspaceCreateForm(forms.ModelForm):
+    class Meta:
+        model = Workspace
+        fields = ("name",)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.helper = FormHelper(self)
+        self.helper.form_tag = False
 
 
 class BackupSelectionForm(forms.Form):
@@ -67,8 +94,8 @@ class FontField(forms.CharField):
 class ThemeColorWidget(MultiWidget):
     def __init__(self, attrs=None) -> None:
         widgets = (
-            forms.TextInput(attrs={"type": "color", "class": "light-theme"}),
-            forms.TextInput(attrs={"type": "color", "class": "dark-theme"}),
+            forms.TextInput(attrs={"type": "color", "class": "col light-theme"}),
+            forms.TextInput(attrs={"type": "color", "class": "col dark-theme"}),
         )
         super().__init__(widgets, attrs)
 
@@ -97,20 +124,33 @@ class AppearanceForm(forms.Form):
     brand_font = FontField(label=gettext_lazy("Header font"), required=False)
 
     header_color = ThemeColorField(
-        label=gettext_lazy("Navigation color (Light, Dark)"), initial="#2a3744,#1a2634"
+        label=gettext_lazy("Header color (Light, Dark)"), initial="#2a3744,#1a2634"
     )
     header_text_color = ThemeColorField(
-        label=gettext_lazy("Navigation text color (Light, Dark)"),
+        label=gettext_lazy("Header text color (Light, Dark)"),
         initial="#bfc3c7,#e0e3e7",
     )
     navi_color = ThemeColorField(
-        label=gettext_lazy("Navigation color (Light, Dark)"), initial="#1fa385,#0f9375"
+        label=gettext_lazy("Accent color (Light, Dark)"), initial="#107a62,#0f9375"
     )
     focus_color = ThemeColorField(
-        label=gettext_lazy("Focus color (Light, Dark)"), initial="#2eccaa,#25303b"
+        label=gettext_lazy("Header accent color (Light, Dark)"),
+        initial="#158068,#25303b",
     )
     hover_color = ThemeColorField(
         label=gettext_lazy("Hover color (Light, Dark)"), initial="#144d3f,#0a3d2f"
+    )
+    link_color = ThemeColorField(
+        label=gettext_lazy("Link and button color (Light, Dark)"),
+        initial="#107a62,#6cf8d8",
+    )
+    progress_color = ThemeColorField(
+        label=gettext_lazy("Progress bar color (Light, Dark)"),
+        initial="#107a62,#1c8f75",
+    )
+    progress_background_color = ThemeColorField(
+        label=gettext_lazy("Progress bar background color (Light, Dark)"),
+        initial="#e9ecef,#343a40",
     )
 
     hide_footer = forms.BooleanField(
@@ -129,8 +169,45 @@ class AppearanceForm(forms.Form):
         super().__init__(*args, **kwargs)
         self.helper = FormHelper(self)
         self.helper.form_tag = False
+        self.helper.field_class = "row"
 
 
 class ChangedCharField(forms.CharField):
     def has_changed(self, initial, data) -> bool:
         return True
+
+
+class SecurityUploadForm(forms.Form):
+    report = forms.FileField(label=gettext_lazy("CSV report"), required=False)
+    delimiter = forms.CharField(
+        label=gettext_lazy("Delimiter"),
+        required=False,
+        max_length=2,
+        strip=False,
+        help_text=gettext_lazy(
+            "Leave blank to detect automatically. Use a comma, semicolon, pipe, or \\t for a tab."
+        ),
+    )
+    header = forms.BooleanField(
+        label=gettext_lazy("First row contains column names"),
+        required=False,
+        initial=True,
+    )
+    identifier_column = forms.IntegerField(
+        label=gettext_lazy("Username or e-mail column"), required=False, min_value=1
+    )
+    password_column = forms.IntegerField(
+        label=gettext_lazy("Password column"), required=False, min_value=1
+    )
+
+    def clean(self):
+        cleaned = super().clean() or {}
+        if bool(cleaned.get("identifier_column")) != bool(
+            cleaned.get("password_column")
+        ):
+            raise forms.ValidationError(
+                gettext_lazy(
+                    "Specify both column numbers, or leave both blank for automatic detection."
+                )
+            )
+        return cleaned

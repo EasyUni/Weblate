@@ -24,11 +24,12 @@ def icon(name: str) -> str:
 
     Inlining is necessary to be able to apply CSS styles on the path.
     """
-    return mark_safe(load_icon(name).decode())  # noqa: S308
+    # ruff: ignore[suspicious-mark-safe-usage]
+    return mark_safe(load_icon(name).decode())
 
 
 @register.simple_tag
-def loading_icon(name=None, hidden=True):
+def loading_icon(name: str | None = None, hidden: bool = True) -> str:
     return format_html(
         SPIN,
         format_html('id="loading-{}"', name) if name else "",

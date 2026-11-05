@@ -13,12 +13,21 @@ src/main/java/org/freeplane/ant/FormatTranslation.java
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING, ClassVar, TypedDict
 
 from django.utils.translation import gettext_lazy
 
 from weblate.addons.base import BaseAddon
-from weblate.addons.events import AddonEvent
+from weblate.addons.events import (
+    AddonActivityLogReason,
+    AddonEvent,
+    AddonEventOutcome,
+)
 from weblate.addons.forms import PropertiesSortAddonForm
+
+if TYPE_CHECKING:
+    from weblate.addons.base import CompatDict
+    from weblate.trans.models import Translation
 
 SPLITTER = re.compile(r"\s*=\s*")
 UNICODE = re.compile(r"\\[uU][0-9a-fA-F]{4}")
@@ -32,7 +41,7 @@ def sort_key(line: str, case_sensitive: bool) -> str:
     return prefix.lower()
 
 
-def unicode_format(match) -> str:
+def unicode_format(match: re.Match[str]) -> str:
     """
     Format unicode characters.
 
@@ -41,24 +50,24 @@ def unicode_format(match) -> str:
     return f"\\u{match.group(0)[2:].upper()}"
 
 
-def fix_newlines(lines) -> None:
+def fix_newlines(lines: list[str]) -> None:
     """Convert newlines to unix."""
     for i, line in enumerate(lines):
         if line.endswith("\r\n"):
-            lines[i] = line[:-2] + "\n"
+            lines[i] = f"{line[:-2]}\n"
         elif line.endswith("\r"):
-            lines[i] = line[:-1] + "\n"
+            lines[i] = f"{line[:-1]}\n"
 
 
-def format_unicode(lines) -> None:
+def format_unicode(lines: list[str]) -> None:
     """Format unicode characters."""
     for i, line in enumerate(lines):
-        if UNICODE.findall(line) is None:
+        if not UNICODE.findall(line):
             continue
         lines[i] = UNICODE.sub(unicode_format, line)
 
 
-def value_quality(value) -> int:
+def value_quality(value: str | None) -> int:
     """Calculate value quality."""
     if not value:
         return 0
@@ -69,7 +78,7 @@ def value_quality(value) -> int:
     return 3
 
 
-def filter_lines(lines):
+def filter_lines(lines: list[str]) -> list[str]:
     """Filter comments, empty lines and duplicate strings."""
     result: list[str] = []
     lastkey = None
@@ -118,7 +127,7 @@ def filter_lines(lines):
 
 def format_file(filename: str, case_sensitive: bool) -> bool:
     """Format single properties file."""
-    with open(filename) as handle:
+    with open(filename, encoding="utf-8") as handle:
         lines = handle.readlines()
 
     result = sorted(lines, key=lambda line: sort_key(line, case_sensitive))
@@ -128,25 +137,54 @@ def format_file(filename: str, case_sensitive: bool) -> bool:
     result = filter_lines(result)
 
     if lines != result:
-        with open(filename, "w") as handle:
-            handle.writelines(result)
+        BaseAddon.write_repo_file(filename, "".join(result))
         return True
     return False
 
 
-class PropertiesSortAddon(BaseAddon):
-    events: set[AddonEvent] = {
+class PropertiesSortAddonStoredConfiguration(TypedDict, total=False):
+    case_sensitive: bool
+
+
+class PropertiesSortAddonConfiguration(TypedDict):
+    case_sensitive: bool
+
+
+class PropertiesSortAddon(
+    BaseAddon[
+        PropertiesSortAddonStoredConfiguration,
+        PropertiesSortAddonConfiguration,
+    ]
+):
+    events: ClassVar[set[AddonEvent]] = {
         AddonEvent.EVENT_PRE_COMMIT,
     }
     name = "weblate.properties.sort"
     verbose = gettext_lazy("Format the Java properties file")
     description = gettext_lazy("Formats and sorts the Java properties file.")
-    compat = {"file_format": {"properties-utf8", "properties", "gwt"}}
+    compat: ClassVar[CompatDict] = {
+        "file_format": {"properties", "gwt"},
+    }
     icon = "sort-alphabetical.svg"
     settings_form = PropertiesSortAddonForm
 
-    def pre_commit(self, translation, author: str, store_hash: bool) -> None:
-        case_sensitive = self.instance.configuration.get("case_sensitive", False)
-        changed = format_file(translation.get_filename(), case_sensitive)
+    def pre_commit(
+        self,
+        translation: Translation,
+        author: str,
+        store_hash: bool,
+        activity_log_id: int | None = None,
+    ) -> AddonEventOutcome | None:
+        case_sensitive = self.configuration["case_sensitive"]
+        filename = translation.get_filename()
+        if filename is None:
+            return AddonEventOutcome.skipped(AddonActivityLogReason.NOT_APPLICABLE)
+        changed = format_file(filename, case_sensitive)
         if changed and store_hash:
             translation.store_hash()
+        return None
+
+    def normalize_configuration(
+        self, configuration: PropertiesSortAddonStoredConfiguration
+    ) -> PropertiesSortAddonConfiguration:
+        return {"case_sensitive": configuration.get("case_sensitive", False)}

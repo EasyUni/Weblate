@@ -4,8 +4,10 @@
 
 from django.urls import include, path
 
+from weblate.addons.api import api_patterns
 from weblate.api.routers import WeblateRouter
 from weblate.api.views import (
+    Activity,
     AddonViewSet,
     CategoryViewSet,
     ChangeViewSet,
@@ -16,14 +18,17 @@ from weblate.api.views import (
     MemoryViewSet,
     Metrics,
     ProjectViewSet,
+    ReportViewSet,
     RoleViewSet,
     ScreenshotViewSet,
     Search,
+    SuggestionViewSet,
     TasksViewSet,
     TranslationViewSet,
     UnitViewSet,
     UserViewSet,
 )
+from weblate.machinery.api import ExclusionViewSet, InstallationViewSet
 
 # Routers provide an easy way of automatically determining the URL conf.
 router = WeblateRouter()
@@ -38,14 +43,22 @@ router.register("languages", LanguageViewSet)
 router.register("component-lists", ComponentListViewSet)
 router.register("changes", ChangeViewSet)
 router.register("units", UnitViewSet)
+router.register("suggestions", SuggestionViewSet)
 router.register("screenshots", ScreenshotViewSet)
 router.register("tasks", TasksViewSet, "task")
 router.register("addons", AddonViewSet)
+router.register("translation-services", InstallationViewSet, "machinery-installation")
+router.register(
+    "translation-service-exclusions", ExclusionViewSet, "machinery-exclusion"
+)
 router.register("categories", CategoryViewSet)
+router.register("reports", ReportViewSet, "report")
 
 # Wire up our API using automatic URL routing.
 # Additionally, we include login URLs for the browsable API.
 urlpatterns = [
+    *api_patterns(),
+    path("activity/", Activity.as_view(), name="activity"),
     path("metrics/", Metrics.as_view(), name="metrics"),
     path("search/", Search.as_view(), name="search"),
     path("", include(router.urls)),

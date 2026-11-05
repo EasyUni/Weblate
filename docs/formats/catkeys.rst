@@ -1,7 +1,7 @@
 .. _catkeys:
 
 Catkeys file
--------------------
+------------
 
 .. versionadded:: 5.13
 
@@ -18,6 +18,8 @@ Example file:
    1 english application 12345678
    source1 context1 remarks1 target1
    source2 context2 remarks2 target2
+
+.. include:: /snippets/format-features/catkeys-features.rst
 
 Weblate configuration
 +++++++++++++++++++++

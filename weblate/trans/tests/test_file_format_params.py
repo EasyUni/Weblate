@@ -5,40 +5,78 @@
 
 """Test for File format params."""
 
+from __future__ import annotations
+
+import os.path
+from typing import TYPE_CHECKING, Literal, Unpack
+from unittest.mock import patch
+
+from django.test import SimpleTestCase
 from django.test.utils import override_settings
 from django.urls import reverse
 
 from weblate.addons.gettext import MsgmergeAddon
-from weblate.lang.models import get_default_lang
-from weblate.trans.file_format_params import get_default_params_for_file_format
-from weblate.trans.models import Component
+from weblate.formats.base import BilingualUpdateMixin
+from weblate.formats.ttkit import StringsFormat
+from weblate.lang.models import Language, get_default_lang
+from weblate.trans.file_format_params import (
+    GettextPoLineWrap,
+    get_default_params_for_file_format,
+    get_effective_params_for_file_format,
+)
+from weblate.trans.models import Component, Unit
 from weblate.trans.tests.test_views import ViewTestCase
+from weblate.trans.tests.utils import get_optional_path, get_test_actor
 from weblate.utils.views import get_form_data
+
+if TYPE_CHECKING:
+    from weblate.trans.file_format_params import FileFormatParams
+
+
+class FileFormatParamsTest(SimpleTestCase):
+    def test_po_mono_remove_obsolete_default(self) -> None:
+        self.assertEqual(
+            get_default_params_for_file_format("po-mono")["po_remove_obsolete"], False
+        )
+
+    def test_numeric_choice_preserves_type(self) -> None:
+        value = GettextPoLineWrap.get_value({"po_line_wrap": "-1"})
+        self.assertEqual(value, -1)
+        self.assertIsInstance(value, int)
+
+    def test_effective_params_normalize_flatxml_names(self) -> None:
+        params = get_effective_params_for_file_format(
+            "flatxml", {"flatxml_root_name": " root "}
+        )
+        self.assertEqual(params["flatxml_root_name"], "root")
 
 
 class BaseFileFormatsTest(ViewTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.user.is_superuser = True
         self.user.save()
 
-    def update_component_file_params(self, **file_param_kwargs):
-        file_param_kwargs = (
-            get_default_params_for_file_format(self.component.file_format)
-            | file_param_kwargs
-        )
-        url = reverse("settings", kwargs={"path": self.component.get_url_path()})
+    def update_component_file_params(
+        self,
+        component: Component | None = None,
+        **new_file_param_kwargs: Unpack[FileFormatParams],
+    ) -> None:
+        if component is None:
+            component = self.component
+        file_param_kwargs = get_default_params_for_file_format(component.file_format)
+        file_param_kwargs.update(new_file_param_kwargs)
+        url = reverse("settings", kwargs={"path": component.get_url_path()})
         response = self.client.get(url)
         data = get_form_data(response.context["form"].initial)
         data.update(
             {f"file_format_params_{k}": v for k, v in file_param_kwargs.items()}
         )
-        self.client.post(url, data, follow=True)
-        self.component.refresh_from_db()
+        response = self.client.post(url, data, follow=True)
+        self.assertContains(response, "Settings saved")
+        component.refresh_from_db()
 
-
-class ComponentFileFormatsParamsTest(BaseFileFormatsTest):
-    def client_create_component(self, result, **kwargs):
+    def client_create_component(self, result: bool, **kwargs):
         params = {
             "name": "New Component With File Params",
             "slug": "new-component-with-file-params",
@@ -61,37 +99,64 @@ class ComponentFileFormatsParamsTest(BaseFileFormatsTest):
             self.assertEqual(response.status_code, 200)
         return response
 
+    def do_create_with_encoding_test(
+        self, encoding_name: str, encoding: str, success: bool = True
+    ) -> None:
+        kwargs = {f"file_format_params_{encoding_name}": encoding}
+        response = self.client_create_component(
+            success,
+            file_format=self.component.file_format,
+            filemask=self.component.filemask,
+            new_base="",
+            new_lang="contact",
+            **kwargs,
+        )
+        if success:
+            self.assertTrue(
+                Component.objects.filter(slug="new-component-with-file-params").exists()
+            )
+        else:
+            self.assertContains(response, "Could not parse")
+            self.assertFalse(
+                Component.objects.filter(slug="new-component-with-file-params").exists()
+            )
+
+
+class ComponentFileFormatsParamsTest(BaseFileFormatsTest):
     def get_new_component(
         self, slug: str = "new-component-with-file-params"
     ) -> Component:
         return Component.objects.get(slug=slug, project_id=self.project.pk)
 
-    def test_file_params(self):
+    def test_file_params(self) -> None:
         self.client_create_component(
             True,
             file_format_params_po_line_wrap="77",
-            json_sort_keys=True,
+            json_sort_keys="case_sensitive",
         )
         component = self.get_new_component()
         # check that only the expected parameters are set
         self.assertEqual(component.file_format_params["po_line_wrap"], "77")
         self.assertNotIn("json_sort_keys", component.file_format_params)
 
-    def test_file_params_invalid(self):
+    def test_file_params_invalid(self) -> None:
         self.client_create_component(False, file_format_params_po_line_wrap="999999")
         with self.assertRaises(Component.DoesNotExist):
             self.get_new_component()
 
-    def test_file_params_update(self):
+    def test_file_params_update(self) -> None:
         self.client_create_component(True)
         self.component = self.get_new_component()
         self.assertFalse(self.component.file_format_params["po_line_wrap"])
         self.update_component_file_params(po_line_wrap=65535)
         self.assertEqual(self.component.file_format_params["po_line_wrap"], "65535")
 
-    def test_create_component_from_existing(self):
+    def test_create_component_from_existing(self) -> None:
         self.update_component_file_params(
-            po_line_wrap=-1, po_keep_previous=False, po_fuzzy_matching=False
+            po_line_wrap=-1,
+            po_keep_previous=False,
+            po_remove_obsolete=True,
+            po_fuzzy_matching=False,
         )
 
         response = self.client.post(
@@ -106,10 +171,7 @@ class ComponentFileFormatsParamsTest(BaseFileFormatsTest):
             follow=True,
         )
 
-        create_url = (
-            reverse("create-component-vcs")
-            + f"?source_component={self.component.pk}#existing"
-        )
+        create_url = f"{reverse('create-component-vcs')}?source_component={self.component.pk}#existing"
         data = response.context["form"].initial
         data.pop("category", None)
         data["project"] = self.component.project_id
@@ -142,7 +204,26 @@ class ComponentFileFormatsParamsTest(BaseFileFormatsTest):
         new_component = Component.objects.get(slug="create-component-from-existing")
         self.assertEqual(new_component.file_format_params["po_line_wrap"], "-1")
         self.assertEqual(new_component.file_format_params["po_keep_previous"], False)
+        self.assertEqual(new_component.file_format_params["po_remove_obsolete"], True)
         self.assertEqual(new_component.file_format_params["po_fuzzy_matching"], False)
+
+    def test_universal_file_format_parameters(self) -> None:
+        # test dos_eol file format params
+        component1 = self.component
+        component2 = self.create_json_mono(name="component2", project=self.project)
+        component3 = self.create_csv_mono(name="component3", project=self.project)
+
+        self.assertIsNone(component1.file_format_params.get("dos_eol", None))
+        self.assertIsNone(component2.file_format_params.get("dos_eol", None))
+        self.assertIsNone(component3.file_format_params.get("dos_eol", None))
+
+        self.update_component_file_params(component=component1, dos_eol=True)
+        self.update_component_file_params(component=component2, dos_eol=False)
+        self.update_component_file_params(component=component3, dos_eol=True)
+
+        self.assertTrue(component1.file_format_params["dos_eol"])
+        self.assertFalse(component2.file_format_params["dos_eol"])
+        self.assertTrue(component3.file_format_params["dos_eol"])
 
 
 class JsonParamsTest(BaseFileFormatsTest):
@@ -166,7 +247,7 @@ class JsonParamsTest(BaseFileFormatsTest):
         self.update_component_file_params(
             json_indent=8,
             json_indent_style="spaces",
-            json_sort_keys=True,
+            json_sort_keys="case_sensitive",
         )
 
         commit = self.assert_customize("        ")
@@ -181,7 +262,7 @@ class JsonParamsTest(BaseFileFormatsTest):
         self.update_component_file_params(
             json_indent=0,
             json_indent_style="spaces",
-            json_sort_keys=True,
+            json_sort_keys="case_sensitive",
         )
 
         commit = self.assert_customize("+")
@@ -192,17 +273,63 @@ class JsonParamsTest(BaseFileFormatsTest):
             commit,
         )
 
-    def test_customize_no_sort(self) -> None:
+    def do_customize_sort_test(
+        self, sort_keys: Literal["case_sensitive", "case_insensitive", "none"]
+    ) -> str:
+        self.make_manager()
+        self.component.manage_units = True
+        self.component.save()
+
         self.update_component_file_params(
-            json_indent=8,
-            json_indent_style="spaces",
-            json_sort_keys=False,
+            json_sort_keys=sort_keys,
+            json_indent=0,
         )
-        commit = self.assert_customize("        ")
+        self.client.post(
+            reverse(
+                "new-unit",
+                kwargs={
+                    "path": [self.component.project.slug, self.component.slug, "en"]
+                },
+            ),
+            {
+                "source_0": "Thanks again!\n",
+                "context": "tHanks2",
+            },
+            follow=True,
+        )
+        self.edit_unit("Thanks again!\n", "Thanks")
+        return self.assert_customize("+")
+
+    def test_customize_case_insensitive_sort(self) -> None:
+        commit = self.do_customize_sort_test("case_insensitive")
+        # capital H and lowercase h are sorted similarly: thanks < tHanks2
         self.assertIn(
             '''"orangutan": "",
-+        "try": "",
-+        "thanks": ""''',
++"thanks": "",
++"tHanks2": "Thanks\\n",
++"try": ""''',
+            commit,
+        )
+
+    def test_customize_case_sensitive_sort(self) -> None:
+        commit = self.do_customize_sort_test("case_sensitive")
+        # capital H is sorted before lowercase h thanks > tHanks2
+        self.assertIn(
+            '''"orangutan": "",
++"tHanks2": "Thanks\\n",
++"thanks": "",
++"try": ""''',
+            commit,
+        )
+
+    def test_customize_no_sort(self) -> None:
+        commit = self.do_customize_sort_test("none")
+        # new units are appended to the end of the file
+        self.assertIn(
+            '''"orangutan": "",
++"try": "",
++"thanks": "",
++"tHanks2": "Thanks\\n"''',
             commit,
         )
 
@@ -210,7 +337,6 @@ class JsonParamsTest(BaseFileFormatsTest):
         self.update_component_file_params(
             json_indent=8,
             json_indent_style="tabs",
-            json_sort_keys=True,
         )
         self.assert_customize("\t\t\t\t\t\t\t\t")
 
@@ -218,7 +344,6 @@ class JsonParamsTest(BaseFileFormatsTest):
         self.update_component_file_params(
             json_indent=4,
             json_indent_style="spaces",
-            json_sort_keys=True,
             json_use_compact_separators=True,
         )
         self.assert_customize("    ", is_compact=True)
@@ -227,7 +352,6 @@ class JsonParamsTest(BaseFileFormatsTest):
         self.update_component_file_params(
             json_indent=4,
             json_indent_style="spaces",
-            json_sort_keys=True,
             json_use_compact_separators=False,
         )
         self.assert_customize("    ", is_compact=False)
@@ -245,8 +369,8 @@ class YAMLParamsTest(BaseFileFormatsTest):
         commit = self.component.repository.show(self.component.repository.last_revision)
         self.assertIn(f"{expected}try:", commit)
         self.assertIn("cs.yml", commit)
-        with open(self.get_translation().get_filename(), "rb") as handle:
-            self.assertIn(b"\r\n", handle.read())
+        filepath = get_optional_path(self.get_translation().get_filename())
+        self.assertIn(b"\r\n", filepath.read_bytes())
 
     def test_customize(self) -> None:
         self.update_component_file_params(
@@ -260,6 +384,24 @@ class YAMLParamsTest(BaseFileFormatsTest):
 class XMLParamsTest(BaseFileFormatsTest):
     def create_component(self) -> Component:
         return self.create_xliff("complex")
+
+    def test_serialization_params(self) -> None:
+        self.update_component_file_params(
+            xml_utf8_bom="include",
+            xml_encoding_case="lowercase",
+            xml_final_newline="omit",
+        )
+        self.assertEqual(self.component.file_format_params["xml_utf8_bom"], "include")
+        self.assertEqual(
+            self.component.file_format_params["xml_encoding_case"], "lowercase"
+        )
+        self.assertEqual(self.component.file_format_params["xml_final_newline"], "omit")
+        self.edit_unit("Thank you for using Weblate", "Děkujeme, že používáte Weblate")
+        self.get_translation().commit_pending("test", get_test_actor(self))
+        result = get_optional_path(self.get_translation().get_filename()).read_bytes()
+        self.assertTrue(result.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b'encoding="utf-8"', result)
+        self.assertFalse(result.endswith(b"\n"))
 
     def test_closing_tags(self, closing_tags_active: bool = True) -> None:
         self.update_component_file_params(xml_closing_tags=closing_tags_active)
@@ -278,20 +420,155 @@ class XMLParamsTest(BaseFileFormatsTest):
     def test_closing_tags_off(self) -> None:
         self.test_closing_tags(closing_tags_active=False)
 
+    def test_whitespace_normalize(self) -> None:
+        # check that the default param is preserve
+        defaults = get_default_params_for_file_format(self.component.file_format)
+        self.assertEqual(defaults["xml_whitespace_handling"], "preserve")
+
+        self.update_component_file_params(xml_whitespace_handling="normalize")
+        translation = self.get_translation()
+        store = translation.store
+        unit = next(u for u in store.all_units if "Thank you" in u.source)
+        unit.set_target("  Díky  za  \n")
+        store.save()
+        content = get_optional_path(translation.get_filename()).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(">Díky za<", content)
+        self.assertIn('xml:space="default"', content)
+        self.assertNotIn('xml:space="preserve"', content)
+
+    def test_whitespace_standard_new_unit_omits_preserve(self) -> None:
+        self.update_component_file_params(xml_whitespace_handling="standard")
+        translation = self.get_translation()
+        # Adding via the store path used for new strings
+        store = translation.store
+        store.new_unit("new-key", "Brand new string")
+        store.save()
+        content = get_optional_path(translation.get_filename()).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('id="new-key"', content)
+        self.assertNotIn('xml:space="preserve" id="new-key"', content)
+        self.assertNotIn('id="new-key" xml:space="preserve"', content)
+
+    def test_placeables_param_default(self) -> None:
+        defaults = get_default_params_for_file_format(self.component.file_format)
+        self.assertEqual(defaults["xliff_placeables"], "placeables")
+
+        self.update_component_file_params(xliff_placeables="plain")
+        self.assertEqual(
+            self.component.file_format_cls.get_unit_class(
+                self.component.file_format_params
+            ).__name__,
+            "XliffUnit",
+        )
+
+        self.update_component_file_params(xliff_placeables="placeables")
+        self.assertEqual(
+            self.component.file_format_cls.get_unit_class(
+                self.component.file_format_params
+            ).__name__,
+            "RichXliffUnit",
+        )
+
+
+class TSParamsTest(BaseFileFormatsTest):
+    def create_component(self) -> Component:
+        return self.create_ts(name="TS", new_lang="add", new_base="ts/cs.ts")
+
+    def _test_closing_tags(self, closing_tags_active: bool = True) -> None:
+        """Check that effect of xml_closing_tags file format param on the location tag."""
+        units = [
+            u for u in self.translation.store.all_units if "Hello, world!\n" in u.source
+        ]
+        unit = units[0]
+        unit.mainunit.addlocation("main.c:11")
+        file_path = os.path.join(self.component.full_path, self.translation.filename)
+        with open(file_path, "wb") as handle:
+            self.translation.store.save_content(handle)
+        self.edit_unit("Hello, world!\n", "Ahoj svete!\n")
+        translation = self.get_translation()
+
+        translation.commit_pending("test", None)
+        rev = self.component.repository.last_revision
+        commit = self.component.repository.show(rev)
+        if closing_tags_active:
+            self.assertIn('<location filename="main.c" line="11"></location>', commit)
+        else:
+            self.assertIn('<location filename="main.c" line="11"/>', commit)
+            self.assertNotIn("</location>", commit)
+
+        # check that parameter is applied when a new language is added
+        self.component.add_new_language(Language.objects.get(code="de"), None)
+        new_revision = self.component.repository.last_revision
+        self.assertNotEqual(rev, new_revision)
+        new_commit = self.component.repository.show(new_revision)
+        self.assertIn("chore(l10n): add German translation", new_commit)
+        if closing_tags_active:
+            self.assertIn(
+                '<location filename="main.c" line="11"></location>', new_commit
+            )
+        else:
+            self.assertIn('<location filename="main.c" line="11"/>', new_commit)
+            self.assertNotIn("</location>", new_commit)
+
+    def test_closing_tags(self) -> None:
+        self.update_component_file_params(xml_closing_tags=True)
+        self._test_closing_tags(True)
+
+    def test_closing_tags_off(self) -> None:
+        """Check that closing tags are turned off as default behavior."""
+        self._test_closing_tags(False)
+
 
 class GettextParamsTest(BaseFileFormatsTest):
-    def create_component(self):
+    def test_contributor_comments(self) -> None:
+        self.update_component_file_params(po_contributor_comments="spdx")
+        self.assertEqual(
+            self.component.file_format_params["po_contributor_comments"], "spdx"
+        )
+        self.update_component_file_params(po_contributor_comments="none")
+        self.assertEqual(
+            self.component.file_format_params["po_contributor_comments"], "none"
+        )
+
+    def create_component(self) -> Component:
         return self.create_po_new_base(new_lang="add")
 
+    def remove_thank_you_from_template(self) -> None:
+        template = get_optional_path(self.component.get_new_base_filename())
+        content = template.read_text(encoding="utf-8")
+        for line in ("14", "15"):
+            content = content.replace(
+                f"\n#: main.c:{line}\n"
+                'msgid "Thank you for using Weblate."\n'
+                'msgstr ""\n',
+                "\n",
+            )
+        template.write_text(content, encoding="utf-8")
+
+    def translate_thank_you(self) -> None:
+        translation = get_optional_path(self.get_translation().get_filename())
+        translation.write_text(
+            translation.read_text(encoding="utf-8").replace(
+                'msgid "Thank you for using Weblate."\nmsgstr ""',
+                'msgid "Thank you for using Weblate."\nmsgstr "Dekuji"',
+            ),
+            encoding="utf-8",
+        )
+
     def test_msgmerge(self, wrapped=True) -> None:
-        self.assertTrue(MsgmergeAddon.can_install(self.component, None))
+        self.assertTrue(MsgmergeAddon.can_install(component=self.component))
         rev = self.component.repository.last_revision
-        addon = MsgmergeAddon.create(component=self.component)
+        addon = MsgmergeAddon.create(
+            acting_user=get_test_actor(self), component=self.component
+        )
         self.assertNotEqual(rev, self.component.repository.last_revision)
         rev = self.component.repository.last_revision
-        addon.post_update(self.component, "", False)
+        addon.post_update(self.component, "", False, [])
         self.assertEqual(rev, self.component.repository.last_revision)
-        addon.post_update(self.component, rev, False)
+        addon.post_update(self.component, rev, False, [self.component.new_base])
         self.assertEqual(rev, self.component.repository.last_revision)
         commit = self.component.repository.show(self.component.repository.last_revision)
         self.assertIn("po/cs.po", commit)
@@ -300,6 +577,65 @@ class GettextParamsTest(BaseFileFormatsTest):
     def test_msgmerge_nowrap(self) -> None:
         self.update_component_file_params(po_line_wrap=-1)
         self.test_msgmerge(False)
+
+    def test_msgmerge_imports_changed_source(self) -> None:
+        addon = MsgmergeAddon.create(
+            acting_user=get_test_actor(self), component=self.component, run=False
+        )
+        template = get_optional_path(self.component.get_new_base_filename())
+        template.write_text(
+            template.read_text(encoding="utf-8").replace(
+                "Thank you for using Weblate.",
+                "Thank you for using Weblate!",
+            ),
+            encoding="utf-8",
+        )
+
+        addon.post_update(self.component, "", False, [])
+
+        self.assertTrue(
+            Unit.objects.filter(
+                translation__component=self.component,
+                translation__language__code="cs",
+                source="Thank you for using Weblate!",
+            ).exists()
+        )
+        self.assertFalse(
+            Unit.objects.filter(
+                translation__component=self.component,
+                translation__language__code="cs",
+                source="Thank you for using Weblate.",
+            ).exists()
+        )
+
+    def test_msgmerge_removes_obsolete(self) -> None:
+        self.update_component_file_params(po_remove_obsolete=True)
+        addon = MsgmergeAddon.create(
+            acting_user=get_test_actor(self), component=self.component, run=False
+        )
+        self.translate_thank_you()
+        self.remove_thank_you_from_template()
+
+        addon.post_update(self.component, "", False, [])
+
+        content = get_optional_path(self.get_translation().get_filename()).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("#~ msgid", content)
+
+    def test_msgmerge_keeps_obsolete_by_default(self) -> None:
+        addon = MsgmergeAddon.create(
+            acting_user=get_test_actor(self), component=self.component, run=False
+        )
+        self.translate_thank_you()
+        self.remove_thank_you_from_template()
+
+        addon.post_update(self.component, "", False, [])
+
+        content = get_optional_path(self.get_translation().get_filename()).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('#~ msgid "Thank you for using Weblate."', content)
 
     def test_store(self) -> None:
         self.update_component_file_params(
@@ -314,22 +650,39 @@ class GettextParamsTest(BaseFileFormatsTest):
             "Last-Translator: Weblate Test <weblate@example.org>\\nLanguage", commit
         )
 
+    def test_store_removes_obsolete(self) -> None:
+        self.update_component_file_params(po_remove_obsolete=True)
+        translation = self.get_translation()
+        filename = get_optional_path(translation.get_filename())
+        filename.write_text(
+            filename.read_text(encoding="utf-8")
+            + '\n#~ msgid "Obsolete string"\n#~ msgstr "Zastaraly retezec"\n',
+            encoding="utf-8",
+        )
+        translation.drop_store_cache()
+
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+        translation.commit_pending("test", None)
+
+        self.assertNotIn("#~ msgid", filename.read_text(encoding="utf-8"))
+
     def test_msgmerge_no_location(self) -> None:
         self.update_component_file_params(po_no_location=True)
         rev = self.component.repository.last_revision
         commit = self.component.repository.show(self.component.repository.last_revision)
         self.assertIn("#: main.c:", commit)
-        addon = MsgmergeAddon.create(component=self.component)
+        addon = MsgmergeAddon.create(
+            acting_user=get_test_actor(self), component=self.component
+        )
         self.assertNotEqual(rev, self.component.repository.last_revision)
         rev = self.component.repository.last_revision
-        addon.post_update(self.component, rev, False)
+        addon.post_update(self.component, rev, False, [self.component.new_base])
         self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
         self.get_translation().commit_pending("test", None)
         commit = self.component.repository.show(self.component.repository.last_revision)
         self.assertNotIn("#: main.c:", commit)
 
     def test_msgmerge_args(self) -> None:
-        from weblate.formats.base import BilingualUpdateMixin
 
         # default parameters
         self.assertEqual(
@@ -342,18 +695,21 @@ class GettextParamsTest(BaseFileFormatsTest):
             po_no_location=True,
             po_line_wrap=77,
         )
-
-        # if Msgmerge addon is not installed, only default parameters are returned
         self.assertEqual(
-            BilingualUpdateMixin.get_msgmerge_args(self.component), ["--previous"]
+            set(BilingualUpdateMixin.get_msgmerge_args(self.component)),
+            {"--no-fuzzy-matching", "--no-location"},
         )
 
-        MsgmergeAddon.create(component=self.component)
-
-        msgmerge_args = BilingualUpdateMixin.get_msgmerge_args(self.component)
-        self.assertNotIn("--previous", msgmerge_args)
-        self.assertIn("--no-fuzzy-matching", msgmerge_args)
-        self.assertIn("--no-location", msgmerge_args)
+        self.update_component_file_params(
+            po_fuzzy_matching=False,
+            po_keep_previous=True,
+            po_no_location=False,
+            po_line_wrap=77,
+        )
+        self.assertEqual(
+            set(BilingualUpdateMixin.get_msgmerge_args(self.component)),
+            {"--no-fuzzy-matching", "--previous"},
+        )
 
         self.update_component_file_params(
             po_fuzzy_matching=False,
@@ -361,6 +717,156 @@ class GettextParamsTest(BaseFileFormatsTest):
             po_no_location=True,
             po_line_wrap=-1,
         )
-        self.assertIn(
-            "--no-wrap", BilingualUpdateMixin.get_msgmerge_args(self.component)
+        self.assertEqual(
+            set(BilingualUpdateMixin.get_msgmerge_args(self.component)),
+            {"--no-fuzzy-matching", "--no-location", "--no-wrap"},
         )
+
+    def edit_unit_and_commit_changes(self, suffix: str) -> tuple[str, str]:
+        self.edit_unit("Hello, world!\n", f"Nazdar svete {suffix}!\n")
+        self.get_translation().commit_pending(f"commit message {suffix}", None)
+        rev = self.component.repository.last_revision
+        return rev, self.component.repository.show(rev)
+
+    def test_update_language_team_header(self) -> None:
+        commit0 = self.component.repository.show(
+            self.component.repository.last_revision
+        )
+        self.assertNotIn(
+            "Language-Team: Czech <http://example.com/projects/test/test/cs/>", commit0
+        )
+
+        # header remains unchanged when the parameter is set to False
+        self.update_component_file_params(po_set_language_team=False)
+        rev1, commit1 = self.edit_unit_and_commit_changes("one")
+        self.assertNotIn(
+            '+"Language-Team: Czech <http://example.com/projects/test/test/cs/>',
+            commit1,
+        )
+
+        self.update_component_file_params(po_set_language_team=True)
+        rev2, commit2 = self.edit_unit_and_commit_changes("two")
+        self.assertNotEqual(rev1, rev2)
+        self.assertIn(
+            '+"Language-Team: Czech <http://example.com/projects/test/test/cs/>',
+            commit2,
+        )
+
+    def test_last_translator_header(self) -> None:
+        commit0 = self.component.repository.show(
+            self.component.repository.last_revision
+        )
+        self.assertNotIn("Last-Translator: Weblate Test <weblate@example.org>", commit0)
+
+        # check header remains unchanged when the parameter is set to False
+        self.update_component_file_params(po_set_last_translator=False)
+        rev1, commit1 = self.edit_unit_and_commit_changes("one")
+        self.assertNotIn("Last-Translator: Weblate Test <weblate@example.org>", commit1)
+
+        # check header is updated when the parameter is set to True
+        self.update_component_file_params(po_set_last_translator=True)
+        rev2, commit2 = self.edit_unit_and_commit_changes("two")
+        self.assertNotEqual(rev1, rev2)
+        self.assertIn('+"Last-Translator: Weblate Test <weblate@example.org>', commit2)
+
+        # check header is absent when a new language is added and parameter set to False
+        self.update_component_file_params(po_set_last_translator=False)
+        self.component.add_new_language(Language.objects.get(code="pl"), None)
+        rev3 = self.component.repository.last_revision
+        commit3 = self.component.repository.show(rev3)
+        self.assertNotEqual(rev2, rev3)
+        self.assertIn("chore(l10n): add Polish translation", commit3)
+        self.assertNotIn("Last-Translator: Automatically generated", commit3)
+
+        # check header is present when a new language is added and parameter set to True
+        self.update_component_file_params(po_set_last_translator=True)
+        self.component.add_new_language(Language.objects.get(code="fr"), None)
+        rev4 = self.component.repository.last_revision
+        self.assertNotEqual(rev3, rev4)
+        commit4 = self.component.repository.show(rev4)
+        self.assertIn("chore(l10n): add French translation", commit4)
+        self.assertIn("Last-Translator: Automatically generated", commit4)
+
+    def test_x_generator_header(self) -> None:
+        with patch("weblate.utils.version.VERSION", new="9.99"):
+            commit0 = self.component.repository.show(
+                self.component.repository.last_revision
+            )
+            self.assertNotIn("X-Generator: Weblate 9.99", commit0)
+            self.update_component_file_params(po_set_x_generator=False)
+
+            rev1, commit1 = self.edit_unit_and_commit_changes("one")
+            self.assertNotIn("X-Generator: Weblate 9.99", commit1)
+
+            self.update_component_file_params(po_set_x_generator=True)
+            rev2, commit2 = self.edit_unit_and_commit_changes("two")
+            self.assertNotEqual(rev1, rev2)
+            self.assertIn("X-Generator: Weblate 9.99", commit2)
+
+    def test_report_msgid_bugs_to_header(self) -> None:
+        self.component.report_source_bugs = "weblate@example.org"
+        self.component.save()
+        commit0 = self.component.repository.show(
+            self.component.repository.last_revision
+        )
+        self.assertNotIn("Report-Msgid-Bugs-To: weblate@example.org", commit0)
+
+        self.update_component_file_params(po_report_msgid_bugs_to=False)
+        rev1, commit1 = self.edit_unit_and_commit_changes("one")
+        self.assertNotIn("Report-Msgid-Bugs-To: weblate@example.org", commit1)
+
+        self.update_component_file_params(po_report_msgid_bugs_to=True)
+        rev2, commit2 = self.edit_unit_and_commit_changes("two")
+        self.assertNotEqual(rev1, rev2)
+        self.assertIn("Report-Msgid-Bugs-To: weblate@example.org", commit2)
+
+
+class StringsParamsTest(BaseFileFormatsTest):
+    def create_component(self) -> Component:
+        return self.create_iphone()
+
+    def test_encoding_param(self) -> None:
+        self.do_create_with_encoding_test("strings_encoding", "utf-8", success=False)
+        self.do_create_with_encoding_test("strings_encoding", "utf-16", success=True)
+
+    def test_new_file_content(self) -> None:
+
+        self.assertNotEqual(
+            StringsFormat.get_new_file_content("utf-8"),
+            StringsFormat.get_new_file_content("utf-16"),
+        )
+
+
+class JavaPropertiesTest(BaseFileFormatsTest):
+    def create_component(self) -> Component:
+        return self.create_java()
+
+    def test_encoding_param(self) -> None:
+        self.do_create_with_encoding_test(
+            "properties_encoding", "utf-16", success=False
+        )
+        self.do_create_with_encoding_test(
+            "properties_encoding", "iso-8859-1", success=True
+        )
+
+    def test_encoding_param_utf8(self) -> None:
+        # Java properties need to be ISO 8859-1, but Translate Toolkit converts
+        # them to UTF-8.
+        self.do_create_with_encoding_test("properties_encoding", "utf-8", success=True)
+
+
+class CSVParamsTest(BaseFileFormatsTest):
+    def create_component(self) -> Component:
+        return self.create_csv_mono()
+
+    def test_encoding_param(self) -> None:
+        # both "auto" and "utf-8" are valid for the test CSV files
+        self.do_create_with_encoding_test("csv_encoding", "utf-8", success=True)
+
+
+class CSVSimpleParamsTest(BaseFileFormatsTest):
+    def create_component(self) -> Component:
+        return self.create_csv()
+
+    def test_encoding_param(self) -> None:
+        self.do_create_with_encoding_test("csv_simple_encoding", "utf-8", success=True)

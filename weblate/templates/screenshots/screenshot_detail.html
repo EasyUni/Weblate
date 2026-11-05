@@ -1,44 +1,42 @@
 {% extends "base.html" %}
 
-{% load compress crispy_forms_tags i18n icons permissions static translations %}
+{% load crispy_forms_tags i18n icons permissions static translations user_display %}
 
 {% block extra_script %}
-  {% compress js %}
-    <script defer
-            data-cfasync="false"
-            src="{% static 'js/screenshots/clipboard-paste.js' %}{{ cache_param }}"></script>
-  {% endcompress %}
+  <script defer src="{% static 'js/screenshots/clipboard-paste.js' %}"></script>
 {% endblock extra_script %}
 
 {% block extra_styles %}
-  <link rel="stylesheet"
-        href="{% static 'styles/screenshots/screenshot_detail.css' %}{{ cache_param }}" />
+  <link rel="stylesheet" href="{% static 'styles/screenshots/screenshot_detail.css' %}" />
 {% endblock extra_styles %}
 
 {% block breadcrumbs %}
   {% path_object_breadcrumbs object.translation.component %}
-  <li>
+  <li class="breadcrumb-item">
     <a href="{% url 'screenshots' path=object.translation.component.get_url_path %}">{% translate "Screenshots" %}</a>
   </li>
-  <li>
+  <li class="breadcrumb-item">
     <a href="{{ object.get_absolute_url }}">{{ object.name }}</a>
   </li>
 {% endblock breadcrumbs %}
 
 {% block content %}
 
-  {% perm 'screenshot.delete' object.translation.component as user_can_delete_screenshot %}
-  {% perm 'screenshot.edit' object.translation.component as user_can_edit_screenshot %}
+  {% perm 'screenshot.delete' object.translation as user_can_delete_screenshot %}
+  {% perm 'screenshot.edit' object.translation as user_can_edit_screenshot %}
 
 
-  <div class="panel panel-default"
+  <div class="card"
        id="sources-listing"
        data-href="{% url 'screenshot-js-get' pk=object.pk %}">
-    <div class="panel-heading">
-      <h4 class="panel-title">{% translate "Assigned source strings" %}</h4>
+    <div class="card-header">
+      <h4 class="card-title">
+        {% documentation_icon 'admin/translating' 'screenshots' right=True %}
+        {% translate "Assigned source strings" %}
+      </h4>
     </div>
     <div id="strings-table-container">{% include "screenshots/screenshot_sources_body.html" %}</div>
-    <div class="panel-footer">
+    <div class="card-footer">
       {% translate "Screenshot is shown to add visual context for all listed source strings." %}
     </div>
   </div>
@@ -48,41 +46,122 @@
       {% csrf_token %}
       <input type="hidden" name="source" id="add-source" />
     </form>
-    <div class="panel panel-default" id="search-results">
-      <div class="panel-heading">
-        <h4 class="panel-title">{% translate "Assign source strings" %}</h4>
+    <div class="card" id="search-results">
+      <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+        <h4 class="card-title">{% translate "Assign source strings" %}</h4>
+        <ul class="nav nav-pills mb-0"
+            role="tablist"
+            aria-label="{% translate "Find source strings" %}">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active"
+                    id="screenshot-image-text-tab"
+                    data-bs-toggle="tab"
+                    data-bs-target="#screenshot-image-text"
+                    type="button"
+                    role="tab"
+                    aria-controls="screenshot-image-text"
+                    aria-selected="true">{% translate "Image text" %}</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link"
+                    id="screenshot-search-tab"
+                    data-bs-toggle="tab"
+                    data-bs-target="#screenshot-search"
+                    type="button"
+                    role="tab"
+                    aria-controls="screenshot-search"
+                    aria-selected="false">{% translate "Search" %}</button>
+          </li>
+        </ul>
       </div>
-      <div class="search-results">{% include "screenshots/screenshot_sources_search.html" %}</div>
-      <div class="panel-footer">
-        <div class="pull-right flip">
-          <form class="form-inline">
-            {% csrf_token %}
-            <button data-href="{% url 'screenshot-js-ocr' pk=object.pk %}"
-                    class="btn btn-warning"
-                    id="screenshots-auto">{% translate "Automatically recognize" %}</button>
-          </form>
+      <div class="tab-content">
+        <div class="tab-pane active"
+             id="screenshot-image-text"
+             role="tabpanel"
+             aria-labelledby="screenshot-image-text-tab"
+             tabindex="0"
+             data-screenshot-results="ocr">
+          <div class="card-body">
+            <p>{% translate "Suggests source strings by recognizing text in this screenshot." %}</p>
+            <form id="screenshots-ocr-form"
+                  class="double-submission"
+                  data-href="{% url 'screenshot-js-ocr' pk=object.pk %}">
+              {% csrf_token %}
+              <button class="btn btn-primary"
+                      id="screenshots-recognition-retry"
+                      type="submit"
+                      hidden>{% translate "Retry" %}</button>
+            </form>
+          </div>
+          <div class="search-results">{% include "screenshots/screenshot_sources_search.html" with result_kind="ocr" %}</div>
+          <div class="card-footer">
+            <button class="btn btn-primary screenshots-add-selected"
+                    id="screenshots-ocr-add-selected"
+                    type="button"
+                    disabled>{% translate "Add selected" %}</button>
+            <div class="screenshots-search-summary small text-body-secondary mt-2"
+                 aria-live="polite"></div>
+          </div>
         </div>
-        <form class="form-inline double-submission">
-          {% csrf_token %}
-          <input class="textinput form-control"
-                 type="text"
-                 required="yes"
-                 name="q"
-                 id="search-input"
-                 placeholder="{% translate "Source string search" %}" />
-          <button data-href="{% url 'screenshot-js-search' pk=object.pk %}"
-                  class="btn btn-primary"
-                  id="screenshots-search">{% translate "Search" %}</button>
-        </form>
+        <div class="tab-pane"
+             id="screenshot-search"
+             role="tabpanel"
+             aria-labelledby="screenshot-search-tab"
+             tabindex="0"
+             data-screenshot-results="search">
+          <div class="search-results">{% include "screenshots/screenshot_sources_search.html" with result_kind="search" %}</div>
+          <div class="card-footer">
+            <div class="d-flex flex-column flex-xl-row gap-2 align-items-stretch">
+              <form class="double-submission flex-grow-1"
+                    id="screenshots-search-form"
+                    data-href="{% url 'screenshot-js-search' pk=object.pk %}">
+                {% csrf_token %}
+                <div class="input-group">
+                  <div class="flex-grow-1">
+                    <textarea class="textarea form-control"
+                              required
+                              name="q"
+                              id="search-input"
+                              aria-describedby="screenshots-search-help"
+                              rows="1"
+                              aria-label="{% translate "Source string search" %}"
+                              placeholder="{% translate "Source string search" %}"></textarea>
+                  </div>
+                  <button data-href="{% url 'screenshot-js-search' pk=object.pk %}"
+                          class="btn btn-primary"
+                          type="submit"
+                          id="screenshots-search">{% translate "Search" %}</button>
+                </div>
+                <div id="screenshots-search-help" class="form-text">
+                  {% blocktranslate trimmed %}
+                    Use query syntax; boolean operators like <code>AND</code>, <code>OR</code>, and <code>NOT</code> are case-insensitive.
+                  {% endblocktranslate %}
+                  <a class="doc-link"
+                     href="{% documentation 'user/search' 'search-boolean' %}"
+                     title="{% translate "Documentation" %}"
+                     target="_blank"
+                     rel="noopener">{% icon "info.svg" %}<span class="visually-hidden">{% translate "Search query syntax documentation" %}</span></a>
+                </div>
+              </form>
+              <button class="btn btn-primary screenshots-add-selected align-self-xl-start"
+                      id="screenshots-add-selected"
+                      type="button"
+                      disabled>{% translate "Add selected" %}</button>
+            </div>
+            <div id="screenshots-search-summary"
+                 class="screenshots-search-summary small text-body-secondary mt-2"
+                 aria-live="polite"></div>
+          </div>
+        </div>
       </div>
     </div>
   {% endif %}
 
-  <div class="panel panel-default">
-    <div class="panel-heading">
-      <h4 class="panel-title">{% translate "Image" %}</h4>
+  <div class="card">
+    <div class="card-header">
+      <h4 class="card-title">{% translate "Image" %}</h4>
     </div>
-    <div class="panel-body">{% include "screenshots/screenshot_show.html" with screenshot=object %}</div>
+    <div class="card-body">{% include "screenshots/screenshot_show.html" with screenshot=object %}</div>
   </div>
 
   {% if user_can_edit_screenshot %}
@@ -91,31 +170,31 @@
           enctype="multipart/form-data"
           id="screenshot-form-container">
       {% csrf_token %}
-      <div class="panel panel-default">
-        <div class="panel-heading">
-          <h4 class="panel-title">{% translate "Edit screenshot" %}</h4>
+      <div class="card">
+        <div class="card-header">
+          <h4 class="card-title">{% translate "Edit screenshot" %}</h4>
         </div>
-        <div class="panel-body">{{ edit_form|crispy }}</div>
-        <div class="panel-footer">
+        <div class="card-body">{% crispy edit_form %}</div>
+        <div class="card-footer">
           <input type="submit" class="btn btn-primary" value="{% translate "Save" %}" />
         </div>
       </div>
     </form>
 
   {% endif %}
-  <div class="panel panel-default">
-    <div class="panel-heading">
-      <h4 class="panel-title">{% translate "Screenshot details" %}</h4>
+  <div class="card">
+    <div class="card-header">
+      <h4 class="card-title">{% translate "Screenshot details" %}</h4>
     </div>
 
-    <table class="table table-condensed table-striped">
+    <table class="table table-sm table-striped">
       <tr>
         <th>{% translate "Created" %}</th>
         <td>{{ object.timestamp|naturaltime }}</td>
       </tr>
       <tr>
         <th>{% translate "Uploaded by" %}</th>
-        <td>{{ object.get_user_display }}</td>
+        <td>{% user_display object.user resource=object.translation %}</td>
       </tr>
       <tr>
         <th>{% translate "Language" %}</th>
@@ -126,11 +205,11 @@
   </div>
 
   {% if user_can_delete_screenshot %}
-    <div class="panel panel-danger">
-      <div class="panel-heading">
-        <h4 class="panel-title">{% translate "Delete screenshot" %}</h4>
+    <div class="card">
+      <div class="card-header text-bg-danger">
+        <h4 class="card-title">{% translate "Delete screenshot" %}</h4>
       </div>
-      <div class="panel-body">
+      <div class="card-body">
 
         <p class="help-block">{% translate "Deleting screenshot will remove it from all associated source strings." %}</p>
 

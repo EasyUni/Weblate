@@ -4,36 +4,112 @@
 
 """Tests for data exports."""
 
-import os
-from zipfile import ZipFile
+from __future__ import annotations
 
+import errno
+import json
+import os
+import tempfile
+import warnings
+from contextlib import contextmanager, suppress
+from copy import copy, deepcopy
+from io import BytesIO, StringIO
+from pathlib import Path
+from shutil import copyfile
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
+
+import jsonschema
 from django.conf import settings
-from django.contrib.staticfiles.storage import staticfiles_storage
+from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.files import File
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.db import connection
-from django.test import skipIfDBFeature, skipUnlessDBFeature
+from django.core.management.base import CommandError
+from django.db import DatabaseError, connection, transaction
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext, modify_settings
 from django.urls import reverse
+from django.utils import timezone
+from weblate_schemas import load_schema
 
-from weblate.auth.data import SELECTION_MANUAL
-from weblate.auth.models import AutoGroup, Group, Role
+from weblate.addons.webhooks import WebhookAddon
+from weblate.auth.bots import InternalBot
+from weblate.auth.data import SELECTION_ALL, SELECTION_MANUAL
+from weblate.auth.models import (
+    AutoGroup,
+    Group,
+    Permission,
+    Role,
+    TeamMembership,
+    User,
+    get_anonymous,
+)
 from weblate.checks.models import Check
 from weblate.lang.models import Language
+from weblate.memory.models import Memory, MemoryScope
+from weblate.memory.utils import CATEGORY_FILE, CATEGORY_PRIVATE_OFFSET
 from weblate.screenshots.models import Screenshot
-from weblate.trans.backups import ProjectBackup, list_backups
+from weblate.trans.actions import ActionEvents
+from weblate.trans.backups import (
+    CATEGORY_BACKUP_FIELDS,
+    COMPONENT_BACKUP_FIELDS,
+    PROJECT_BACKUP_FIELDS,
+    PROJECTBACKUP_PREFIX,
+    ProjectBackup,
+    backup_uses_xliff_format_params,
+    format_backup_error,
+    get_project_backup_download_storage,
+    get_project_backup_download_url,
+    list_backups,
+)
+from weblate.trans.change_display import get_change_history_context
+from weblate.trans.forms import (
+    CategorySettingsForm,
+    ComponentSettingsForm,
+    ProjectSettingsForm,
+)
 from weblate.trans.models import (
     Category,
+    Change,
     Comment,
+    Component,
     PendingUnitChange,
     Project,
+    SavedSearch,
     Suggestion,
     Unit,
     Vote,
+    WorkflowSetting,
 )
-from weblate.trans.tasks import cleanup_project_backup_download, cleanup_project_backups
-from weblate.trans.tests.test_views import ViewTestCase
-from weblate.trans.tests.utils import get_test_file
+from weblate.trans.models.project import CommitPolicyChoices
+from weblate.trans.tasks import (
+    cleanup_project_backup_download,
+    cleanup_project_backups,
+    import_project_backup,
+)
+from weblate.trans.tests.test_views import ReusableViewTestCase
+from weblate.trans.tests.utils import (
+    TEST_VCS_ALLOW_SCHEMES,
+    create_test_billing,
+    get_test_actor,
+    get_test_file,
+)
+from weblate.utils.change_origin import acting_user_context
+from weblate.utils.data import data_path
+from weblate.utils.files import remove_tree
+from weblate.utils.hash import calculate_hash, hash_to_checksum
+from weblate.utils.state import STATE_EMPTY, STATE_READONLY, STATE_TRANSLATED
+from weblate.vcs.base import RepositoryCommandError
+from weblate.vcs.git import GitRepository, SubversionRepository
+from weblate.vcs.mercurial import HgRepository
+from weblate.workspaces.models import WORKSPACE_PROJECT_CREATORS_GROUP, Workspace
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from unittest.mock import Mock
+
 
 TEST_SCREENSHOT = get_test_file("screenshot.png")
 TEST_BACKUP = get_test_file("projectbackup-4.14.zip")
@@ -41,8 +117,1825 @@ TEST_BACKUP_DUPLICATE = get_test_file("projectbackup-duplicate.zip")
 TEST_BACKUP_DUPLICATE_FILES = get_test_file("projectbackup-duplicate-files.zip")
 
 
-class BackupsTest(ViewTestCase):
+@contextmanager
+def remove_file_after(filename: str) -> Generator[None, None, None]:
+    try:
+        yield
+    finally:
+        with suppress(OSError):
+            os.unlink(filename)
+
+
+def resolve_private_example(host, *args, **kwargs):
+    address = "127.0.0.1" if host == "private.example" else "8.8.8.8"
+    return [(0, 0, 0, "", (address, 443))]
+
+
+class BackupSettingCoverageTest(SimpleTestCase):
+    def test_backup_setting_coverage(self) -> None:
+        """Ensure newly introduced editable settings are not silently omitted."""
+        backup = ProjectBackup()
+        backup_settings = (
+            # Workspace is selected by the restore caller. Machinery settings can
+            # contain service credentials and are intentionally not exported.
+            (
+                Project,
+                ProjectSettingsForm,
+                backup.project_schema["properties"]["project"],
+                PROJECT_BACKUP_FIELDS,
+                {"workspace"},
+            ),
+            # Category hierarchy is represented by the backup object graph.
+            (
+                Category,
+                CategorySettingsForm,
+                backup.project_schema["$defs"]["category"],
+                CATEGORY_BACKUP_FIELDS,
+                {"project", "category"},
+            ),
+            # Component hierarchy is represented by the backup object graph;
+            # generated and internal repository revisions are not settings.
+            (
+                Component,
+                ComponentSettingsForm,
+                backup.component_schema["properties"]["component"],
+                COMPONENT_BACKUP_FIELDS,
+                {
+                    "project",
+                    "category",
+                    "git_export",
+                    "processed_revision",
+                },
+            ),
+        )
+        for (
+            model,
+            form,
+            schema,
+            extra_fields,
+            excluded_fields,
+        ) in backup_settings:
+            with self.subTest(model=model.__name__):
+                backup_fields = set(schema["required"]) | set(extra_fields)
+                schema_fields = set(schema["properties"])
+                # ruff: ignore[private-member-access]
+                editable_fields = {
+                    field.name
+                    for field in model._meta.fields
+                    if field.editable and not field.auto_created
+                }
+
+                self.assertSetEqual(
+                    editable_fields - excluded_fields,
+                    backup_fields & editable_fields,
+                )
+                # ruff: ignore[private-member-access]
+                self.assertLessEqual(set(form._meta.fields), backup_fields)
+                self.assertLessEqual(backup_fields, schema_fields)
+
+    def test_migrate_component_file_format_params_xliff_version_gate(self) -> None:
+        cases = (
+            (
+                "2026.9",
+                "xliff2",
+                {"xliff_placeables": "plain", "xml_whitespace_handling": "standard"},
+            ),
+            (
+                "2026.9.1",
+                "xliff2",
+                {"xliff_placeables": "plain", "xml_whitespace_handling": "standard"},
+            ),
+            ("2026.10.dev0", "xliff2", {}),
+            (
+                "2026.10.dev0",
+                "plainxliff",
+                {"xliff_placeables": "plain", "xml_whitespace_handling": "standard"},
+            ),
+        )
+        for backup_version, file_format, expected_params in cases:
+            with self.subTest(backup_version=backup_version, file_format=file_format):
+                component = {
+                    "file_format": file_format,
+                    "file_format_params": {},
+                }
+                ProjectBackup.migrate_component_file_format_params(
+                    component,
+                    backup_version=backup_version,
+                )
+                expected_format = (
+                    "xliff" if file_format == "plainxliff" else file_format
+                )
+                self.assertEqual(component["file_format"], expected_format)
+                self.assertEqual(component["file_format_params"], expected_params)
+
+    def test_backup_uses_xliff_format_params(self) -> None:
+        self.assertFalse(backup_uses_xliff_format_params(None))
+        self.assertFalse(backup_uses_xliff_format_params("2026.9"))
+        self.assertFalse(backup_uses_xliff_format_params("2026.9.1"))
+        self.assertTrue(backup_uses_xliff_format_params("2026.10.dev0"))
+        self.assertTrue(backup_uses_xliff_format_params("2026.10"))
+
+
+class BackupErrorFormattingTest(SimpleTestCase):
+    def test_validation_message_shapes(self) -> None:
+        for error, expected in (
+            (ValidationError("Invalid archive."), ["Invalid archive."]),
+            (ValidationError(["First.", "Second."]), ["First.", "Second."]),
+            (ValueError("Invalid ZIP."), ["Invalid ZIP."]),
+            (
+                ValidationError(
+                    {
+                        "teams[0].name": [
+                            ValidationError(
+                                "Invalid %(value)s.", params={"value": "name"}
+                            ),
+                            "Second.",
+                        ],
+                        NON_FIELD_ERRORS: ["Invalid archive."],
+                    }
+                ),
+                [
+                    "teams[0].name: Invalid name.",
+                    "teams[0].name: Second.",
+                    "Invalid archive.",
+                ],
+            ),
+        ):
+            with self.subTest(error=error):
+                self.assertEqual(format_backup_error(error), expected)
+
+    def test_restore_warnings_include_components_and_teams(self) -> None:
+        backup = ProjectBackup()
+        backup.skipped_components = ["missing"]
+        backup.renamed_teams = [("Legacy", "Legacy (2)")]
+        self.assertEqual(
+            backup.get_restore_warnings(),
+            [
+                "Component missing was skipped because its linked repository is unavailable.",
+                "Team Legacy was renamed to Legacy (2) because its name was already in use.",
+            ],
+        )
+
+
+class BackupsTest(ReusableViewTestCase):
     CREATE_GLOSSARIES: bool = True
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Shared project IDs also share archive paths outside the VCS snapshot.
+        backup_path = data_path(PROJECTBACKUP_PREFIX) / str(self.project.pk)
+        remove_tree(backup_path, True)
+        self.addCleanup(remove_tree, backup_path, True)
+        media_root = self.enterContext(
+            tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+                prefix="weblate-backup-media-"
+            )
+        )
+        self.enterContext(override_settings(MEDIA_ROOT=media_root))
+
+    def metadata_backup(self, units: list[Unit]) -> ProjectBackup:
+        backup = ProjectBackup()
+        backup.IMPORT_BATCH_SIZE = 2
+        anonymous = get_anonymous()
+        backup.user_cache = {
+            self.user.username: self.user,
+            anonymous.username: anonymous,
+        }
+        for unit in units:
+            unit.import_data = {
+                "labels": [],
+                "comments": [],
+                "checks": [],
+                "suggestions": [],
+            }
+        return backup
+
+    def test_restore_metadata_batches_across_units(self) -> None:
+        units = list(self.component.source_translation.unit_set.order_by("pk")[:3])
+        self.assertEqual(len(units), 3)
+        Check.objects.filter(unit__in=units).delete()
+        backup = self.metadata_backup(units)
+        label = self.project.label_set.create(name="Restored label", color="navy")
+        backup.labels_map = {label.name: label}
+        missing_author = "missing-metadata-author"
+        backup.restore_user(missing_author)
+        timestamp = timezone.now()
+        for index, unit in enumerate(units):
+            unit.import_data.update(
+                labels=[label.name],
+                comments=[
+                    {
+                        "comment": f"Restored comment {index}",
+                        "user": missing_author if index == 2 else self.user.username,
+                        "timestamp": timestamp,
+                        "resolved": bool(index % 2),
+                        "userdetails": {"custom": "保留"},
+                    }
+                ],
+                checks=[
+                    {
+                        "name": "same",
+                        "dismissed": bool(index % 2),
+                        "metadata": {"index": index},
+                    }
+                ],
+            )
+        original = [deepcopy(unit.import_data) for unit in units]
+        with self.assertNumQueries(6):
+            backup.restore_unit_metadata(units)
+        self.assertEqual([unit.import_data for unit in units], original)
+        for index, unit in enumerate(units):
+            self.assertTrue(unit.labels.filter(pk=label.pk).exists())
+            comment = Comment.objects.get(
+                unit=unit, comment=f"Restored comment {index}"
+            )
+            self.assertEqual(
+                comment.user_id, get_anonymous().pk if index == 2 else self.user.pk
+            )
+            self.assertEqual(comment.timestamp, timestamp)
+            self.assertEqual(comment.resolved, bool(index % 2))
+            self.assertEqual(comment.userdetails, {"custom": "保留"})
+            check = Check.objects.get(unit=unit, name="same")
+            self.assertEqual(check.dismissed, bool(index % 2))
+            self.assertEqual(check.metadata, {"index": index})
+
+    def test_restore_metadata_bounds_records_within_one_unit(self) -> None:
+        units = list(self.component.source_translation.unit_set.order_by("pk")[:2])
+        backup = self.metadata_backup(units)
+        unit = units[0]
+        Check.objects.filter(unit=unit).delete()
+        labels = [
+            self.project.label_set.create(
+                name=f"Large metadata label {index}", color="navy"
+            )
+            for index in range(3)
+        ]
+        backup.labels_map = {label.name: label for label in labels}
+        unit.import_data.update(
+            labels=[label.name for label in labels],
+            comments=[
+                {
+                    "comment": f"Large metadata comment {index}",
+                    "user": self.user.username,
+                }
+                for index in range(3)
+            ],
+            checks=[{"name": name} for name in ("same", "begin_space", "end_space")],
+        )
+        label_model = Unit.labels.through
+        with (
+            patch.object(
+                label_model.objects,
+                "bulk_create",
+                wraps=label_model.objects.bulk_create,
+            ) as create_labels,
+            patch.object(
+                Comment.objects, "bulk_create", wraps=Comment.objects.bulk_create
+            ) as create_comments,
+            patch.object(
+                Check.objects, "bulk_create", wraps=Check.objects.bulk_create
+            ) as create_checks,
+            self.assertNumQueries(6),
+        ):
+            backup.restore_unit_metadata(units)
+        for create in (create_labels, create_comments, create_checks):
+            self.assertEqual(
+                [len(call.args[0]) for call in create.call_args_list], [2, 1]
+            )
+        self.assertEqual(
+            list(
+                unit.labels.filter(pk__in=[label.pk for label in labels]).order_by("pk")
+            ),
+            labels,
+        )
+        self.assertEqual(
+            list(unit.comment_set.order_by("pk").values_list("comment", flat=True)),
+            [f"Large metadata comment {index}" for index in range(3)],
+        )
+        self.assertEqual(
+            list(unit.check_set.order_by("pk").values_list("name", flat=True)),
+            ["same", "begin_space", "end_space"],
+        )
+
+    def test_restore_empty_metadata(self) -> None:
+        units = list(self.component.source_translation.unit_set.order_by("pk")[:2])
+        backup = self.metadata_backup(units)
+        with self.assertNumQueries(0):
+            backup.restore_unit_metadata([])
+            backup.restore_unit_metadata(units)
+
+    def test_restore_metadata_preserves_suggestion_vote_mapping(self) -> None:
+        units = list(self.component.source_translation.unit_set.order_by("pk")[:2])
+        backup = self.metadata_backup(units)
+        for unit in units:
+            unit.import_data["suggestions"] = [
+                {
+                    "target": "Same restored suggestion",
+                    "user": self.user.username,
+                    "votes": [
+                        {"user": "missing-voter-one", "value": 1},
+                        {"user": "missing-voter-two", "value": 1},
+                    ],
+                }
+            ]
+        backup.restore_unit_metadata(units)
+        for unit in units:
+            suggestion = Suggestion.objects.get(
+                unit=unit, target="Same restored suggestion"
+            )
+            self.assertEqual(suggestion.user_id, self.user.pk)
+            vote = Vote.objects.get(suggestion=suggestion)
+            self.assertEqual(vote.user_id, get_anonymous().pk)
+            self.assertEqual(vote.value, 1)
+
+    def test_restore_metadata_failure_rolls_back_units(self) -> None:
+        units = [
+            Unit(
+                translation=self.component.source_translation,
+                source=f"Rollback metadata {index}",
+                target=f"Rollback metadata {index}",
+                position=index,
+                id_hash=calculate_hash(f"Rollback metadata {index}", ""),
+            )
+            for index in range(3)
+        ]
+        backup = self.metadata_backup(units)
+        label = self.project.label_set.create(
+            name="Rollback metadata label", color="navy"
+        )
+        backup.labels_map = {label.name: label}
+        for unit in units:
+            unit.import_data.update(
+                labels=[label.name],
+                comments=[{"comment": "Rollback comment", "user": self.user.username}],
+            )
+        label_model = Unit.labels.through
+        before = (
+            Unit.objects.count(),
+            label_model.objects.count(),
+            Comment.objects.count(),
+        )
+        write_comments = Comment.objects.bulk_create
+        calls = 0
+
+        def fail_later_chunk(batch: tuple[Comment, ...]) -> list[Comment]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.assertEqual(Unit.objects.count(), before[0] + 3)
+                self.assertEqual(label_model.objects.count(), before[1] + 3)
+                self.assertEqual(Comment.objects.count(), before[2] + 2)
+                msg = "Metadata write failed"
+                raise DatabaseError(msg)
+            return write_comments(batch)
+
+        with (
+            self.assertRaisesMessage(DatabaseError, "Metadata write failed"),
+            transaction.atomic(),
+            patch.object(Comment.objects, "bulk_create", side_effect=fail_later_chunk),
+        ):
+            backup.restore_source_unit_batch(units, {}, None, {})
+        self.assertEqual(calls, 2)
+        self.assertEqual(
+            (
+                Unit.objects.count(),
+                label_model.objects.count(),
+                Comment.objects.count(),
+            ),
+            before,
+        )
+
+    def test_restore_source_batch_links_before_metadata(self) -> None:
+        source = self.component.source_translation
+        before = list(Unit.objects.order_by("pk").values())
+        units = [
+            Unit(
+                translation=source,
+                source=f"Restored source {index}",
+                target=f"Restored source {index}",
+                explanation=f"Restored explanation {index}",
+                position=index,
+                id_hash=calculate_hash(f"Restored source {index}", ""),
+            )
+            for index in range(3)
+        ]
+        for unit in units:
+            unit.import_data = {
+                "labels": [],
+                "comments": [],
+                "checks": [],
+                "suggestions": [],
+                "pending": True,
+            }
+        backup = ProjectBackup()
+        lookup: dict[int, int] = {}
+        restore_metadata = backup.restore_unit_metadata
+
+        def check_links(batch: list[Unit]) -> None:
+            for unit in batch:
+                with self.assertNumQueries(0):
+                    self.assertIs(unit.source_unit, unit)
+                    self.assertEqual(unit.source_unit_id, unit.pk)
+            self.assertEqual(
+                dict(
+                    Unit.objects.filter(pk__in=[unit.pk for unit in batch]).values_list(
+                        "pk", "source_unit_id"
+                    )
+                ),
+                {unit.pk: unit.pk for unit in batch},
+            )
+            restore_metadata(batch)
+
+        with (
+            patch.object(backup, "restore_unit_metadata", side_effect=check_links),
+            CaptureQueriesContext(connection) as queries,
+        ):
+            backup.restore_source_unit_batch(units, {}, None, lookup)
+        updates = [
+            query["sql"] for query in queries if query["sql"].startswith("UPDATE ")
+        ]
+        self.assertEqual(len(updates), 1)
+        self.assertNotIn("CASE", updates[0])
+        self.assertEqual(
+            [query["sql"].split()[0] for query in queries.captured_queries[:2]],
+            ["INSERT", "UPDATE"],
+        )
+        self.assertEqual(lookup, {unit.checksum: unit.pk for unit in units})
+        self.assertEqual(
+            list(
+                Unit.objects.filter(pk__in=[row["id"] for row in before])
+                .order_by("pk")
+                .values()
+            ),
+            before,
+        )
+        for unit in units:
+            self.assertEqual(unit.import_data, {})
+            pending = PendingUnitChange.objects.get(unit=unit)
+            self.assertEqual(pending.source_unit_explanation, unit.explanation)
+            self.assertEqual(pending.author_id, get_anonymous().pk)
+
+    def test_restore_source_units_flushes_partial_batch(self) -> None:
+        source = self.component.source_translation
+        items = [
+            {
+                "translation_id": source.pk,
+                "position": index,
+                "source": f"Batched source {index}",
+                "target": f"Batched source {index}",
+                "id_hash": hash_to_checksum(
+                    calculate_hash(f"Batched source {index}", "")
+                ),
+                "labels": [],
+                "comments": [],
+                "checks": [],
+                "suggestions": [],
+            }
+            for index in range(5)
+        ]
+        backup = ProjectBackup()
+        backup.IMPORT_BATCH_SIZE = 2
+        with patch.object(
+            backup, "restore_source_unit_batch", wraps=backup.restore_source_unit_batch
+        ) as restore_batch:
+            lookup = backup.restore_source_units(
+                {"units": items},
+                translation_lookup={source.pk: source},
+                source_translation_id=source.pk,
+                pending_unit_change_map=None,
+            )
+        self.assertEqual(
+            [len(call.args[0]) for call in restore_batch.call_args_list], [2, 2, 1]
+        )
+        self.assertEqual(set(lookup), {item["id_hash"] for item in items})
+        for unit in Unit.objects.filter(pk__in=lookup.values()):
+            self.assertEqual(unit.source_unit_id, unit.pk)
+
+    def test_restore_empty_source_batch(self) -> None:
+        lookup = {123: 456}
+        with self.assertNumQueries(0):
+            ProjectBackup().restore_source_unit_batch([], {}, None, lookup)
+        self.assertEqual(lookup, {123: 456})
+
+    def test_restore_legacy_pending_batches_authors(self) -> None:
+        author = User.objects.create(username="legacy-content-author")
+        units = list(
+            self.component.translation_set.get(language_code="cs")
+            .unit_set.prefetch_source()
+            .order_by("pk")
+        )
+        for unit in units:
+            unit.change_set.all().delete()
+            unit.import_data = {"pending": True}
+        Change.objects.create(
+            unit=units[0], user=self.user, author=author, action=ActionEvents.CHANGE
+        )
+        anonymous_id = get_anonymous().pk
+        backup = ProjectBackup()
+        for size in (1, len(units)):
+            with self.subTest(size=size), self.assertNumQueries(2):
+                backup.restore_pending_unit_changes({}, units=units[:size])
+        for index, unit in enumerate(units):
+            pending = unit.pending_changes.order_by("-timestamp", "-pk").first()
+            assert pending is not None
+            self.assertEqual(
+                pending.author_id, author.pk if index == 0 else anonymous_id
+            )
+            self.assertEqual(pending.target, unit.target)
+            self.assertEqual(unit.import_data, {"pending": True})
+
+    def test_restore_legacy_pending_skips_nonpending_units(self) -> None:
+        unit = self.component.translation_set.get(language_code="cs").unit_set.get(
+            source="Hello, world!\n"
+        )
+        unit.import_data = {"pending": False}
+        with self.assertNumQueries(0):
+            ProjectBackup().restore_pending_unit_changes({}, units=[unit])
+
+    def test_restore_explicit_pending_author_is_authoritative(self) -> None:
+        unit = (
+            self.component.translation_set.get(language_code="cs")
+            .unit_set.prefetch_source()
+            .get(source="Hello, world!\n")
+        )
+        historical_author = User.objects.create(username="historical-author")
+        Change.objects.create(
+            unit=unit,
+            user=self.user,
+            author=historical_author,
+            action=ActionEvents.CHANGE,
+        )
+        unit.import_data = {"pending": True, "translation_id": 100, "id_hash": 200}
+        item = {
+            "translation_id": 100,
+            "unit_id_hash": 200,
+            "author": self.user.username,
+            "target": "Restored pending target",
+            "explanation": "",
+            "source_unit_explanation": "",
+            "timestamp": unit.timestamp,
+            "add_unit": False,
+            "state": unit.state,
+        }
+        backup = ProjectBackup()
+        with patch(
+            "weblate.trans.models.unit.UnitQuerySet.with_last_content_author",
+            side_effect=AssertionError("Modern backup must use stored authors"),
+        ):
+            backup.restore_pending_unit_changes(
+                {"pending_unit_changes": [item]}, units=[unit]
+            )
+            backup.restore_pending_unit_changes(
+                {"pending_unit_changes": []}, units=[unit]
+            )
+        pending = unit.pending_changes.get(target="Restored pending target")
+        self.assertEqual(pending.author_id, self.user.pk)
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_restore_rechecks_full_billing_workspace(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        billing = create_test_billing(self.user)
+        Project.objects.create(
+            name="Project filling import slot",
+            slug="project-filling-import-slot",
+            workspace_id=billing.workspace_id,
+        )
+
+        for workspace in (billing.workspace, None):
+            with (
+                self.subTest(workspace=workspace),
+                self.assertRaisesMessage(
+                    ValidationError, "No valid billing found or limit exceeded."
+                ),
+            ):
+                restore.restore(
+                    project_name="Rejected billed restore",
+                    project_slug="rejected-billed-restore",
+                    user=self.user,
+                    billing=billing,
+                    workspace=workspace,
+                )
+        self.assertFalse(
+            Project.objects.filter(slug="rejected-billed-restore").exists()
+        )
+        self.assertEqual(Project.objects.filter(workspace=billing.workspace).count(), 1)
+
+    def test_download_uses_configured_static_storage(self) -> None:
+        storage = MagicMock()
+        storage.url.return_value = (
+            "https://cdn.example.com/backups/test.zip?signature=x"
+        )
+        with patch("weblate.trans.backups.staticfiles_storage", storage):
+            self.assertIs(get_project_backup_download_storage(), storage)
+            self.assertEqual(
+                get_project_backup_download_url("backups/test.zip"),
+                "https://cdn.example.com/backups/test.zip?signature=x",
+            )
+
+    def write_tampered_component_backup(
+        self,
+        *,
+        component_updates: dict | None = None,
+        repo: str | None = None,
+        push: str | None = None,
+        translation_updates: dict | None = None,
+        translation_language_code: str | None = None,
+        unit_updates: dict | None = None,
+        component_removals: tuple[str, ...] = (),
+        all_components: bool = False,
+        component_slug: str | None = None,
+    ) -> str:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+        slug = component_slug or self.component.slug
+
+        with (
+            ZipFile(backup.filename, "r") as source_zip,
+            ZipFile(temp_name, "w") as target_zip,
+        ):
+            for item in source_zip.infolist():
+                if (
+                    repo is not None
+                    and repo.startswith("weblate:")
+                    and item.filename.startswith("vcs/")
+                    and (all_components or item.filename.startswith(f"vcs/{slug}/"))
+                ):
+                    continue
+                data = source_zip.read(item.filename)
+                if item.filename.startswith("components/") and (
+                    all_components or item.filename.endswith(f"{slug}.json")
+                ):
+                    component_data = json.loads(data.decode("utf-8"))
+                    if repo is not None:
+                        component_data["component"]["repo"] = repo
+                    if push is not None:
+                        component_data["component"]["push"] = push
+                    if component_updates is not None:
+                        component_data["component"].update(component_updates)
+                    for field in component_removals:
+                        component_data["component"].pop(field, None)
+                    if translation_updates is not None:
+                        translation = next(
+                            item
+                            for item in component_data["translations"]
+                            if translation_language_code is None
+                            or item["language_code"] == translation_language_code
+                        )
+                        translation.update(translation_updates)
+                    if unit_updates is not None:
+                        component_data["units"][0].update(unit_updates)
+                    data = json.dumps(component_data).encode("utf-8")
+                target_zip.writestr(item, data)
+
+        return temp_name
+
+    def write_tampered_project_backup(self, **updates) -> str:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with (
+            ZipFile(backup.filename, "r") as source_zip,
+            ZipFile(temp_name, "w") as target_zip,
+        ):
+            for item in source_zip.infolist():
+                data = source_zip.read(item.filename)
+                if item.filename == "weblate-backup.json":
+                    project_data = json.loads(data.decode("utf-8"))
+                    project_data["project"].update(updates)
+                    data = json.dumps(project_data).encode("utf-8")
+                target_zip.writestr(item, data)
+
+        return temp_name
+
+    def write_tampered_team_backup(self, *, role: str, member: str) -> str:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with (
+            ZipFile(backup.filename, "r") as source_zip,
+            ZipFile(temp_name, "w") as target_zip,
+        ):
+            for item in source_zip.infolist():
+                data = source_zip.read(item.filename)
+                if item.filename == "weblate-backup.json":
+                    project_data = json.loads(data.decode("utf-8"))
+                    project_data["teams"].append(
+                        {
+                            "name": "Escalation",
+                            "roles": [role],
+                            "components": [],
+                            "language_selection": SELECTION_ALL,
+                            "languages": [],
+                            "admins": [],
+                            "enforced_2fa": False,
+                            "members": [member],
+                            "autogroups": [],
+                        }
+                    )
+                    data = json.dumps(project_data).encode("utf-8")
+                target_zip.writestr(item, data)
+
+        return temp_name
+
+    def test_backup_restore_vcs_params(self) -> None:
+        self.component.vcs_params = {"git_force_push": True}
+        self.component.save(update_fields=["vcs_params"])
+        backup = ProjectBackup()
+
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            component_data = json.loads(
+                zipfile.read(f"components/{self.component.slug}.json")
+            )
+        self.assertEqual(
+            component_data["component"]["vcs_params"], {"git_force_push": True}
+        )
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored VCS parameters",
+            project_slug="restored-vcs-parameters",
+            user=self.user,
+        )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(restored_component.vcs_params, {"git_force_push": True})
+
+    @contextmanager
+    def relaxed_parameter_schema(self) -> Generator[None, None, None]:
+        """Simulate the upcoming schema until the separate dependency update."""
+        schema = deepcopy(load_schema("weblate-component.schema.json"))
+        properties = schema["properties"]["component"]["properties"]
+        properties["vcs_params"] = {"type": "object"}
+        properties["file_format_params"] = {"type": "object"}
+
+        def load(name: str) -> dict:
+            if name == "weblate-component.schema.json":
+                return schema
+            return load_schema(name)
+
+        with patch("weblate_schemas.validator.load_schema", side_effect=load):
+            yield
+
+    def test_restore_rejects_malformed_stored_parameters(self) -> None:
+        for family, values in (
+            ("vcs_params", (None, [], "", False)),
+            ("file_format_params", (None, [], "", False)),
+        ):
+            for value in values:
+                with self.subTest(family=family, value=value):
+                    filename = self.write_tampered_component_backup(
+                        component_updates={family: value}
+                    )
+                    with (
+                        remove_file_after(filename),
+                        self.relaxed_parameter_schema(),
+                        self.assertRaises(jsonschema.ValidationError) as error,
+                    ):
+                        ProjectBackup(filename).validate()
+                    self.assertEqual(
+                        list(error.exception.absolute_path), ["component", family]
+                    )
+
+    def test_restore_rejects_invalid_supported_parameters(self) -> None:
+        project_count = Project.objects.count()
+        component_count = Component.objects.count()
+        for family, key, value, updates in (
+            ("vcs_params", "git_force_push", "false", {}),
+            ("vcs_params", "git_force_push", 1, {}),
+            ("vcs_params", "git_force_push", None, {}),
+            ("vcs_params", "merge_request_merge_method", "invalid", {"vcs": "github"}),
+            ("file_format_params", "po_keep_previous", "true", {}),
+            ("file_format_params", "po_line_wrap", "invalid", {}),
+            ("file_format_params", "json_indent", "4", {"file_format": "json"}),
+        ):
+            with self.subTest(key=key, value=value):
+                filename = self.write_tampered_component_backup(
+                    component_updates={family: {key: value}, **updates}
+                )
+                with (
+                    remove_file_after(filename),
+                    self.relaxed_parameter_schema(),
+                    self.assertRaises(ValidationError) as error,
+                ):
+                    ProjectBackup(filename).validate()
+                self.assertIn(
+                    f"components/{self.component.slug}.json.component.{family}.{key}",
+                    error.exception.message_dict,
+                )
+                self.assertEqual(Project.objects.count(), project_count)
+                self.assertEqual(Component.objects.count(), component_count)
+
+    def test_restore_preserves_numeric_parameter_choices(self) -> None:
+        for index, value in enumerate((77, "77", "")):
+            with self.subTest(value=value):
+                filename = self.write_tampered_component_backup(
+                    component_updates={"file_format_params": {"po_line_wrap": value}}
+                )
+                with remove_file_after(filename), self.relaxed_parameter_schema():
+                    restore = ProjectBackup(filename)
+                    restore.validate()
+                    restored = restore.restore(
+                        project_name=f"Numeric parameters {index}",
+                        project_slug=f"numeric-parameters-{index}",
+                        user=self.user,
+                    )
+                component = restored.component_set.get(slug=self.component.slug)
+                stored = component.file_format_params["po_line_wrap"]
+                self.assertEqual(stored, value)
+                self.assertIs(type(stored), type(value))
+
+    def test_restore_skips_unsupported_parameters(self) -> None:
+        filename = self.write_tampered_component_backup(
+            component_updates={
+                "vcs": "git-force-push",
+                "vcs_params": {"unknown_vcs": [], "merge_request_automerge": None},
+                "file_format_params": {
+                    "unknown_format": {},
+                    "json_indent": "invalid",
+                    "po_line_wrap": "77",
+                },
+            }
+        )
+        with remove_file_after(filename), self.relaxed_parameter_schema():
+            restore = ProjectBackup(filename)
+            restore.validate()
+            restore_warnings = restore.get_restore_warnings()
+            self.assertEqual(len(restore_warnings), 4)
+            restore.validate()
+            self.assertEqual(restore.get_restore_warnings(), restore_warnings)
+            restored = restore.restore(
+                project_name="Filtered parameters",
+                project_slug="filtered-parameters",
+                user=self.user,
+            )
+        component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(component.vcs, "git")
+        self.assertEqual(component.vcs_params, {"git_force_push": True})
+        self.assertEqual(component.file_format_params["po_line_wrap"], "77")
+        self.assertNotIn("unknown_format", component.file_format_params)
+        self.assertNotIn("json_indent", component.file_format_params)
+        self.assertEqual(restore.get_restore_warnings(), restore_warnings)
+        for key, reason in (
+            ("unknown_vcs", "unknown"),
+            ("merge_request_automerge", "not applicable"),
+            ("unknown_format", "unknown"),
+            ("json_indent", "not applicable"),
+        ):
+            warning = next(message for message in restore_warnings if key in message)
+            self.assertIn(f"components/{self.component.slug}.json", warning)
+            self.assertIn(reason, warning)
+
+    def test_backup_restore_push_on_update(self) -> None:
+        self.component.push_on_update = False
+        self.component.save(update_fields=["push_on_update"])
+        backup = ProjectBackup()
+
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            component_data = json.loads(
+                zipfile.read(f"components/{self.component.slug}.json")
+            )
+        self.assertIs(component_data["component"]["push_on_update"], False)
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored push on update",
+            project_slug="restored-push-on-update",
+            user=self.user,
+        )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        self.assertIs(restored_component.push_on_update, False)
+
+    def test_backup_restore_repoweb_translations(self) -> None:
+        repoweb_translations = (
+            "https://example.com/{{branch}}/{{filename|parentdir}}#L{{line}}"
+        )
+        self.component.repoweb_translations = repoweb_translations
+        self.component.save(update_fields=["repoweb_translations"])
+        backup = ProjectBackup()
+
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            component_data = json.loads(
+                zipfile.read(f"components/{self.component.slug}.json")
+            )
+        self.assertEqual(
+            component_data["component"]["repoweb_translations"],
+            repoweb_translations,
+        )
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored translation repository browser",
+            project_slug="restored-repoweb-translations",
+            user=self.user,
+        )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(
+            restored_component.repoweb_translations,
+            repoweb_translations,
+        )
+
+    def test_restore_backup_without_vcs_params(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            component_removals=("vcs_params",), all_components=True
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Restored legacy backup",
+                project_slug="restored-legacy-backup",
+                user=self.user,
+            )
+
+        self.assertEqual(
+            restored.component_set.get(slug=self.component.slug).vcs_params, {}
+        )
+
+    def test_restore_legacy_force_push_vcs(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            component_updates={"vcs": "git-force-push"},
+            component_removals=("vcs_params",),
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Restored legacy force push",
+                project_slug="restored-legacy-force-push",
+                user=self.user,
+            )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(restored_component.vcs, "git")
+        self.assertEqual(restored_component.vcs_params, {"git_force_push": True})
+
+    def test_restore_legacy_file_format(self) -> None:
+        java = self.create_java(project=self.project, name="Java")
+        xliff = self.create_xliff_mono(project=self.project, name="XLIFF")
+
+        cases = (
+            (
+                java.slug,
+                "properties-utf8",
+                "properties",
+                "properties_encoding",
+                "utf-8",
+            ),
+            (xliff.slug, "plainxliff", "xliff", "xliff_placeables", "plain"),
+        )
+        for slug, old_format, new_format, param_name, param_value in cases:
+            with self.subTest(old_format=old_format):
+                temp_name = self.write_tampered_component_backup(
+                    component_updates={"file_format": old_format},
+                    component_removals=("file_format_params",),
+                    component_slug=slug,
+                )
+                with remove_file_after(temp_name):
+                    restore = ProjectBackup(temp_name)
+                    restore.validate()
+                    restored = restore.restore(
+                        project_name=f"Restored {old_format}",
+                        project_slug=f"restored-{old_format}",
+                        user=self.user,
+                    )
+
+                restored_component = restored.component_set.get(slug=slug)
+                self.assertEqual(restored_component.file_format, new_format)
+                self.assertEqual(
+                    restored_component.file_format_params[param_name], param_value
+                )
+
+    def test_restore_legacy_json_sort_keys(self) -> None:
+        component = self.create_json_mono(
+            project=self.project, name="JSON-sort", suffix="sort-keys"
+        )
+        cases = (
+            (True, "case_sensitive"),
+            (False, "none"),
+            ("none", "none"),
+            ("case_sensitive", "case_sensitive"),
+            ("case_insensitive", "case_insensitive"),
+        )
+        for index, (old_value, new_value) in enumerate(cases):
+            with self.subTest(old_value=old_value):
+                temp_name = self.write_tampered_component_backup(
+                    component_updates={
+                        "file_format_params": {"json_sort_keys": old_value}
+                    },
+                    component_slug=component.slug,
+                )
+                with remove_file_after(temp_name):
+                    restore = ProjectBackup(temp_name)
+                    restore.validate()
+                    restored = restore.restore(
+                        project_name=f"Restored json sort {index}",
+                        project_slug=f"restored-json-sort-{index}",
+                        user=self.user,
+                    )
+
+                restored_component = restored.component_set.get(slug=component.slug)
+                self.assertEqual(
+                    restored_component.file_format_params["json_sort_keys"], new_value
+                )
+
+    def test_backup_creates_history_entry(self) -> None:
+        backup = ProjectBackup()
+
+        backup.backup_project(self.project)
+
+        change = self.project.change_set.get(action=ActionEvents.PROJECT_BACKUP)
+        self.assertEqual(change.user, InternalBot.BACKUP.get_user())
+        self.assertEqual(
+            change.details,
+            {
+                "backup_filename": backup.relative_filename,
+                "change_origin": {"scope": "system"},
+            },
+        )
+        history_data = get_change_history_context(change)
+        self.assertEqual(history_data["description"], "Project backed up")
+        self.assertEqual(
+            history_data["change_details_fields"][0]["label"],
+            "Backup file",
+        )
+        self.assertIn(
+            backup.relative_filename,
+            history_data["change_details_fields"][0]["content"],
+        )
+
+    def test_backup_creates_history_entry_with_user(self) -> None:
+        backup = ProjectBackup()
+
+        backup.backup_project(self.project, self.user)
+
+        change = self.project.change_set.get(action=ActionEvents.PROJECT_BACKUP)
+        self.assertEqual(change.user, self.user)
+        self.assertEqual(change.author, self.user)
+
+    def test_backup_includes_compacted_project_memory(self) -> None:
+        source = "Compacted project memory"
+        memory = Memory.objects.create(
+            legacy_project=self.project,
+            source=source,
+            context="",
+            target="Kompaktni projektova pamet",
+            origin=self.component.full_slug,
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            status=Memory.STATUS_ACTIVE,
+        )
+        MemoryScope.objects.create(
+            memory=memory,
+            scope=MemoryScope.SCOPE_SHARED,
+            source_project=self.project,
+        )
+        Memory.objects.filter(pk=memory.pk).update(
+            legacy_project=None, legacy_user=None, legacy_shared=False
+        )
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            memory_data = json.loads(zipfile.read("weblate-memory.json"))
+
+        self.assertIn(source, {entry["source"] for entry in memory_data})
+
+    def test_backup_uses_requested_project_memory_category(self) -> None:
+        other_project = Project.objects.create(
+            name="Other memory backup", slug="other-memory-backup"
+        )
+        source = "Multi project scoped memory"
+        memory = Memory.objects.create(
+            source=source,
+            context="",
+            target="Viceprojektova pamet",
+            origin=self.component.full_slug,
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            status=Memory.STATUS_ACTIVE,
+        )
+        MemoryScope.objects.create(
+            memory=memory,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=other_project,
+        )
+        MemoryScope.objects.create(
+            memory=memory,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=self.project,
+        )
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            memory_data = json.loads(zipfile.read("weblate-memory.json"))
+
+        entry = next(item for item in memory_data if item["source"] == source)
+        self.assertEqual(entry["category"], CATEGORY_PRIVATE_OFFSET + self.project.id)
+
+    def test_backup_restores_workspace_tm_flags(self) -> None:
+        self.project.use_workspace_tm = True
+        self.project.contribute_workspace_tm = True
+        self.project.save(update_fields=["use_workspace_tm", "contribute_workspace_tm"])
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            project_data = json.loads(zipfile.read("weblate-backup.json"))["project"]
+
+        self.assertTrue(project_data["use_workspace_tm"])
+        self.assertTrue(project_data["contribute_workspace_tm"])
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored workspace TM",
+            project_slug="restored-workspace-tm",
+            user=self.user,
+        )
+
+        self.assertTrue(restored.use_workspace_tm)
+        self.assertTrue(restored.contribute_workspace_tm)
+
+    def test_restore_attributes_memory_scopes(self) -> None:
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        attributed_memory = Memory.objects.create(
+            source="Restored attributed memory",
+            context="",
+            target="Obnovena prirazena pamet",
+            origin=self.component.full_slug,
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            status=Memory.STATUS_ACTIVE,
+        )
+        MemoryScope.objects.create(
+            memory=attributed_memory,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=self.project,
+            source_component=self.component,
+        )
+        unresolved_memory = Memory.objects.create(
+            source="Restored unresolved memory",
+            context="",
+            target="Obnovena nerozpoznana pamet",
+            origin=f"{self.project.slug}/missing-component",
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            status=Memory.STATUS_ACTIVE,
+        )
+        MemoryScope.objects.create(
+            memory=unresolved_memory,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=self.project,
+        )
+        uploaded_memory = Memory.objects.create(
+            source="Restored uploaded memory",
+            context="",
+            target="Obnovena nahrana pamet",
+            origin="uploaded-memory.tmx",
+            source_language=self.component.source_language,
+            target_language=self.translation.language,
+            status=Memory.STATUS_ACTIVE,
+        )
+        MemoryScope.objects.create(
+            memory=uploaded_memory,
+            scope=MemoryScope.SCOPE_PROJECT_FILE,
+            project=self.project,
+        )
+        MemoryScope.objects.create(
+            memory=uploaded_memory,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=self.project,
+        )
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            memory_data = json.loads(zipfile.read("weblate-memory.json"))
+        uploaded_entries = [
+            entry for entry in memory_data if entry["source"] == uploaded_memory.source
+        ]
+        self.assertEqual(
+            {entry["category"] for entry in uploaded_entries},
+            {CATEGORY_PRIVATE_OFFSET + self.project.pk, CATEGORY_FILE},
+        )
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restore.IMPORT_BATCH_SIZE = 1
+        restored = restore.restore(
+            project_name="Restored memory attribution",
+            project_slug="restored-memory-attribution",
+            user=self.user,
+        )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        attributed_scope = MemoryScope.objects.get(
+            memory__source=attributed_memory.source,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=restored,
+        )
+        self.assertTrue(restored_component.restricted)
+        self.assertEqual(attributed_scope.source_component_id, restored_component.id)
+        unresolved_scope = MemoryScope.objects.get(
+            memory__source=unresolved_memory.source,
+            scope=MemoryScope.SCOPE_PROJECT,
+            project=restored,
+        )
+        self.assertIsNone(unresolved_scope.source_component_id)
+        restored_uploaded_memory = (
+            Memory.objects.filter(
+                source=uploaded_memory.source, scopes__project=restored
+            )
+            .distinct()
+            .get()
+        )
+        self.assertEqual(
+            set(
+                restored_uploaded_memory.scopes.filter(project=restored).values_list(
+                    "scope", flat=True
+                )
+            ),
+            {MemoryScope.SCOPE_PROJECT, MemoryScope.SCOPE_PROJECT_FILE},
+        )
+        self.assertFalse(
+            restored_uploaded_memory.scopes.exclude(
+                source_component__isnull=True
+            ).exists()
+        )
+
+    def test_restore_creates_history_entries(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+
+        project_change = restored.change_set.get(action=ActionEvents.PROJECT_RESTORE)
+        self.assertEqual(project_change.user, self.user)
+        self.assertEqual(project_change.author, self.user)
+        self.assertEqual(
+            project_change.details,
+            {
+                "backup_timestamp": restore.data["metadata"]["timestamp"],
+                "backup_server": restore.data["metadata"]["server"],
+                "backup_domain": restore.data["metadata"]["domain"],
+                "change_origin": {"scope": "system"},
+            },
+        )
+        history_data = get_change_history_context(project_change)
+        self.assertEqual(history_data["description"], "Project restored")
+        self.assertEqual(
+            [field["label"] for field in history_data["change_details_fields"]],
+            ["Backup created", "Backup server", "Backup domain"],
+        )
+
+        component_changes = Change.objects.filter(
+            project=restored, action=ActionEvents.COMPONENT_RESTORE
+        )
+        self.assertEqual(component_changes.count(), restored.component_set.count())
+        self.assertEqual(
+            {change.details["original_slug"] for change in component_changes},
+            {
+                ProjectBackup.full_slug_without_project(component)
+                for component in self.project.component_set.iterator()
+            },
+        )
+        for change in component_changes:
+            self.assertEqual(change.user, self.user)
+            self.assertEqual(change.author, self.user)
+            self.assertIsNotNone(change.component)
+            component_history_data = get_change_history_context(change)
+            self.assertEqual(
+                component_history_data["description"], "Component restored"
+            )
+            self.assertEqual(
+                component_history_data["change_details_fields"][0]["label"],
+                "Original component",
+            )
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_import_task_returns_project_url(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+        copyfile(TEST_BACKUP, temp_name)
+
+        result = import_project_backup(
+            "Restored URL", "restored-url", self.user.id, temp_name
+        )
+
+        project = Project.objects.get(slug="restored-url")
+        self.assertEqual(
+            result,
+            {
+                "message": "Project backup import completed.",
+                "url": project.get_absolute_url(),
+            },
+        )
+        self.assertFalse(os.path.exists(temp_name))
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_import_task_reports_progress(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+        copyfile(TEST_BACKUP, temp_name)
+        task = MagicMock()
+        task.request.id = "task-id"
+
+        with patch("weblate.trans.tasks.current_task", task):
+            import_project_backup(
+                "Restored Progress", "restored-progress", self.user.id, temp_name
+            )
+
+        self.assertEqual(
+            [
+                call.kwargs["meta"]["progress"]
+                for call in task.update_state.call_args_list
+            ],
+            [5, 10, 30, 60, 90, 95],
+        )
+
+    def test_import_task_unlinks_file_when_user_lookup_fails(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with self.assertRaises(type(self.user).DoesNotExist):
+            import_project_backup("Restored", "restored", 0, temp_name)
+
+        self.assertFalse(os.path.exists(temp_name))
+
+    def test_import_task_unlinks_file_when_billing_lookup_fails(self) -> None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.billing.models import Billing
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with self.assertRaises(Billing.DoesNotExist):
+            import_project_backup(
+                "Restored", "restored", self.user.id, temp_name, billing_id=0
+            )
+
+        self.assertFalse(os.path.exists(temp_name))
+
+    def test_restore_batches_change_addon_dispatch(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        WebhookAddon.create(
+            acting_user=get_test_actor(self),
+            configuration={
+                "webhook_url": "https://example.com/hook",
+                "events": [ActionEvents.PROJECT_RESTORE],
+            },
+            run=False,
+        )
+
+        with patch("weblate.addons.tasks.addon_change.delay_on_commit") as mocked_delay:
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+
+        self.assertEqual(mocked_delay.call_count, 2)
+        self.assertEqual(
+            sorted(len(call.args[0]) for call in mocked_delay.call_args_list),
+            [1, restored.component_set.count() + 1],
+        )
+
+    def test_create_backup_missing_repository(self) -> None:
+        linked = self.create_link_existing()
+        repository_path = Path(self.component.full_path)
+        backup = ProjectBackup()
+        with tempfile.TemporaryDirectory(dir=repository_path.parent) as temporary:
+            moved_path = repository_path.rename(Path(temporary) / "repository")
+            try:
+                with (
+                    patch.object(
+                        GitRepository, "maintenance", autospec=True
+                    ) as maintenance,
+                    self.assertLogs("weblate", "WARNING") as logs,
+                ):
+                    backup.backup_project(self.project)
+                self.assertNotIn(
+                    repository_path.as_posix(),
+                    [call.args[0].path for call in maintenance.call_args_list],
+                )
+            finally:
+                moved_path.rename(repository_path)
+
+        self.assertIn("skipping missing repository directory", "\n".join(logs.output))
+        with ZipFile(backup.filename) as backupzip:
+            data = json.loads(backupzip.read("components/test.json"))
+            self.assertEqual(
+                len(data["translations"]), self.component.translation_set.count()
+            )
+            self.assertTrue(data["units"])
+            self.assertFalse(
+                any(name.startswith("vcs/test/") for name in backupzip.namelist())
+            )
+            self.assertIn("vcs/glossary/.git/index", backupzip.namelist())
+            self.assertIn("weblate-backup.json", backupzip.namelist())
+        self.assertFalse(Path(f"{backup.filename}.part").exists())
+        self.assertTrue(
+            self.project.change_set.filter(action=ActionEvents.PROJECT_BACKUP).exists()
+        )
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        with patch.object(
+            GitRepository, "clone_from", side_effect=AssertionError("Unexpected clone")
+        ):
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+        component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(
+            component.translation_set.count(), self.component.translation_set.count()
+        )
+        self.assertCountEqual(
+            Unit.objects.filter(translation__component=component).values_list(
+                "source", "target", "state"
+            ),
+            Unit.objects.filter(translation__component=self.component).values_list(
+                "source", "target", "state"
+            ),
+        )
+        self.assertFalse(Path(component.full_path).exists())
+        self.assertTrue(
+            (
+                Path(restored.component_set.get(slug="glossary").full_path)
+                / ".git/index"
+            ).exists()
+        )
+        self.assertEqual(
+            restored.component_set.get(slug=linked.slug).linked_component, component
+        )
+
+    def test_create_backup_maintenance_failure(self) -> None:
+        backup = ProjectBackup()
+        with (
+            patch.object(
+                GitRepository,
+                "maintenance",
+                side_effect=RepositoryCommandError(1, "maintenance failed"),
+            ),
+            self.assertLogs("weblate", "WARNING") as logs,
+        ):
+            backup.backup_project(self.project)
+
+        self.assertIn("repository maintenance failed", "\n".join(logs.output))
+        with ZipFile(backup.filename) as backupzip:
+            self.assertIn("components/test.json", backupzip.namelist())
+            self.assertIn("vcs/test/.git/index", backupzip.namelist())
+            self.assertIn("vcs/glossary/.git/index", backupzip.namelist())
+        ProjectBackup(backup.filename).validate()
+
+    def test_create_backup_holds_repository_lock_while_archiving(self) -> None:
+        backup = ProjectBackup()
+        repository = self.component.repository
+        archived = False
+
+        def check_lock(*args, **kwargs) -> None:
+            nonlocal archived
+            self.assertTrue(repository.lock.is_locked)
+            archived = True
+
+        with (
+            ZipFile(BytesIO(), "w") as backupzip,
+            patch.object(backup, "backup_dir", side_effect=check_lock),
+        ):
+            backup.backup_component(backupzip, self.component)
+
+        self.assertTrue(archived)
+
+    def test_backup_dir_refreshes_repository_lock(self) -> None:
+        backup = ProjectBackup()
+        refresh_lock = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            ZipFile(BytesIO(), "w", compression=ZIP_DEFLATED) as backupzip,
+            patch("weblate.trans.backups.monotonic", side_effect=(0, 0, 301, 301)),
+        ):
+            Path(directory, "file").write_bytes(b"content")
+            backup.backup_dir(backupzip, directory, "vcs/test", refresh_lock)
+            file_info = backupzip.getinfo("vcs/test/file")
+            self.assertEqual(file_info.compress_type, ZIP_DEFLATED)
+            # ruff: ignore[private-member-access]
+            self.assertEqual(
+                file_info._compresslevel,  # type: ignore[attr-defined]
+                backupzip.compresslevel,
+            )
+
+        refresh_lock.assert_called_once_with()
+
+    def test_backup_dir_refreshes_repository_lock_for_empty_file(self) -> None:
+        backup = ProjectBackup()
+        refresh_lock = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            ZipFile(BytesIO(), "w") as backupzip,
+            patch("weblate.trans.backups.monotonic", side_effect=(0, 0, 301)),
+        ):
+            Path(directory, "empty").touch()
+            backup.backup_dir(backupzip, directory, "vcs/test", refresh_lock)
+            self.assertEqual(backupzip.getinfo("vcs/test/empty").file_size, 0)
+
+        refresh_lock.assert_called_once_with()
+
+    def test_create_backup_invalid_git_head(self) -> None:
+        head_path = Path(self.component.full_path) / ".git/HEAD"
+        original_head = head_path.read_bytes()
+        filename = self.component.translation_set.get(language_code="cs").filename
+        expected_content = (Path(self.component.full_path) / filename).read_bytes()
+        backup = ProjectBackup()
+        head_path.write_bytes(b"invalid HEAD\n")
+        try:
+            with self.assertLogs("weblate", "WARNING") as logs:
+                backup.backup_project(self.project)
+        finally:
+            head_path.write_bytes(original_head)
+
+        self.assertIn("repository maintenance failed", "\n".join(logs.output))
+        with ZipFile(backup.filename) as backupzip:
+            self.assertEqual(backupzip.read("vcs/test/.git/HEAD"), b"invalid HEAD\n")
+            self.assertEqual(backupzip.read(f"vcs/test/{filename}"), expected_content)
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        with self.assertLogs("weblate", "WARNING") as logs:
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+        component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(
+            (Path(component.full_path) / filename).read_bytes(), expected_content
+        )
+        self.assertFalse((Path(component.full_path) / ".git/config").exists())
+        self.assertCountEqual(
+            Unit.objects.filter(translation__component=component).values_list(
+                "source", "target", "state"
+            ),
+            Unit.objects.filter(translation__component=self.component).values_list(
+                "source", "target", "state"
+            ),
+        )
+        self.assertIn(
+            "repository metadata is missing or invalid", "\n".join(logs.output)
+        )
+
+    def test_restore_without_usable_repository_metadata(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        filename = self.component.translation_set.get(language_code="cs").filename
+        member_name = f"vcs/test/{filename}"
+        with ZipFile(backup.filename) as source_zip:
+            expected_content = source_zip.read(member_name)
+
+            for metadata in ("missing", "invalid-head", "missing-objects"):
+                with (
+                    self.subTest(metadata=metadata),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    archive = Path(temporary) / "backup.zip"
+                    with ZipFile(archive, "w") as target_zip:
+                        for info in source_zip.infolist():
+                            if metadata == "missing" and info.filename.startswith(
+                                "vcs/test/.git/"
+                            ):
+                                continue
+                            if (
+                                metadata == "missing-objects"
+                                and info.filename.startswith("vcs/test/.git/objects/")
+                            ):
+                                continue
+                            content = source_zip.read(info.filename)
+                            if (
+                                metadata == "invalid-head"
+                                and info.filename == "vcs/test/.git/HEAD"
+                            ):
+                                content = b"invalid HEAD\n"
+                            target_zip.writestr(copy(info), content)
+                        target_zip.writestr(
+                            "vcs/test/config", b"working-tree configuration\n"
+                        )
+
+                    restore = ProjectBackup(archive.as_posix())
+                    restore.validate()
+                    with (
+                        patch.object(
+                            GitRepository,
+                            "clone_from",
+                            side_effect=AssertionError("Unexpected clone"),
+                        ),
+                        self.assertLogs("weblate", "WARNING") as logs,
+                    ):
+                        restored = restore.restore(
+                            project_name=f"Restored {metadata}",
+                            project_slug=f"restored-{metadata}",
+                            user=self.user,
+                        )
+                    component = restored.component_set.get(slug=self.component.slug)
+                    self.assertEqual(
+                        (Path(component.full_path) / filename).read_bytes(),
+                        expected_content,
+                    )
+                    self.assertFalse(
+                        (Path(component.full_path) / ".git/config").exists()
+                    )
+                    self.assertCountEqual(
+                        Unit.objects.filter(
+                            translation__component=component
+                        ).values_list("source", "target", "state"),
+                        Unit.objects.filter(
+                            translation__component=self.component
+                        ).values_list("source", "target", "state"),
+                    )
+                    self.assertTrue(
+                        (
+                            Path(restored.component_set.get(slug="glossary").full_path)
+                            / ".git/index"
+                        ).exists()
+                    )
+                    self.assertIn(
+                        "repository metadata is missing or invalid",
+                        "\n".join(logs.output),
+                    )
+
+    def test_create_backup_repository_disappears_during_maintenance(self) -> None:
+        repository_path = Path(self.component.full_path)
+        backup = ProjectBackup()
+        with tempfile.TemporaryDirectory(dir=repository_path.parent) as temporary:
+            moved_path = Path(temporary) / "repository"
+
+            def maintenance(repository: GitRepository) -> None:
+                if repository.path == repository_path.as_posix():
+                    repository_path.rename(moved_path)
+                    raise RepositoryCommandError(2, "repository directory is missing")
+
+            try:
+                with (
+                    patch.object(
+                        GitRepository,
+                        "maintenance",
+                        autospec=True,
+                        side_effect=maintenance,
+                    ),
+                    self.assertLogs("weblate", "WARNING") as logs,
+                ):
+                    backup.backup_project(self.project)
+            finally:
+                if moved_path.exists():
+                    moved_path.rename(repository_path)
+
+        self.assertIn("repository maintenance failed", "\n".join(logs.output))
+        with ZipFile(backup.filename) as backupzip:
+            self.assertIn("components/test.json", backupzip.namelist())
+            self.assertFalse(
+                any(name.startswith("vcs/test/") for name in backupzip.namelist())
+            )
+            self.assertIn("vcs/glossary/.git/index", backupzip.namelist())
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+        self.assertFalse(
+            Path(restored.component_set.get(slug="test").full_path).exists()
+        )
+        self.assertEqual(
+            restored.component_set.count(), self.project.component_set.count()
+        )
+
+    def test_create_backup_unexpected_maintenance_failure(self) -> None:
+        for error in (
+            RuntimeError("unexpected failure"),
+            PermissionError("permission denied"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                backup = ProjectBackup()
+                with (
+                    patch.object(GitRepository, "maintenance", side_effect=error),
+                    self.assertRaises(type(error)),
+                ):
+                    backup.backup_project(self.project)
+                self.assertFalse(Path(backup.filename).exists())
+                self.assertFalse(Path(f"{backup.filename}.part").exists())
+
+    @override_settings(PROJECT_BACKUP_KEEP_COUNT=1)
+    def test_create_backup_archive_write_failure(self) -> None:
+        previous = ProjectBackup()
+        previous.backup_project(self.project)
+        backup = ProjectBackup()
+        with (
+            patch.object(GitRepository, "maintenance"),
+            patch.object(ZipFile, "open", side_effect=OSError("disk full")),
+            self.assertRaisesMessage(OSError, "disk full"),
+        ):
+            backup.backup_project(self.project)
+        self.assertFalse(Path(backup.filename).exists())
+        self.assertFalse(Path(f"{backup.filename}.part").exists())
+        cleanup_project_backups()
+        self.assertTrue(Path(previous.filename).exists())
+
+    def test_create_backup_rename_failure(self) -> None:
+        backup = ProjectBackup()
+        with (
+            patch.object(GitRepository, "maintenance"),
+            patch(
+                "weblate.trans.backups.os.rename", side_effect=OSError("rename failed")
+            ),
+            self.assertRaisesMessage(OSError, "rename failed"),
+        ):
+            backup.backup_project(self.project)
+        self.assertFalse(Path(backup.filename).exists())
+        self.assertFalse(Path(f"{backup.filename}.part").exists())
+
+    def test_create_backup_preserves_existing_partial_archive(self) -> None:
+        backup = ProjectBackup()
+        backup.generate_filename(self.project)
+        part_path = Path(f"{backup.filename}.part")
+        part_path.write_bytes(b"another backup is in progress")
+        self.addCleanup(part_path.unlink, missing_ok=True)
+        with (
+            patch.object(backup, "generate_filename"),
+            self.assertRaises(FileExistsError),
+        ):
+            backup.backup_project(self.project)
+        self.assertEqual(part_path.read_bytes(), b"another backup is in progress")
+
+    def test_create_backup_repository_access_failure(self) -> None:
+        repository_path = self.component.full_path
+        for operation in ("stat", "scandir"):
+            original = getattr(os, operation)
+            for error in (
+                PermissionError(errno.EACCES, "permission denied", repository_path),
+                OSError(errno.EIO, "I/O error", repository_path),
+                NotADirectoryError(errno.ENOTDIR, "not a directory", repository_path),
+            ):
+                with self.subTest(operation=operation, error=type(error).__name__):
+                    backup = ProjectBackup()
+
+                    def access(
+                        path,
+                        *args,
+                        failure: OSError = error,
+                        access_function=original,
+                        **kwargs,
+                    ):
+                        if os.fspath(path) == repository_path:
+                            raise failure
+                        return access_function(path, *args, **kwargs)
+
+                    with (
+                        patch(
+                            f"weblate.trans.backups.os.{operation}", side_effect=access
+                        ),
+                        patch.object(GitRepository, "maintenance"),
+                        self.assertRaises(type(error)) as raised,
+                    ):
+                        backup.backup_project(self.project)
+                    self.assertIs(raised.exception, error)
+                    self.assertFalse(Path(backup.filename).exists())
+                    self.assertFalse(Path(f"{backup.filename}.part").exists())
+                    self.assertFalse(
+                        self.project.change_set.filter(
+                            action=ActionEvents.PROJECT_BACKUP
+                        ).exists()
+                    )
 
     def test_create_backup(self) -> None:
         # Create linked component
@@ -56,12 +1949,19 @@ class BackupsTest(ViewTestCase):
         label = self.project.label_set.create(name="Label", color="navy")
         unit = self.component.source_translation.unit_set.all()[0]
         unit.labels.add(label)
+        SavedSearch.objects.create(
+            project=self.project,
+            name="Important",
+            query="priority:>100",
+            description="Translate first",
+        )
+        SavedSearch.objects.create(user=self.user, name="Personal", query="has:comment")
         shot = Screenshot.objects.create(
             name="Obrazek", translation=self.component.source_translation
         )
         with open(TEST_SCREENSHOT, "rb") as handle:
             shot.image.save("screenshot.png", File(handle))
-        shot.units.add(unit)
+        shot.add_unit(unit, user=self.user)
 
         unit.comment_set.create(
             comment="Test comment",
@@ -78,12 +1978,16 @@ class BackupsTest(ViewTestCase):
         team = Group.objects.create(name="Test group", defining_project=self.project)
         team.roles.set([Role.objects.get(name="Translate")])
         team.admins.add(self.user)
+        team.user_set.add(self.user)
         team.language_selection = SELECTION_MANUAL
         team.languages.set(
             [
                 Language.objects.get(code="en"),
                 Language.objects.get(code="ru"),
             ]
+        )
+        TeamMembership.objects.get(user=self.user, group=team).limit_languages.set(
+            [Language.objects.get(code="en")]
         )
         AutoGroup(match="^.*$", group=team).save()
 
@@ -95,23 +1999,27 @@ class BackupsTest(ViewTestCase):
         with ZipFile(backup.filename, "r") as zipfile:
             files = set(zipfile.namelist())
             self.assertIn("weblate-backup.json", files)
-            self.assertIn("components/test.json", files)
+            self.assertIn("components/my-category/test.json", files)
             self.assertIn("components/glossary.json", files)
             self.assertIn("vcs/my-category/test/.git/index", files)
             self.assertIn("vcs/glossary/.git/index", files)
+            metadata = json.loads(zipfile.read("weblate-backup.json"))
+            backup_team = next(
+                item for item in metadata["teams"] if item["name"] == team.name
+            )
+            self.assertEqual(
+                backup_team["members"],
+                [{"username": self.user.username, "limit_languages": ["en"]}],
+            )
 
         restore = ProjectBackup(backup.filename)
 
-        if not connection.features.can_return_rows_from_bulk_insert:
-            with self.assertRaises(ValueError):
-                restore.validate()
-            return
-
         restore.validate()
 
-        restored = restore.restore(
-            project_name="Restored", project_slug="restored", user=self.user
-        )
+        with patch.object(ProjectBackup, "IMPORT_BATCH_SIZE", 1):
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
 
         self.assertEqual(
             Vote.objects.filter(
@@ -149,6 +2057,11 @@ class BackupsTest(ViewTestCase):
             set(self.project.label_set.values_list("name", "color")),
             set(restored.label_set.values_list("name", "color")),
         )
+        # Personal searches are not part of the project
+        self.assertEqual(
+            list(restored.savedsearch_set.values_list("name", "query", "description")),
+            [("Important", "priority:>100", "Translate first")],
+        )
         self.assertEqual(
             set(self.project.component_set.values_list("slug", flat=True)),
             set(restored.component_set.values_list("slug", flat=True)),
@@ -165,9 +2078,17 @@ class BackupsTest(ViewTestCase):
             self.project.count_pending_units,
             restored.count_pending_units,
         )
+        restored_screenshot = Screenshot.objects.get(
+            translation__component__project=restored
+        )
+        assert restored_screenshot.image.name is not None
+        self.assertTrue(
+            restored_screenshot.image.storage.exists(restored_screenshot.image.name)
+        )
+        self.assertGreater(restored_screenshot.image.size, 0)
 
         restored_team = restored.defined_groups.filter(name=team.name).first()
-        self.assertIsNotNone(restored_team)
+        assert restored_team is not None
         self.assertEqual(team.language_selection, restored_team.language_selection)
         self.assertEqual(
             set(team.roles.values_list("name", flat=True)),
@@ -180,6 +2101,14 @@ class BackupsTest(ViewTestCase):
         self.assertEqual(
             set(team.user_set.values_list("username", flat=True)),
             set(restored_team.user_set.values_list("username", flat=True)),
+        )
+        self.assertEqual(
+            set(
+                TeamMembership.objects.get(
+                    user__username=self.user.username, group=restored_team
+                ).limit_languages.values_list("code", flat=True)
+            ),
+            {"en"},
         )
         self.assertEqual(
             set(team.languages.values_list("code", flat=True)),
@@ -202,17 +2131,1690 @@ class BackupsTest(ViewTestCase):
             component_category_mapping(restored),
         )
         # Verify that Git operations work on restored repos
-        restored.do_reset()
+        restored.do_reset(self.get_request())
 
-    @skipUnlessDBFeature("can_return_rows_from_bulk_insert")
-    def test_restore_supported(self) -> None:
-        self.assertTrue(connection.features.can_return_rows_from_bulk_insert)
+    def test_backup_inherited_settings(self) -> None:
+        workspace = Workspace.objects.create(
+            name="Backup workspace",
+            license="MIT",
+            secondary_language=Language.objects.get(code="de"),
+            check_flags="safe-html",
+            commit_message="Workspace commit",
+        )
+        Project.objects.filter(pk=self.project.pk).update(
+            workspace=workspace,
+            license="GPL-3.0-or-later",
+            secondary_language=Language.objects.get(code="ru"),
+            check_flags="strict-same",
+            commit_message="Project commit",
+            inherit_license=True,
+            inherit_secondary_language=True,
+            inherit_commit_message=True,
+        )
+        category = Category.objects.create(
+            name="Backup category",
+            slug="backup-category",
+            project=self.project,
+            commit_message="Category commit",
+            inherit_commit_message=False,
+            check_flags="xml-text",
+        )
+        self.component.category = category
+        self.component.check_flags = "ignore-same"
+        self.component.inherit_secondary_language = True
+        self.component.inherit_commit_message = True
+        self.component.save()
+        project = Project.objects.select_related("workspace").get(pk=self.project.pk)
 
-    @skipIfDBFeature("can_return_rows_from_bulk_insert")
-    def test_restore_not_supported(self) -> None:
-        self.assertFalse(connection.features.can_return_rows_from_bulk_insert)
+        backup = ProjectBackup()
+        backup.backup_project(project)
 
-    @skipUnlessDBFeature("can_return_rows_from_bulk_insert")
+        with ZipFile(backup.filename, "r") as zipfile:
+            project_data = json.loads(zipfile.read("weblate-backup.json"))
+            category_data = project_data["categories"][0]
+            component_data = json.loads(
+                zipfile.read("components/backup-category/test.json")
+            )
+
+        self.assertEqual(project_data["project"]["commit_message"], "Workspace commit")
+        self.assertEqual(project_data["project"]["license"], "MIT")
+        self.assertEqual(project_data["project"]["secondary_language"], "de")
+        self.assertEqual(
+            project_data["project"]["check_flags"], "safe-html, strict-same"
+        )
+        self.assertTrue(project_data["project"]["inherit_license"])
+        self.assertTrue(project_data["project"]["inherit_commit_message"])
+        self.assertTrue(project_data["project"]["inherit_secondary_language"])
+        self.assertEqual(category_data["commit_message"], "Category commit")
+        self.assertEqual(category_data["check_flags"], "xml-text")
+        self.assertFalse(category_data["inherit_commit_message"])
+        self.assertTrue(category_data["inherit_secondary_language"])
+        self.assertEqual(component_data["component"]["check_flags"], "ignore-same")
+        self.assertTrue(component_data["component"]["inherit_commit_message"])
+        self.assertTrue(component_data["component"]["inherit_secondary_language"])
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+        restored_component = restored.component_set.select_related(
+            "project",
+            "project__workspace",
+            "project__secondary_language",
+            "category",
+            "category__category",
+            "secondary_language",
+        ).get(slug=self.component.slug)
+        restored_category = restored.category_set.get(slug=category.slug)
+
+        self.assertIsNone(restored.workspace)
+        self.assertEqual(restored.license, "MIT")
+        self.assertEqual(restored.commit_message, "Workspace commit")
+        assert restored.secondary_language is not None
+        self.assertEqual(restored.secondary_language.code, "de")
+        self.assertEqual(
+            restored.effective_check_flags.format(), "safe-html, strict-same"
+        )
+        self.assertTrue(restored.inherit_license)
+        self.assertTrue(restored.inherit_commit_message)
+        self.assertTrue(restored.inherit_secondary_language)
+        self.assertEqual(restored_category.commit_message, "Category commit")
+        self.assertEqual(restored_category.check_flags, "xml-text")
+        self.assertFalse(restored_category.inherit_commit_message)
+        self.assertTrue(restored_category.inherit_secondary_language)
+        self.assertTrue(restored_component.inherit_commit_message)
+        self.assertTrue(restored_component.inherit_secondary_language)
+        self.assertEqual(restored_component.effective_commit_message, "Category commit")
+        component_secondary_language = restored_component.effective_secondary_language
+        assert component_secondary_language is not None
+        self.assertEqual(component_secondary_language.code, "de")
+        self.assertEqual(
+            set(restored_component.all_flags),
+            {"safe-html", "strict-same", "xml-text", "ignore-same"},
+        )
+
+        target_workspace = Workspace.objects.create(
+            name="Target workspace",
+            license="GPL-3.0-or-later",
+            secondary_language=Language.objects.get(code="fr"),
+            commit_message="Target workspace commit",
+        )
+        workspace_restore = ProjectBackup(backup.filename)
+        workspace_restore.validate()
+        restored_workspace_project = workspace_restore.restore(
+            project_name="Restored workspace",
+            project_slug="restored-workspace",
+            user=self.user,
+            workspace=target_workspace,
+        )
+
+        self.assertEqual(restored_workspace_project.workspace_id, target_workspace.pk)
+        self.assertFalse(restored_workspace_project.inherit_license)
+        self.assertFalse(restored_workspace_project.inherit_commit_message)
+        self.assertFalse(restored_workspace_project.inherit_secondary_language)
+        self.assertEqual(
+            restored_workspace_project.get_effective_setting("license"), "MIT"
+        )
+        self.assertEqual(
+            restored_workspace_project.get_effective_setting("commit_message"),
+            "Workspace commit",
+        )
+        secondary_language = restored_workspace_project.get_effective_setting(
+            "secondary_language"
+        )
+        assert isinstance(secondary_language, Language)
+        self.assertEqual(secondary_language.code, "de")
+
+    def test_backup_settings(self) -> None:
+        project = self.project
+        project.autoclean_tm = not project.autoclean_tm
+        project.public_sharing = True
+        project.enforced_2fa = True
+        project.commit_policy = CommitPolicyChoices.APPROVED_ONLY
+        project.save(
+            update_fields=[
+                "autoclean_tm",
+                "public_sharing",
+                "enforced_2fa",
+                "commit_policy",
+            ]
+        )
+        component = self.create_po_mono(project=project, name="Backup-settings")
+        component.hide_glossary_matches = True
+        component.contribute_project_tm = False
+        component.file_format_params = {
+            "po_line_wrap": 65535,
+            "po_set_language_team": True,
+        }
+        component.screenshot_filemask = "screenshots/*.png"
+        component.key_filter = "^keep"
+        component.save(
+            update_fields=[
+                "hide_glossary_matches",
+                "contribute_project_tm",
+                "file_format_params",
+                "screenshot_filemask",
+                "key_filter",
+            ]
+        )
+
+        backup = ProjectBackup()
+        backup.backup_project(project)
+        with ZipFile(backup.filename, "r") as zipfile:
+            project_data = json.loads(zipfile.read("weblate-backup.json"))["project"]
+            component_data = json.loads(
+                zipfile.read(f"components/{component.slug}.json")
+            )["component"]
+
+        self.assertEqual(project_data["autoclean_tm"], project.autoclean_tm)
+        self.assertTrue(project_data["public_sharing"])
+        self.assertTrue(project_data["enforced_2fa"])
+        self.assertEqual(
+            project_data["commit_policy"], CommitPolicyChoices.APPROVED_ONLY
+        )
+        self.assertTrue(component_data["hide_glossary_matches"])
+        self.assertFalse(component_data["contribute_project_tm"])
+        self.assertEqual(
+            component_data["file_format_params"], component.file_format_params
+        )
+        self.assertEqual(component_data["screenshot_filemask"], "screenshots/*.png")
+        self.assertEqual(component_data["key_filter"], "^keep")
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored settings",
+            project_slug="restored-settings",
+            user=self.user,
+        )
+        restored_component = restored.component_set.get(slug=component.slug)
+
+        self.assertEqual(restored.autoclean_tm, project.autoclean_tm)
+        self.assertTrue(restored.public_sharing)
+        self.assertTrue(restored.enforced_2fa)
+        self.assertEqual(restored.commit_policy, CommitPolicyChoices.APPROVED_ONLY)
+        self.assertTrue(restored_component.hide_glossary_matches)
+        self.assertFalse(restored_component.contribute_project_tm)
+        self.assertEqual(
+            restored_component.file_format_params, component.file_format_params
+        )
+        self.assertEqual(restored_component.screenshot_filemask, "screenshots/*.png")
+        self.assertEqual(restored_component.key_filter, "^keep")
+
+    def test_backup_team_members_prefetches_limit_languages(self) -> None:
+        team = Group.objects.create(name="Prefetch team", defining_project=self.project)
+        first_user = type(self.user).objects.create_user(
+            "backup-limit-a", "backup-limit-a@example.com", "x"
+        )
+        second_user = type(self.user).objects.create_user(
+            "backup-limit-b", "backup-limit-b@example.com", "x"
+        )
+        team.user_set.add(first_user, second_user)
+        TeamMembership.objects.get(user=first_user, group=team).limit_languages.set(
+            [Language.objects.get(code="cs")]
+        )
+        TeamMembership.objects.get(user=second_user, group=team).limit_languages.set(
+            [Language.objects.get(code="de")]
+        )
+
+        with self.assertNumQueries(2):
+            self.assertEqual(
+                ProjectBackup.backup_team_members(team),
+                [
+                    {"username": first_user.username, "limit_languages": ["cs"]},
+                    {"username": second_user.username, "limit_languages": ["de"]},
+                ],
+            )
+
+    def test_restore_team_members_accepts_legacy_member_dict(self) -> None:
+        team = Group.objects.create(name="Restore team", defining_project=self.project)
+        user = type(self.user).objects.create_user(
+            "backup-limit-legacy", "backup-limit-legacy@example.com", "x"
+        )
+        backup = ProjectBackup()
+
+        backup.restore_team_members(team, [{"username": user.username}])
+
+        membership = TeamMembership.objects.get(user=user, group=team)
+        self.assertFalse(membership.limit_languages.exists())
+
+    def test_restore_team_members_deduplicates_users(self) -> None:
+        team = Group.objects.create(name="Restore duplicate team")
+        user = type(self.user).objects.create_user(
+            "backup-limit-duplicate", "backup-limit-duplicate@example.com", "x"
+        )
+        czech = Language.objects.get(code="cs")
+        german = Language.objects.get(code="de")
+        backup = ProjectBackup()
+        backup.languages_cache = {czech.code: czech, german.code: german}
+
+        with self.assertWarnsRegex(UserWarning, "Conflicting language limits"):
+            backup.restore_team_members(
+                team,
+                [
+                    {"username": user.username, "limit_languages": [czech.code]},
+                    {"username": user.username, "limit_languages": [german.code]},
+                ],
+            )
+
+        self.assertEqual(team.user_set.count(), 1)
+        membership = TeamMembership.objects.get(user=user, group=team)
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)), ["de"]
+        )
+
+    def test_restore_team_members_bulk_restores_limit_languages(self) -> None:
+        team = Group.objects.create(name="Restore bulk limit team")
+        first_user = type(self.user).objects.create_user(
+            "backup-limit-bulk-a", "backup-limit-bulk-a@example.com", "x"
+        )
+        second_user = type(self.user).objects.create_user(
+            "backup-limit-bulk-b", "backup-limit-bulk-b@example.com", "x"
+        )
+        czech = Language.objects.get(code="cs")
+        german = Language.objects.get(code="de")
+        backup = ProjectBackup()
+        backup.languages_cache = {czech.code: czech, german.code: german}
+
+        with patch.object(
+            TeamMembership,
+            "set_limit_languages",
+            side_effect=AssertionError("restore should use bulk m2m writes"),
+        ):
+            backup.restore_team_members(
+                team,
+                [
+                    {
+                        "username": first_user.username,
+                        "limit_languages": [german.code, czech.code, czech.code],
+                    },
+                    {
+                        "username": second_user.username,
+                        "limit_languages": [german.code],
+                    },
+                ],
+            )
+
+        memberships = TeamMembership.objects.filter(group=team).prefetch_related(
+            "limit_languages"
+        )
+        restored_limits = {
+            membership.user.username: sorted(
+                membership.limit_languages.values_list("code", flat=True)
+            )
+            for membership in memberships
+        }
+        self.assertEqual(
+            restored_limits,
+            {
+                first_user.username: ["cs", "de"],
+                second_user.username: ["de"],
+            },
+        )
+
+    def test_restore_team_members_ignores_equivalent_duplicate_limits(self) -> None:
+        team = Group.objects.create(name="Restore equivalent duplicate team")
+        user = type(self.user).objects.create_user(
+            "backup-limit-equivalent", "backup-limit-equivalent@example.com", "x"
+        )
+        czech = Language.objects.get(code="cs")
+        german = Language.objects.get(code="de")
+        backup = ProjectBackup()
+        backup.languages_cache = {czech.code: czech, german.code: german}
+
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            backup.restore_team_members(
+                team,
+                [
+                    {
+                        "username": user.username,
+                        "limit_languages": [czech.code, german.code],
+                    },
+                    {
+                        "username": user.username,
+                        "limit_languages": [german.code, czech.code],
+                    },
+                ],
+            )
+
+        self.assertEqual(caught_warnings, [])
+
+    def test_restore_team_members_creates_missing_limit_language(self) -> None:
+        team = Group.objects.create(name="Restore missing limit language team")
+        user = type(self.user).objects.create_user(
+            "backup-limit-missing", "backup-limit-missing@example.com", "x"
+        )
+        backup = ProjectBackup()
+        backup.languages_cache = {}
+
+        backup.restore_team_members(
+            team,
+            [{"username": user.username, "limit_languages": ["missing"]}],
+        )
+
+        membership = TeamMembership.objects.get(group=team, user=user)
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)),
+            ["missing"],
+        )
+
+    def test_restore_team_members_rolls_back_limit_failure(self) -> None:
+        team = Group.objects.create(name="Restore rollback team")
+        user = type(self.user).objects.create_user(
+            "backup-limit-rollback", "backup-limit-rollback@example.com", "x"
+        )
+        czech = Language.objects.get(code="cs")
+        backup = ProjectBackup()
+        backup.languages_cache = {czech.code: czech}
+
+        with (
+            patch.object(
+                backup, "get_items_from_cache", side_effect=RuntimeError("failed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "failed"),
+        ):
+            backup.restore_team_members(
+                team,
+                [
+                    {
+                        "username": user.username,
+                        "limit_languages": [czech.code],
+                    }
+                ],
+            )
+
+        self.assertFalse(team.user_set.filter(pk=user.pk).exists())
+
+    def test_restore_rejects_global_role_in_project_team(self) -> None:
+        attacker = User.objects.create_user(
+            "backup-role-attacker", "backup-role-attacker@example.com"
+        )
+        role = Role.objects.create(name="Backup global role")
+        role.permissions.add(Permission.objects.get(codename="user.edit"))
+        temp_name = self.write_tampered_team_backup(
+            role=role.name, member=attacker.username
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            with self.assertRaises(ValidationError) as error:
+                restore.restore(
+                    project_name="Escalation",
+                    project_slug="escalation",
+                    user=attacker,
+                )
+
+        self.assertIn(
+            "Referenced role cannot be assigned to a project team.",
+            str(error.exception),
+        )
+        self.assertFalse(Project.objects.filter(slug="escalation").exists())
+        attacker.refresh_from_db()
+        attacker.clear_permissions_cache()
+        self.assertFalse(attacker.has_perm("user.edit"))
+
+    def test_restore_validates_saved_searches(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        valid = {"name": "Search", "query": "has:comment", "description": ""}
+        for searches, path in (
+            ([{**valid, "query": "invalidfield:x"}], "saved_searches[0].query"),
+            ([{**valid, "name": "x" * 191}], "saved_searches[0].name"),
+            ([valid, {**valid, "query": "has:check"}], "saved_searches[1].name"),
+        ):
+            with self.subTest(path=path), self.assertRaises(ValidationError) as error:
+                backup.data["saved_searches"] = searches
+                backup.validate_project_objects()
+            self.assertIn(path, error.exception.message_dict)
+
+        # Backups created before saved searches existed
+        del backup.data["saved_searches"]
+        backup.validate_project_objects()
+
+    def test_restore_rejects_invalid_autogroup_expression(self) -> None:
+        with self.assertRaises(ValidationError):
+            ProjectBackup.validate_model_data(
+                AutoGroup, {"match": "["}, "teams[0].autogroups[0]"
+            )
+
+    def test_checksum_validation_rejects_non_string(self) -> None:
+        path = "components/test.json.units[0].id_hash"
+        for value in (None, 123):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(ValidationError) as error,
+            ):
+                ProjectBackup.validate_checksum(value, path)
+
+            self.assertEqual(set(error.exception.message_dict), {path})
+
+    def test_nested_category_validation_preserves_path(self) -> None:
+        categories = [
+            {
+                "name": "Parent",
+                "slug": "parent",
+                "categories": [
+                    {"name": "First", "slug": "duplicate", "categories": []},
+                    {"name": "Second", "slug": "duplicate", "categories": []},
+                ],
+            }
+        ]
+
+        with self.assertRaises(ValidationError) as error:
+            ProjectBackup().validate_categories(categories)
+
+        self.assertIn("categories[0].categories[1].slug", error.exception.message_dict)
+
+    def test_validation_resolves_languages_without_creating_them(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        language_count = Language.objects.count()
+
+        with patch.object(
+            Language.objects,
+            "auto_get_or_create",
+            wraps=Language.objects.auto_get_or_create,
+        ) as resolver:
+            ProjectBackup(backup.filename).validate()
+
+        self.assertGreater(resolver.call_count, 0)
+        self.assertTrue(
+            all(call.kwargs.get("create") is False for call in resolver.call_args_list)
+        )
+        self.assertEqual(Language.objects.count(), language_count)
+
+    def test_restore_file_language_alias(self) -> None:
+        cases = (
+            ("b+en", "en"),
+            ("b+xx+Backup", "xx_BACKUP"),
+            ("b+zh+Hant+HK", "zh_Hant_HK"),
+        )
+        for index, (code, canonical_code) in enumerate(cases):
+            with self.subTest(code=code):
+                temp_name = self.write_tampered_component_backup(
+                    component_updates={"source_language": canonical_code},
+                    translation_updates={"language_code": code},
+                    translation_language_code="en",
+                )
+                with remove_file_after(temp_name):
+                    restore = ProjectBackup(temp_name)
+                    count = Language.objects.count()
+                    restore.validate()
+                    self.assertEqual(Language.objects.count(), count)
+                    restored = restore.restore(
+                        project_name=f"Restored {index}",
+                        project_slug=f"restored-alias-{index}",
+                        user=self.user,
+                    )
+                translation = restored.component_set.get(
+                    slug=self.component.slug
+                ).translation_set.get(language_code=code)
+                self.assertEqual(translation.language.code, canonical_code)
+                self.assertGreater(translation.unit_set.count(), 0)
+
+    def test_restore_rejects_overlong_file_language_code(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            translation_updates={"language_code": "b+en" + "(2)" * 16}
+        )
+        with remove_file_after(temp_name), self.assertRaises(ValidationError) as error:
+            ProjectBackup(temp_name).validate()
+        self.assertIn("language_code", str(error.exception))
+        self.assertIn("at most 50 characters", str(error.exception))
+
+    def test_restore_bounds_raw_file_language_before_resolution(self) -> None:
+        with (
+            patch.object(Language.objects, "auto_get_or_create") as resolve,
+            self.assertRaises(ValidationError) as error,
+        ):
+            ProjectBackup.validate_language(
+                "!" * 10000 + "en", "translations[0].language_code", file_code=True
+            )
+        resolve.assert_not_called()
+        self.assertIn("at most 50 characters", str(error.exception))
+        self.assertIn("translations[0].language_code", error.exception.message_dict)
+
+    def test_restore_norwegian_language_alias(self) -> None:
+        from weblate.lang.test_language_move import norwegian_alias_data  # ruff: ignore[import-outside-top-level]
+
+        with norwegian_alias_data():
+            Language.objects.filter(code="nb_NO").delete()
+            norwegian = Language.objects.auto_get_or_create("nb")
+            temp_name = self.write_tampered_component_backup(
+                component_updates={"source_language": "nb_NO"},
+                translation_updates={"language_code": "nb_NO"},
+                translation_language_code="en",
+            )
+            with remove_file_after(temp_name):
+                restore = ProjectBackup(temp_name)
+                restore.validate()
+                restored = restore.restore(
+                    project_name="Restored",
+                    project_slug="restored-norwegian",
+                    user=self.user,
+                )
+            translation = restored.component_set.get(
+                slug=self.component.slug
+            ).translation_set.get(language_code="nb_NO")
+            self.assertEqual(translation.language, norwegian)
+            self.assertFalse(Language.objects.filter(code="nb_NO").exists())
+
+    def test_restore_rejects_invalid_resolved_language(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            translation_updates={"language_code": "b+en/<script>"}
+        )
+        with remove_file_after(temp_name), self.assertRaises(ValidationError) as error:
+            ProjectBackup(temp_name).validate()
+        self.assertIn("language_code", str(error.exception))
+
+    def test_restore_rejects_language_alias_collision(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            translation_updates={"language_code": "b+de"},
+            translation_language_code="cs",
+        )
+        with (
+            remove_file_after(temp_name),
+            self.assertRaisesRegex(ValueError, "map to single language"),
+        ):
+            ProjectBackup(temp_name).validate()
+
+    def test_restored_autogroup_invites_new_user(self) -> None:
+        team = Group.objects.create(
+            name="Automatic backup team", defining_project=self.project
+        )
+        team.roles.add(Role.objects.get(name="Administration"))
+        AutoGroup.objects.create(group=team, match="^.*$")
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored-auto", user=self.user
+        )
+        restored_team = restored.defined_groups.get(name=team.name)
+        with (
+            self.captureOnCommitCallbacks(execute=True),
+            patch("weblate.auth.models.Invitation.send_email"),
+        ):
+            user = User.objects.create_user("backup-new-user", "backup-new@example.com")
+        self.assertFalse(user.groups.filter(pk=restored_team.pk).exists())
+        invitation = user.invitation_set.get(group=restored_team)
+        self.assertTrue(invitation.automatic)
+        self.assertFalse(user.has_perm("project.permissions", restored))
+
+    def test_restore_duplicate_teams_preserves_settings(self) -> None:
+        teams = Group.objects.bulk_create(
+            [
+                Group(name="Legacy", defining_project=self.project),
+                Group(
+                    name="Legacy",
+                    defining_project=self.project,
+                    language_selection=SELECTION_ALL,
+                    enforced_2fa=True,
+                ),
+                Group(name="Legacy (2)", defining_project=self.project),
+                Group(name="Administration", defining_project=self.project),
+                Group(name="x" * 150, defining_project=self.project),
+                Group(name="x" * 150, defining_project=self.project),
+            ]
+        )
+        teams[0].roles.add(Role.objects.get(name="Translate"))
+        teams[1].roles.add(Role.objects.get(name="Power user"))
+        teams[1].user_set.add(self.user)
+        teams[1].admins.add(self.user)
+        teams[1].components.add(self.component)
+        teams[0].languages.add(Language.objects.get(code="cs"))
+        AutoGroup.objects.create(group=teams[1], match="^backup$")
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored-teams", user=self.user
+        )
+        first = restored.defined_groups.get(name="Legacy")
+        second = restored.defined_groups.get(name="Legacy (3)")
+        self.assertEqual(
+            list(first.roles.values_list("name", flat=True)), ["Translate"]
+        )
+        self.assertEqual(list(first.languages.values_list("code", flat=True)), ["cs"])
+        self.assertEqual(
+            list(second.roles.values_list("name", flat=True)), ["Power user"]
+        )
+        self.assertEqual(list(second.user_set.all()), [self.user])
+        self.assertEqual(list(second.admins.all()), [self.user])
+        self.assertEqual(
+            list(second.components.values_list("slug", flat=True)),
+            [self.component.slug],
+        )
+        self.assertEqual(
+            list(second.autogroup_set.values_list("match", flat=True)), ["^backup$"]
+        )
+        self.assertEqual(second.language_selection, SELECTION_ALL)
+        self.assertTrue(second.enforced_2fa)
+        self.assertEqual(
+            restored.defined_groups.count(), self.project.defined_groups.count()
+        )
+        self.assertTrue(
+            restored.defined_groups.filter(name="Administration (2)").exists()
+        )
+        self.assertTrue(
+            restored.defined_groups.filter(name=f"{'x' * 146} (2)").exists()
+        )
+        self.assertIn(("Legacy", "Legacy (3)"), restore.renamed_teams)
+        self.assertIn(
+            "Team Legacy was renamed to Legacy (3)",
+            "\n".join(restore.get_restore_warnings()),
+        )
+
+    def test_restore_team_only_languages(self) -> None:
+        backup = ProjectBackup()
+        backup.project = self.project
+        team = {
+            "name": "Languages only",
+            "roles": ["Translate"],
+            "components": [],
+            "language_selection": SELECTION_MANUAL,
+            "enforced_2fa": False,
+            "languages": ["en-us", "xx_Team"],
+            "admins": [],
+            "members": [
+                {
+                    "username": self.user.username,
+                    "limit_languages": ["en-us", "xx_Limit"],
+                }
+            ],
+            "autogroups": [],
+        }
+        backup.restore_teams([team])
+        restored = self.project.defined_groups.get(name=team["name"])
+        self.assertEqual(
+            set(restored.languages.values_list("code", flat=True)), {"en_US", "xx_TEAM"}
+        )
+        membership = TeamMembership.objects.get(group=restored, user=self.user)
+        self.assertEqual(
+            set(membership.limit_languages.values_list("code", flat=True)),
+            {"en_US", "xx_LIMIT"},
+        )
+
+    def test_restore_missing_member_does_not_create_limit_languages(self) -> None:
+        group = Group.objects.create(
+            name="Stale members", defining_project=self.project
+        )
+        backup = ProjectBackup()
+        for username in ("missing-backup-member", settings.ANONYMOUS_USER_NAME):
+            with self.subTest(username=username):
+                backup.restore_team_members(
+                    group, [{"username": username, "limit_languages": ["xx_STALE"]}]
+                )
+                self.assertFalse(Language.objects.filter(code="xx_STALE").exists())
+                self.assertFalse(group.memberships.exists())
+
+    def test_restore_private_project_reuses_generated_teams(self) -> None:
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.translation_review = True
+        self.project.save()
+        teams = self.project.defined_groups.filter(internal=True)
+        for team in teams:
+            team.user_set.add(self.user)
+            team.admins.add(self.user)
+            team.language_selection = SELECTION_MANUAL
+            team.enforced_2fa = True
+            team.save(update_fields=["language_selection", "enforced_2fa"])
+            team.languages.add(Language.objects.get(code="cs"))
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored private",
+            project_slug="restored-private",
+            user=self.user,
+        )
+        self.assertEqual(
+            restored.defined_groups.count(), self.project.defined_groups.count()
+        )
+        self.assertEqual(restore.get_restore_warnings(), [])
+        for original in teams:
+            team = restored.defined_groups.get(name=original.name)
+            self.assertTrue(team.internal)
+            self.assertEqual(team.language_selection, SELECTION_MANUAL)
+            self.assertTrue(team.enforced_2fa)
+            self.assertEqual(
+                list(team.languages.values_list("code", flat=True)), ["cs"]
+            )
+            self.assertEqual(list(team.user_set.all()), [self.user])
+            self.assertEqual(list(team.admins.all()), [self.user])
+            self.assertEqual(
+                set(team.roles.values_list("name", flat=True)),
+                set(original.roles.values_list("name", flat=True)),
+            )
+
+    def test_restore_retained_inactive_builtin_teams(self) -> None:
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.translation_review = True
+        self.project.source_review = False
+        self.project.save()
+        for name in ("Translate", "Review"):
+            team = self.project.defined_groups.get(name=name)
+            team.user_set.add(self.user)
+            team.admins.add(self.user)
+            team.language_selection = SELECTION_MANUAL
+            team.enforced_2fa = True
+            team.save(update_fields=["language_selection", "enforced_2fa"])
+            team.languages.add(Language.objects.get(code="cs"))
+        self.project.access_control = Project.ACCESS_PUBLIC
+        self.project.translation_review = False
+        self.project.save()
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored inactive teams",
+            project_slug="restored-inactive-teams",
+            user=self.user,
+        )
+        teams = {}
+        for name in ("Translate", "Review"):
+            team = restored.defined_groups.get(name=name)
+            self.assertTrue(team.internal)
+            self.assertEqual(list(team.projects.all()), [restored])
+            teams[name] = team.pk
+        self.assertEqual(restore.get_restore_warnings(), [])
+        restored.access_control = Project.ACCESS_PRIVATE
+        restored.translation_review = True
+        restored.save()
+        self.assertEqual(restored.renamed_teams, [])
+        for name, pk in teams.items():
+            team = restored.defined_groups.get(name=name, internal=True)
+            self.assertEqual(team.pk, pk)
+            self.assertEqual(list(team.user_set.all()), [self.user])
+            self.assertEqual(list(team.admins.all()), [self.user])
+            self.assertEqual(team.language_selection, SELECTION_MANUAL)
+            self.assertTrue(team.enforced_2fa)
+            self.assertEqual(
+                list(team.languages.values_list("code", flat=True)), ["cs"]
+            )
+            self.assertEqual(
+                set(team.roles.values_list("name", flat=True)),
+                set(
+                    self.project.defined_groups.get(name=name).roles.values_list(
+                        "name", flat=True
+                    )
+                ),
+            )
+
+    def test_restore_inactive_builtin_after_custom_team(self) -> None:
+        restored = Project.objects.create(
+            name="Inactive review", slug="inactive-review", web="https://example.com/"
+        )
+        restore = ProjectBackup()
+        restore.project = restored
+        team = {
+            "name": "Review",
+            "internal": False,
+            "roles": ["Translate"],
+            "components": [],
+            "language_selection": SELECTION_ALL,
+            "languages": [],
+            "admins": [],
+            "enforced_2fa": False,
+            "members": [self.user.username],
+            "autogroups": [],
+        }
+        builtin = {**team, "internal": True, "roles": ["Review strings"]}
+        restore.restore_teams([team, builtin])
+        internal = restored.defined_groups.get(name="Review")
+        custom = restored.defined_groups.get(name="Review (2)")
+        self.assertTrue(internal.internal)
+        self.assertFalse(custom.internal)
+        self.assertEqual(list(internal.projects.all()), [restored])
+        self.assertEqual(list(custom.projects.all()), [restored])
+        self.assertEqual(list(custom.user_set.all()), [self.user])
+        self.assertEqual(
+            list(internal.roles.values_list("name", flat=True)), ["Review strings"]
+        )
+        self.assertEqual(restore.renamed_teams, [("Review", "Review (2)")])
+        restored.translation_review = True
+        self.enterContext(acting_user_context(self.user))
+        restored.save(update_fields=["translation_review"])
+        internal.refresh_from_db()
+        self.assertEqual(restored.defined_groups.get(name="Review").pk, internal.pk)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.review", restored))
+
+    def test_restore_preserves_team_internal_flag(self) -> None:
+        self.project.translation_review = False
+        self.project.source_review = False
+        self.project.save()
+        self.project.defined_groups.filter(name="Review", internal=True).delete()
+        custom = Group.objects.create(
+            name="Review", defining_project=self.project, enforced_2fa=True
+        )
+        custom.roles.add(Role.objects.get(name="Review strings"))
+        custom.user_set.add(self.user)
+        builtin = Group.objects.bulk_create(
+            [Group(name="Review", defining_project=self.project, internal=True)]
+        )[0]
+        # Both teams' roles can be customized, so identity needs its own field.
+        builtin.roles.add(Role.objects.get(name="Translate"))
+        builtin.admins.add(self.user)
+        self.project.translation_review = True
+        Project.objects.filter(pk=self.project.pk).update(translation_review=True)
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        entries = [team for team in backup.data["teams"] if team["name"] == "Review"]
+        self.assertCountEqual([team["internal"] for team in entries], [False, True])
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored identity",
+            project_slug="restored-team-identity",
+            user=self.user,
+        )
+        builtin = restored.defined_groups.get(name="Review")
+        custom = restored.defined_groups.get(name="Review (2)")
+        self.assertTrue(builtin.internal)
+        self.assertEqual(
+            list(builtin.roles.values_list("name", flat=True)), ["Translate"]
+        )
+        self.assertEqual(list(builtin.admins.all()), [self.user])
+        self.assertFalse(custom.internal)
+        self.assertTrue(custom.enforced_2fa)
+        self.assertEqual(
+            list(custom.roles.values_list("name", flat=True)), ["Review strings"]
+        )
+        self.assertEqual(list(custom.user_set.all()), [self.user])
+
+    def check_restore_legacy_duplicate_teams(self, *, same_roles: bool) -> None:
+        self.project.translation_review = True
+        self.project.save()
+        builtin = self.project.defined_groups.get(name="Review", internal=True)
+        team = {
+            "name": "Review",
+            "roles": ["Review strings"],
+            "components": [],
+            "language_selection": SELECTION_ALL,
+            "languages": [],
+            "admins": [],
+            "enforced_2fa": False,
+            "members": [],
+            "autogroups": [],
+        }
+        custom = {
+            **team,
+            "roles": ["Review strings" if same_roles else "Translate"],
+            "enforced_2fa": True,
+            "members": [self.user.username],
+        }
+        restore = ProjectBackup()
+        restore.project = self.project
+        restore.restore_teams([custom, team])
+        builtin.refresh_from_db()
+        self.assertTrue(builtin.internal)
+        self.assertEqual(builtin.name, "Review")
+        self.assertFalse(builtin.memberships.exists())
+        restored_custom = self.project.defined_groups.get(name="Review (2)")
+        self.assertFalse(restored_custom.internal)
+        self.assertTrue(restored_custom.enforced_2fa)
+        self.assertEqual(list(restored_custom.user_set.all()), [self.user])
+        self.assertEqual(
+            list(restored_custom.roles.values_list("name", flat=True)),
+            custom["roles"],
+        )
+        second = self.project.defined_groups.get(name="Review (3)")
+        self.assertFalse(second.internal)
+        self.assertEqual(
+            list(second.roles.values_list("name", flat=True)), team["roles"]
+        )
+        self.assertEqual(
+            restore.renamed_teams,
+            [("Review", "Review (2)"), ("Review", "Review (3)")],
+        )
+
+    def test_restore_legacy_custom_team_before_builtin(self) -> None:
+        self.check_restore_legacy_duplicate_teams(same_roles=False)
+
+    def test_restore_ambiguous_legacy_teams_remain_editable(self) -> None:
+        self.check_restore_legacy_duplicate_teams(same_roles=True)
+
+    def test_restore_legacy_unique_builtin_teams(self) -> None:
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.translation_review = True
+        self.project.save()
+        teams = dict(self.project.defined_groups.values_list("name", "pk"))
+        builtin = self.project.defined_groups.get(name="Review")
+        builtin.roles.set([Role.objects.get(name="Translate")])
+        backup = ProjectBackup()
+        data = backup.backup_teams(self.project)
+        for team in data:
+            team.pop("internal")
+        backup.project = self.project
+        backup.restore_teams(data)
+        self.assertEqual(backup.get_restore_warnings(), [])
+        self.assertEqual(
+            dict(self.project.defined_groups.values_list("name", "pk")), teams
+        )
+        self.assertEqual(
+            list(builtin.roles.values_list("name", flat=True)), ["Translate"]
+        )
+
+    def test_restore_explicit_custom_team_keeps_builtin_separate(self) -> None:
+        self.project.translation_review = True
+        self.project.save()
+        builtin = self.project.defined_groups.get(name="Review", internal=True)
+        restore = ProjectBackup()
+        restore.project = self.project
+        team = next(
+            team
+            for team in restore.backup_teams(self.project)
+            if team["name"] == "Review"
+        )
+        team["internal"] = False
+        team["members"] = [self.user.username]
+        restore.restore_teams([team])
+        self.assertFalse(builtin.memberships.exists())
+        custom = self.project.defined_groups.get(name="Review (2)")
+        self.assertFalse(custom.internal)
+        self.assertEqual(list(custom.user_set.all()), [self.user])
+
+    def test_restore_duplicate_builtin_teams(self) -> None:
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.save()
+        originals = list(self.project.defined_groups.filter(internal=True))
+        Group.objects.bulk_create(
+            [Group(name=team.name, defining_project=self.project) for team in originals]
+        )
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored duplicates",
+            project_slug="restored-builtin-duplicates",
+            user=self.user,
+        )
+        self.assertEqual(
+            restored.defined_groups.count(), self.project.defined_groups.count()
+        )
+        self.assertEqual(
+            set(restore.renamed_teams),
+            {(team.name, f"{team.name} (2)") for team in originals},
+        )
+        for original in originals:
+            self.assertTrue(restored.defined_groups.get(name=original.name).internal)
+            self.assertFalse(
+                restored.defined_groups.get(name=f"{original.name} (2)").internal
+            )
+
+    def test_import_task_reports_team_renames(self) -> None:
+        Group.objects.bulk_create(
+            [
+                Group(name="Legacy", defining_project=self.project),
+                Group(name="Legacy", defining_project=self.project),
+            ]
+        )
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        result = import_project_backup(
+            "Restored", "restored-warning", self.user.pk, backup.filename
+        )
+        self.assertEqual(
+            result["message"], "Project backup import completed with warnings."
+        )
+        self.assertIn(
+            "Team Legacy was renamed to Legacy (2)", "\n".join(result["warnings"])
+        )
+
+    def test_import_command_reports_team_renames(self) -> None:
+        Group.objects.bulk_create(
+            [
+                Group(name="Legacy", defining_project=self.project),
+                Group(name="Legacy", defining_project=self.project),
+            ]
+        )
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        stderr = StringIO()
+        call_command(
+            "import_projectbackup",
+            "Restored",
+            "restored-command-warning",
+            self.user.username,
+            backup.filename,
+            stderr=stderr,
+        )
+        self.assertIn("Team Legacy was renamed to Legacy (2)", stderr.getvalue())
+
+    def test_import_command_formats_validation_error(self) -> None:
+        with (
+            patch.object(
+                ProjectBackup,
+                "validate",
+                side_effect=ValidationError({"teams[0].name": ["Invalid name."]}),
+            ),
+            self.assertRaisesMessage(CommandError, "teams[0].name: Invalid name."),
+        ):
+            call_command(
+                "import_projectbackup",
+                "Restored",
+                "restored-command-error",
+                self.user.username,
+                "unused.zip",
+            )
+
+    def test_view_restore_formats_validation_errors(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        error = ValidationError(
+            {"teams[0].name": ["Invalid <script>name</script>.", "Another error."]}
+        )
+        with patch.object(ProjectBackup, "validate", side_effect=error):
+            response = self.client.post(
+                reverse("create-project-import"),
+                {
+                    "zipfile": SimpleUploadedFile(
+                        "invalid.zip", b"x", content_type="application/zip"
+                    )
+                },
+            )
+        self.assertEqual(
+            response.context["form"].errors["zipfile"],
+            [
+                "Could not load project backup.",
+                "teams[0].name: Invalid <script>name</script>.",
+                "teams[0].name: Another error.",
+            ],
+        )
+        self.assertContains(response, "Invalid &lt;script&gt;name&lt;/script&gt;.")
+        self.assertNotContains(response, "<script>name</script>")
+
+    def test_view_restore_reports_incompatible_version(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        with patch("weblate.trans.forms.ProjectBackup") as backup:
+            backup.return_value.data = {"metadata": {"version": "999.0"}}
+            backup.return_value.validate.side_effect = (
+                jsonschema.exceptions.ValidationError("Invalid schema.")
+            )
+            response = self.client.post(
+                reverse("create-project-import"),
+                {
+                    "zipfile": SimpleUploadedFile(
+                        "invalid.zip", b"x", content_type="application/zip"
+                    )
+                },
+            )
+        self.assertContains(
+            response,
+            "The backup is from an incompatible version (999.0). Please upgrade your Weblate instance.",
+        )
+
+    def test_restore_reconciles_dependency_metadata_without_workflows(self) -> None:
+        child = self.translation.unit_set.order_by("pk")[0]
+        parent = self.component.translation_set.get(language_code="de").unit_set.get(
+            id_hash=child.id_hash
+        )
+        parent.translate(self.user, "", STATE_EMPTY)
+        child.translate(self.user, "Child translation", STATE_TRANSLATED)
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=child.translation.language,
+            source_language=parent.translation.language,
+        )
+        child.refresh_from_db()
+        self.assertEqual(child.state, STATE_READONLY)
+        self.assertTrue(child.details["translation_parent"]["blocked"])
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+        self.assertFalse(WorkflowSetting.objects.filter(project=restored).exists())
+        restored_child = (
+            restored.component_set.get(slug=self.component.slug)
+            .translation_set.get(language=child.translation.language)
+            .unit_set.get(id_hash=child.id_hash)
+        )
+        self.assertIsNone(restored_child.translation_parent_id)
+        self.assertFalse(restored_child.translation_parent_blocked)
+        self.assertEqual(restored_child.state, STATE_TRANSLATED)
+        self.assertEqual(restored_child.target, child.target)
+        self.assertEqual(restored_child.effective_source, child.source)
+        self.assertNotIn("translation_parent", restored_child.details)
+
+    def test_restore_reconciles_existing_source_workflow(self) -> None:
+        child = self.translation.unit_set.order_by("pk")[0]
+        parent = self.component.translation_set.get(language_code="de").unit_set.get(
+            id_hash=child.id_hash
+        )
+        parent.translate(self.user, "", STATE_EMPTY)
+        child.translate(self.user, "Child translation", STATE_TRANSLATED)
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        original_restore = ProjectBackup.restore_component
+
+        def restore_with_workflow(restoring, zipfile, data, actor, changes):
+            # Seed an existing workflow before the component's bulk restore.
+            WorkflowSetting.objects.bulk_create(
+                [
+                    WorkflowSetting(
+                        project=restoring.project,
+                        language=child.translation.language,
+                        source_language=parent.translation.language,
+                    )
+                ],
+                ignore_conflicts=True,
+            )
+            Project.invalidate_translation_parent_cache()
+            return original_restore(restoring, zipfile, data, actor, changes)
+
+        with patch.object(
+            ProjectBackup, "restore_component", new=restore_with_workflow
+        ):
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+        component = restored.component_set.get(slug=self.component.slug)
+        restored_child = component.translation_set.get(
+            language=child.translation.language
+        ).unit_set.get(id_hash=child.id_hash)
+        restored_parent = component.translation_set.get(
+            language=parent.translation.language
+        ).unit_set.get(id_hash=child.id_hash)
+        self.assertEqual(restored_child.translation_parent_id, restored_parent.pk)
+        self.assertEqual(restored_child.effective_source, "")
+        self.assertEqual(restored_child.state, STATE_READONLY)
+        self.assertTrue(restored_child.translation_parent_blocked)
+
+    def test_restore_synthesizes_source_translation_check_flags(self) -> None:
+        source = self.component.source_translation
+        source.check_flags = "strict-same"
+        source.save(update_fields=["check_flags"])
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as zipfile:
+            component_file = next(
+                path
+                for path in zipfile.namelist()
+                if path.startswith("components/")
+                and path.endswith(f"{self.component.slug}.json")
+            )
+            component_data = json.loads(zipfile.read(component_file).decode("utf-8"))
+        self.assertFalse(
+            any(
+                "check_flags" in translation
+                for translation in component_data["translations"]
+            )
+        )
+
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        restored_source = restored_component.source_translation
+
+        self.assertEqual(restored_source.check_flags, "read-only")
+
+    def test_restore_rejects_invalid_repo_url(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            repo="https://private.example/repo.git"
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with (
+                patch(
+                    "weblate.utils.outbound.socket.getaddrinfo",
+                    side_effect=resolve_private_example,
+                ),
+                self.assertRaises(ValidationError) as error,
+            ):
+                restore.validate()
+
+            self.assertEqual(
+                error.exception.message_dict,
+                {
+                    "repo": [
+                        "This URL is prohibited because it points to an internal or non-public address."
+                    ]
+                },
+            )
+
+    def test_restore_rejects_invalid_revision_before_project_creation(self) -> None:
+        for field in ("local_revision", "remote_revision"):
+            with self.subTest(field=field):
+                temp_name = self.write_tampered_component_backup(
+                    component_updates={field: "--output=outside"}
+                )
+                with remove_file_after(temp_name):
+                    restore = ProjectBackup(temp_name)
+                    # Keep testing Weblate's guard when an older schema
+                    # package permits arbitrary revision strings.
+                    with (
+                        patch("weblate.trans.backups.validate_schema"),
+                        self.assertRaises(ValidationError) as error,
+                    ):
+                        restore.validate()
+                    self.assertEqual(
+                        list(error.exception.message_dict),
+                        [f"components/{self.component.slug}.json.component.{field}"],
+                    )
+                self.assertFalse(Project.objects.filter(slug="restored").exists())
+
+    def test_restore_accepts_complete_revision_hashes(self) -> None:
+        for revision in ("a" * 40, "B" * 64, ""):
+            with self.subTest(revision=revision):
+                temp_name = self.write_tampered_component_backup(
+                    component_updates={
+                        "local_revision": revision,
+                        "remote_revision": revision,
+                    }
+                )
+                with remove_file_after(temp_name):
+                    ProjectBackup(temp_name).validate()
+
+    def test_backup_clears_stale_revisions(self) -> None:
+        self.component.local_revision = "--output=unexpected"
+        self.component.remote_revision = "invalid"
+        self.component.save(update_fields=["local_revision", "remote_revision"])
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        with ZipFile(backup.filename) as archive:
+            component = json.loads(
+                archive.read(f"components/{self.component.slug}.json")
+            )["component"]
+        self.assertEqual(component["local_revision"], "")
+        self.assertEqual(component["remote_revision"], "")
+
+    def test_restore_rejects_invalid_new_base(self) -> None:
+        for filename in ("../outside.pot", "/outside.pot"):
+            with self.subTest(filename=filename):
+                temp_name = self.write_tampered_component_backup(
+                    component_updates={"new_base": filename}
+                )
+                with remove_file_after(temp_name):
+                    with self.assertRaises(ValidationError) as error:
+                        ProjectBackup(temp_name).validate()
+                    self.assertIn(
+                        f"components/{self.component.slug}.json.component.new_base",
+                        error.exception.message_dict,
+                    )
+                self.assertFalse(Project.objects.filter(slug="restored").exists())
+
+    def test_restore_rejects_invalid_translation_revision(self) -> None:
+        for revision in ("abcdef", "--output=outside", "a" * 40 + "\n"):
+            with self.subTest(revision=revision):
+                temp_name = self.write_tampered_component_backup(
+                    translation_updates={"revision": revision}
+                )
+                with remove_file_after(temp_name):
+                    # Exercise the application check independently of the
+                    # tighter schema in a future weblate-schemas release.
+                    with (
+                        patch("weblate.trans.backups.validate_schema"),
+                        self.assertRaises(ValidationError) as error,
+                    ):
+                        ProjectBackup(temp_name).validate()
+                    self.assertIn(
+                        f"components/{self.component.slug}.json.translations[0].revision",
+                        error.exception.message_dict,
+                    )
+                self.assertFalse(Project.objects.filter(slug="restored").exists())
+
+    def test_restore_accepts_translation_revision_forms(self) -> None:
+        first = "a" * 40
+        second = "b" * 40
+        third = "c" * 40
+        for revision in ("", first, f"{first}:2", f"{first}:2,{second},{third}"):
+            with self.subTest(revision=revision):
+                temp_name = self.write_tampered_component_backup(
+                    translation_updates={"revision": revision}
+                )
+                with remove_file_after(temp_name):
+                    ProjectBackup(temp_name).validate()
+
+    def test_backup_clears_stale_translation_revision(self) -> None:
+        source = self.component.source_translation
+        source.revision = "invalid"
+        source.save(update_fields=["revision"])
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        with ZipFile(backup.filename) as archive:
+            component = json.loads(
+                archive.read(f"components/{self.component.slug}.json")
+            )
+        source_data = next(
+            item
+            for item in component["translations"]
+            if item["language_code"] == source.language.code
+        )
+        self.assertEqual(source_data["revision"], "")
+
+    def test_restore_rejects_invalid_push_url(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            push="https://private.example/push.git"
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with (
+                patch(
+                    "weblate.utils.outbound.socket.getaddrinfo",
+                    side_effect=resolve_private_example,
+                ),
+                self.assertRaises(ValidationError) as error,
+            ):
+                restore.validate()
+
+            self.assertEqual(
+                error.exception.message_dict,
+                {
+                    "push": [
+                        "This URL is prohibited because it points to an internal or non-public address."
+                    ]
+                },
+            )
+
+    def test_restore_rejects_unsafe_repository_urls(self) -> None:
+        for field in ("repo", "push"):
+            with self.subTest(field=field):
+                temp_name = self.write_tampered_component_backup(
+                    **{field: ("ssh://example.com/repository\r[alias]\rlog = !true")}
+                )
+
+                with remove_file_after(temp_name):
+                    restore = ProjectBackup(temp_name)
+                    with self.assertRaises(ValidationError) as error:
+                        restore.validate()
+
+                self.assertEqual(
+                    error.exception.message_dict,
+                    {field: ["Repository URL contains unsafe characters."]},
+                )
+
+    def test_restore_rejects_invalid_component_slug(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            component_updates={"slug": "../../outside"}
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(ValidationError) as error:
+                restore.validate()
+
+        self.assertIn("component.slug", next(iter(error.exception.message_dict)))
+
+    def test_component_path_rejects_escape(self) -> None:
+        component = Component(
+            project=Project(name="Path test", slug="path-test"),
+            name="Outside",
+            slug="/outside",
+        )
+
+        with self.assertRaisesRegex(ValueError, "escapes the VCS directory"):
+            self.assertIsInstance(component.full_path, str)
+
+    def test_restore_rejects_invalid_repository_browser_url(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            component_updates={"repoweb": "javascript:alert(1)"}
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(ValidationError) as error:
+                restore.validate()
+
+        self.assertIn("component.repoweb", next(iter(error.exception.message_dict)))
+
+    def test_restore_rejects_invalid_project_url(self) -> None:
+        temp_name = self.write_tampered_project_backup(web="javascript:alert(1)")
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(ValidationError) as error:
+                restore.validate()
+
+        self.assertIn("project.web", error.exception.message_dict)
+
+    def test_backup_restore_empty_source(self) -> None:
+        unit = self.translation.unit_set.get(source="Hello, world!\n")
+        source_unit = unit.source_unit
+        context = "settings.tipsNotChosen"
+        Unit.objects.filter(
+            translation__component=self.component, id_hash=unit.id_hash
+        ).update(source="", context=context)
+        Unit.objects.filter(pk=source_unit.pk).update(target="")
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        restored_source = restored_component.source_translation.unit_set.get(
+            id_hash=source_unit.id_hash
+        )
+        restored_unit = restored_component.translation_set.get(
+            language_code=self.translation.language_code
+        ).unit_set.get(id_hash=unit.id_hash)
+        for restored_item in (restored_source, restored_unit):
+            with self.subTest(language=restored_item.translation.language_code):
+                self.assertEqual(restored_item.source, "")
+                self.assertEqual(restored_item.context, context)
+        self.assertEqual(restored_source.target, "")
+        self.assertEqual(restored_unit.target, unit.target)
+        self.assertEqual(restored_unit.source_unit_id, restored_source.pk)
+
+    def test_restore_rejects_null_source(self) -> None:
+        temp_name = self.write_tampered_component_backup(unit_updates={"source": None})
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(jsonschema.ValidationError) as error:
+                restore.validate()
+
+        self.assertEqual(error.exception.path[-1], "source")
+
+    def test_restore_rejects_malformed_unit_checksum(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            unit_updates={"id_hash": "x0123456789abcdefy"}
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            # Check the application guard independently of the schema check.
+            with (
+                patch("weblate.trans.backups.validate_schema"),
+                self.assertRaises(ValidationError) as error,
+            ):
+                restore.validate()
+
+        self.assertIn("units[0].id_hash", next(iter(error.exception.message_dict)))
+
+    def test_restore_rejects_unsafe_translation_filename(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            translation_updates={"filename": "../../outside.po"}
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(ValidationError) as error:
+                restore.validate()
+
+        self.assertIn(
+            "translations[0].filename", next(iter(error.exception.message_dict))
+        )
+
+    def test_restore_skips_inaccessible_linked_component(self) -> None:
+        victim_project = Project.objects.create(name="Victim", slug="victim")
+        victim_component = self.create_po(project=victim_project, name="Victim")
+        temp_name = self.write_tampered_component_backup(
+            repo=victim_component.get_repo_link_url()
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            self.assertFalse(
+                self.anotheruser.has_perm("component.edit", victim_component)
+            )
+
+            restored = restore.restore(
+                project_name="Partial restore",
+                project_slug="partial-restore",
+                user=self.anotheruser,
+            )
+
+        self.assertFalse(
+            restored.component_set.filter(slug=self.component.slug).exists()
+        )
+        self.assertEqual(restore.skipped_components, [self.component.slug])
+        restore_change = restored.change_set.get(action=ActionEvents.PROJECT_RESTORE)
+        self.assertEqual(
+            restore_change.details["skipped_components"], [self.component.slug]
+        )
+        history_data = get_change_history_context(restore_change)
+        self.assertEqual(
+            [field["label"] for field in history_data["change_details_fields"]],
+            ["Backup created", "Backup server", "Backup domain", "Skipped components"],
+        )
+        self.assertIn(
+            f"<code>{self.component.slug}</code>",
+            history_data["change_details_fields"][-1]["content"],
+        )
+
+    def test_restore_skips_missing_linked_component(self) -> None:
+        temp_name = self.write_tampered_component_backup(
+            repo="weblate://missing-project/missing-component"
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Missing link restore",
+                project_slug="missing-link-restore",
+                user=self.anotheruser,
+            )
+
+        self.assertFalse(
+            restored.component_set.filter(slug=self.component.slug).exists()
+        )
+        self.assertEqual(restore.skipped_components, [self.component.slug])
+
+    def test_restore_allows_accessible_cross_project_link(self) -> None:
+        target_project = Project.objects.create(name="Target", slug="target")
+        target_component = self.create_po(project=target_project, name="Target")
+        target_project.add_user(self.anotheruser, "Administration")
+        self.anotheruser.clear_permissions_cache()
+        self.assertTrue(self.anotheruser.has_perm("component.edit", target_component))
+        temp_name = self.write_tampered_component_backup(
+            repo=target_component.get_repo_link_url()
+        )
+
+        with remove_file_after(temp_name):
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Linked restore",
+                project_slug="linked-restore",
+                user=self.anotheruser,
+            )
+
+        restored_component = restored.component_set.get(slug=self.component.slug)
+        self.assertEqual(restored_component.linked_component, target_component)
+        self.assertEqual(restore.skipped_components, [])
+
+    def test_import_task_keeps_empty_project_and_reports_skipped_components(
+        self,
+    ) -> None:
+        victim_project = Project.objects.create(name="Task victim", slug="task-victim")
+        victim_component = self.create_po(project=victim_project, name="Taskvictim")
+        temp_name = self.write_tampered_component_backup(
+            repo=victim_component.get_repo_link_url(), all_components=True
+        )
+
+        result = import_project_backup(
+            "Empty partial restore",
+            "empty-partial-restore",
+            self.anotheruser.id,
+            temp_name,
+        )
+
+        restored = Project.objects.get(slug="empty-partial-restore")
+        self.assertFalse(restored.component_set.exists())
+        self.assertNotIn("url", result)
+        self.assertEqual(
+            result["message"],
+            "Project backup import completed with warnings.",
+        )
+        self.assertEqual(len(result["warnings"]), 2)
+        self.assertTrue(
+            all(
+                warning.endswith(
+                    "was skipped because its linked repository is unavailable."
+                )
+                for warning in result["warnings"]
+            )
+        )
+        restore_change = restored.change_set.get(action=ActionEvents.PROJECT_RESTORE)
+        self.assertEqual(
+            set(restore_change.details["skipped_components"]),
+            {"glossary", self.component.slug},
+        )
+
+    def test_create_duplicate(self) -> None:
+        def extract_names(qs) -> list[str]:
+            return list(qs.order_by("name").values_list("name", flat=True))
+
+        category = self.project.category_set.create(
+            name="My Category", slug="my-category"
+        )
+        self.create_link_existing(name="Test", slug="test", category=category)
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        self.assertTrue(os.path.exists(backup.filename))
+
+        restore = ProjectBackup(backup.filename)
+
+        restore.validate()
+
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+
+        self.assertEqual(
+            extract_names(Category.objects.filter(project=self.project)),
+            extract_names(Category.objects.filter(project=restored)),
+        )
+        self.assertEqual(
+            extract_names(Component.objects.filter(project=self.project)),
+            extract_names(Component.objects.filter(project=restored)),
+        )
+        restored_link = restored.component_set.get(category__isnull=False)
+        restored_target = restored.component_set.get(category__isnull=True, slug="test")
+        self.assertEqual(restored_link.linked_component, restored_target)
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
     def test_restore_4_14(self) -> None:
         restore = ProjectBackup(TEST_BACKUP)
         restore.validate()
@@ -221,15 +3823,51 @@ class BackupsTest(ViewTestCase):
         )
         self.verify_restored()
 
-    @skipUnlessDBFeature("can_return_rows_from_bulk_insert")
+    def test_restore_requires_validation(self) -> None:
+        restore = ProjectBackup(TEST_BACKUP)
+        with self.assertRaisesRegex(ValueError, "validated before restore"):
+            restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
     def test_restore_cli(self) -> None:
         call_command(
             "import_projectbackup", "Restored", "restored", "testuser", TEST_BACKUP
         )
         self.verify_restored()
 
+    def test_restore_cli_reports_skipped_components(self) -> None:
+        victim_project = Project.objects.create(name="CLI victim", slug="cli-victim")
+        victim_component = self.create_po(project=victim_project, name="Clivictim")
+        temp_name = self.write_tampered_component_backup(
+            repo=victim_component.get_repo_link_url()
+        )
+        stderr = StringIO()
+
+        with remove_file_after(temp_name):
+            call_command(
+                "import_projectbackup",
+                "CLI partial restore",
+                "cli-partial-restore",
+                self.anotheruser.username,
+                temp_name,
+                stderr=stderr,
+            )
+
+        restored = Project.objects.get(slug="cli-partial-restore")
+        self.assertFalse(
+            restored.component_set.filter(slug=self.component.slug).exists()
+        )
+        self.assertIn(
+            f"Component {self.component.slug} was skipped because its linked repository is unavailable.",
+            stderr.getvalue(),
+        )
+
     def verify_restored(self) -> None:
         restored = Project.objects.get(slug="restored")
+        component = restored.component_set.get(slug="test")
+        glossary = restored.component_set.get(slug="glossary")
         self.assertEqual(
             16,
             Unit.objects.filter(translation__component__project=restored).count(),
@@ -262,19 +3900,639 @@ class BackupsTest(ViewTestCase):
             {("Label", "navy")},
             set(restored.label_set.values_list("name", "color")),
         )
+        # check that set_language_team is migrated to file format parameters
+        self.assertTrue(component.file_format_params["po_set_language_team"])
+        self.assertIsNone(glossary.file_format_params.get("po_set_language_team"))
+        self.assertFalse(restored.inherit_commit_message)
+        self.assertFalse(restored.inherit_secondary_language)
+        self.assertFalse(component.inherit_commit_message)
+        self.assertFalse(component.inherit_secondary_language)
+        self.assertFalse(glossary.inherit_commit_message)
+        self.assertFalse(glossary.inherit_secondary_language)
 
-    @skipUnlessDBFeature("can_return_rows_from_bulk_insert")
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
     def test_restore_duplicate(self) -> None:
         restore = ProjectBackup(TEST_BACKUP_DUPLICATE)
         with self.assertRaises(ValueError):
             restore.validate()
 
-    @skipUnlessDBFeature("can_return_rows_from_bulk_insert")
     def test_restore_duplicate_files(self) -> None:
         restore = ProjectBackup(TEST_BACKUP_DUPLICATE_FILES)
         with self.assertRaises(ValueError) as ex:
             restore.validate()
         self.assertIn("zip file contains duplicate files", str(ex.exception))
+
+    @override_settings(
+        PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_RATIO=5,
+        PROJECT_BACKUP_IMPORT_MIN_RATIO_SIZE=10,
+        PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE=100,
+    )
+    def test_restore_zip_bomb_compressed_large_entry(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(TEST_BACKUP, "r") as source_zip,
+                ZipFile(temp_name, "w") as zipfile,
+            ):
+                for item in source_zip.infolist():
+                    zipfile.writestr(item, source_zip.read(item.filename))
+                zipfile.writestr("payload.bin", b"a" * 5000, compress_type=ZIP_DEFLATED)
+
+            restore = ProjectBackup(temp_name)
+            with self.assertRaisesRegex(
+                ValueError, "compressed entry that is too large"
+            ):
+                restore.validate()
+
+    @override_settings(PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE=10)
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_restore_low_compression_large_entry_allowed(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(TEST_BACKUP, "r") as source_zip,
+                ZipFile(temp_name, "w") as zipfile,
+            ):
+                for item in source_zip.infolist():
+                    zipfile.writestr(item, source_zip.read(item.filename))
+                zipfile.writestr(
+                    "payload.bin", b"12345678901", compress_type=ZIP_STORED
+                )
+
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+
+    @override_settings(PROJECT_BACKUP_IMPORT_MAX_MEMBERS=5)
+    def test_restore_zip_bomb_too_many_members(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(TEST_BACKUP, "r") as source_zip,
+                ZipFile(temp_name, "w") as zipfile,
+            ):
+                for item in source_zip.infolist():
+                    zipfile.writestr(item, source_zip.read(item.filename))
+                for idx in range(5):
+                    zipfile.writestr(f"extra-{idx}.txt", b"x", compress_type=ZIP_STORED)
+
+            restore = ProjectBackup(temp_name)
+            with self.assertRaisesRegex(ValueError, "contains too many entries"):
+                restore.validate()
+
+    def test_restore_zip_bomb_too_much_uncompressed_data(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(TEST_BACKUP, "r") as source_zip,
+                ZipFile(temp_name, "w") as zipfile,
+            ):
+                total_size = sum(
+                    item.file_size
+                    for item in source_zip.infolist()
+                    if not item.is_dir()
+                )
+                for item in source_zip.infolist():
+                    zipfile.writestr(item, source_zip.read(item.filename))
+                zipfile.writestr(
+                    "payload.bin", b"12345678901", compress_type=ZIP_STORED
+                )
+
+            restore = ProjectBackup(temp_name)
+            with (
+                override_settings(
+                    PROJECT_BACKUP_IMPORT_MAX_TOTAL_UNCOMPRESSED_SIZE=total_size
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "data after unpacking, exceeding the configured limit",
+                ),
+            ):
+                restore.validate()
+
+    def test_restore_rejects_unsafe_vcs_path_after_prefix_strip(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(TEST_BACKUP, "r") as source_zip,
+                ZipFile(temp_name, "w") as zipfile,
+            ):
+                for item in source_zip.infolist():
+                    zipfile.writestr(item, source_zip.read(item.filename))
+                zipfile.writestr("vcs/C:foo", b"blocked", compress_type=ZIP_STORED)
+
+            restore = ProjectBackup(temp_name)
+            with self.assertRaisesRegex(ValueError, "ZIP file contains invalid path"):
+                restore.validate()
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_restore_rejects_unowned_repository_data(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(TEST_BACKUP, "r") as source_zip,
+                ZipFile(temp_name, "w") as zipfile,
+            ):
+                for item in source_zip.infolist():
+                    zipfile.writestr(item, source_zip.read(item.filename))
+                zipfile.writestr("vcs/orphan/file", b"blocked")
+
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(ValidationError) as error:
+                restore.validate()
+
+        self.assertIn("vcs/orphan/file", error.exception.message_dict)
+
+    @override_settings(
+        PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_RATIO=5,
+        PROJECT_BACKUP_IMPORT_MIN_RATIO_SIZE=10,
+        PROJECT_BACKUP_IMPORT_MAX_COMPRESSED_ENTRY_SIZE=100,
+    )
+    def test_restore_revalidates_zip_members(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(backup.filename, "r") as source_zip,
+                ZipFile(temp_name, "w") as target_zip,
+            ):
+                for item in source_zip.infolist():
+                    target_zip.writestr(item, source_zip.read(item.filename))
+
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+
+            with ZipFile(temp_name, "a") as zipfile:
+                zipfile.writestr("payload.bin", b"a" * 5000, compress_type=ZIP_DEFLATED)
+
+            with self.assertRaisesRegex(
+                ValueError, "compressed entry that is too large"
+            ):
+                restore.restore(
+                    project_name="Restored", project_slug="restored", user=self.user
+                )
+
+    def test_restore_failure_cleans_database_and_repository(self) -> None:
+        screenshot = Screenshot.objects.create(
+            name="Cleanup screenshot", translation=self.component.source_translation
+        )
+        with open(TEST_SCREENSHOT, "rb") as handle:
+            screenshot.image.save("cleanup-screenshot.pngrawtrue", File(handle))
+        screenshot_dir = os.path.join(settings.MEDIA_ROOT, "screenshots")
+        media_before = set(os.listdir(screenshot_dir))
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        project_path = Project(name="Restored", slug="restored").full_path
+
+        with (
+            patch.object(
+                Component, "configure_repo", side_effect=RuntimeError("failed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "failed"),
+        ):
+            restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+
+        self.assertFalse(Project.objects.filter(slug="restored").exists())
+        self.assertFalse(os.path.exists(project_path))
+        self.assertEqual(set(os.listdir(screenshot_dir)), media_before)
+
+    def test_restore_after_failed_project_creation(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        project = Project(name="Restored", slug="restored", web="https://example.com/")
+        with (
+            patch.object(Role.objects, "get", side_effect=RuntimeError("missing role")),
+            self.assertRaisesMessage(RuntimeError, "missing role"),
+        ):
+            project.save()
+        restored = restore.restore(
+            project_name="Restored", project_slug="restored", user=self.user
+        )
+        self.assertEqual(restored.slug, project.slug)
+        self.assertEqual(
+            restored.component_set.count(), self.project.component_set.count()
+        )
+
+    def test_restore_does_not_remove_existing_repository_directory(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        project_path = Project(name="Restored", slug="restored").full_path
+        os.mkdir(project_path)
+        self.addCleanup(os.rmdir, project_path)
+
+        with self.assertRaises(ValidationError):
+            restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+
+        self.assertTrue(os.path.isdir(project_path))
+
+    def test_safe_vcs_paths(self) -> None:
+        safe_paths = (
+            ("git", "README.md"),
+            ("git", ".GIT\\OBJECTS\\INFO\\PACKS"),
+            ("subversion", ".git/svn/refs/remotes/origin/.rev_map.UUID"),
+            ("mercurial", ".HG\\STORE\\META\\manifest.i"),
+        )
+        for vcs, path in safe_paths:
+            with self.subTest(vcs=vcs, path=path):
+                self.assertTrue(ProjectBackup.is_safe_vcs_path(path, vcs))
+
+        unsafe_paths = (
+            ("git", ".git"),
+            ("git", ".git/config"),
+            ("git", "nested/.git/HEAD"),
+            ("git", ".hg/store/data/file.i"),
+            ("git", ".git/refs/nested/.git/config"),
+            ("subversion", ".git/svn/refs/remotes/origin/unhandled.log"),
+            ("mercurial", "nested/.hg/requires"),
+            ("unknown", ".git/HEAD"),
+        )
+        for vcs, path in unsafe_paths:
+            with self.subTest(vcs=vcs, path=path):
+                self.assertFalse(ProjectBackup.is_safe_vcs_path(path, vcs))
+
+    def test_restore_skips_unsafe_vcs_files(self) -> None:
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        marker = Path(settings.DATA_DIR) / "PWNED_COMMONDIR"
+        marker.unlink(missing_ok=True)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        unsafe_paths = {
+            ".git/commondir": b"evil\n",
+            ".git/evil/config": (
+                b'[filter "pwn"]\n'
+                + f"clean = touch {marker.as_posix()}\n".encode()
+                + b"required = true\n"
+            ),
+            ".git/evil/info/attributes": b"* filter=pwn\n",
+            ".git/hooks/post-checkout": b"unsafe",
+            ".git/info/attributes": b"unsafe",
+            ".git/modules/submodule/config": b"unsafe",
+            ".git/objects/info/alternates": b"evil/objects\n",
+            ".git/worktrees/evil/config": b"unsafe",
+            ".hg/hgrc": b"unsafe",
+            ".hg/sharedpath": b"unsafe",
+            ".GIT/HOOKS/pre-commit": b"unsafe",
+            ".GiT/CONFIG": b"unsafe",
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(backup.filename, "r") as source_zip,
+                ZipFile(temp_name, "w") as target_zip,
+            ):
+                for item in source_zip.infolist():
+                    data = source_zip.read(item.filename)
+                    target_zip.writestr(item, data)
+                    git_prefix = "vcs/test/.git/"
+                    if (
+                        item.filename.startswith(
+                            (f"{git_prefix}objects/", f"{git_prefix}refs/")
+                        )
+                        or item.filename == f"{git_prefix}packed-refs"
+                    ):
+                        relative_path = item.filename.removeprefix(git_prefix)
+                        target_zip.writestr(f"{git_prefix}evil/{relative_path}", data)
+                for path, data in unsafe_paths.items():
+                    target_zip.writestr(f"vcs/test/{path}", data)
+
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+            component = restored.component_set.get(slug="test")
+            repository = component.repository
+            assert isinstance(repository, GitRepository)
+            for path, payload in unsafe_paths.items():
+                with self.subTest(path=path):
+                    restored_path = os.path.join(component.full_path, path)
+                    if os.path.exists(restored_path):
+                        # On case-insensitive filesystems, a mixed-case path can
+                        # resolve to the legitimate .git/config from the backup.
+                        self.assertNotEqual(Path(restored_path).read_bytes(), payload)
+            with repository.lock:
+                common_dir = Path(
+                    repository.execute(
+                        ["rev-parse", "--git-common-dir"], remote_op="none"
+                    ).strip()
+                )
+                if not common_dir.is_absolute():
+                    common_dir = Path(component.full_path) / common_dir
+                self.assertEqual(
+                    common_dir.resolve(),
+                    (Path(component.full_path) / ".git").resolve(),
+                )
+            self.assertEqual(repository.get_config("remote.origin.url"), component.repo)
+            self.assertEqual(
+                repository.get_config(f"branch.{component.branch}.remote"),
+                "origin",
+            )
+            self.assertEqual(
+                repository.get_config(f"branch.{component.branch}.merge"),
+                f"refs/heads/{component.branch}",
+            )
+            security_test = Path(component.full_path) / "security-test.txt"
+            security_test.write_text("security test", encoding="utf-8")
+            with repository.lock:
+                self.assertTrue(
+                    repository.commit("Security test", files=[security_test.name])
+                )
+                self.assertEqual(
+                    repository.execute(
+                        [
+                            "diff-tree",
+                            "--no-commit-id",
+                            "--name-only",
+                            "-r",
+                            "HEAD^",
+                            "HEAD",
+                        ],
+                        remote_op="none",
+                    ).splitlines(),
+                    [security_test.name],
+                )
+            self.assertFalse(marker.exists())
+            restored.do_reset(self.get_request())
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_restore_git_svn_metadata_allowlist(self) -> None:
+        self.create_po(vcs="subversion", name="Subversion", project=self.project)
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with ZipFile(backup.filename, "r") as source_zip:
+            git_svn_prefix = "vcs/subversion/.git/svn/"
+            rev_map_names = [
+                name
+                for name in source_zip.namelist()
+                if name.startswith(git_svn_prefix)
+                and "/.rev_map." in name.removeprefix(git_svn_prefix)
+            ]
+        if not rev_map_names:
+            self.skipTest("git-svn fixture has no revision map")
+
+        unsafe_name = f"{git_svn_prefix}injected/unhandled.log"
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(backup.filename, "r") as source_zip,
+                ZipFile(temp_name, "w") as target_zip,
+            ):
+                for item in source_zip.infolist():
+                    target_zip.writestr(item, source_zip.read(item.filename))
+                target_zip.writestr(unsafe_name, b"unsafe")
+
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+            component = restored.component_set.get(slug="subversion")
+            repository = component.repository
+            assert isinstance(repository, SubversionRepository)
+            for name in rev_map_names:
+                relative_name = name.removeprefix("vcs/subversion/")
+                self.assertTrue(Path(component.full_path, relative_name).is_file())
+            self.assertFalse(
+                Path(
+                    component.full_path,
+                    unsafe_name.removeprefix("vcs/subversion/"),
+                ).exists()
+            )
+            self.assertEqual(
+                repository.get_config("svn-remote.svn.url"), component.repo
+            )
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_restore_mercurial_metadata_allowlist(self) -> None:
+        self.create_po(vcs="mercurial", name="Mercurial", project=self.project)
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        malicious_config = b"[hooks]\ncommit.pwn = touch PWNED\n"
+        config_name = "vcs/mercurial/.hg/hgrc"
+        with remove_file_after(temp_name):
+            config_replaced = False
+            with (
+                ZipFile(backup.filename, "r") as source_zip,
+                ZipFile(temp_name, "w") as target_zip,
+            ):
+                for item in source_zip.infolist():
+                    if item.filename == config_name:
+                        data = malicious_config
+                        config_replaced = True
+                    else:
+                        data = source_zip.read(item.filename)
+                    target_zip.writestr(item, data)
+                target_zip.writestr("vcs/mercurial/.hg/sharedpath", b"evil")
+            self.assertTrue(config_replaced)
+
+            restore = ProjectBackup(temp_name)
+            restore.validate()
+            restored = restore.restore(
+                project_name="Restored", project_slug="restored", user=self.user
+            )
+            component = restored.component_set.get(slug="mercurial")
+            repository = component.repository
+            assert isinstance(repository, HgRepository)
+            metadata_dir = Path(component.full_path, ".hg")
+            self.assertTrue(repository.is_valid())
+            self.assertTrue((metadata_dir / "dirstate").is_file())
+            self.assertTrue((metadata_dir / "store" / "00changelog.i").is_file())
+            self.assertNotIn(malicious_config, (metadata_dir / "hgrc").read_bytes())
+            self.assertFalse((metadata_dir / "sharedpath").exists())
+            self.assertEqual(repository.get_config("paths", "default"), component.repo)
+
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_restore_mercurial_missing_requires(self) -> None:
+        original = self.create_po(
+            vcs="mercurial", name="Mercurial", project=self.project
+        )
+        filename = original.translation_set.get(language_code="cs").filename
+        expected_content = (Path(original.full_path) / filename).read_bytes()
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "backup.zip"
+            with (
+                ZipFile(backup.filename) as source_zip,
+                ZipFile(archive, "w") as target_zip,
+            ):
+                self.assertIn("vcs/mercurial/.hg/requires", source_zip.namelist())
+                for info in source_zip.infolist():
+                    if info.filename != "vcs/mercurial/.hg/requires":
+                        target_zip.writestr(copy(info), source_zip.read(info.filename))
+
+            restore = ProjectBackup(archive.as_posix())
+            restore.validate()
+            with self.assertLogs("weblate", "WARNING") as logs:
+                restored = restore.restore(
+                    project_name="Restored", project_slug="restored", user=self.user
+                )
+        component = restored.component_set.get(slug=original.slug)
+        self.assertFalse(component.repository.is_valid())
+        self.assertFalse((Path(component.full_path) / ".hg/hgrc").exists())
+        self.assertEqual(
+            (Path(component.full_path) / filename).read_bytes(), expected_content
+        )
+        self.assertCountEqual(
+            Unit.objects.filter(translation__component=component).values_list(
+                "source", "target", "state"
+            ),
+            Unit.objects.filter(translation__component=original).values_list(
+                "source", "target", "state"
+            ),
+        )
+        self.assertIn(
+            "repository metadata is missing or invalid", "\n".join(logs.output)
+        )
+
+    def test_restore_rejects_invalid_screenshot(self) -> None:
+        screenshot = Screenshot.objects.create(
+            name="Tampered screenshot", translation=self.component.source_translation
+        )
+        with open(TEST_SCREENSHOT, "rb") as handle:
+            screenshot.image.save("screenshot.png", File(handle))
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_handle:
+            temp_name = temp_handle.name
+
+        with remove_file_after(temp_name):
+            with (
+                ZipFile(backup.filename, "r") as source_zip,
+                ZipFile(temp_name, "w") as target_zip,
+            ):
+                for item in source_zip.infolist():
+                    data = source_zip.read(item.filename)
+                    if item.filename.startswith("screenshots/"):
+                        data = b"not an image"
+                    target_zip.writestr(item, data)
+
+            restore = ProjectBackup(temp_name)
+            with self.assertRaises(ValidationError):
+                restore.validate()
+
+    def test_restore_schedules_screenshot_recognition(self) -> None:
+        with open(TEST_SCREENSHOT, "rb") as handle:
+            Screenshot.objects.create(
+                name="Recognized screenshot",
+                translation=self.component.source_translation,
+                image=File(handle, name="recognition.png"),
+                user=self.user,
+            )
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        with patch("weblate.trans.backups.schedule_ocr") as schedule:
+            project = restore.restore("Restored", "restored", self.user)
+        screenshot = Screenshot.objects.get(
+            translation__component__project=project, name="Recognized screenshot"
+        )
+        schedule.assert_called_once_with(screenshot.pk)
+
+    def test_restore_repairs_screenshot_extensions(self) -> None:
+        content = Path(TEST_SCREENSHOT).read_bytes()
+        filenames = (
+            "screenshot.pngrawtrue",
+            "screenshot.html",
+            "screenshot",
+            "screenshot.jpg",
+            "screenshot.png",
+            "matching.PNG",
+        )
+        unit = self.get_unit(translation=self.component.source_translation)
+        for filename in filenames:
+            screenshot = Screenshot.objects.create(
+                name=filename,
+                translation=self.component.source_translation,
+                user=self.user,
+            )
+            screenshot.image.save(filename, File(BytesIO(content)))
+            screenshot.add_unit(unit, user=self.user)
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+        archive_before = Path(backup.filename).read_bytes()
+        files_before = set(Path(settings.MEDIA_ROOT).rglob("*"))
+        restore = ProjectBackup(backup.filename)
+        restore.validate()
+        self.assertEqual(set(Path(settings.MEDIA_ROOT).rglob("*")), files_before)
+        restored = restore.restore("Restored", "restored", self.user)
+        images = set()
+        for screenshot in Screenshot.objects.filter(
+            translation__component__project=restored
+        ):
+            self.assertIn(screenshot.name, filenames)
+            self.assertEqual(screenshot.user, self.user)
+            self.assertEqual(
+                list(screenshot.units.values_list("id_hash", flat=True)), [unit.id_hash]
+            )
+            expected_extension = ".PNG" if screenshot.name == "matching.PNG" else ".png"
+            assert screenshot.image.name is not None
+            self.assertTrue(screenshot.image.name.endswith(expected_extension))
+            with screenshot.image.open("rb") as image:
+                self.assertEqual(image.read(), content)
+            images.add(screenshot.image.name)
+        self.assertEqual(len(images), len(filenames))
+        self.assertEqual(Path(backup.filename).read_bytes(), archive_before)
+
+    def test_restore_rejects_oversized_screenshot_during_validation(self) -> None:
+        screenshot = Screenshot.objects.create(
+            name="Oversized screenshot", translation=self.component.source_translation
+        )
+        with open(TEST_SCREENSHOT, "rb") as handle:
+            screenshot.image.save("oversized-screenshot.png", File(handle))
+
+        backup = ProjectBackup()
+        backup.backup_project(self.project)
+
+        restore = ProjectBackup(backup.filename)
+        with (
+            override_settings(ALLOWED_ASSET_SIZE=1),
+            self.assertRaises(ValidationError) as error,
+        ):
+            restore.validate()
+
+        self.assertIn("screenshots[0].image", next(iter(error.exception.message_dict)))
 
     def test_cleanup(self) -> None:
         cleanup_project_backups()
@@ -304,6 +4562,9 @@ class BackupsTest(ViewTestCase):
         response = self.client.post(url)
         self.assertRedirects(response, url)
         self.assertEqual(start + 1, len(list_backups(self.project)))
+        change = self.project.change_set.get(action=ActionEvents.PROJECT_BACKUP)
+        self.assertEqual(change.user, self.user)
+        self.assertEqual(change.author, self.user)
         response = self.client.get(url)
         self.assertNotContains(response, " no backups")
 
@@ -317,13 +4578,13 @@ class BackupsTest(ViewTestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 302)
         # Testing staticfiles doesn't work, so we emulate this manually
-        url = response.url
+        url = response["Location"]
         self.assertTrue(url.startswith(settings.STATIC_URL))
         filename = url[len(settings.STATIC_URL) :]
-        with staticfiles_storage.open(filename, "rb") as handle:
+        with get_project_backup_download_storage().open(filename, "rb") as handle:
             self.assertEqual(handle.read(2), b"PK")
 
-    @skipUnlessDBFeature("can_return_rows_from_bulk_insert")
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
     def test_view_restore(self) -> None:
         self.user.is_superuser = True
         self.user.save()
@@ -337,6 +4598,18 @@ class BackupsTest(ViewTestCase):
             follow=True,
         )
         self.assertContains(response, "Could not load project backup")
+
+        with override_settings(PROJECT_BACKUP_UPLOAD_MAX_SIZE=1):
+            response = self.client.post(
+                reverse("create-project-import"),
+                {
+                    "zipfile": SimpleUploadedFile(
+                        "backup.zip", b"xx", content_type="application/zip"
+                    )
+                },
+                follow=True,
+            )
+        self.assertContains(response, "Uploaded ZIP file is too big.")
 
         with open(TEST_BACKUP, "rb") as handle:
             response = self.client.post(
@@ -357,6 +4630,88 @@ class BackupsTest(ViewTestCase):
                 },
                 follow=True,
             )
-            self.assertContains(response, "Import Test")
+            self.assertContains(response, "Project backup import in progress")
             project = Project.objects.get(slug="import-test")
             self.assertEqual(project.component_set.count(), 2)
+
+    def test_workspace_project_creator_cannot_import_global_role(self) -> None:
+        attacker = User.objects.create_user(
+            "workspace-importer",
+            "workspace-importer@example.com",
+            "testpassword",
+        )
+        workspace = Workspace.objects.create(name="Import workspace")
+        attacker.add_team(
+            None, workspace.setup_groups()[WORKSPACE_PROJECT_CREATORS_GROUP]
+        )
+        attacker.clear_permissions_cache()
+        self.assertFalse(attacker.has_perm("project.add"))
+        self.assertFalse(attacker.has_perm("workspace.add"))
+
+        temp_name = self.write_tampered_team_backup(
+            role="Add new projects", member=attacker.username
+        )
+        self.client.login(username=attacker.username, password="testpassword")
+        with remove_file_after(temp_name):
+            with open(temp_name, "rb") as handle:
+                response = self.client.post(
+                    reverse("create-project-import"),
+                    {"zipfile": handle, "workspace": workspace.pk},
+                    follow=True,
+                )
+            self.assertEqual(response.status_code, 200)
+
+            with self.assertRaises(ValidationError):
+                self.client.post(
+                    reverse("create-project-import"),
+                    {
+                        "name": "Escalation import",
+                        "slug": "escalation-import",
+                        "workspace": workspace.pk,
+                    },
+                    follow=True,
+                )
+
+        self.assertFalse(Project.objects.filter(slug="escalation-import").exists())
+        attacker.refresh_from_db()
+        attacker.clear_permissions_cache()
+        self.assertFalse(attacker.has_perm("project.add"))
+        self.assertFalse(attacker.has_perm("workspace.add"))
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
+    @patch("weblate.trans.views.create.import_project_backup.delay")
+    @override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
+    def test_view_restore_schedules_background_import(self, delay: Mock) -> None:
+        delay.return_value.id = "01234567-89ab-cdef-0123-456789abcdef"
+        self.user.is_superuser = True
+        self.user.save()
+        with open(TEST_BACKUP, "rb") as handle:
+            response = self.client.post(
+                reverse("create-project-import"),
+                {
+                    "zipfile": handle,
+                },
+                follow=True,
+            )
+        self.assertContains(
+            response, "Created on Weblate (example.com) by Weblate 4.14-dev"
+        )
+
+        response = self.client.post(
+            reverse("create-project-import"),
+            {
+                "name": "Import Test",
+                "slug": "import-test",
+            },
+            follow=True,
+        )
+        self.assertContains(response, "Project backup import in progress")
+        delay.assert_called_once()
+        kwargs = delay.call_args.kwargs
+        filename = kwargs["filename"]
+        with remove_file_after(filename):
+            self.assertEqual(kwargs["project_name"], "Import Test")
+            self.assertEqual(kwargs["project_slug"], "import-test")
+            self.assertEqual(kwargs["user_id"], self.user.id)
+            self.assertIsNone(kwargs["billing_id"])
+            self.assertFalse(Project.objects.filter(slug="import-test").exists())

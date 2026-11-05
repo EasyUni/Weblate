@@ -1,61 +1,78 @@
 {% extends "base.html" %}
 
-{% load crispy_forms_tags i18n icons permissions translations %}
+{% load crispy_forms_tags i18n icons permissions translations user_display %}
 
 {% block breadcrumbs %}
-  <li>
+  <li class="breadcrumb-item">
     <a href="{% url 'manage' %}">{% translate "Manage" %}</a>
   </li>
-  <li>
+  <li class="breadcrumb-item">
     <a href="{% url 'manage-users' %}">{% translate "Users" %}</a>
   </li>
 {% endblock breadcrumbs %}
 
 {% block content %}
 
-  <div class="panel panel-default">
-    <div class="panel-heading">
-      <h4 class="panel-title">{% translate "Manage users" %}</h4>
+  <div class="card">
+    <div class="card-header">
+      <h4 class="card-title">{% translate "Manage users" %}</h4>
     </div>
-    <div class="panel-body">{% include "snippets/user-list.html" %}</div>
+    <div class="card-body">{% include "snippets/user-list.html" %}</div>
   </div>
 
-  <form method="post">
-    {% csrf_token %}
-    <div class="panel panel-default">
-      <div class="panel-heading">
-        <h4 class="panel-title">{% translate "Add new user" %}</h4>
+  {% if can_edit_users %}
+    <form method="post">
+      {% csrf_token %}
+      <div class="card">
+        <div class="card-header">
+          <h4 class="card-title">{% translate "Add new user" %}</h4>
+        </div>
+        <div class="card-body">{{ invite_form|crispy }}</div>
+        <div class="card-footer">
+          <input type="submit" class="btn btn-primary" value="{% translate "Add" %}" />
+        </div>
       </div>
-      <div class="panel-body">{{ invite_form|crispy }}</div>
-      <div class="panel-footer">
-        <input type="submit" class="btn btn-primary" value="{% translate "Add" %}" />
+    </form>
+
+    <form method="post">
+      {% csrf_token %}
+      <div class="card">
+        <div class="card-header">
+          <h4 class="card-title">{% translate "Bulk invite users" %}</h4>
+        </div>
+        <div class="card-body">{{ bulk_invite_form|crispy }}</div>
+        <div class="card-footer">
+          <input type="submit" class="btn btn-primary" value="{% translate "Invite" %}" />
+        </div>
       </div>
-    </div>
-  </form>
+    </form>
+  {% endif %}
 
   {% if invitations %}
-    <div class="panel panel-default">
-      <div class="panel-heading">
-        <h4 class="panel-title">{% translate "Pending invitations" %}</h4>
+    <div class="card">
+      <div class="card-header">
+        <h4 class="card-title">{% translate "Pending invitations" %}</h4>
       </div>
       <table class="table table-striped">
         <thead>
           <tr>
-            <th>{% translate "Username" %}</th>
-            <th>{% translate "Full name" %}</th>
-            <th>{% translate "E-mail" %}</th>
-            <th>{% translate "Projects" %}</th>
-            <th>{% translate "Teams" %}</th>
-            <th></th>
+            <th scope="col">{% translate "Username" %}</th>
+            <th scope="col">{% translate "Full name" %}</th>
+            <th scope="col">{% translate "E-mail" %}</th>
+            <th scope="col">{% translate "Projects" %}</th>
+            <th scope="col">{% translate "Teams" %}</th>
+            {% if can_edit_users %}
+              <th scope="col">
+                <span class="visually-hidden">{% translate "Actions" %}</span>
+              </th>
+            {% endif %}
           </tr>
         </thead>
         <tbody>
           {% for invitation in invitations %}
             <tr>
               {% if invitation.user %}
-                <td>
-                  <a href="{{ invitation.user.get_absolute_url }}">{{ invitation.user.username }}</a>
-                </td>
+                <td>{% user_display invitation.user icon=False %}</td>
                 <td>{{ invitation.user.full_name }}</td>
                 <td>{{ invitation.user.email }}</td>
               {% else %}
@@ -69,29 +86,31 @@
                 {% endif %}
               </td>
               <td>
-                <span class="badge">{{ invitation.group }}</span>
+                <span class="badge text-bg-secondary">{{ invitation.group }}</span>
               </td>
-              <td>
-                <form action="{{ invitation.get_absolute_url }}" method="post" class="inlineform">
-                  {% csrf_token %}
-                  <input type="hidden" name="action" value="resend" />
-                  <button type="submit"
+              {% if can_edit_users %}
+                <td>
+                  <form action="{{ invitation.get_absolute_url }}" method="post" class="inlineform">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="resend" />
+                    <button type="submit"
+                            class="btn btn-link btn-xs"
+                            title="{% translate "Resend invitation" %}">{% icon 'refresh.svg' %}</button>
+                  </form>
+                  <button type="button"
                           class="btn btn-link btn-xs"
-                          title="{% translate "Resend invitation" %}">{% icon 'refresh.svg' %}</button>
-                </form>
-                <button type="button"
-                        class="btn btn-link btn-xs"
-                        data-clipboard-value="{{ site_url }}{{ invitation.get_absolute_url }}"
-                        data-clipboard-message="{% translate "Invitation link copied to clipboard." %}"
-                        title="{% translate "Copy to clipboard" %}">{% icon "copy.svg" %}</button>
-                <form action="{{ invitation.get_absolute_url }}" method="post" class="inlineform">
-                  {% csrf_token %}
-                  <input type="hidden" name="action" value="remove" />
-                  <button type="submit"
-                          class="btn btn-link btn-xs red"
-                          title="{% translate "Remove invitation" %}">{% icon 'delete.svg' %}</button>
-                </form>
-              </td>
+                          data-clipboard-value="{{ site_url }}{{ invitation.get_absolute_url }}"
+                          data-clipboard-message="{% translate "Invitation link copied to clipboard." %}"
+                          title="{% translate "Copy to clipboard" %}">{% icon "copy.svg" %}</button>
+                  <form action="{{ invitation.get_absolute_url }}" method="post" class="inlineform">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="remove" />
+                    <button type="submit"
+                            class="btn btn-link btn-xs red"
+                            title="{% translate "Remove invitation" %}">{% icon 'delete.svg' %}</button>
+                  </form>
+                </td>
+              {% endif %}
             </tr>
           {% endfor %}
         </tbody>
@@ -99,16 +118,31 @@
     </div>
   {% endif %}
 
-  <form method="get" action="{% url "manage-users-check" %}">
-    <div class="panel panel-default">
-      <div class="panel-heading">
-        <h4 class="panel-title">{% translate "Check user access" %}</h4>
+  {% if can_edit_users %}
+    <form method="get" action="{% url "manage-users-check" %}">
+      <div class="card">
+        <div class="card-header">
+          <h4 class="card-title">{% translate "Check user access" %}</h4>
+        </div>
+        <div class="card-body">{{ search_form|crispy }}</div>
+        <div class="card-footer">
+          <input type="submit" class="btn btn-primary" value="{% translate "Search" %}" />
+        </div>
       </div>
-      <div class="panel-body">{{ search_form|crispy }}</div>
-      <div class="panel-footer">
-        <input type="submit" class="btn btn-primary" value="{% translate "Search" %}" />
+    </form>
+  {% endif %}
+
+  {% if can_edit_users %}
+    <div class="card" id="account-security">
+      <div class="card-header">
+        <h2 class="card-title">{% translate "Account security" %}</h2>
+      </div>
+      <div class="card-body">
+        {% if security_report_available %}<p><a href="{% url 'manage-security' %}">{% blocktranslate %}Security report ({{ security_findings_open }} open findings){% endblocktranslate %}</a></p>{% endif %}
+        <p>{% translate "Validate a CSV report of leaked credentials against current account passwords." %}</p>
+        <a class="btn btn-primary"
+           href="{% url 'manage-security-upload' %}">{% translate "Validate leaked passwords" %}</a>
       </div>
     </div>
-  </form>
-
+  {% endif %}
 {% endblock content %}

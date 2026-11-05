@@ -4,11 +4,11 @@
 
 {% block nav_pills %}
   <ul class="nav nav-pills">
-    <li class="active">
-      <a href="#addons" data-toggle="tab">{% translate "Add-ons" %}</a>
+    <li class="nav-item">
+      <a class="nav-link active" data-bs-target="#addons" data-bs-toggle="tab" href="#">{% translate "Add-ons" %}</a>
     </li>
-    <li>
-      <a href="#history" data-toggle="tab">{% translate "History" %}</a>
+    <li class="nav-item">
+      <a class="nav-link" data-bs-target="#history" data-bs-toggle="tab" href="#">{% translate "History" %}</a>
     </li>
   </ul>
 {% endblock nav_pills %}
@@ -16,14 +16,14 @@
 {% block breadcrumbs %}
   {% if object %}
     {% path_object_breadcrumbs object %}
-    <li>
+    <li class="breadcrumb-item">
       <a href="{% url 'addons' path=object.get_url_path %}">{% translate "Add-ons" %}</a>
     </li>
   {% else %}
-    <li>
+    <li class="breadcrumb-item">
       <a href="{% url 'manage' %}">{% translate "Manage" %}</a>
     </li>
-    <li>
+    <li class="breadcrumb-item">
       <a href="{% url 'manage-addons' %}">{% translate "Add-ons" %}</a>
     </li>
   {% endif %}
@@ -34,9 +34,9 @@
   <div class="tab-content">
 
     <div class="tab-pane active" id="addons">
-      <div class="panel panel-default">
-        <div class="panel-heading">
-          <h4 class="panel-title">
+      <div class="card">
+        <div class="card-header">
+          <h4 class="card-title">
             {% documentation_icon 'admin/addons' right=True %}
             {% if not object_list %}
               {% translate "No add-ons currently installed" %}
@@ -47,48 +47,50 @@
         </div>
         <table class="table table-striped">
           <tbody>
-            {% for addon in object_list %}
-              <tr>
-                <td>{% include 'addons/addon_head.html' with addon=addon.addon %}</td>
-                <td class="bottom-button">
-                  <form method="post" action="{{ addon.get_absolute_url }}" class="inlineform">
-                    {% csrf_token %}
-                    <input type="hidden" name="delete" value="{{ addon.name }}" />
-                    <button type="submit" class="btn btn-danger">{% translate "Uninstall" %}</button>
-                  </form>
-                  <a class="btn btn-primary" href="{% url 'addon-logs' addon.id %}">{% translate "View Logs" %}</a>
-                  {% if addon.addon.has_settings %}
-                    <a class="btn btn-primary" href="{{ addon.get_absolute_url }}">{% translate "Configure" %}</a>
-                  {% endif %}
-                </td>
-              </tr>
+            {% for item in object_list %}
+              {% with addon=item.instance %}
+                <tr>
+                  <td>
+                    {% if addon.is_valid %}
+                      {% if item.inherited %}
+                        {% if item.can_manage %}
+                          {% include "addons/addon_head.html" with addon=addon.addon show_settings=True scope_label=item.scope_label scope_description=item.scope_description url=addon.get_absolute_url %}
+                        {% else %}
+                          {% include "addons/addon_head.html" with addon=addon.addon show_settings=False scope_label=item.scope_label scope_description=item.scope_description %}
+                        {% endif %}
+                      {% elif scope == "component" and addon.repo_scope %}
+                        {% include "addons/addon_head.html" with addon=addon.addon show_settings=item.can_manage url=addon.get_absolute_url %}
+                      {% else %}
+                        {% include "addons/addon_head.html" with addon=addon.addon show_settings=item.can_manage hide_scope_badges=True url=addon.get_absolute_url %}
+                      {% endif %}
+                    {% else %}
+                      <h4>
+                        {% if item.can_manage %}<a href="{{ addon.get_absolute_url }}">{% endif %}
+                        {{ addon.addon_name }}
+                        {% if item.can_manage %}</a>{% endif %}
+                      </h4>
+                    {% endif %}
+                    {% if item.inherited %}
+                      <div>
+                        <span class="format-item">
+                          {% translate "Inherited from" %} <span>{{ item.scope_description }}</span>
+                        </span>
+                      </div>
+                    {% endif %}
+                    {% if item.inherited and not item.can_manage %}
+                      <span class="help-block">{% translate "Managed at a scope you do not have access to." %}</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endwith %}
             {% endfor %}
           </tbody>
         </table>
-        <div class="panel-footer">
-          {% if scope == "sitewide" %}
-            {% translate "Add-ons can also be installed at the project and the component levels." %}
-          {% endif %}
-          {% if scope == "component" %}
-            <a href="{% url 'addons' path=object.project.get_url_path %}"
-               class="btn btn-primary">
-              {% blocktranslate count count=project_addons %}Manage project-wide add-ons ({{ count }} installed){% plural %}Manage project-wide add-ons ({{ count }} installed){% endblocktranslate %}
-            </a>
-          {% endif %}
-          {% if scope == "project" or scope == "component" %}
-            {% perm "management.addons" as user_can_manage_addons %}
-            <a href="{% url 'manage-addons' %}"
-               class="btn btn-primary"
-               {% if not user_can_manage_addons %}disabled="disabled"{% endif %}>
-              {% blocktranslate count count=sitewide_addons %}Manage site-wide add-ons ({{ count }} installed){% plural %}Manage site-wide add-ons ({{ count }} installed){% endblocktranslate %}
-            </a>
-          {% endif %}
-        </div>
       </div>
 
-      <div class="panel panel-default">
-        <div class="panel-heading">
-          <h4 class="panel-title">
+      <div class="card">
+        <div class="card-header">
+          <h4 class="card-title">
             {% documentation_icon 'admin/addons' right=True %}
             {% translate "Available add-ons" %}
           </h4>
@@ -97,11 +99,12 @@
           <tbody>
             {% for addon in available %}
               <tr>
-                <td>{% include 'addons/addon_head.html' with addon=addon %}</td>
+                <td>{% include "addons/addon_head.html" with addon=addon %}</td>
                 <td class="bottom-button">
                   {% if scope != "component" and addon.needs_component %}
                     <button class="btn btn-primary"
                             disabled
+                            type="submit"
                             title="{% translate "The add-on can only be installed on the component level." %}">
                       {% translate "Install" %}
                     </button>
@@ -109,7 +112,9 @@
                     <form method="post" class="inlineform">
                       {% csrf_token %}
                       <input type="hidden" name="name" value="{{ addon.name }}" />
-                      <button type="submit" class="btn btn-primary" data-addon="{{ addon.name }}">{% translate "Install" %}</button>
+                      <button type="submit"
+                              class="btn btn-primary"
+                              data-addon="{{ addon.name }}">{% translate "Install" %}</button>
                     </form>
                   {% endif %}
                 </td>
@@ -117,7 +122,7 @@
             {% endfor %}
           </tbody>
         </table>
-        <div class="panel-footer">
+        <div class="card-footer">
           {% if not available %}
             {% translate "Could not find any additional add-ons compatible with this translation component." %}
           {% else %}
@@ -129,8 +134,7 @@
 
     <div class="tab-pane" id="history">
       {% format_last_changes_content last_changes=last_changes user=user %}
-      <a class="btn btn-primary"
-         href="{% if object %}{% url 'changes' path=object.get_url_path %}{% else %}{% url 'changes' %}{% endif %}?{% for action in change_actions %}action={{ action }}{% if not forloop.last %}&amp;{% endif %}{% endfor %}">{% translate "Browse all add-on changes" %}</a>
+      <a class="btn btn-primary" href="{% if object %}{% url 'changes' path=object.get_url_path %}{% else %}{% url 'changes' %}{% endif %}?{% for action in change_actions %}action={{ action }}{% if not forloop.last %}&amp;{% endif %}{% endfor %}">{% translate "Browse all add-on changes" %}</a>
     </div>
 
   </div>

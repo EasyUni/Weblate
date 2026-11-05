@@ -45,7 +45,7 @@ class ClassLoaderTestCase(TestCase):
         loader.load_data()
         self.assertEqual(len(list(loader.keys())), 1)
 
-    @override_settings(TEST_SERVICES=("weblate.addons.cleanup.CleanupAddon"))
+    @override_settings(TEST_SERVICES="weblate.addons.cleanup.CleanupAddon")
     def test_invalid(self) -> None:
         loader = ClassLoader("TEST_SERVICES", construct=False, base_class=BaseAddon)
         with self.assertRaisesRegex(
@@ -82,3 +82,43 @@ class ClassLoaderTestCase(TestCase):
         loader = ClassLoader("TEST_SERVICES", construct=False, base_class=BaseAddon)
         loader.load_data()
         self.assertEqual(len(list(loader.keys())), 0)
+
+    def test_setting_change_invalidates_cache(self) -> None:
+        loader = ClassLoader(
+            "TEST_DYNAMIC_SERVICES", construct=False, base_class=BaseAddon
+        )
+        second_loader = ClassLoader(
+            "TEST_DYNAMIC_SERVICES", construct=False, base_class=BaseAddon
+        )
+        with override_settings(
+            TEST_DYNAMIC_SERVICES=("weblate.addons.cleanup.CleanupAddon",)
+        ):
+            self.assertEqual(list(loader.keys()), ["weblate.cleanup.generic"])
+            self.assertEqual(list(second_loader.keys()), ["weblate.cleanup.generic"])
+            with override_settings(TEST_DYNAMIC_SERVICES=()):
+                self.assertEqual(list(loader.keys()), [])
+                self.assertEqual(list(second_loader.keys()), [])
+            self.assertEqual(list(loader.keys()), ["weblate.cleanup.generic"])
+            self.assertEqual(list(second_loader.keys()), ["weblate.cleanup.generic"])
+
+    def test_dependent_setting_change_invalidates_cache(self) -> None:
+        loader = ClassLoader(
+            "TEST_DYNAMIC_SERVICES",
+            construct=False,
+            base_class=BaseAddon,
+            dependent_settings=("TEST_DYNAMIC_SERVICE_ENABLED",),
+        )
+        unaffected_loader = ClassLoader(
+            "TEST_DYNAMIC_SERVICES", construct=False, base_class=BaseAddon
+        )
+        with override_settings(
+            TEST_DYNAMIC_SERVICES=("weblate.addons.cleanup.CleanupAddon",)
+        ):
+            cached_data = loader.data
+            unaffected_cached_data = unaffected_loader.data
+            with override_settings(TEST_DYNAMIC_SERVICE_ENABLED=True):
+                dependent_cached_data = loader.data
+                self.assertIsNot(dependent_cached_data, cached_data)
+                self.assertIs(unaffected_loader.data, unaffected_cached_data)
+            self.assertIsNot(loader.data, dependent_cached_data)
+            self.assertIs(unaffected_loader.data, unaffected_cached_data)

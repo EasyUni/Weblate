@@ -4,13 +4,26 @@
 
 """Test for categories."""
 
-import os
+from __future__ import annotations
 
+import os
+import pathlib
+from contextlib import ExitStack
+from unittest.mock import call, patch
+
+from django.core.exceptions import ValidationError
+from django.test.utils import override_settings
 from django.urls import reverse
 
+from weblate.auth.models import Group
 from weblate.lang.models import get_default_lang
-from weblate.trans.models import Category, Component, Project
+from weblate.trans.actions import ActionEvents
+from weblate.trans.models import Category, Component, ComponentLink, Project
+from weblate.trans.removal import RemovalBatch
+from weblate.trans.tasks import category_removal
 from weblate.trans.tests.test_views import ViewTestCase
+from weblate.utils.change_origin import acting_user_context
+from weblate.utils.stats import CategoryLanguage, GlobalStats
 
 
 class CategoriesTest(ViewTestCase):
@@ -18,7 +31,7 @@ class CategoriesTest(ViewTestCase):
         super().setUp()
         self.project.add_user(self.user, "Administration")
 
-    def add_and_organize(self):
+    def add_and_organize(self) -> Category:
         response = self.client.post(
             reverse("add-category", kwargs={"path": self.project.get_url_path()}),
             {"name": "Test category", "slug": "test-cat"},
@@ -47,7 +60,7 @@ class CategoriesTest(ViewTestCase):
             },
         )
         self.assertRedirects(response, new_component_url)
-        self.client.get(category_url)
+        response = self.client.get(category_url)
         self.assertNotContains(response, "Nothing to list here.")
         return category
 
@@ -136,6 +149,77 @@ class CategoriesTest(ViewTestCase):
         self.assertContains(response, "Test category")
         self.assertContains(response, "Nothing to list here.")
 
+    def test_move_nested_category_with_project_team_component_is_rejected(self) -> None:
+        destination = self.create_project(name="Destination", slug="destination")
+        destination.add_user(self.user, "Administration")
+        parent = self.create_category(self.project)
+        child = self.create_category(self.project, category=parent)
+        self.component.category = child
+        self.component.save(update_fields=["category"])
+        team = Group.objects.create(
+            name="Component team", defining_project=self.project
+        )
+        team.components.add(self.component)
+        old_path = self.component.full_path
+
+        response = self.client.post(
+            reverse("rename", kwargs={"path": parent.get_url_path()}),
+            {
+                "project": destination.pk,
+                "category": "",
+                "name": parent.name,
+                "slug": parent.slug,
+            },
+            follow=True,
+        )
+        self.assertRedirects(response, f"{parent.get_absolute_url()}#organize")
+        self.assertContains(
+            response,
+            "Remove the component from project teams before moving it to another project.",
+        )
+        for obj in (parent, child, self.component):
+            obj.refresh_from_db()
+            self.assertEqual(obj.project, self.project)
+        self.assertTrue(os.path.exists(old_path))
+
+        parent.project = destination
+        with self.assertRaisesMessage(ValidationError, "Remove the component"):
+            parent.save(update_fields=["project"])
+        self.assertEqual(Category.objects.get(pk=parent.pk).project, self.project)
+
+    def test_move_nested_category_preserves_actor(self) -> None:
+        destination = self.create_project(name="Destination", slug="destination")
+        destination.add_user(self.user, "Administration")
+        parent = self.create_category(self.project)
+        child = self.create_category(self.project, category=parent)
+        self.component.category = child
+        self.component.save(update_fields=["category"])
+        previous_change = self.component.change_set.latest("pk").pk
+
+        response = self.client.post(
+            reverse("rename", kwargs={"path": parent.get_url_path()}),
+            {
+                "project": destination.pk,
+                "category": "",
+                "name": parent.name,
+                "slug": parent.slug,
+            },
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        for obj in (parent, child, self.component):
+            obj.refresh_from_db()
+            self.assertEqual(obj.project, destination)
+        category_changes = destination.change_set.filter(
+            pk__gt=previous_change, action=ActionEvents.MOVE_CATEGORY
+        )
+        self.assertEqual(category_changes.count(), 2)
+        component_change = self.component.change_set.get(
+            pk__gt=previous_change, action=ActionEvents.MOVE_COMPONENT
+        )
+        self.assertEqual(component_change.user, self.user)
+        self.assertFalse(category_changes.exclude(user=self.user).exists())
+
     def test_move_wrong(self) -> None:
         project = Project.objects.create(name="other", slug="other")
         category = Category.objects.create(name="other", slug="oc", project=project)
@@ -181,7 +265,7 @@ class CategoriesTest(ViewTestCase):
 
         # Rename category
         category.slug = "other"
-        category.acting_user = self.user
+        self.enterContext(acting_user_context(self.user))
         category.save()
         self.assertFalse(os.path.exists(old_category_path))
         self.assertTrue(os.path.exists(category.full_path))
@@ -195,6 +279,40 @@ class CategoriesTest(ViewTestCase):
                 component.translation_set.get(language_code="cs").get_filename()
             )
         )
+
+    def test_move_local_component_to_existing_empty_category_path(self) -> None:
+        component = self.create_po(project=self.project, name="Local", vcs="local")
+        old_path = component.full_path
+        self.assertTrue(os.path.exists(os.path.join(old_path, ".git", "config")))
+
+        category = Category.objects.create(
+            project=self.project, name="Category test", slug="testcat"
+        )
+        os.makedirs(os.path.join(category.full_path, component.slug))
+
+        component.category = category
+        component.save()
+
+        self.assertFalse(os.path.exists(old_path))
+        self.assertTrue(
+            os.path.exists(os.path.join(component.full_path, ".git", "config"))
+        )
+
+    def test_create_category_existing_non_empty_path(self) -> None:
+        path = os.path.join(self.project.full_path, "blocked")
+        git_path = pathlib.Path(path) / ".git"
+        git_path.mkdir(parents=True)
+        (git_path / "config").write_text("stale", encoding="utf-8")
+
+        with self.assertRaisesMessage(
+            ValidationError,
+            "Repository path for this category already exists and is not empty.",
+        ):
+            Category.objects.create(
+                project=self.project, name="Blocked", slug="blocked"
+            )
+
+        self.assertFalse(Category.objects.filter(slug="blocked").exists())
 
     def test_create(self) -> None:
         # Make superuser, otherwise user can not create due to no valid billing
@@ -251,7 +369,7 @@ class CategoriesTest(ViewTestCase):
 
     def test_move_linked_component(self) -> None:
         project = Project.objects.create(name="other", slug="other")
-        self.component.links.add(project)
+        ComponentLink.objects.create(component=self.component, project=project)
 
         response = self.client.post(
             reverse("add-category", kwargs={"path": self.project.get_url_path()}),
@@ -264,7 +382,7 @@ class CategoriesTest(ViewTestCase):
         category = Category.objects.get()
         self.assertRedirects(response, category_url)
         self.assertContains(response, "Nothing to list here.")
-        response = self.client.post(
+        self.client.post(
             reverse("rename", kwargs=self.kw_component),
             {
                 "project": self.project.pk,
@@ -274,7 +392,8 @@ class CategoriesTest(ViewTestCase):
             },
             follow=True,
         )
-        self.assertContains(response, "Categorized component can not be shared.")
+        self.component.refresh_from_db()
+        self.assertEqual(self.component.category, category)
 
     def test_move_category_linked_repo(self) -> None:
         component = self.create_link_existing()
@@ -316,3 +435,309 @@ class CategoriesTest(ViewTestCase):
 
         component.refresh_from_db()
         self.assertEqual(component.repo, "weblate://other/test-rename/test")
+
+    def test_category_removal_batches_linked_alert_updates(self) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Category test", slug="testcat"
+        )
+        first = self.create_link_existing(
+            name="Linked A", slug="linked-a", category=category
+        )
+        second = self.create_link_existing(
+            name="Linked B", slug="linked-b", category=category
+        )
+
+        with (
+            patch.object(Component, "update_alerts", autospec=True) as update_alerts,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            category_removal(category.pk, self.user.pk)
+
+        self.assertFalse(
+            Component.objects.filter(pk__in=[first.pk, second.pk]).exists()
+        )
+        update_alerts.assert_called_once_with(self.component)
+
+    def test_category_removal_skips_propagation_for_removed_components(self) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Category test", slug="testcat"
+        )
+        first = self.create_po(
+            project=self.project,
+            name="Category A",
+            slug="category-a",
+            category=category,
+        )
+        second = self.create_po(
+            project=self.project,
+            name="Category B",
+            slug="category-b",
+            category=category,
+        )
+        first.allow_translation_propagation = True
+        first.save(update_fields=["allow_translation_propagation"])
+        second.allow_translation_propagation = True
+        second.save(update_fields=["allow_translation_propagation"])
+
+        with (
+            patch.object(
+                Component, "schedule_update_checks", autospec=True
+            ) as schedule,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            category_removal(category.pk, self.user.pk)
+
+        self.assertEqual(
+            [call(self.component), call(self.component)],
+            schedule.call_args_list,
+        )
+
+    def test_category_removal_skips_propagation_for_cascaded_linked_components(
+        self,
+    ) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Category test", slug="testcat"
+        )
+        self.component.category = category
+        self.component.save()
+
+        linked = self.create_link_existing(name="Linked A", slug="linked-a")
+        linked.allow_translation_propagation = True
+        linked.save(update_fields=["allow_translation_propagation"])
+
+        other = self.create_po(
+            project=self.project,
+            name="Category A",
+            slug="category-a",
+            category=category,
+        )
+        other.allow_translation_propagation = True
+        other.save(update_fields=["allow_translation_propagation"])
+
+        with (
+            patch.object(
+                Component, "schedule_update_checks", autospec=True
+            ) as schedule,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            category_removal(category.pk, self.user.pk)
+
+        schedule.assert_not_called()
+
+    def test_category_removal_batches_parent_stats_updates(self) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Category test", slug="testcat"
+        )
+        for pos in range(2):
+            self.create_po(
+                project=self.project,
+                name=f"Category {pos}",
+                slug=f"category-{pos}",
+                category=category,
+            )
+
+        collected: list[set[str]] = []
+        executed: list[str] = []
+        original_flush = RemovalBatch.flush
+
+        def record_flush(batch_self: RemovalBatch) -> None:
+            collected.append(set(batch_self.stats_to_update))
+            with ExitStack() as stack:
+                for stats in batch_self.stats_to_update.values():
+                    stack.enter_context(
+                        patch.object(
+                            stats,
+                            "update_stats",
+                            side_effect=lambda stats=stats: executed.append(
+                                stats.cache_key
+                            ),
+                        )
+                    )
+                original_flush(batch_self)
+
+        with (
+            patch.object(
+                RemovalBatch, "flush", autospec=True, side_effect=record_flush
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            category_removal(category.pk, self.user.pk)
+
+        self.assertEqual(1, len(collected))
+        self.assertTrue(
+            {
+                category.stats.cache_key,
+                self.project.stats.cache_key,
+                GlobalStats().cache_key,
+            }.issubset(collected[0])
+        )
+        self.assertTrue(set(executed).issubset(collected[0]))
+        self.assertEqual(len(executed), len(set(executed)))
+        self.assertNotIn(category.stats.cache_key, executed)
+        self.assertLess(
+            executed.index(self.project.stats.cache_key),
+            executed.index(GlobalStats().cache_key),
+        )
+        self.assertEqual(
+            2,
+            self.project.change_set.filter(
+                action=ActionEvents.REMOVE_COMPONENT
+            ).count(),
+        )
+
+    def test_category_removal_skips_deleted_categories_before_global(self) -> None:
+        category = Category.objects.create(
+            project=self.project, name="Parent category", slug="parent"
+        )
+        child = Category.objects.create(
+            project=self.project,
+            category=category,
+            name="Child category",
+            slug="child",
+        )
+        self.create_po(
+            project=self.project,
+            name="Category A",
+            slug="category-a",
+            category=child,
+        )
+
+        executed: list[str] = []
+        original_flush = RemovalBatch.flush
+
+        def record_flush(batch_self: RemovalBatch) -> None:
+            with ExitStack() as stack:
+                for stats in batch_self.stats_to_update.values():
+                    stack.enter_context(
+                        patch.object(
+                            stats,
+                            "update_stats",
+                            side_effect=lambda stats=stats: executed.append(
+                                stats.cache_key
+                            ),
+                        )
+                    )
+                original_flush(batch_self)
+
+        with (
+            patch.object(
+                RemovalBatch, "flush", autospec=True, side_effect=record_flush
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            category_removal(category.pk, self.user.pk)
+
+        self.assertNotIn(child.stats.cache_key, executed)
+        self.assertNotIn(category.stats.cache_key, executed)
+        self.assertLess(
+            executed.index(self.project.stats.cache_key),
+            executed.index(GlobalStats().cache_key),
+        )
+
+    @override_settings(STATS_LAZY=False)
+    def test_category_removal_sorts_shared_category_dependencies(self) -> None:
+        removed = Category.objects.create(
+            project=self.project, name="Removed category", slug="removed"
+        )
+        target = Project.objects.create(name="Stats target", slug="stats-target")
+        parent = Category.objects.create(
+            project=target, name="Target parent", slug="target-parent"
+        )
+        child = Category.objects.create(
+            project=target,
+            category=parent,
+            name="Target child",
+            slug="target-child",
+        )
+        first = self.create_po(
+            project=self.project,
+            name="Shared with parent",
+            slug="shared-parent",
+            category=removed,
+        )
+        second = self.create_po(
+            project=self.project,
+            name="Shared with child",
+            slug="shared-child",
+            category=removed,
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            ComponentLink.objects.create(
+                component=first, project=target, category=parent
+            )
+            ComponentLink.objects.create(
+                component=second, project=target, category=child
+            )
+
+        language = first.translation_set.get(language_code="cs").language
+        self.assertGreater(parent.stats.all, 0)
+        self.assertGreater(parent.stats.get_single_language_stats(language).all, 0)
+        self.assertGreater(child.stats.all, 0)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            category_removal(removed.pk, self.user.pk)
+
+        parent = Category.objects.get(pk=parent.pk)
+        child = Category.objects.get(pk=child.pk)
+        self.assertEqual(child.stats.all, 0)
+        self.assertEqual(parent.stats.all, 0)
+        self.assertEqual(parent.stats.get_single_language_stats(language).all, 0)
+
+    def test_nested_category_language_totals(self) -> None:
+        parent = Category.objects.create(
+            project=self.project, name="Parent", slug="parent"
+        )
+        child = Category.objects.create(
+            project=self.project, category=parent, name="Child", slug="child"
+        )
+        grandchild = Category.objects.create(
+            project=self.project, category=child, name="Grandchild", slug="grandchild"
+        )
+        Component.objects.filter(pk=self.component.pk).update(category=grandchild)
+        translation = self.get_translation()
+        shared_project = Project.objects.create(name="Shared", slug="shared")
+        shared = self.create_po(project=shared_project, name="Shared", slug="shared")
+        ComponentLink.objects.create(
+            component=shared, project=self.project, category=child
+        )
+        shared_translation = shared.translation_set.get(language=translation.language)
+
+        for category, translations in (
+            (grandchild, (translation,)),
+            (child, (translation, shared_translation)),
+            (parent, (translation, shared_translation)),
+        ):
+            with self.subTest(category=category.slug):
+                stats = CategoryLanguage(category, translation.language).stats
+                for key in ("all", "all_words", "all_chars", "check:same"):
+                    self.assertEqual(
+                        getattr(stats, key),
+                        sum(getattr(item.stats, key) for item in translations),
+                    )
+
+    def test_component_category_move_updates_warm_stats(self) -> None:
+        old_category = Category.objects.create(
+            project=self.project, name="Old category", slug="old"
+        )
+        new_category = Category.objects.create(
+            project=self.project, name="New category", slug="new"
+        )
+        self.component.category = old_category
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.save(update_fields=["category"])
+
+        self.assertEqual(old_category.stats.all, self.component.stats.all)
+        self.assertEqual(new_category.stats.all, 0)
+        project_total = self.project.stats.all
+
+        self.component.category = new_category
+        with self.captureOnCommitCallbacks(execute=True):
+            self.component.save(update_fields=["category"])
+
+        old_category = Category.objects.get(pk=old_category.pk)
+        new_category = Category.objects.get(pk=new_category.pk)
+        self.assertEqual(old_category.stats.all, 0)
+        self.assertEqual(new_category.stats.all, self.component.stats.all)
+        self.assertEqual(
+            Project.objects.get(pk=self.project.pk).stats.all, project_total
+        )

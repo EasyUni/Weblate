@@ -4,9 +4,14 @@
 
 """Tests for char based quality checks."""
 
-from unittest import TestCase
+from __future__ import annotations
+
+import regex
+from django.template import Context, Template
+from django.test import SimpleTestCase
 
 from weblate.checks.chars import (
+    AcceleratorKeyCheck,
     BeginNewlineCheck,
     BeginSpaceCheck,
     DoubleSpaceCheck,
@@ -23,11 +28,98 @@ from weblate.checks.chars import (
     KabyleCharactersCheck,
     KashidaCheck,
     MaxLengthCheck,
+    MaxLinesCheck,
+    MultipleCapitalCheck,
     NewLineCountCheck,
     PunctuationSpacingCheck,
     ZeroWidthSpaceCheck,
 )
-from weblate.checks.tests.test_checks import CheckTestCase, MockUnit
+from weblate.checks.models import Check
+from weblate.checks.tests.test_checks import CheckTestCase
+from weblate.trans.tests.factories import make_check, make_unit
+
+
+class CharacterDescriptionTest(SimpleTestCase):
+    def test_rendering_contexts(self) -> None:
+        for name, plain, html in (
+            (
+                "escaped_newline",
+                r"Number of \n literals in translation does not match source.",
+                r"Number of <code>\n</code> literals in translation does not match source.",
+            ),
+            (
+                "kabyle-characters",
+                "Use standardized Latin Kabyle characters (e.g. ɣ instead of Greek γ; ɛ instead of ε).",
+                "Use standardized Latin Kabyle characters (e.g. <code>ɣ</code> instead of Greek <code>γ</code>; <code>ɛ</code> instead of <code>ε</code>).",
+            ),
+        ):
+            with self.subTest(check=name):
+                check = Check(name=name)
+                context = Context({"check": check})
+                self.assertEqual(
+                    Template("{{ check.get_description }}").render(context), html
+                )
+                self.assertEqual(check.get_plain_description(), plain)
+                self.assertEqual(
+                    Template(
+                        '<span title="{{ check.get_plain_description|force_escape }}"></span>'
+                    ).render(context),
+                    f'<span title="{plain}"></span>',
+                )
+
+
+class AcceleratorKeyCheckTest(CheckTestCase):
+    check = AcceleratorKeyCheck()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.test_good_matching = ("&File", "&File", "accelerator:&")
+        self.test_good_none = ("File", "File", "accelerator:&")
+        self.test_good_flag = ("&File", "File", "")
+        self.test_failure_1 = ("&File", "File", "accelerator:&")
+        self.test_failure_2 = ("File", "&File", "accelerator:&")
+        self.test_failure_3 = ("&File", "&File &Edit", "accelerator:&")
+
+    def test_underscore_accelerator(self) -> None:
+        self.do_test(False, ("_File", "_File", "accelerator:_"))
+        self.do_test(True, ("_File", "File", "accelerator:_"))
+        self.do_test(True, ("File", "_File", "accelerator:_"))
+
+    def test_literal_ampersand(self) -> None:
+        # A literal ampersand present in both source and translation should not trigger this check.
+        self.do_test(False, ("Walter & Sons", "Walter & Sons", "accelerator:&"))
+        # Escaped/literal ampersands (Qt/Windows "&&") should not count as accelerators.
+        self.do_test(False, ("Save && Exit", "Save && Exit", "accelerator:&"))
+        # Doubled markers before entity-like text are still literal markers.
+        self.do_test(
+            False,
+            ("Use &&lt; and &&gt;", "Use &&lt; and &&gt;", "accelerator:&"),
+        )
+
+    def test_escaped_underscore(self) -> None:
+        # Escaped/literal underscores (GTK "__") should not count as accelerators.
+        self.do_test(False, ("__File", "__File", "accelerator:_"))
+        # "___" is commonly used for a literal underscore plus an accelerator marker.
+        self.do_test(False, ("___File", "___File", "accelerator:_"))
+
+    def test_configured_marker_only(self) -> None:
+        self.do_test(False, ("_File", "File", "accelerator:&"))
+        self.do_test(False, ("&File", "File", "accelerator:_"))
+
+    def test_custom_accelerator(self) -> None:
+        self.do_test(False, ("~File", "~File", "accelerator:~"))
+        self.do_test(True, ("~File", "File", "accelerator:~"))
+        self.do_test(True, ("File", "~File", "accelerator:~"))
+        self.do_test(False, ("~~File", "~~File", "accelerator:~"))
+
+    def test_plain_flag_does_not_enable_runtime(self) -> None:
+        self.assertFalse(
+            self.check.check_target(
+                ["&File"],
+                ["File"],
+                make_unit(None, "accelerator", self.default_lang, source="&File"),
+            )
+        )
 
 
 class BeginNewlineCheckTest(CheckTestCase):
@@ -99,14 +191,14 @@ class EndStopCheckTest(CheckTestCase):
             self.check.check_target(
                 ["<unused singular (hash=…)>", "Lorem ipsum dolor sit amet."],
                 ["zero", "one", "two", "few", "many", "other"],
-                MockUnit(code="ar"),
+                make_unit(code="ar"),
             )
         )
         self.assertFalse(
             self.check.check_target(
                 ["<unused singular (hash=…)>", "Lorem ipsum dolor sit amet."],
                 ["zero.", "one", "two.", "few.", "many.", "other."],
-                MockUnit(code="ar"),
+                make_unit(code="ar"),
             )
         )
 
@@ -117,14 +209,14 @@ class EndStopCheckTest(CheckTestCase):
             self.check.check_target(
                 ["<unused singular (hash=…)>", "English."],
                 ["Japanese…"],
-                MockUnit(code="ja"),
+                make_unit(code="ja"),
             )
         )
         self.assertFalse(
             self.check.check_target(
                 ["<unused singular (hash=…)>", "English."],
                 ["Japanese。"],
-                MockUnit(code="ja"),
+                make_unit(code="ja"),
             )
         )
 
@@ -148,6 +240,17 @@ class EndStopCheckTest(CheckTestCase):
         self.do_test(False, ("Text.", "Text။", ""), "my")
         self.do_test(False, ("Text?", "ပုံဖျက်မလး။", ""), "my")
         self.do_test(False, ("Te xt", "ပုံဖျက်မလး။", ""), "my")  # codespell:ignore
+
+    def test_french(self) -> None:
+        self.do_test(
+            False,
+            (
+                "To enable password-less login, the public SSH key can be copied to the remote host.",
+                "Pour activer l’authentification sans mot de passe, la clé publique SSH peut être copiée sur le serveur distant.",  # codespell:ignore
+                "",
+            ),
+            "fr",
+        )
 
 
 class EndColonCheckTest(CheckTestCase):
@@ -203,6 +306,8 @@ class EndQuestionCheckTest(CheckTestCase):
     def test_interrobang(self) -> None:
         self.do_test(False, ("string!?", "string?", ""))
         self.do_test(False, ("string?", "string?!", ""))
+        self.do_test(False, ("string؟!", "string?", ""))
+        self.do_test(False, ("string?", "string!؟", ""))
         self.do_test(False, ("string⁈", "string?", ""))
         self.do_test(False, ("string?", "string⁉", ""))
         self.do_test(False, ("string？！", "string?", ""))
@@ -229,6 +334,8 @@ class EndExclamationCheckTest(CheckTestCase):
     def test_interrobang(self) -> None:
         self.do_test(False, ("string!?", "string!", ""))
         self.do_test(False, ("string!", "string?!", ""))
+        self.do_test(False, ("string!؟", "string!", ""))
+        self.do_test(False, ("string!", "string؟!", ""))
         self.do_test(False, ("string⁈", "string!", ""))
         self.do_test(False, ("string!", "string⁉", ""))
         self.do_test(False, ("string？！", "string!", ""))
@@ -247,6 +354,8 @@ class EndInterrobangCheckTest(CheckTestCase):
 
     def test_translate(self) -> None:
         self.do_test(False, ("string!?", "string!?", ""))
+        self.do_test(False, ("string?!", "string؟!", ""))
+        self.do_test(False, ("string!?", "string!؟", ""))
         self.do_test(False, ("string⁉", "string⁈", ""))
         self.do_test(False, ("string⁉", "string⁉", ""))
         self.do_test(False, ("string！？", "string！？", ""))
@@ -254,6 +363,7 @@ class EndInterrobangCheckTest(CheckTestCase):
         self.do_test(False, ("string?!", "string？！", ""))
         self.do_test(False, ("string！？", "string!?", ""))
         self.do_test(True, ("string?", "string?!", ""))
+        self.do_test(True, ("string?", "string؟!", ""))
         self.do_test(False, ("string⁉", "string!?", ""))
         self.do_test(False, ("string?!", "string⁈", ""))
         self.do_test(False, ("string？！", "string⁈", ""))
@@ -289,7 +399,7 @@ class NewLineCountCheckTest(CheckTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.test_single_good_matching = ("string\n\nstring", "string\n\nstring", "")
+        self.test_good_matching = ("string\n\nstring", "string\n\nstring", "")
         self.test_failure_1 = ("string\nstring", "string\n\n\nstring", "")
         self.test_failure_2 = ("string\nstring\n\nstring", "string\nstring\nstring", "")
 
@@ -304,7 +414,7 @@ class ZeroWidthSpaceCheckTest(CheckTestCase):
         self.test_failure_1 = ("string", "str\u200bing", "")
 
 
-class MaxLengthCheckTest(TestCase):
+class MaxLengthCheckTest(SimpleTestCase):
     def setUp(self) -> None:
         self.check = MaxLengthCheck()
         self.test_good_matching = ("strings", "less than 21", "max-length:12")
@@ -315,8 +425,28 @@ class MaxLengthCheckTest(TestCase):
             self.check.check_target(
                 [self.test_good_matching[0]],
                 [self.test_good_matching[1]],
-                MockUnit(flags=self.test_good_matching[2]),
+                make_unit(flags=self.test_good_matching[2]),
             )
+        )
+
+    def test_check_invalid_flag(self) -> None:
+        self.assertTrue(
+            self.check.check_target(
+                [self.test_good_matching[0]],
+                [self.test_good_matching[1]],
+                make_unit(flags="max-length:*"),
+            )
+        )
+
+    def test_description_invalid_flag(self) -> None:
+        unit = make_unit(
+            source=self.test_good_matching[0],
+            target=self.test_good_matching[1],
+            flags="max-length:*",
+        )
+        check = make_check(unit, self.check)
+        self.assertIn(
+            "Could not parse max-length flag:", str(self.check.get_description(check))
         )
 
     def test_unicode_check(self) -> None:
@@ -324,7 +454,7 @@ class MaxLengthCheckTest(TestCase):
             self.check.check_target(
                 [self.test_good_matching_unicode[0]],
                 [self.test_good_matching_unicode[1]],
-                MockUnit(flags=self.test_good_matching_unicode[2]),
+                make_unit(flags=self.test_good_matching_unicode[2]),
             )
         )
 
@@ -333,7 +463,7 @@ class MaxLengthCheckTest(TestCase):
             self.check.check_target(
                 [self.test_good_matching[0]],
                 [self.test_good_matching[1]],
-                MockUnit(flags="max-length:10"),
+                make_unit(flags="max-length:10"),
             )
         )
 
@@ -342,7 +472,7 @@ class MaxLengthCheckTest(TestCase):
             self.check.check_target(
                 [self.test_good_matching_unicode[0]],
                 [self.test_good_matching_unicode[1]],
-                MockUnit(flags="max-length:10"),
+                make_unit(flags="max-length:10"),
             )
         )
 
@@ -351,14 +481,14 @@ class MaxLengthCheckTest(TestCase):
             self.check.check_target(
                 ["hi %s"],
                 ["ahoj %s"],
-                MockUnit(flags="max-length:10"),
+                make_unit(flags="max-length:10"),
             )
         )
         self.assertTrue(
             self.check.check_target(
                 ["hi %s"],
                 ["ahoj %s"],
-                MockUnit(flags='max-length:10, replacements:%s:"very long text"'),
+                make_unit(flags='max-length:10, replacements:%s:"very long text"'),
             )
         )
 
@@ -367,21 +497,80 @@ class MaxLengthCheckTest(TestCase):
             self.check.check_target(
                 ["hi <mrk>%s</mrk>"],
                 ["ahoj <mrk>%s</mrk>"],
-                MockUnit(flags="max-length:10"),
+                make_unit(flags="max-length:10"),
             )
         )
         self.assertFalse(
             self.check.check_target(
                 ["hi <mrk>%s</mrk>"],
                 ["ahoj <mrk>%s</mrk>"],
-                MockUnit(flags="max-length:10, xml-text"),
+                make_unit(flags="max-length:10, xml-text"),
             )
         )
         self.assertTrue(
             self.check.check_target(
                 ["hi <mrk>%s</mrk>"],
                 ["ahoj <mrk>%s</mk>"],
-                MockUnit(flags="max-length:10, xml-text"),
+                make_unit(flags="max-length:10, xml-text"),
+            )
+        )
+
+
+class MaxLinesCheckTest(SimpleTestCase):
+    def setUp(self) -> None:
+        self.check = MaxLinesCheck()
+
+    def test_single_line_within_limit(self) -> None:
+        self.assertFalse(
+            self.check.check_target(
+                ["source"],
+                ["translation"],
+                make_unit(flags="max-lines:3"),
+            )
+        )
+
+    def test_single_line_exceeds_limit(self) -> None:
+        self.assertTrue(
+            self.check.check_target(
+                ["source"],
+                ["line1\nline2"],
+                make_unit(flags="max-lines:1"),
+            )
+        )
+
+    def test_multi_line_within_limit(self) -> None:
+        self.assertFalse(
+            self.check.check_target(
+                ["source"],
+                ["line1\nline2"],
+                make_unit(flags="max-lines:3"),
+            )
+        )
+
+    def test_multi_line_exceeds_limit(self) -> None:
+        self.assertTrue(
+            self.check.check_target(
+                ["source"],
+                ["line1\nline2\nline3\nline4"],
+                make_unit(flags="max-lines:3"),
+            )
+        )
+
+    def test_exact_boundary(self) -> None:
+        self.assertFalse(
+            self.check.check_target(
+                ["source"],
+                ["line1\nline2\nline3"],
+                make_unit(flags="max-lines:3"),
+            )
+        )
+
+    def test_invalid_flag(self) -> None:
+        self.assertTrue(
+            self.check.check_target(
+                ["source"],
+                ["translation"],
+                make_unit(flags="max-lines:*"),
             )
         )
 
@@ -408,11 +597,20 @@ class KashidaCheckTest(CheckTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.test_good_matching = ("string", "string", "")
+        self.test_good_matching = ("string", "مـ", "")
         self.test_good_ignore = ("string", "بـ:", "")
-        self.test_failure_1 = ("string", "string\u0640", "")
-        self.test_failure_2 = ("string", "string\ufe79", "")
-        self.test_failure_3 = ("string", "string\ufe7f", "")
+        self.test_failure_1 = ("string", "صـــفــــحـــــے", "")
+        self.test_failure_2 = ("string", "صـف", "")
+        self.test_failure_3 = ("string", "بـالبيت", "")
+
+    def test_kashida_abbreviation(self) -> None:
+        # Single and multiple kashidas at end of abbreviation/word should be allowed
+        self.do_test(False, ("string", "اتـ", ""))
+        self.do_test(False, ("string", "مــ", ""))
+
+    def test_kashida_combining_mark(self) -> None:
+        # Kashidas holding combining marks should be allowed
+        self.do_test(False, ("string", "ــ٘ـ", ""))
 
 
 class PunctuationSpacingCheckTest(CheckTestCase):
@@ -459,6 +657,56 @@ class PunctuationSpacingCheckTest(CheckTestCase):
             "fr",
         )
 
+    def test_markdown_image(self) -> None:
+        self.do_test(
+            False,
+            (
+                (
+                    "Or buy a 👕 T-shirt 👕 from <br>\n"
+                    "[![HELLOTUX]({% asset hellotux_banner.jpg %})](https://www.hellotux.com/f-droid)<br>\n"
+                    "(F-Droid will receive 3€ per shirt sold.)\n"
+                ),
+                (
+                    "Ou achetez un 👕 T-shirt 👕 depuis <br>\n"
+                    "[![HELLOTUX]({% asset hellotux_banner.jpg %})](https://www.hellotux.com/f-droid)<br>\n"
+                    "(F-Droid recevra 3€ par T-shirt vendu.)\n"
+                ),
+                "md-text",
+            ),
+            "fr",
+        )
+        self.do_test(
+            True,
+            (
+                "[Read it!](https://example.com)",
+                "[Lisez-le!](https://example.com)",
+                "md-text",
+            ),
+            "fr",
+        )
+        self.do_test(
+            False,
+            (
+                "[Search](https://example.com/search?)",
+                "[Rechercher](https://example.com/search?)",
+                "md-text",
+            ),
+            "fr",
+        )
+
+    def test_description(self) -> None:
+        unit = make_unit(source="string", target="Oups!", code="fr")
+        description = str(self.check.get_description(make_check(unit, self.check)))
+        self.assertIn("punctuation mark", description)
+        self.assertIn("<code>!</code>", description)
+
+        unit = make_unit(source="string", target="Oups! Encore: vraiment?", code="fr")
+        description = str(self.check.get_description(make_check(unit, self.check)))
+        self.assertIn("punctuation marks", description)
+        self.assertIn("<code>!</code>", description)
+        self.assertIn("<code>:</code>", description)
+        self.assertIn("<code>?</code>", description)
+
     def test_restructured_text(self) -> None:
         self.do_test(
             True,
@@ -478,6 +726,57 @@ class PunctuationSpacingCheckTest(CheckTestCase):
             ),
             "fr",
         )
+
+    def test_angular_fr_placeholders(self) -> None:
+        # XLIFF placeholder regex so highlight_string skips equiv-text content
+        xliff_placeholder = r'placeholders:r"<x\s[^>]*/>"'
+        # Check should not fire when punctuation is inside placeholder equiv-text
+        self.do_test(
+            False,
+            (
+                'Orangutan has <x id="INTERPOLATION" equiv-text="{{ count | other: 0 }}"/> banana.\n',
+                'Orangutan a <x id="INTERPOLATION" equiv-text="{{ count | other: 0 }}"/> banane.\n',
+                xliff_placeholder,
+            ),
+            "fr",
+        )
+        # Check should fire when punctuation is outside placeholder
+        self.do_test(
+            True,
+            (
+                'Orangutan has: <x id="INTERPOLATION" equiv-text="{{ count }}"/> banana.\n',
+                'Orangutan a: <x id="INTERPOLATION" equiv-text="{{ count }}"/> banane.\n',
+                xliff_placeholder,
+            ),
+            "fr",
+        )
+
+    def test_cdata(self) -> None:
+        self.do_test(
+            False,
+            (
+                "<![CDATA[Auto-run is <i>enabled</i>]]>",
+                "<![CDATA[Auto-run is <i>enabled</i>]]>",
+                "",
+            ),
+            "fr",
+        )
+
+    def test_fixup_markdown_url(self) -> None:
+        unit = make_unit(
+            source="Read: [docs](https://example.com)",
+            target="Lire: [docs](https://example.com)",
+            code="fr",
+            flags="md-text",
+        )
+        fixup = self.check.get_fixup(unit)
+        assert fixup is not None
+        result = unit.target
+        for item in fixup:
+            assert item[0] == "regex"
+            _kind, pattern, replacement, _flags = item
+            result = regex.sub(pattern, replacement.replace("$", "\\"), result)
+        self.assertEqual(result, "Lire\u00a0: [docs](https://example.com)")
 
 
 class KabyleCharactersCheckTest(CheckTestCase):
@@ -500,4 +799,46 @@ class KabyleCharactersCheckTest(CheckTestCase):
                 "",
             ),
             "el",
+        )
+
+
+class MultipleCapitalCheckTest(CheckTestCase):
+    check = MultipleCapitalCheck()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.test_good_matching = ("Hello", "Hello", "")
+        self.test_failure_1 = ("Hello", "HEllo", "")
+        self.test_failure_2 = ("camel case", "CAmelCase", "")
+        self.test_failure_3 = ("sigma", "ΣIGMA", "")
+
+    def test_acronyms(self) -> None:
+        self.do_test(
+            False,
+            (
+                "Welcome NATO",
+                "Bonjour OTAN",
+                "",
+            ),
+            "fr",
+        )
+        self.do_test(
+            False,
+            (
+                "Welcome NATO",
+                "Vítej NATO",
+                "",
+            ),
+            "cs",
+        )
+
+    def test_translation(self) -> None:
+        self.do_test(
+            False,
+            (
+                "Hello world",
+                "שלום עולם (World)",
+                "",
+            ),
+            "he",
         )

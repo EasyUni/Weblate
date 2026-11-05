@@ -2,14 +2,17 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Amalia Nostalgia <cadenanostalgia@gmail.com>, 2025.
-# ButterflyOfFire <boffire@users.noreply.hosted.weblate.org>, 2025.
+# ButterflyOfFire <boffire@users.noreply.hosted.weblate.org>, 2025, 2026.
+# Automatic translation add-on <noreply-addon-autotranslate@weblate.org>, 2026.
 msgid ""
 msgstr ""
-"Project-Id-Version: Weblate 5.13\n"
-"Report-Msgid-Bugs-To: https://github.com/WeblateOrg/weblate/issues\n"
-"POT-Creation-Date: 2025-08-12 08:54+0000\n"
-"PO-Revision-Date: 2025-05-24 05:02+0000\n"
-"Last-Translator: ButterflyOfFire <boffire@users.noreply.hosted.weblate.org>\n"
+"Project-Id-Version: Weblate 5.16.1\n"
+"Report-Msgid-Bugs-To: https://hosted.weblate.org/projects/weblate/"
+"javascript/\n"
+"POT-Creation-Date: 2026-10-29 23:03-0500\n"
+"PO-Revision-Date: 2026-06-25 05:12+0000\n"
+"Last-Translator: Automatic translation add-on <noreply-addon-"
+"autotranslate@weblate.org>\n"
 "Language-Team: Kabyle <https://hosted.weblate.org/projects/weblate/"
 "javascript/kab/>\n"
 "Language: kab\n"
@@ -17,323 +20,535 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=n != 1;\n"
-"X-Generator: Weblate 5.12-dev\n"
+"X-Generator: Weblate 2026.7.dev0\n"
 
-#: weblate/static/editor/base.js:54
 msgid "Unsaved changes!"
 msgstr "Asnifel ur yettwasekles ara!"
 
-#: weblate/static/editor/base.js:132
 msgid "Please select target plural by clicking."
 msgstr ""
 
-#: weblate/static/editor/base.js:213
 msgid "You have unsaved changes. Are you sure you want to skip?"
 msgstr "Tesɛiḍ isenfal ur nettwaklas ara. Tetḥeqqeḍ tebɣiḍ ad ten-tzegleḍ?"
 
-#: weblate/static/editor/base.js:256
 #, javascript-format
 msgid "Cmd+%s"
 msgstr "Cmd+%s"
 
-#: weblate/static/editor/base.js:258
 #, javascript-format
 msgid "Ctrl+%s"
 msgstr "Ctrl+%s"
 
-#: weblate/static/editor/full.js:268
 msgid "Translation memory entry removed."
 msgstr ""
 
-#: weblate/static/editor/full.js:302
 msgid "The request for machine translation has failed:"
 msgstr "Tuttra n tsuqilt tawurmant ur teddi ara:"
 
-#: weblate/static/editor/full.js:312
 #, javascript-format
 msgid "The request for machine translation using %s has failed:"
 msgstr "tuttra n tsuqlit tawurmant iseqdacen %s ur teddi ara:"
 
-#: weblate/static/editor/full.js:347
 #, javascript-format
 msgid "Cmd+M then %s"
 msgstr "Cmd+M sakin %s"
 
-#: weblate/static/editor/full.js:349
 #, javascript-format
 msgid "Ctrl+M then %s"
 msgstr "Alt+M sakin %s"
 
-#: weblate/static/editor/full.js:451
 #, javascript-format
 msgid "Press Cmd+I then %s to dismiss this."
 msgstr "Senned Cmd+I Sakin %s akken ad tesfesxeḍ."
 
-#: weblate/static/editor/full.js:456
 #, javascript-format
 msgid "Press Ctrl+I then %s to dismiss this."
 msgstr "Press Ctrl+I sakin %s akken ad tsurfeḍ i waya."
 
-#: weblate/static/editor/full.js:598
-msgid "Clone to translation"
-msgstr "Nɣel ar tsuqilt"
-
-#: weblate/static/editor/full.js:600
-msgid "Accept"
-msgstr "Qbel"
-
-#: weblate/static/editor/full.js:609
-msgid "Accept and approve"
+msgid "Slug"
 msgstr ""
 
-#: weblate/static/editor/full.js:621
-msgid "Delete entry"
-msgstr "Kkes anekcam"
+#, javascript-format
+msgid "%s more origin"
+msgid_plural "%s more origins"
+msgstr[0] ""
+msgstr[1] ""
 
-#: weblate/static/editor/tools/search.js:50
 msgid "No results found"
 msgstr "Ulac igemmad yettwafen"
 
-#: weblate/static/editor/tools/search.js:103
 #, javascript-format
 msgid "%s matching string"
 msgid_plural "%s matching strings"
 msgstr[0] ""
 msgstr[1] ""
 
-#: weblate/static/editor/zen.js:110
+msgid ""
+"Your previous search results are no longer available. Refresh results to "
+"continue."
+msgstr ""
+
 msgid "There are some unsaved changes, are you sure you want to leave?"
 msgstr "Llan isenfal ur yettwaskelsen ara, tebɣid ad teffɣeḍ?"
 
-#: weblate/static/js/screenshots/clipboard-paste.js:38
-msgid "Image Pasted!"
+msgid "Save or discard your changes before accepting a suggestion."
 msgstr ""
 
-#: weblate/static/js/screenshots/clipboard-paste.js:40
-#: weblate/static/js/screenshots/clipboard-paste.js:56
-msgid "Something went wrong!"
-msgstr ""
+#, javascript-format
+msgid "%s suggestion"
+msgid_plural "%s suggestions"
+msgstr[0] ""
+msgstr[1] ""
 
-#: weblate/static/js/screenshots/clipboard-paste.js:53
-msgid "No image found in clipboard"
-msgstr ""
-
-#: weblate/static/loader-bootstrap.js:178
-msgid "Error loading search results!"
-msgstr "Tuccḍa deg usali n igmaḍ n unadi!"
-
-#: weblate/static/loader-bootstrap.js:182
-msgid "No new matching source strings found."
-msgstr "Ulac azrir amaynut aɣbalu yenmeɣran."
-
-#: weblate/static/loader-bootstrap.js:266
-msgid "Sort this column"
-msgstr "Smizzwer tagejdit-agi"
-
-#: weblate/static/loader-bootstrap.js:579
-msgid "Error while loading page:"
-msgstr "Tuccḍa deg usali n usebter:"
-
-#: weblate/static/loader-bootstrap.js:867
-msgid "Text copied to clipboard."
-msgstr "Aḍris yenɣel ɣef afus."
-
-#: weblate/static/loader-bootstrap.js:871
-msgid "Please press Ctrl+C to copy."
-msgstr "Senned ɣe Ctrl+C akken ad tneɣleḍ."
-
-#: weblate/static/loader-bootstrap.js:894
-msgid "Search…"
-msgstr "Nadi…"
-
-#: weblate/static/loader-bootstrap.js:895
-msgid "Available:"
-msgstr "Yella:"
-
-#: weblate/static/loader-bootstrap.js:896
-msgid "Chosen:"
-msgstr "Ittwafren:"
-
-#: weblate/static/loader-bootstrap.js:1232
-msgid "Weblate is now scanning the repository, please be patient."
-msgstr "Weblate yettḍummu-d akka tura, ttxil-k rgu."
-
-#: weblate/static/loader-bootstrap.js:1346
 msgid ""
-"Notification settings removed, please do not forget to save the changes."
+"The translation was changed while you were editing it, your unsaved changes "
+"were kept."
 msgstr ""
 
-#: weblate/static/loader-bootstrap.js:1505
-msgid "Custom range"
+msgid "Hide suggestions"
 msgstr ""
 
-#: weblate/static/loader-bootstrap.js:1506
-msgid "Clear"
-msgstr "Sfeḍ"
+msgid "Show suggestions"
+msgstr ""
 
-#: weblate/static/loader-bootstrap.js:1508
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "Su"
+#, javascript-format
+msgid "Results of action %s"
+msgstr ""
+
+msgid "This workflow is not valid YAML, so the editor cannot show it."
+msgstr ""
+
+msgid ""
+"This workflow uses parts the editor does not handle yet, such as nested "
+"conditions or branches. Edit it as YAML."
+msgstr ""
+
+#, javascript-format
+msgid "Added %s."
+msgstr ""
+
+#, javascript-format
+msgid "Removed %s."
+msgstr ""
+
+#, javascript-format
+msgid "Moved %s."
+msgstr ""
+
+msgid "Security token missing. Please reload the page."
+msgstr ""
+
+#, javascript-format
+msgid "Loading suggestion count for %s"
+msgstr ""
+
+msgid "Bulk accept cancelled."
+msgstr ""
+
+#, javascript-format
+msgid "Scheduling bulk accept for %s"
+msgstr ""
+
+msgid "Unknown error"
+msgstr "Tuccḍa tarussint"
+
+#, javascript-format
+msgid "Error: %s"
+msgstr "Tuccḍa: %s"
+
+msgid "Network error"
+msgstr "Tuccḍa deg uẓeṭṭa"
+
+msgid "Invalid server response"
+msgstr ""
+
+msgid ""
+"Accepting the suggestions takes longer than expected, reload the page to see "
+"the result."
+msgstr ""
+
+#, javascript-format
+msgid "Server error (%s)"
+msgstr "Tuccḍa n uqeddac (%s)"
+
+msgid "There are no pending suggestions from %(username)s in %(translation)s."
+msgstr ""
+
+msgid ""
+"This will accept %(count)s suggestion from %(username)s in %(translation)s."
+msgid_plural ""
+"This will accept %(count)s suggestions from %(username)s in %(translation)s."
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Accept all suggestions?"
+msgstr ""
+
+msgid "Close"
+msgstr "Mdel"
+
+msgid "Cancel"
+msgstr ""
+
+msgid "Accept suggestions"
+msgstr ""
+
+msgid "Accept and approve suggestions"
+msgstr ""
+
+msgid "No strings selected"
+msgstr ""
+
+#, javascript-format
+msgid "%s string selected"
+msgid_plural "%s strings selected"
+msgstr[0] ""
+msgstr[1] ""
+
 msgctxt "Short name of day"
 msgid "Su"
-msgstr "Ac"
+msgstr "Cr"
 
-#: weblate/static/loader-bootstrap.js:1509
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "Mo"
 msgctxt "Short name of day"
 msgid "Mo"
 msgstr "Ri"
 
-#: weblate/static/loader-bootstrap.js:1510
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "Tu"
 msgctxt "Short name of day"
 msgid "Tu"
 msgstr "Ra"
 
-#: weblate/static/loader-bootstrap.js:1511
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "We"
 msgctxt "Short name of day"
 msgid "We"
-msgstr "Ah"
+msgstr "Hd"
 
-#: weblate/static/loader-bootstrap.js:1512
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "Th"
 msgctxt "Short name of day"
 msgid "Th"
-msgstr "Am"
+msgstr "Mh"
 
-#: weblate/static/loader-bootstrap.js:1513
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "Fr"
 msgctxt "Short name of day"
 msgid "Fr"
 msgstr "Sm"
 
-#: weblate/static/loader-bootstrap.js:1514
-#, fuzzy
-#| msgctxt "Minimal (for example two letter) name of day in week"
-#| msgid "Sa"
 msgctxt "Short name of day"
 msgid "Sa"
 msgstr "Sd"
 
-#: weblate/static/loader-bootstrap.js:1517
 msgctxt "Short name of month"
 msgid "Jan"
 msgstr "Yen"
 
-#: weblate/static/loader-bootstrap.js:1518
 msgctxt "Short name of month"
 msgid "Feb"
 msgstr "Fuṛ"
 
-#: weblate/static/loader-bootstrap.js:1519
 msgctxt "Short name of month"
 msgid "Mar"
 msgstr "Meɣ"
 
-#: weblate/static/loader-bootstrap.js:1520
 msgctxt "Short name of month"
 msgid "Apr"
 msgstr "Yeb"
 
-#: weblate/static/loader-bootstrap.js:1521
 msgctxt "Short name of month"
 msgid "May"
 msgstr "May"
 
-#: weblate/static/loader-bootstrap.js:1522
 msgctxt "Short name of month"
 msgid "Jun"
 msgstr "Yun"
 
-#: weblate/static/loader-bootstrap.js:1523
 msgctxt "Short name of month"
 msgid "Jul"
 msgstr "Yul"
 
-#: weblate/static/loader-bootstrap.js:1524
 msgctxt "Short name of month"
 msgid "Aug"
 msgstr "Ɣuc"
 
-#: weblate/static/loader-bootstrap.js:1525
 msgctxt "Short name of month"
 msgid "Sep"
 msgstr "Cte"
 
-#: weblate/static/loader-bootstrap.js:1526
 msgctxt "Short name of month"
 msgid "Oct"
 msgstr "Tub"
 
-#: weblate/static/loader-bootstrap.js:1527
 msgctxt "Short name of month"
 msgid "Nov"
 msgstr "Wam"
 
-#: weblate/static/loader-bootstrap.js:1528
 msgctxt "Short name of month"
 msgid "Dec"
 msgstr "Duj"
 
-#: weblate/static/loader-bootstrap.js:1532
 msgid "Today"
 msgstr "Ass-a"
 
-#: weblate/static/loader-bootstrap.js:1533
 msgid "Yesterday"
 msgstr "Iḍelli"
 
-#: weblate/static/loader-bootstrap.js:1537
 msgid "Last 7 days"
 msgstr "7 n wussan yezrin"
 
-#: weblate/static/loader-bootstrap.js:1538
 msgid "Last 30 days"
 msgstr "30 n wussan yezrin"
 
-#: weblate/static/loader-bootstrap.js:1539
 msgid "This month"
 msgstr "Ayyur-a"
 
-#: weblate/static/loader-bootstrap.js:1543
 msgid "Last month"
 msgstr "Ayyur yezrin"
 
-#: weblate/static/loader-bootstrap.js:1547
 msgid "This year"
 msgstr "Aseggas-a"
 
-#: weblate/static/loader-bootstrap.js:1551
 msgid "Last year"
 msgstr "Ilindi"
 
-#: weblate/static/loader-bootstrap.js:1632
+msgid "Select date range"
+msgstr ""
+
+#, fuzzy
+#| msgid "This month"
+msgid "Previous month"
+msgstr "Ayyur-a"
+
+#, fuzzy
+#| msgid "Last month"
+msgid "Next month"
+msgstr "Ayyur yezrin"
+
+msgid "Clear"
+msgstr "Sfeḍ"
+
+msgid "Apply"
+msgstr "Snes"
+
+msgid "Custom"
+msgstr "Udmawan"
+
+msgid "Add a flag…"
+msgstr ""
+
+#, javascript-format
+msgid ""
+"No matching flag found for \"%s\"; press Enter to add it as a custom flag."
+msgstr ""
+
+msgid "Image Pasted!"
+msgstr ""
+
+msgid "Press Ctrl+V or Command+V to paste an image."
+msgstr ""
+
+msgid "No image found in clipboard"
+msgstr ""
+
+#, fuzzy
+#| msgid "Loading…"
+msgid "Loading screenshots…"
+msgstr "Asali…"
+
+msgid "Could not load screenshots. Please try again."
+msgstr ""
+
+#, fuzzy
+#| msgid "Add to screenshot"
+msgid "Adding screenshot…"
+msgstr "Rnu ɣer tuṭṭfa n ugdil"
+
+msgid "Could not add screenshot. Please try again."
+msgstr ""
+
+msgid ""
+"A pull or merge request will be created from a branch in the repository."
+msgstr ""
+
+msgid ""
+"A push URL is set but no push branch is given. Set a push branch that "
+"differs from the translated branch."
+msgstr ""
+
+msgid ""
+"The push branch must differ from the translated branch when creating a pull "
+"or merge request."
+msgstr ""
+
+msgid "A pull or merge request will be created from a fork of the repository."
+msgstr ""
+
+#, javascript-format
+msgid ""
+"A pull or merge request will be created from the “%s” branch in the "
+"repository."
+msgstr ""
+
+#, javascript-format
+msgid ""
+"Changes will be sent as a Gerrit review request targeting the “%s” branch."
+msgstr ""
+
+msgid "Changes will be sent as a Gerrit review request."
+msgstr ""
+
+msgid ""
+"Changes will not be pushed automatically. You can still push them manually "
+"from the repository maintenance."
+msgstr ""
+
+#, javascript-format
+msgid ""
+"Changes will be pushed directly to the “%s” branch in the push repository."
+msgstr ""
+
+msgid ""
+"Changes will be pushed directly to the default branch of the push repository."
+msgstr ""
+
+msgid "Text copied to clipboard."
+msgstr "Aḍris yenɣel ɣef afus."
+
+#, fuzzy
+#| msgid "Text copied to clipboard."
+msgid "Error copying to clipboard."
+msgstr "Aḍris yenɣel ɣef afus."
+
+#, fuzzy
+#| msgid "No new matching source strings found."
+msgid "Could not remove the source string."
+msgstr "Ulac azrir amaynut aɣbalu yenmeɣran."
+
+msgid "Some source strings could not be assigned."
+msgstr ""
+
+msgid "Error loading search results!"
+msgstr "Tuccḍa deg usali n igmaḍ n unadi!"
+
+msgid "No new matching source strings found."
+msgstr "Ulac azrir amaynut aɣbalu yenmeɣran."
+
+msgid "Sort this column"
+msgstr "Smizzwer tagejdit-agi"
+
+msgid "Error while loading page:"
+msgstr "Tuccḍa deg usali n usebter:"
+
+msgid "Could not load text recognition progress. Please try again."
+msgstr ""
+
+msgid "Could not load strings from the image. Please try again."
+msgstr ""
+
+msgid "Finding strings in image…"
+msgstr ""
+
+msgid "Finding strings is taking longer than expected. Please try again later."
+msgstr ""
+
+msgid "Please press Ctrl+C to copy."
+msgstr "Senned ɣe Ctrl+C akken ad tneɣleḍ."
+
+msgid "Search…"
+msgstr "Nadi…"
+
+msgid "Loading…"
+msgstr "Asali…"
+
+#, fuzzy
+#| msgid "Error while loading page:"
+msgid "Error while loading form:"
+msgstr "Tuccḍa deg usali n usebter:"
+
+msgid "Select a component to load repository branches."
+msgstr ""
+
+#, fuzzy
+#| msgid "Loading…"
+msgid "Loading repository branches…"
+msgstr "Asali…"
+
+msgid "Repository branches loaded."
+msgstr ""
+
+msgid "No additional repository branches are available."
+msgstr ""
+
+msgid "Could not load repository branches. Please try again."
+msgstr ""
+
+msgid "Weblate is now scanning the repository, please be patient."
+msgstr "Weblate yettḍummu-d akka tura, ttxil-k rgu."
+
+msgid "Nothing to preview."
+msgstr ""
+
+msgid "Please sign in again."
+msgstr ""
+
+msgid ""
+"Notification settings removed, please do not forget to save the changes."
+msgstr ""
+
 msgctxt "Alert to user when opening browser developer console"
 msgid "Stop!"
 msgstr "Seḥbes"
 
-#: weblate/static/loader-bootstrap.js:1638
 msgid ""
 "This is a browser feature intended for developers. If someone told you to "
 "copy-paste something here, they are likely trying to compromise your Weblate "
 "account."
 msgstr ""
 
-#: weblate/static/loader-bootstrap.js:1644
 msgid "See https://en.wikipedia.org/wiki/Self-XSS for more information."
 msgstr "Wali https://en.wikipedia.org/wiki/Self-XSS i wugar n telɣut."
+
+msgid "just now"
+msgstr "tura kan"
+
+#, javascript-format
+msgid "%s second ago"
+msgid_plural "%s seconds ago"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "a minute ago"
+msgstr ""
+
+#, javascript-format
+msgid "%s minute ago"
+msgid_plural "%s minutes ago"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "an hour ago"
+msgstr "yiwen n wesrag aya"
+
+#, javascript-format
+msgid "%s hour ago"
+msgid_plural "%s hours ago"
+msgstr[0] "%s n wesrag aya"
+msgstr[1] "%s n yesragen aya"
+
+#~ msgid "Clone to translation"
+#~ msgstr "Nɣel ar tsuqilt"
+
+#~ msgid "Accept"
+#~ msgstr "Qbel"
+
+#~ msgid "Delete entry"
+#~ msgstr "Kkes anekcam"
+
+#~ msgid "Something went wrong!"
+#~ msgstr "Yella kra n wugur ay d-yeḍran!"
+
+#~ msgid "Done"
+#~ msgstr "Yemmug"
+
+#~ msgid "Available:"
+#~ msgstr "Yella:"
+
+#~ msgid "Chosen:"
+#~ msgstr "Ittwafren:"
 
 #~ msgid "Weblate feedback"
 #~ msgstr "Tuɣalin n yisallen seg Weblate"
@@ -458,9 +673,6 @@ msgstr "Wali https://en.wikipedia.org/wiki/Self-XSS i wugar n telɣut."
 
 #~ msgid "Copy and save"
 #~ msgstr "Nɣel sakin sekles"
-
-#~ msgid "Add to screenshot"
-#~ msgstr "Rnu ɣer tuṭṭfa n ugdil"
 
 #~ msgid "Ctrl/Command+%s"
 #~ msgstr "Ctrl/Command+%s"

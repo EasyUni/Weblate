@@ -4,76 +4,228 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-from typing import TYPE_CHECKING
+import shutil
+import tempfile
+from operator import itemgetter
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
+from urllib.parse import quote
 from uuid import uuid4
 
 from django.conf import settings
 from django.template.loader import render_to_string
 from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy
+from django.utils.translation import gettext, gettext_lazy
+from weblate_schemas import validate_schema
 
 from weblate.addons.base import BaseAddon
-from weblate.addons.events import AddonEvent
+from weblate.addons.events import (
+    AddonActivityLogReason,
+    AddonEvent,
+    AddonEventOutcome,
+)
 from weblate.addons.forms import CDNJSForm
 from weblate.addons.tasks import cdn_parse_html
+from weblate.utils.cdn import CDNFileMetadata, content_metadata
 from weblate.utils.state import STATE_TRANSLATED
 
+CDN_JS_FILENAME = "weblate.js"
+CDN_MANIFEST_FILENAME = "manifest.json"
+
 if TYPE_CHECKING:
+    from django.http import HttpRequest
+
+    from weblate.addons.models import Addon
     from weblate.auth.models import User
-    from weblate.trans.models import Component
+    from weblate.trans.models import Category, Component, Project, Translation
 
 
-class CDNJSAddon(BaseAddon):
-    events = {
+class CDNBaseAddon(BaseAddon):
+    user_name = "cdn"
+    user_verbose = "CDN add-on"
+    icon = "cloud-upload.svg"
+    stay_on_create = True
+
+    @classmethod
+    def create_object(
+        cls,
+        *,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+        **kwargs,
+    ) -> Addon:
+        # Generate UUID for the CDN
+        if "state" not in kwargs:
+            kwargs["state"] = {"uuid": uuid4().hex}
+        return super().create_object(
+            component=component,
+            category=category,
+            project=project,
+            **kwargs,
+        )
+
+    @classmethod
+    def can_install(
+        cls,
+        *,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+    ) -> bool:
+        if (
+            not settings.LOCALIZE_CDN_URL
+            or not settings.LOCALIZE_CDN_PATH
+            or (component is not None and not component.translation_set.exists())
+        ):
+            return False
+        return super().can_install(
+            component=component, category=category, project=project
+        )
+
+    def cdn_path(self, filename: str) -> str:
+        return os.path.join(
+            settings.LOCALIZE_CDN_PATH, self.instance.state["uuid"], filename
+        )
+
+    def cdn_url(self, filename: str) -> str:
+        return os.path.join(
+            settings.LOCALIZE_CDN_URL, self.instance.state["uuid"], filename
+        )
+
+    @cached_property
+    def cdn_base_url(self) -> str:
+        return os.path.join(settings.LOCALIZE_CDN_URL, self.instance.state["uuid"])
+
+    def ensure_cdn_dir(self) -> None:
+        Path(self.cdn_path("")).mkdir(parents=True, exist_ok=True)
+
+    @cached_property
+    def cdn_manifest_url(self) -> str:
+        return self.cdn_url(CDN_MANIFEST_FILENAME)
+
+    def write_cdn_json(self, filename: str, content: object) -> None:
+        self.write_cdn_text(filename, json.dumps(content, sort_keys=True))
+
+    @staticmethod
+    def validate_manifest_filename(filename: str) -> None:
+        if Path(filename).as_posix() == CDN_MANIFEST_FILENAME:
+            raise ValueError(
+                gettext("The CDN add-on cannot publish a translation as manifest.json.")
+            )
+
+    def write_manifest(self, locales: dict[str, list[CDNFileMetadata]]) -> None:
+        manifest = {
+            "schemaVersion": 1,
+            "locales": {
+                language: sorted(files, key=itemgetter("url"))
+                for language, files in locales.items()
+            },
+        }
+        validate_schema(manifest, "weblate-cdn-manifest.schema.json")
+        self.write_cdn_json(CDN_MANIFEST_FILENAME, manifest)
+
+    def write_cdn_text(self, filename: str, content: str) -> None:
+        self.write_cdn_bytes(filename, content.encode("utf-8"))
+
+    def copy_cdn_file(self, source: str, filename: str) -> None:
+        target = Path(self.cdn_path(filename))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb", delete=False, dir=target.parent
+            ) as handle:
+                temporary = handle.name
+            shutil.copy2(source, temporary)
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, target)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def write_cdn_bytes(self, filename: str, content: bytes) -> None:
+        target = Path(self.cdn_path(filename))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb", delete=False, dir=target.parent
+            ) as handle:
+                temporary = handle.name
+                handle.write(content)
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, target)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def delete_stale_cdn_files(self, expected: set[str]) -> None:
+        root = Path(self.cdn_path(""))
+        if not root.exists():
+            return
+
+        for path in root.rglob("*"):
+            if path.is_file() and path.relative_to(root).as_posix() not in expected:
+                path.unlink()
+
+        for path in sorted(
+            root.rglob("*"), key=lambda item: len(item.parts), reverse=True
+        ):
+            if path.is_dir():
+                with contextlib.suppress(OSError):
+                    path.rmdir()
+
+
+class CDNJSAddon(CDNBaseAddon):
+    events: ClassVar[set[AddonEvent]] = {
         AddonEvent.EVENT_DAILY,
         AddonEvent.EVENT_POST_COMMIT,
+        AddonEvent.EVENT_POST_REMOVE,
         AddonEvent.EVENT_POST_UPDATE,
     }
     name = "weblate.cdn.cdnjs"
+    version_added = "4.2"
     verbose = gettext_lazy("JavaScript localization CDN")
     description = gettext_lazy(
         "Publishes translations into content delivery network "
         "for use in JavaScript or HTML localization."
     )
-    user_name = "cdn"
-    user_verbose = "CDN add-on"
 
     settings_form = CDNJSForm
-    icon = "cloud-upload.svg"
-    stay_on_create = True
+
+    def get_integration_instructions(
+        self, user: User, request: HttpRequest | None = None
+    ) -> str:
+        if not self.instance.pk:
+            return ""
+        return render_to_string(
+            "addons/cdnjs.html",
+            {"url": self.cdn_js_url, "manifest_url": self.cdn_manifest_url},
+        )
 
     @classmethod
-    def create_object(cls, component, **kwargs):
-        # Generate UUID for the CDN
-        if "state" not in kwargs:
-            kwargs["state"] = {"uuid": uuid4().hex}
-        return super().create_object(component=component, **kwargs)
-
-    @classmethod
-    def can_install(cls, component, user: User | None):
-        if (
-            not settings.LOCALIZE_CDN_URL
-            or not settings.LOCALIZE_CDN_PATH
-            or not component.has_template()
-            or not component.translation_set.exists()
-        ):
+    def can_install(
+        cls,
+        *,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+    ) -> bool:
+        if component is not None and not component.has_template():
             return False
-        return super().can_install(component, user)
-
-    def cdn_path(self, filename):
-        return os.path.join(
-            settings.LOCALIZE_CDN_PATH, self.instance.state["uuid"], filename
+        return super().can_install(
+            component=component, category=category, project=project
         )
 
     @cached_property
-    def cdn_js_url(self):
-        return os.path.join(
-            settings.LOCALIZE_CDN_URL, self.instance.state["uuid"], "weblate.js"
-        )
+    def cdn_js_url(self) -> str:
+        return self.cdn_url(CDN_JS_FILENAME)
 
-    def post_commit(self, component: Component, store_hash: bool) -> None:
+    def publish_localization(self, component: Component) -> None:
         # Get list of applicable translations
         threshold = self.instance.configuration["threshold"]
         translations = [
@@ -82,53 +234,199 @@ class CDNJSAddon(BaseAddon):
             if (not translation.is_source or component.intermediate)
             and translation.stats.translated > threshold
         ]
+        for translation in translations:
+            self.validate_manifest_filename(f"{translation.language.code}.json")
 
         # Create output directory
-        dirname = self.cdn_path("")
-        if not os.path.exists(dirname):
-            os.makedirs(dirname)
+        self.ensure_cdn_dir()
 
-        # Generate JavasScript loader
-        with open(self.cdn_path("weblate.js"), "w") as handle:
-            # The languages variable is included inside quotes to make
-            # sure the template is valid JavaScript code as well
-            handle.write(
-                render_to_string(
-                    "addons/js/weblate.js.template",
-                    {
-                        "languages": sorted(
-                            translation.language.code for translation in translations
-                        ),
-                        "url": os.path.join(
-                            settings.LOCALIZE_CDN_URL,
-                            self.instance.state["uuid"],
-                        ),
-                        "cookie_name": self.instance.configuration["cookie_name"],
-                        "css_selector": self.instance.configuration["css_selector"],
-                    },
-                )
-            )
+        # Generate JavaScript loader
+        expected = {CDN_JS_FILENAME, CDN_MANIFEST_FILENAME}
+        self.write_cdn_text(
+            CDN_JS_FILENAME,
+            render_to_string(
+                "addons/js/weblate.js.template",
+                {
+                    "languages": sorted(
+                        translation.language.code for translation in translations
+                    ),
+                    "url": self.cdn_base_url,
+                    "cookie_name": self.instance.configuration["cookie_name"],
+                    "css_selector": self.instance.configuration["css_selector"],
+                },
+            ),
+        )
 
         # Generate bilingual JSON files
+        locales: dict[str, list[CDNFileMetadata]] = {}
         for translation in translations:
-            with open(
-                self.cdn_path(f"{translation.language.code}.json"), "w"
-            ) as handle:
-                json.dump(
-                    {
-                        unit.source: unit.target
-                        for unit in translation.unit_set.filter(
-                            state__gte=STATE_TRANSLATED
-                        )
-                    },
-                    handle,
-                )
+            filename = f"{translation.language.code}.json"
+            content = json.dumps(
+                {
+                    unit.source: unit.target
+                    for unit in translation.unit_set.filter(state__gte=STATE_TRANSLATED)
+                }
+            ).encode("utf-8")
+            self.write_cdn_bytes(filename, content)
+            locales[translation.language.code] = [
+                {"url": quote(filename), **content_metadata(content)}
+            ]
+            expected.add(filename)
 
-    def daily(self, component) -> None:
+        self.write_manifest(locales)
+        self.delete_stale_cdn_files(expected)
+
+    def post_commit(
+        self, component: Component, store_hash: bool, activity_log_id: int | None = None
+    ) -> None:
+        self.publish_localization(component)
+
+    def daily_component(
+        self,
+        component: Component,
+        activity_log_id: int | None = None,
+    ) -> AddonEventOutcome:
         if not self.instance.configuration["files"].strip():
-            return
+            return AddonEventOutcome.skipped(AddonActivityLogReason.NO_SOURCE_FILES)
         # Trigger parsing files
-        cdn_parse_html.delay(self.instance.id, component.id)
+        cdn_parse_html.delay_on_commit(
+            self.instance.id,
+            component.id,
+            activity_log_id=activity_log_id,
+        )
+        return AddonEventOutcome.pending()
 
-    def post_update(self, component, previous_head: str, skip_push: bool) -> None:
-        self.daily(component)
+    def post_update(
+        self,
+        component: Component,
+        previous_head: str,
+        skip_push: bool,
+        changed_files: list[str],
+        parse_after_update: bool = False,
+        activity_log_id: int | None = None,
+    ) -> AddonEventOutcome:
+        return self.daily_component(component, activity_log_id=activity_log_id)
+
+    def post_remove(
+        self, translation: Translation, activity_log_id: int | None = None
+    ) -> None:
+        self.publish_localization(translation.component)
+
+
+class CDNFilesAddon(CDNBaseAddon):
+    events: ClassVar[set[AddonEvent]] = {
+        AddonEvent.EVENT_COMPONENT_UPDATE,
+        AddonEvent.EVENT_POST_COMMIT,
+        AddonEvent.EVENT_POST_REMOVE,
+        AddonEvent.EVENT_POST_UPDATE,
+    }
+    name = "weblate.cdn.files"
+    version_added = "2026.5"
+    verbose = gettext_lazy("Translation files CDN")
+    description = gettext_lazy(
+        "Publishes translation files into a content delivery network."
+    )
+    needs_component = True
+
+    def get_integration_instructions(
+        self, user: User, request: HttpRequest | None = None
+    ) -> str:
+        if not self.instance.pk:
+            return ""
+        return render_to_string(
+            "addons/cdnfiles.html",
+            {"url": self.cdn_files_url, "manifest_url": self.cdn_manifest_url},
+        )
+
+    @cached_property
+    def cdn_files_url(self) -> str:
+        return self.cdn_url("")
+
+    def get_translations(self, component: Component) -> list[Translation]:
+        return [
+            translation
+            for translation in component.translation_set.select_related("language")
+            if translation.filename
+            and (component.has_template() or not translation.is_source)
+        ]
+
+    def get_output_filename(self, translation: Translation, filename: str) -> str:
+        language_code = translation.language.code
+        if translation.component.file_format_cls.simple_filename:
+            return f"{language_code}{Path(translation.filename).suffix}"
+        base_path = Path(translation.component.full_path, translation.filename)
+        try:
+            relative_path = Path(filename).relative_to(base_path)
+        except ValueError:
+            relative_path = Path(
+                os.path.relpath(filename, translation.component.full_path)
+            )
+        return os.path.join(
+            language_code,
+            relative_path.as_posix(),
+        )
+
+    @staticmethod
+    def validate_output_filename(filename: str) -> None:
+        CDNBaseAddon.validate_manifest_filename(filename)
+        if Path(filename).as_posix() == CDN_JS_FILENAME:
+            raise ValueError(
+                gettext("The translation files CDN add-on cannot publish weblate.js.")
+            )
+
+    def publish_files(self, component: Component) -> None:
+        self.ensure_cdn_dir()
+
+        outputs: list[tuple[str, str, str]] = []
+        for translation in self.get_translations(component):
+            filenames = translation.filenames
+            for filename in filenames:
+                if not os.path.isfile(filename):
+                    continue
+                output_filename = self.get_output_filename(
+                    translation,
+                    filename,
+                )
+                self.validate_output_filename(output_filename)
+                outputs.append((translation.language.code, filename, output_filename))
+
+        expected = {CDN_MANIFEST_FILENAME}
+        locales: dict[str, list[CDNFileMetadata]] = {}
+        for language, filename, output_filename in outputs:
+            self.copy_cdn_file(filename, output_filename)
+            locales.setdefault(language, []).append(
+                {
+                    "url": quote(output_filename),
+                    **content_metadata(Path(self.cdn_path(output_filename))),
+                }
+            )
+            expected.add(output_filename)
+
+        self.write_manifest(locales)
+        self.delete_stale_cdn_files(expected)
+
+    def post_commit(
+        self, component: Component, store_hash: bool, activity_log_id: int | None = None
+    ) -> None:
+        self.publish_files(component)
+
+    def component_update(
+        self, component: Component, activity_log_id: int | None = None
+    ) -> None:
+        self.publish_files(component)
+
+    def post_remove(
+        self, translation: Translation, activity_log_id: int | None = None
+    ) -> None:
+        self.publish_files(translation.component)
+
+    def post_update(
+        self,
+        component: Component,
+        previous_head: str,
+        skip_push: bool,
+        changed_files: list[str],
+        parse_after_update: bool = False,
+        activity_log_id: int | None = None,
+    ) -> None:
+        self.publish_files(component)

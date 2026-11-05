@@ -2,10 +2,23 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
+from time import monotonic
+
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
+from django.utils.translation import override
+from lxml import etree
 
-from weblate.checks.flags import TYPED_FLAGS, TYPED_FLAGS_ARGS, Flags, FlagsValidator
+from weblate.checks.flags import (
+    TYPED_FLAGS,
+    TYPED_FLAGS_ARGS,
+    Flags,
+    FlagsValidator,
+    get_auto_flag_names,
+    get_flag_choices,
+)
 from weblate.formats.helpers import NamedBytesIO
 from weblate.formats.ttkit import PoFormat
 from weblate.trans.defines import VARIANT_KEY_LENGTH
@@ -31,6 +44,19 @@ msgstr ""
 
 
 class FlagTest(SimpleTestCase):
+    def test_auto_java_malformed_styles_are_linear(self) -> None:
+        flags = Flags("auto-java-messageformat")
+        for text, expected in (
+            ("{1,a," * 20_000, False),
+            ("{1,a," * 10_000 + " " + "{1,a," * 10_000 + "}", True),
+            ("{1,a," * 20_000 + " broken style}", False),
+            ("{ 0,number,integer }", True),
+        ):
+            with self.subTest(ending=text[-20:]):
+                started = monotonic()
+                self.assertEqual(flags.is_active("java-format", text), expected)
+                self.assertLess(monotonic() - started, 2)
+
     def test_parse(self) -> None:
         self.assertEqual(Flags("foo, bar").items(), {"foo", "bar"})
 
@@ -52,6 +78,38 @@ class FlagTest(SimpleTestCase):
         self.assertTrue(flags.has_any({"bar", "foo"}))
         self.assertTrue(flags.has_any({"bar", "baz"}))
 
+    def test_is_active(self) -> None:
+        flags = Flags("safe-html")
+        self.assertTrue(flags.is_active("safe-html", "source"))
+        self.assertEqual(get_auto_flag_names("safe-html"), ("auto-safe-html",))
+
+        flags = Flags("java-format")
+        self.assertTrue(flags.is_active("java-format", "source"))
+        self.assertEqual(
+            get_auto_flag_names("java-format"), ("auto-java-messageformat",)
+        )
+
+        flags = Flags("auto-safe-html")
+        self.assertTrue(flags.is_active("safe-html", "Plain text"))
+        self.assertFalse(
+            flags.is_active(
+                "safe-html",
+                "<TOCInline toc={toc.filter((node)) => node.level === 2)} />",
+            )
+        )
+
+        flags = Flags("auto-safe-html,ignore-safe-html")
+        self.assertFalse(flags.is_active("safe-html", "Plain text"))
+
+        flags = Flags("auto-java-messageformat")
+        self.assertTrue(flags.is_active("java-format", "{0} strings"))
+        self.assertTrue(flags.is_active("java-format", "{0,number} strings"))
+        self.assertFalse(flags.is_active("java-format", "Plain text"))
+        self.assertFalse(flags.is_active("java-format", "{0 strings"))
+
+        flags = Flags("auto-java-messageformat,ignore-java-format")
+        self.assertFalse(flags.is_active("java-format", "{0} strings"))
+
     def test_parse_empty(self) -> None:
         self.assertEqual(Flags("").items(), set())
 
@@ -64,6 +122,15 @@ class FlagTest(SimpleTestCase):
     def test_values(self) -> None:
         flags = Flags("placeholders:bar:baz")
         self.assertEqual(flags.get_value("placeholders"), ["bar", "baz"])
+
+    def test_get_value_raw(self) -> None:
+        flags = Flags("placeholders:bar:baz")
+        self.assertEqual(flags.get_value_raw("placeholders"), ("bar", "baz"))
+
+    def test_get_value_raw_without_value(self) -> None:
+        flags = Flags("foo")
+        with self.assertRaises(KeyError):
+            flags.get_value_raw("foo")
 
     def test_quoted_values(self) -> None:
         flags = Flags(r"""placeholders:"bar: \"value\"":'baz \'value\''""")
@@ -80,10 +147,34 @@ class FlagTest(SimpleTestCase):
         flags = Flags(r"""placeholders:"\n" """)
         self.assertEqual(flags.get_value("placeholders"), ["\n"])
 
+    def test_set_values(self) -> None:
+        flags = Flags()
+        flags.set_values("placeholders", "$URL$", "$COUNT$")
+        self.assertEqual(flags.get_value("placeholders"), ["$URL$", "$COUNT$"])
+        self.assertEqual(flags.format(), "placeholders:$URL$:$COUNT$")
+
+    def test_set_values_empty(self) -> None:
+        flags = Flags()
+        with self.assertRaises(ValueError):
+            flags.set_values("placeholders")
+
     def test_validate_value(self) -> None:
         with self.assertRaises(ValidationError):
             Flags("max-length:x").validate()
         Flags("max-length:30").validate()
+
+    def test_validate_accelerator_value(self) -> None:
+        Flags("accelerator:&").validate()
+        Flags("accelerator:_").validate()
+        Flags("accelerator:~").validate()
+        with self.assertRaises(ValidationError):
+            Flags("accelerator").validate()
+        with self.assertRaises(ValidationError):
+            Flags("accelerator:").validate()
+        with self.assertRaises(ValidationError):
+            Flags("accelerator:&&").validate()
+        with self.assertRaises(ValidationError):
+            Flags("accelerator:a").validate()
 
     def test_validate_name(self) -> None:
         with self.assertRaises(ValidationError):
@@ -110,6 +201,16 @@ class FlagTest(SimpleTestCase):
         regex = flags.get_value("regex")
         self.assertEqual(regex.pattern, "")
 
+    def test_empty_placeholder_value(self) -> None:
+        for value in (
+            "placeholders:",
+            'placeholders:""',
+            'placeholders:r""',
+            "placeholders:$URL$:",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                FlagsValidator(value).validate()
+
     def test_regex(self) -> None:
         flags = Flags("regex:.*")
         regex = flags.get_value("regex")
@@ -134,7 +235,7 @@ class FlagTest(SimpleTestCase):
     def test_whitespace(self) -> None:
         self.assertEqual(Flags("  foo    , bar  ").items(), {"foo", "bar"})
         flags = Flags(
-            "max-size:120:2,font-family:DIN next pro,font-spacing:2, priority:140"
+            "max-size:120:2,font-family:DIN next pro,font-spacing:1.2, priority:140"
         )
         self.assertEqual(
             flags.items(),
@@ -142,7 +243,7 @@ class FlagTest(SimpleTestCase):
                 ("font-family", "DIN next pro"),
                 ("priority", "140"),
                 ("max-size", "120", "2"),
-                ("font-spacing", "2"),
+                ("font-spacing", "1.2"),
             },
         )
         self.assertEqual(
@@ -159,7 +260,8 @@ class FlagTest(SimpleTestCase):
         )
 
     def test_replacements(
-        self, text='replacements:{COLOR-GREY}:"":{COLOR-GARNET}:"":{VARIABLE-01}:99'
+        self,
+        text: str = 'replacements:{COLOR-GREY}:"":{COLOR-GARNET}:"":{VARIABLE-01}:99',
     ) -> None:
         flags = Flags(text)
         self.assertEqual(
@@ -231,7 +333,6 @@ class FlagTest(SimpleTestCase):
         flags.validate()
 
     def test_equals(self) -> None:
-        from lxml import etree
 
         flags = Flags("foo:foo, bar:bar")
         self.assertEqual(flags, Flags("bar:bar, foo:foo"))
@@ -251,22 +352,51 @@ class FlagTest(SimpleTestCase):
     def test_automatic_location_flags(self) -> None:
         def check_location_flags(content: str, expected_flags: set[str]) -> None:
             fileformat = PoFormat(NamedBytesIO("", content.encode()))
-            flags = list(fileformat.all_units)[0].flags  # noqa: RUF015
+            # ruff: ignore[unnecessary-iterable-allocation-for-first-element]
+            flags = list(fileformat.all_units)[0].flags
             self.assertEqual(set(flags), expected_flags)
 
         # test rst-text flag
-        content = PO_HEADER + (
-            "#: ../../path/file.rst:24 ../../path/file.rst:52"
-            "#: ../../path/file.rst:63"
-            'msgid "Hello, world!"'
-            'msgstr "Nazdar svete!"'
-        )
+        content = f'{PO_HEADER}#: ../../path/file.rst:24 ../../path/file.rst:52#: ../../path/file.rst:63msgid "Hello, world!"msgstr "Nazdar svete!"'
         check_location_flags(content, {"rst-text"})
 
         # test md-text flag
-        content = PO_HEADER + (
-            "#: ../../path/file.md:24 ../../path/file.md:52"
-            'msgid "Hello, world!"'
-            'msgstr "Nazdar svete!"'
-        )
+        content = f'{PO_HEADER}#: ../../path/file.md:24 ../../path/file.md:52msgid "Hello, world!"msgstr "Nazdar svete!"'
         check_location_flags(content, {"md-text"})
+
+        # test md-text flag for MDX
+        content = f'{PO_HEADER}#: ../../path/file.mdx:24 ../../path/file.mdx:52msgid "Hello, world!"msgstr "Nazdar svete!"'
+        check_location_flags(content, {"md-text", "safe-mdx"})
+
+    def test_get_flag_choices(self) -> None:
+        choices = get_flag_choices()
+        # Catalog is non-empty and every entry has the expected keys
+        self.assertGreater(len(choices), 0)
+        for entry in choices:
+            self.assertIn("name", entry)
+            self.assertIn("label", entry)
+            self.assertIn("category", entry)
+            self.assertIn("has_value", entry)
+        names = {entry["name"] for entry in choices}
+        # A few representative flags from each category are exposed
+        self.assertIn("read-only", names)
+        self.assertIn("max-length", names)
+        self.assertIn("md-text", names)
+        # Typed flags are marked as such
+        max_length = next(e for e in choices if e["name"] == "max-length")
+        self.assertTrue(max_length["has_value"])
+        read_only = next(e for e in choices if e["name"] == "read-only")
+        self.assertFalse(read_only["has_value"])
+        # Names are unique (no duplicates across categories)
+        self.assertEqual(len(names), len(choices))
+
+    def test_get_flag_choices_per_language(self) -> None:
+        with override("en"):
+            en_choices = get_flag_choices()
+        with override("cs"):
+            cs_choices = get_flag_choices()
+        with override("en"):
+            en_choices_again = get_flag_choices()
+
+        self.assertIsNot(en_choices, cs_choices)
+        self.assertIs(en_choices, en_choices_again)

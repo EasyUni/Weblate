@@ -8,10 +8,13 @@ from typing import TYPE_CHECKING
 
 from weblate.lang.models import Language
 
-from .base import MachineTranslation, TranslationResultDict
+from .base import MACHINERY_DEFAULT_THRESHOLD, MachineTranslation
+from .types import TranslationResultDict
 
 if TYPE_CHECKING:
-    from weblate.trans.models import Translation
+    from weblate.auth.models import User
+    from weblate.machinery.base import DownloadTranslations
+    from weblate.trans.models import Translation, Unit
 
 CYRTRANSLIT_TO_WEBLATE_LANGS = {
     # bulgarian
@@ -38,6 +41,12 @@ CYRTRANSLIT_TO_WEBLATE_LANGS = {
     # ukrainian
     "ua@latin": [],
     "ua@cyrillic": ["uk"],
+    # Greek
+    "el@latin": ["el_Latn"],
+    "el@cyrillic": ["el"],
+    # Belarusian
+    "be@latin": ["by_Latn"],
+    "be@cyrillic": ["by"],
 }
 
 
@@ -46,9 +55,13 @@ class CyrTranslitTranslation(MachineTranslation):
 
     name = "CyrTranslit"
     max_score = 100
+    version_added = "5.7"
     cache_translations = False
+    sends_data_to_third_party = False
     replacement_start = "[___"
     replacement_end = "___]"
+    validate_source_language = "sr@latin"
+    validate_target_language = "sr@cyrillic"
 
     def download_languages(self):
         """List of supported languages."""
@@ -82,22 +95,23 @@ class CyrTranslitTranslation(MachineTranslation):
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
-    ):
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
+        # ruff: ignore[import-outside-top-level]
         import cyrtranslit
 
         target_language, script = target_language.split("@")
 
         translated_text = (
-            cyrtranslit.to_cyrillic(text, target_language)
+            cyrtranslit.to_cyrillic(text, target_language, preserve_accents=True)
             if script == "cyrillic"
-            else cyrtranslit.to_latin(text, target_language)
+            else cyrtranslit.to_latin(text, target_language, preserve_accents=True)
         )
 
         yield TranslationResultDict(
@@ -107,10 +121,13 @@ class CyrTranslitTranslation(MachineTranslation):
             source=text,
         )
 
-    def is_supported(self, source_language, target_language):
+    def is_supported(self, source_language: str, target_language: str) -> bool:
         """Check whether given language combination is supported."""
         if super().is_supported(source_language, target_language):
-            return source_language.split("@")[0] == target_language.split("@")[0]
+            return (
+                source_language.split("@", maxsplit=1)[0]
+                == target_language.split("@", maxsplit=1)[0]
+            )
         return False
 
     def map_language_code(self, code: str) -> str:

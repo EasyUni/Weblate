@@ -1,24 +1,36 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
 import csv
 import json
 import os
 import tempfile
+from typing import TYPE_CHECKING, ClassVar
 
+import httpx2
+from asgiref.sync import sync_to_async
 from dateutil.parser import isoparse
-from requests.exceptions import HTTPError
 
 import weblate.utils.version
 
 from .base import (
-    DownloadTranslations,
+    MACHINERY_DEFAULT_THRESHOLD,
     GlossaryDoesNotExistError,
     GlossaryMachineTranslationMixin,
     MachineTranslationError,
 )
 from .forms import ModernMTMachineryForm
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import (
+        DownloadTranslations,
+        TranslationResultDict,
+    )
 
 
 class ModernMTTranslation(GlossaryMachineTranslationMixin):
@@ -27,13 +39,18 @@ class ModernMTTranslation(GlossaryMachineTranslationMixin):
     name = "ModernMT"
     max_score = 90
     settings_form = ModernMTMachineryForm
+    version_added = "4.2"
 
-    language_map = {
+    language_map: ClassVar[dict[str, str]] = {
         "fa": "pes",
         "pt": "pt-PT",
         "sr": "sr-Cyrl",
         "zh_Hant": "zh-TW",
         "zh_Hans": "zh-CN",
+    }
+    # Supported language variants not visible in the API
+    language_variants: ClassVar[dict[str, list[str]]] = {
+        "sr": ["sr-Cyrl", "sr-Latn"],
     }
     glossary_count_limit = 1000
 
@@ -49,11 +66,7 @@ class ModernMTTranslation(GlossaryMachineTranslationMixin):
             "MMT-PlatformVersion": weblate.utils.version.VERSION,
         }
 
-    def is_supported(self, source_language, target_language):
-        """Check whether given language combination is supported."""
-        return (source_language, target_language) in self.supported_languages
-
-    def check_failure(self, response) -> None:
+    def check_failure(self, response: httpx2.Response) -> None:
         super().check_failure(response)
         payload = response.json()
 
@@ -62,25 +75,58 @@ class ModernMTTranslation(GlossaryMachineTranslationMixin):
 
     def download_languages(self):
         """List of supported languages."""
-        response = self.request("get", self.get_api_url("languages"))
+        response = self.request("get", self.get_api_url("translate", "languages"))
         payload = response.json()
 
-        for source_language, target_languages in payload["data"].items():
-            yield from (
-                (source_language, target_language)
-                for target_language in target_languages
-            )
+        for language in payload["data"]:
+            if language in self.language_variants:
+                yield from self.language_variants[language]
+            else:
+                yield language
 
     def download_translations(
+        self,
+        source_language: str,
+        target_language: str,
+        text: str,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        """Download list of possible translations from a service."""
+        params = self._prepare_translation_request(
+            source_language, target_language, text, unit
+        )
+        response = self.request(
+            "get",
+            self.get_api_url("translate"),
+            params=params,
+        )
+        yield self._format_translation(text, response.json())
+
+    async def adownload_translations(
         self,
         source_language,
         target_language,
         text: str,
         unit,
         user,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
-        """Download list of possible translations from a service."""
+        """Download a translation without blocking."""
+        params = await sync_to_async(self._prepare_translation_request)(
+            source_language, target_language, text, unit
+        )
+        response = await self.arequest(
+            "get",
+            self.get_api_url("translate"),
+            params=params,
+        )
+        return [self._format_translation(text, response.json())]
+
+    def _prepare_translation_request(
+        self, source_language, target_language, text: str, unit
+    ) -> dict[str, str]:
         params = {"q": text, "source": source_language, "target": target_language}
         glossary_id: str | None = self.get_glossary_id(
             source_language, target_language, unit
@@ -91,15 +137,10 @@ class ModernMTTranslation(GlossaryMachineTranslationMixin):
 
         if context_vector := self.settings.get("context_vector"):
             params["context_vector"] = context_vector
+        return params
 
-        response = self.request(
-            "get",
-            self.get_api_url("translate"),
-            params=params,
-        )
-        payload = response.json()
-
-        yield {
+    def _format_translation(self, text: str, payload: dict) -> TranslationResultDict:
+        return {
             "text": payload["data"]["translation"],
             "quality": self.max_score,
             "service": self.name,
@@ -138,7 +179,7 @@ class ModernMTTranslation(GlossaryMachineTranslationMixin):
         """Delete single glossary."""
         try:
             self.request("delete", self.get_api_url("memories", str(glossary_id)))
-        except HTTPError as error:
+        except httpx2.HTTPStatusError as error:
             if error.response.status_code == 404:
                 raise GlossaryDoesNotExistError from error
 
@@ -184,7 +225,7 @@ class ModernMTTranslation(GlossaryMachineTranslationMixin):
 
         try:
             with open(temp_filename, "rb") as file_content:
-                response = self.request(
+                self.request(
                     "post",
                     self.get_api_url("memories", str(glossary_id), "glossary"),
                     data={

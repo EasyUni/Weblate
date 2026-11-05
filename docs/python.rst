@@ -10,12 +10,13 @@ Weblate's Python API
 Installation
 ============
 
-The Python API is shipped separately, you need to install the
-:ref:`wlc` (wlc) to have it.
+The Python API is shipped separately as the :pypi:`Weblate Client <wlc>`
+package:
 
 .. code-block:: sh
 
     pip install wlc
+
 
 :mod:`wlc`
 ==========
@@ -23,42 +24,130 @@ The Python API is shipped separately, you need to install the
 .. module:: wlc
     :synopsis: Weblate API
 
-:exc:`WeblateException`
------------------------
+The :mod:`wlc` module exposes the Weblate API client, API objects returned by
+the client, and exceptions raised for common API failures.
 
-.. exception:: WeblateException
-
-    Base class for all exceptions.
 
 :class:`Weblate`
 ----------------
 
-.. class:: Weblate(key='', url=None, config=None)
+The :class:`Weblate` class is the main API entry point. Constructing it directly
+does not load Weblate Client configuration files or ``WLC_*`` environment
+variables; its connection settings come from the supplied arguments:
 
-    :param key: User key
-    :type key: str
-    :param url: API server URL, if not specified default is used.
-    :type url: str
-    :param config: Configuration object, overrides any other parameters.
-    :type config: wlc.config.WeblateConfig
+.. code-block:: python
 
-    Access class to the API, define API key and optionally API URL.
+   from wlc import Weblate
 
-    .. method:: get(path)
+   client = Weblate(
+       url="https://hosted.weblate.org/api/",
+       key="APIKEY",
+   )
+   projects = list(client.list_projects())
 
-        :param path: Request path
-        :type path: str
-        :rtype: object
+To use configuration-file and environment discovery, explicitly load
+:class:`~wlc.config.WeblateConfig` and pass it to the client:
 
-        Performs a single API GET call.
+.. code-block:: python
 
-    .. method:: post(path, **kwargs)
+   from wlc import Weblate
+   from wlc.config import WeblateConfig
 
-        :param path: Request path
-        :type path: str
-        :rtype: object
+   config = WeblateConfig()
+   config.load()
+   client = Weblate(config=config)
 
-        Performs a single API GET call.
+The Python client follows the same URL, credential, and transport policy as the
+command-line client, see :ref:`wlc-security`. Direct API consumers remain
+responsible for safely rendering and storing returned values.
+
+.. autoclass:: Weblate
+   :members: get, post, request, raw_request, invoke_request, get_object, get_project, get_component, get_translation, get_unit, get_activity, list_projects, list_components, list_changes, list_units, list_translations, list_languages, list_categories, add_source_string, create_project, create_component, create_language
+
+
+Exceptions
+----------
+
+.. autoexception:: WeblateException
+
+.. autoexception:: WeblatePermissionError
+
+.. autoexception:: WeblateDeniedError
+
+.. autoexception:: WeblateThrottlingError
+
+
+API objects
+-----------
+
+API objects support attribute and keyed access to their fields, together with
+``keys()`` and ``items()``. Accessing a known field that is not loaded yet
+fetches the object from the API. ``get_data()`` returns a copy of only the data
+currently loaded without fetching missing fields.
+
+API objects inherit from ``collections.UserDict``. They are mappings,
+but ``isinstance(obj, dict)`` is false. Membership tests, ``get()``, and
+iteration use the currently loaded fields without fetching missing fields.
+``pop()``, ``setdefault()``, ``popitem()``, and ``clear()`` also operate only
+on loaded fields without fetching missing fields. Mapping writes update local
+object data; they do not send changes to the API. The ``|`` operator merges
+loaded fields into a new plain dictionary, with values from the right operand
+taking precedence.
+For consumers that require a plain dictionary, use ``obj.get_data()`` for
+loaded fields or ``dict(obj.items())`` to include all exposed fields, fetching
+missing fields as needed. Standard ``json.dumps`` does not serialize API
+objects directly; convert them and any nested API objects to dictionaries first.
+
+Projects, components, and translations share repository operations:
+``repository()``, ``commit()``, ``push()``, ``pull()``, ``reset()``, and
+``cleanup()``.
+
+.. autoclass:: Project
+   :members: get_data, list, statistics, languages, changes, categories, delete, create_component, full_slug, repository, commit, push, pull, reset, cleanup
+
+.. autoclass:: Component
+   :members: get_data, full_slug, list, add_translation, statistics, lock, unlock, lock_status, changes, delete, add_source_string, download, patch, repository, commit, push, pull, reset, cleanup
+
+.. autoclass:: Translation
+   :members: get_data, list, statistics, changes, download, upload, delete, units, repository, commit, push, pull, reset, cleanup
+
+.. autoclass:: Unit
+   :members: get_data, list, patch, put, delete
+
+.. autoclass:: Category
+   :members: get_data, full_slug
+
+.. autoclass:: Language
+   :members: get_data
+
+.. autoclass:: Change
+   :members: get_data
+
+.. autoclass:: Statistics
+   :members: get_data, refresh, keys
+
+.. autoclass:: LanguageStats
+   :members: get_data, refresh, keys
+
+.. autoclass:: TranslationStatistics
+   :members: get_data, refresh, keys
+
+.. autoclass:: ProjectRepository
+   :members: get_data, commit, push, pull, reset, cleanup
+
+.. autoclass:: Repository
+   :members: get_data, commit, push, pull, reset, cleanup
+
+
+:class:`Activity`
+-----------------
+
+.. autoclass:: wlc.Activity
+
+``client.get_activity()`` returns a :class:`wlc.Activity` with
+``daily_activity`` (a list of daily counts) and ``projects`` (a list of
+:class:`wlc.Statistics` objects). Project timestamps are parsed as datetimes.
+This requires a server providing :http:get:`/api/activity/`.
 
 
 :mod:`wlc.config`
@@ -67,52 +156,7 @@ The Python API is shipped separately, you need to install the
 .. module:: wlc.config
     :synopsis: Configuration parsing
 
-:class:`WeblateConfig`
-----------------------
+.. autoexception:: WLCConfigurationError
 
-.. class:: WeblateConfig(section='wlc')
-
-    :param section: Configuration section to use
-    :type section: str
-
-    Configuration file parser following XDG specification.
-
-
-    .. method:: load(path=None)
-
-        :param path: Path from which to load configuration.
-        :type path: str
-
-        Loads configuration from a file, if none is specified, it loads from
-        the `wlc` configuration file (:file:`~/.config/wlc`) placed in your
-        XDG configuration path (:file:`/etc/xdg/wlc`).
-
-
-:mod:`wlc.main`
-===============
-
-.. module:: wlc.main
-    :synopsis: Command-line interface
-
-.. function:: main(settings=None, stdout=None, args=None)
-
-    :param settings: Settings to override as list of tuples
-    :type settings: list
-    :param stdout: stdout file object for printing output, uses ``sys.stdout`` as default
-    :type stdout: object
-    :param args: Command-line arguments to process, uses ``sys.args`` as default
-    :type args: list
-
-    Main entry point for command-line interface.
-
-.. decorator:: register_command(command)
-
-    Decorator to register :class:`Command` class in main parser used by
-    :func:`main`.
-
-:class:`Command`
-----------------
-
-.. class:: Command(args, config, stdout=None)
-
-    Main class for invoking commands.
+.. autoclass:: WeblateConfig
+   :members: find_config, find_project_config, load, validate_url_key, get_url_key, get_request_options, get_allow_insecure_http, get_allow_insecure_ssl

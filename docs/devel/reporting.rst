@@ -4,9 +4,27 @@ Translation progress reporting
 Reporting features give insight into translation progress over a given period.
 A summary of contributions to any given component over time is provided.
 The reporting tool is found in the :guilabel:`Insights` menu of the dashboard,
-any translation component, or project:
+workspace, project, category, or translation component:
 
 .. image:: /screenshots/reporting.webp
+
+Reports are generated in the background. Weblate shows the generation progress
+and opens the stored report when it is ready. Previously generated reports remain
+available on the same page according to :setting:`REPORT_EXPIRY`.
+
+.. warning::
+
+   The :guilabel:`Manage reports` permission applies to the complete selected
+   report scope. Reports for a project or category include restricted
+   components, and reports for a workspace include private projects, even when
+   the user can not otherwise access those descendants. Grant this permission
+   only to users trusted with all report data in that scope.
+
+   Complete workspace reports require two-factor authentication for regular
+   users when any project in the workspace enforces it. Superusers and bot
+   accounts are exempt.
+
+.. image:: /screenshots/report-view.webp
 
 Several reporting tools are available on this page, all of which can produce output
 in HTML, reStructuredText or JSON. The first two formats are suitable for
@@ -81,6 +99,11 @@ Generates the number of translated words and strings by translator name:
 This can be useful if you pay your translators based on the amount of work done;
 it gives you various stats of translators’ work.
 
+By default, repeated changes by the same translator on the same string are
+counted once for each stats variant in the selected report period. Choose
+:guilabel:`All changes` in the counting mode if you need every edit or approval
+to be counted separately.
+
 All stats are available in four variants:
 
 `Total`
@@ -97,7 +120,13 @@ The following metrics are available for each:
 `Count`
    Amount of strings.
 `Edits`
-   Amount of edited characters in the string, measured in Damerau–Levenshtein distance.
+   Amount of edited characters in the string, measured in Damerau–Levenshtein
+   distance when the product of the old and new string lengths is at most
+   1,000,000. For larger comparisons, shared prefixes and suffixes are removed,
+   then positional character differences and the remaining length difference
+   are counted. This linear-time estimate can overcount complex shifts and
+   transpositions. Change history badges and CSV exports use the same metric.
+   Previously generated reports retain their saved counts.
 `Source words`
    Amount of words in the source string.
 `Source characters`
@@ -108,3 +137,29 @@ The following metrics are available for each:
    Amount of characters in the translated string.
 
 The translator's join date is also included in the report.
+
+Use source-word metrics when comparing work across target languages, because the
+source text is shared while translated word counts differ by language.
+
+.. _cost-estimate:
+
+Cost estimate
+-------------
+
+Estimates translation costs for the selected scope from source-word counts. It
+classifies strings as repetitions, exact translation memory matches, fuzzy
+translation memory matches, strings needing editing, or new strings, and then
+applies the configured rate percentage for each category.
+
+The estimate uses Weblate translation memory matches and does not contact
+external machine translation services. The base rate is the price per source
+word. Category rates are percentages of that base rate; for example, ``50``
+charges half of the base rate and ``0`` excludes that category from the total.
+
+Translator work analysis
+------------------------
+
+Estimates realistic daily translator throughput from change history. It reports
+the median, average, 75th percentile, and 90th percentile for translated strings
+and source words. Minimum and maximum daily changes and maximum source words can
+be used to exclude incomplete work days, automated changes, and obvious outliers.

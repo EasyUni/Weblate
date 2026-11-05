@@ -4,29 +4,39 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, cast
 
+from django.core.exceptions import FieldDoesNotExist
+from django.db import models
 from django.template.loader import render_to_string
 from django.utils.html import escape, format_html
 from django.utils.translation import gettext, gettext_lazy, npgettext, pgettext
 
+from weblate.addons.base import is_public_addon_change_details
 from weblate.addons.models import ADDONS
 from weblate.lang.models import Language
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models.alert import ALERTS
-from weblate.trans.models.change import COMPONENT_ORIGINS, Change
-from weblate.trans.models.project import Project
-from weblate.trans.templatetags.translations import (
+from weblate.trans.alerts.registry import get_alert_class
+from weblate.trans.formatting import (
     format_language_string,
     format_unit_source,
     format_unit_target,
 )
+from weblate.trans.models.change import COMPONENT_ORIGINS
+from weblate.trans.models.project import Project
+from weblate.trans.source_snapshot import SourceSnapshot
 from weblate.utils.files import FileUploadMethod, get_upload_message
+from weblate.utils.html import format_html_join_comma
 from weblate.utils.markdown import render_markdown
 from weblate.utils.pii import mask_email
 
 if TYPE_CHECKING:
+    from django.contrib.auth.models import AnonymousUser
     from django_stubs_ext import StrOrPromise
+
+    from weblate.auth.models import User
+    from weblate.trans.models.audit import AuditValue
+    from weblate.trans.models.change import Change, Translation
 
 AUTO_ACTIONS = {
     # Translators: Name of event in the history
@@ -42,24 +52,26 @@ AUTO_ACTIONS = {
 
 class ChangeDetailsRenderFactory:
     @staticmethod
-    def get_strategy(change: Change) -> BaseDetailsRenderStrategy:
+    def get_strategy(
+        change: Change, *, viewer: User | AnonymousUser | None = None
+    ) -> BaseDetailsRenderStrategy:
         """Get strategy for displaying change details."""
         for strategy in [
             s for s in DETAILS_DISPLAY_STRATEGIES if not s.details_required
         ]:
             if change.action in strategy.actions:
-                return strategy()
+                return strategy(viewer=viewer)
 
         if not change.details:
-            return RenderEmptyDetails()
+            return RenderEmptyDetails(viewer=viewer)
 
         # Following rendering relies on details present
         for strategy in [s for s in DETAILS_DISPLAY_STRATEGIES if s.details_required]:
             if change.action in strategy.actions:
-                return strategy()
+                return strategy(viewer=viewer)
 
         # No specific strategy is found, return an empty display strategy
-        return RenderEmptyDetails()
+        return RenderEmptyDetails(viewer=viewer)
 
 
 DETAILS_DISPLAY_STRATEGIES: list[type[BaseDetailsRenderStrategy]] = []
@@ -74,8 +86,11 @@ def register_details_display_strategy(
 
 
 class BaseDetailsRenderStrategy:
-    actions: set[ActionEvents] = set()
+    actions: ClassVar[set[ActionEvents]] = set()
     details_required: bool = False
+
+    def __init__(self, *, viewer: User | AnonymousUser | None = None) -> None:
+        self.viewer = viewer
 
     def render_details(self, change: Change) -> StrOrPromise:
         raise NotImplementedError
@@ -89,7 +104,7 @@ class RenderEmptyDetails(BaseDetailsRenderStrategy):
 
 @register_details_display_strategy
 class RenderFileUploadDetails(BaseDetailsRenderStrategy):
-    actions = {ActionEvents.FILE_UPLOAD}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.FILE_UPLOAD}
 
     def render_details(self, change: Change) -> StrOrPromise:
         details = change.details
@@ -112,25 +127,31 @@ class RenderFileUploadDetails(BaseDetailsRenderStrategy):
 
 @register_details_display_strategy
 class RenderTarget(BaseDetailsRenderStrategy):
-    actions = {ActionEvents.ANNOUNCEMENT, ActionEvents.AGREEMENT_CHANGE}
+    actions: ClassVar[set[ActionEvents]] = {
+        ActionEvents.ANNOUNCEMENT,
+        ActionEvents.AGREEMENT_CHANGE,
+    }
 
     def render_details(self, change: Change) -> StrOrPromise:
-        return render_markdown(change.target)
+        return render_markdown(change.target, viewer=self.viewer)
 
 
 @register_details_display_strategy
 class RenderComment(BaseDetailsRenderStrategy):
-    actions = {ActionEvents.COMMENT_DELETE, ActionEvents.COMMENT}
+    actions: ClassVar[set[ActionEvents]] = {
+        ActionEvents.COMMENT_DELETE,
+        ActionEvents.COMMENT,
+    }
 
     def render_details(self, change: Change) -> StrOrPromise:
         if "comment" in change.details:
-            return render_markdown(change.details["comment"])
+            return render_markdown(change.details["comment"], viewer=self.viewer)
         return ""
 
 
 @register_details_display_strategy
 class RenderAddon(BaseDetailsRenderStrategy):
-    actions = {
+    actions: ClassVar[set[ActionEvents]] = {
         ActionEvents.ADDON_CREATE,
         ActionEvents.ADDON_CHANGE,
         ActionEvents.ADDON_REMOVE,
@@ -138,16 +159,39 @@ class RenderAddon(BaseDetailsRenderStrategy):
 
     def render_details(self, change: Change) -> StrOrPromise:
         try:
-            return ADDONS[change.target].name
+            addon_name = ADDONS[change.target].name
         except KeyError:
-            return change.target
+            addon_name = change.target
+
+        if not is_public_addon_change_details(change.details):
+            return addon_name
+        changed_fields = change.details["changed_fields"]
+        if not changed_fields:
+            return addon_name
+        redacted_fields = set(change.details["redacted_fields"])
+        fields = format_html_join_comma(
+            "<code>{}</code>{}",
+            (
+                (
+                    field,
+                    f" ({gettext('redacted')})" if field in redacted_fields else "",
+                )
+                for field in changed_fields
+            ),
+        )
+        return format_html(
+            "{}<br>{}: {}",
+            addon_name,
+            gettext("Changed settings"),
+            fields,
+        )
 
 
 @register_details_display_strategy
 class RenderUpdateEventDetails(BaseDetailsRenderStrategy):
     """Strategy for displaying details of an update event."""
 
-    actions = {ActionEvents.UPDATE}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.UPDATE}
 
     def render_details(self, change: Change) -> StrOrPromise:
         details = change.details
@@ -175,7 +219,7 @@ class RenderUpdateEventDetails(BaseDetailsRenderStrategy):
 class RenderLicenceChangeDetails(BaseDetailsRenderStrategy):
     """Strategy for displaying details of a license change event."""
 
-    actions = {ActionEvents.LICENSE_CHANGE}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.LICENSE_CHANGE}
 
     def render_details(self, change: Change) -> StrOrPromise:
         not_available = pgettext("License information not available", "N/A")
@@ -191,7 +235,7 @@ class RenderLicenceChangeDetails(BaseDetailsRenderStrategy):
 
 @register_details_display_strategy
 class RenderAutoActions(BaseDetailsRenderStrategy):
-    actions = set(AUTO_ACTIONS.keys())
+    actions: ClassVar[set[ActionEvents]] = set(AUTO_ACTIONS.keys())
 
     def render_details(self, change: Change) -> StrOrPromise:
         if change.auto_status:
@@ -204,24 +248,101 @@ class RenderAccessEdit(BaseDetailsRenderStrategy):
     """Strategy for displaying details of an access edit event."""
 
     details_required = True
-    actions = {ActionEvents.ACCESS_EDIT}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.ACCESS_EDIT}
 
     def render_details(self, change: Change) -> StrOrPromise:
         details = change.details
         for number, name in Project.ACCESS_CHOICES:
             if number == details["access_control"]:
                 return name
-        return "Unknown {}".format(details["access_control"])
+        return f"Unknown {details['access_control']}"
+
+
+@register_details_display_strategy
+class RenderSettingChange(BaseDetailsRenderStrategy):
+    """Strategy for displaying details of setting changes."""
+
+    details_required = True
+    actions: ClassVar[set[ActionEvents]] = {
+        ActionEvents.PROJECT_SETTING_CHANGE,
+        ActionEvents.COMPONENT_SETTING_CHANGE,
+        ActionEvents.WORKSPACE_SETTING_CHANGE,
+    }
+
+    def render_details(self, change: Change) -> StrOrPromise:
+        obj: models.Model | None
+        match change.action:
+            case ActionEvents.PROJECT_SETTING_CHANGE:
+                obj = change.project
+            case ActionEvents.COMPONENT_SETTING_CHANGE:
+                obj = change.component
+            case ActionEvents.WORKSPACE_SETTING_CHANGE:
+                obj = change.workspace
+            case _:
+                obj = None
+        details = change.details
+        if obj is None or "field" not in details:
+            return change.get_action_display()
+
+        try:
+            field = cast(
+                "models.Field",
+                # ruff: ignore[private-member-access]
+                obj._meta.get_field(details["field"]),
+            )
+        except FieldDoesNotExist:
+            return change.get_action_display()
+
+        return gettext('%(setting)s changed from "%(old)s" to "%(target)s".') % {
+            "setting": field.verbose_name,
+            "old": self.format_setting_value(field, details.get("old")),
+            "target": self.format_setting_value(field, details.get("target")),
+        }
+
+    def format_setting_value(
+        self, field: models.Field, value: AuditValue
+    ) -> StrOrPromise:
+        if value in (None, "", []):
+            return pgettext("Setting value", "Not set")
+        if isinstance(field, models.BooleanField):
+            return gettext("enabled") if value else gettext("disabled")
+        if field.choices:
+            for choice_value, choice_label in field.flatchoices:
+                if choice_value == value:
+                    return choice_label
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value)
+        return str(value)
+
+
+@register_details_display_strategy
+class RenderProjectMove(BaseDetailsRenderStrategy):
+    """Strategy for displaying details of project moves."""
+
+    details_required = True
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.MOVE_PROJECT}
+
+    def render_details(self, change: Change) -> StrOrPromise:
+        no_workspace = gettext("No workspace")
+        details = change.details
+        old = details.get("old_workspace_name") or no_workspace
+        target = details.get("workspace_name") or no_workspace
+        return gettext('Project moved from "%(old)s" to "%(target)s".') % {
+            "old": old,
+            "target": target,
+        }
 
 
 @register_details_display_strategy
 class RenderUserActions(BaseDetailsRenderStrategy):
     """Strategy for displaying details of user actions."""
 
-    actions = {
+    actions: ClassVar[set[ActionEvents]] = {
         ActionEvents.ADD_USER,
         ActionEvents.INVITE_USER,
         ActionEvents.REMOVE_USER,
+        ActionEvents.USER_ACCESS_CHANGE,
+        ActionEvents.USER_REVERT,
     }
     details_required = True
 
@@ -240,7 +361,7 @@ class RenderUserActions(BaseDetailsRenderStrategy):
 class RenderLanguage(BaseDetailsRenderStrategy):
     """Strategy for displaying details of language actions."""
 
-    actions = {
+    actions: ClassVar[set[ActionEvents]] = {
         ActionEvents.ADDED_LANGUAGE,
         ActionEvents.REQUESTED_LANGUAGE,
     }
@@ -257,38 +378,72 @@ class RenderLanguage(BaseDetailsRenderStrategy):
 class RenderAlert(BaseDetailsRenderStrategy):
     """Strategy for displaying details of an alert event."""
 
-    actions = {ActionEvents.ALERT}
+    actions: ClassVar[set[ActionEvents]] = {
+        ActionEvents.ALERT,
+        ActionEvents.ALERT_DISMISSED,
+        ActionEvents.ALERT_REOPENED,
+    }
     details_required = True
 
-    def render_details(self, change: Change) -> StrOrPromise:
+    @staticmethod
+    def render_alert(change: Change) -> StrOrPromise:
         try:
-            return ALERTS[change.details["alert"]].verbose
+            return get_alert_class(change.details["alert"]).verbose
         except KeyError:
             return change.details["alert"]
+
+    def render_details(self, change: Change) -> StrOrPromise:
+        alert = self.render_alert(change)
+        reason = change.details.get("reason")
+        if reason:
+            return format_html("{} — {}", alert, reason)
+        return alert
 
 
 @register_details_display_strategy
 class RenderRepositoryDetails(BaseDetailsRenderStrategy):
     """Strategy for displaying details of repository events."""
 
-    actions = {
+    actions: ClassVar[set[ActionEvents]] = {
         ActionEvents.RESET,
         ActionEvents.MERGE,
         ActionEvents.REBASE,
+        ActionEvents.REMOTE_UPDATE,
     }
 
     def render_details(self, change: Change) -> StrOrPromise:
+        previous_revision = change.details.get(
+            "previous_head", change.details.get("previous_remote_revision", "N/A")
+        )
+        new_revision = change.details.get(
+            "new_head", change.details.get("remote_revision", "N/A")
+        )
         return format_html(
             "{}<br/><br/>{}<br/>{}",
             change.get_action_display(),
             format_html(
                 escape(gettext("Original revision: {}")),
-                change.details.get("previous_head", "N/A"),
+                previous_revision,
             ),
             format_html(
                 escape(gettext("New revision: {}")),
-                change.details.get("new_head", "N/A"),
+                new_revision,
             ),
+        )
+
+
+@register_details_display_strategy
+class RenderRepositoryFailureDetails(BaseDetailsRenderStrategy):
+    """Strategy for displaying details of repository failure events."""
+
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.FAILED_REMOTE_UPDATE}
+    details_required = True
+
+    def render_details(self, change: Change) -> StrOrPromise:
+        return format_html(
+            "{}<br/><br/>{}",
+            change.get_action_display(),
+            change.details.get("error", change.target),
         )
 
 
@@ -296,34 +451,33 @@ class RenderRepositoryDetails(BaseDetailsRenderStrategy):
 class RenderParseError(BaseDetailsRenderStrategy):
     """Strategy for displaying details of a parse error event."""
 
-    actions = {ActionEvents.PARSE_ERROR}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.PARSE_ERROR}
     details_required = True
 
     def render_details(self, change: Change) -> StrOrPromise:
-        return "{filename}: {error_message}".format(**change.details)
+        return f"{change.details['filename']}: {change.details['error_message']}"
 
 
 @register_details_display_strategy
 class RenderHook(BaseDetailsRenderStrategy):
     """Strategy for displaying details of a hook event."""
 
-    actions = {ActionEvents.HOOK}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.HOOK}
     details_required = True
 
     def render_details(self, change: Change) -> StrOrPromise:
-        return "{service_long_name}: {repo_url}, {branch}".format(**change.details)
+        return f"{change.details['service_long_name']}: {change.details['repo_url']}, {change.details['branch']}"
 
 
 @register_details_display_strategy
 class RenderCreateComponent(BaseDetailsRenderStrategy):
     """Strategy for displaying details of a component creation event."""
 
-    actions = {ActionEvents.CREATE_COMPONENT}
+    actions: ClassVar[set[ActionEvents]] = {ActionEvents.CREATE_COMPONENT}
 
     def render_details(self, change: Change) -> StrOrPromise:
-        try:
-            origin = change.details["origin"]
-        except KeyError:
+        origin = change.details.get("origin")
+        if not isinstance(origin, str):
             return ActionEvents.CREATE_COMPONENT.label
         try:
             return COMPONENT_ORIGINS[origin]
@@ -331,15 +485,45 @@ class RenderCreateComponent(BaseDetailsRenderStrategy):
             return f"{ActionEvents.CREATE_COMPONENT.label} ({origin})"
 
 
-def get_change_history_context(change: Change) -> dict[str, Any]:
+def get_change_history_context(
+    change: Change,
+    *,
+    include_private_details: bool = True,
+    viewer: User | AnonymousUser | None = None,
+) -> dict[str, Any]:
     """
     Get context for rendering change history.
 
     This function returns a dictionary containing the main content and fields
     for displaying the change history.
     """
-    if details := change.get_details_display():
+    from copy import copy  # ruff: ignore[import-outside-top-level]
+
+    from weblate.accounts.visibility import can_view_contributor, public_change_details  # ruff: ignore[import-outside-top-level]
+
+    if not can_view_contributor(viewer, change):
+        change = copy(change)
+        change.details = public_change_details(change, viewer)
+        if not (
+            change.action == ActionEvents.COMMENT
+            or change.show_content()
+            or change.show_source()
+            or change.show_diff()
+            or change.show_removed_string()
+        ):
+            return ShowChangeAction(change).get_context()
+    if not include_private_details and change.action == ActionEvents.ALERT_DISMISSED:
+        details = RenderAlert.render_alert(change)
+    else:
+        details = change.get_details_display(viewer=viewer)
+    if details:
         return {"description": details, "change_details_fields": []}
+    if change.action in {
+        ActionEvents.PROJECT_BACKUP,
+        ActionEvents.PROJECT_RESTORE,
+        ActionEvents.COMPONENT_RESTORE,
+    }:
+        return ShowBackupRestoreEvent(change).get_context()
     if change.show_content() and change.unit:
         return ShowChangeContent(change).get_context()
     if change.show_source():
@@ -353,11 +537,19 @@ def get_change_history_context(change: Change) -> dict[str, Any]:
     return ShowChangeAction(change).get_context()
 
 
+class FieldDict(TypedDict):
+    label: str
+    content: str
+    tags: list[StrOrPromise]
+    label_class: str
+
+
 class BaseChangeHistoryContext:
     """Base class for change history context rendering."""
 
     def __init__(self, change: Change) -> None:
         self.change = change
+        self.fields: list[FieldDict] = []
 
     def get_context(self) -> dict[str, Any]:
         """Get context for rendering change history."""
@@ -369,7 +561,7 @@ class BaseChangeHistoryContext:
     def get_description(self) -> str:
         return ""
 
-    def get_change_details_fields(self) -> list[dict]:
+    def get_change_details_fields(self) -> list[FieldDict]:
         """
         Generate a list of dictionaries representing fields to be displayed as label and input-like content.
 
@@ -383,9 +575,9 @@ class BaseChangeHistoryContext:
         self,
         label: str,
         field_content: str,
-        label_badges: list[str] | None = None,
+        label_badges: list[StrOrPromise] | None = None,
         extra_label_classes: list[str] | None = None,
-    ) -> dict:
+    ) -> FieldDict:
         return {
             "label": label,
             "content": field_content,
@@ -398,13 +590,24 @@ class BaseChangeHistoryContext:
         return render_to_string("snippets/format-translation.html", context)
 
     def make_distance_badge(self, count: int) -> str:
-        """Create a badge for the Damerau–Levenshtein distance."""  # noqa: RUF002
+        """Create a badge for the edit distance, estimated for large changes."""
         return npgettext(
             "Number of edits on a change in Damerau–Levenshtein distance",
             "%(count)d character edited",
             "%(count)d characters edited",
             count,
         ) % {"count": count}
+
+    def add_context_field(self, translation: Translation) -> None:
+        if context := self.change.details.get("context"):
+            self.fields.append(
+                self.make_field(
+                    gettext("Context"),
+                    self.format_translation(
+                        format_language_string(context, translation)
+                    ),
+                )
+            )
 
 
 class ShowChangeTarget(BaseChangeHistoryContext):
@@ -421,6 +624,58 @@ class ShowChangeAction(BaseChangeHistoryContext):
         return self.change.get_action_display()
 
 
+class ShowBackupRestoreEvent(BaseChangeHistoryContext):
+    """Display backup and restore event details in history."""
+
+    def get_description(self) -> str:
+        return self.change.get_action_display()
+
+    def get_change_details_fields(self) -> list[FieldDict]:
+        details = self.change.details
+        if self.change.action == ActionEvents.PROJECT_BACKUP:
+            return [
+                self.make_field(
+                    gettext("Backup file"),
+                    format_html("<code>{}</code>", details["backup_filename"]),
+                )
+            ]
+
+        if self.change.action == ActionEvents.PROJECT_RESTORE:
+            fields = [
+                self.make_field(
+                    gettext("Backup created"),
+                    details["backup_timestamp"],
+                ),
+                self.make_field(
+                    gettext("Backup server"),
+                    details["backup_server"],
+                ),
+                self.make_field(
+                    gettext("Backup domain"),
+                    details["backup_domain"],
+                ),
+            ]
+            skipped_components = details.get("skipped_components")
+            if isinstance(skipped_components, list):
+                fields.append(
+                    self.make_field(
+                        gettext("Skipped components"),
+                        format_html_join_comma(
+                            "<code>{}</code>",
+                            ((component,) for component in skipped_components),
+                        ),
+                    )
+                )
+            return fields
+
+        return [
+            self.make_field(
+                gettext("Original component"),
+                format_html("<code>{}</code>", details["original_slug"]),
+            )
+        ]
+
+
 class ShowChangeContent(BaseChangeHistoryContext):
     """Display the content of a change in the history context."""
 
@@ -430,9 +685,9 @@ class ShowChangeContent(BaseChangeHistoryContext):
     </div>
     """
 
-    def get_change_details_fields(self) -> list[dict]:
+    def get_change_details_fields(self) -> list[FieldDict]:
         """Return the fields to be displayed in the change history."""
-        fields = []
+        self.fields = []
         change = self.change
         if change.unit is None:
             msg = "Change does not contain unit, can not render content!"
@@ -440,29 +695,41 @@ class ShowChangeContent(BaseChangeHistoryContext):
         unit = change.unit
 
         # rejection reason field
-        if "rejection_reason" in change.details:
-            fields.append(
+        if rejection_reason := change.details.get("rejection_reason"):
+            self.fields.append(
                 self.make_field(
                     gettext("Rejection reason"),
                     format_html(
                         self.LIST_GROUP_ITEM_TEMPLATE,
-                        change.details["rejection_reason"],
+                        rejection_reason,
                     ),
                 )
             )
 
+        language = unit.translation.component.source_language
+        plural = unit.source_unit.translation.plural
+        snapshot = change.details.get("source_snapshot")
+        if snapshot:
+            source = SourceSnapshot.from_dict(snapshot)
+            language, plural = source.language, source.plural
+
         # source language field
-        fields.append(
+        self.fields.append(
             self.make_field(
-                str(unit.translation.component.source_language),
+                str(language),
                 self.format_translation(
-                    format_unit_source(unit, value=self.change.get_source())
+                    format_unit_source(
+                        unit,
+                        value=change.get_source(),
+                        language=language,
+                        plural=plural,
+                    )
                 ),
             )
         )
 
         # translation language field
-        translation_language_badges = [
+        translation_language_badges: list[StrOrPromise] = [
             self.make_distance_badge(change.get_distance()),
         ]
 
@@ -476,7 +743,7 @@ class ShowChangeContent(BaseChangeHistoryContext):
                 gettext("State: %(state)s") % {"state": state}
             )
 
-        fields.append(
+        self.fields.append(
             self.make_field(
                 str(unit.translation.language),
                 self.format_translation(
@@ -486,48 +753,85 @@ class ShowChangeContent(BaseChangeHistoryContext):
                 extra_label_classes=["tags-list"],
             )
         )
-        return fields
+        self.add_context_field(unit.translation)
+        return self.fields
 
 
 class ShowChangeSource(BaseChangeHistoryContext):
     """Display the source of a change in the history context."""
 
-    def get_change_details_fields(self) -> list[dict]:
-        fields = []
+    def get_change_details_fields(self) -> list[FieldDict]:
+        self.fields = []
         change = self.change
         if change.unit is None:
             msg = "Change does not contain unit, can not render content!"
             raise ValueError(msg)
         unit = change.unit
 
+        language = unit.translation.component.source_language
+        plural = unit.source_unit.translation.plural
+        snapshot = change.details.get("source_snapshot")
+        if snapshot:
+            source = SourceSnapshot.from_dict(snapshot)
+            language, plural = source.language, source.plural
+
+        previous_data = change.details.get("previous_source_snapshot")
+        previous = SourceSnapshot.from_dict(previous_data) if previous_data else None
+        separate_previous = bool(
+            snapshot and previous and previous.rules != source.rules
+        )
+        if separate_previous and previous is not None and change.old:
+            previous_language, previous_plural = previous.language, previous.plural
+            self.fields.append(
+                self.make_field(
+                    str(previous_language),
+                    self.format_translation(
+                        format_unit_source(
+                            unit,
+                            value=change.old,
+                            language=previous_language,
+                            plural=previous_plural,
+                        )
+                    ),
+                    label_badges=[gettext("Previous source")],
+                )
+            )
+
         # source language field
-        source_lang_badges = [
+        source_lang_badges: list[StrOrPromise] = [
             self.make_distance_badge(change.get_distance()),
         ]
         if change.show_unit_state():
             source_lang_badges.append(change.get_state_display())
 
-        if change.target:
+        if snapshot or change.target:
             source_lang_content = format_unit_source(
-                unit, value=change.target, diff=change.old
+                unit,
+                value=change.target,
+                diff=None if separate_previous else change.old,
+                language=language,
+                plural=plural,
             )
         else:
-            source_lang_content = format_unit_source(unit)
+            source_lang_content = format_unit_source(
+                unit, value=unit.source, language=language, plural=plural
+            )
 
-        fields.append(
+        self.fields.append(
             self.make_field(
-                str(unit.translation.component.source_language),
+                str(language),
                 self.format_translation(source_lang_content),
                 label_badges=source_lang_badges,
             )
         )
-        return fields
+        self.add_context_field(unit.translation)
+        return self.fields
 
 
 class ShowChangeDiff(BaseChangeHistoryContext):
     """Display the diff of a change in the history context."""
 
-    def get_change_details_fields(self) -> list[dict]:
+    def get_change_details_fields(self) -> list[FieldDict]:
         change = self.change
         if change.unit is None:
             msg = "Change does not contain unit, can not render content!"
@@ -547,7 +851,7 @@ class ShowChangeDiff(BaseChangeHistoryContext):
 class ShowRemovedString(BaseChangeHistoryContext):
     """Display the removed string of a change in the history context."""
 
-    def get_change_details_fields(self) -> list[dict]:
+    def get_change_details_fields(self) -> list[FieldDict]:
         change = self.change
         component = change.component
         translation = change.translation
@@ -555,7 +859,7 @@ class ShowRemovedString(BaseChangeHistoryContext):
             msg = "Change does not contain translation, can not render content!"
             raise ValueError(msg)
 
-        fields = [
+        self.fields = [
             self.make_field(
                 str(component.source_translation.language),
                 self.format_translation(
@@ -566,7 +870,7 @@ class ShowRemovedString(BaseChangeHistoryContext):
             )
         ]
         if "target" in change.details and not translation.is_source:
-            fields.append(
+            self.fields.append(
                 self.make_field(
                     str(translation.language),
                     self.format_translation(
@@ -574,4 +878,6 @@ class ShowRemovedString(BaseChangeHistoryContext):
                     ),
                 )
             )
-        return fields
+
+        self.add_context_field(translation)
+        return self.fields

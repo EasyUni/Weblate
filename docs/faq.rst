@@ -4,6 +4,25 @@ Frequently Asked Questions
 Configuration
 +++++++++++++
 
+How do I restrict which languages can be translated?
+----------------------------------------------------
+
+To prevent users from starting new translations across a project, open the
+project settings, select :guilabel:`Workflow`, and set
+:guilabel:`Adding new translation` to :guilabel:`Disable adding new translations`.
+Ensure that the project's categories and components inherit this setting; see
+:ref:`workspace-inherited-settings`. Project admins can still add translations
+when Weblate can create the files.
+
+To allow only selected language codes, configure
+:ref:`component-language_regex` on each component. This filters translation
+files rather than controlling who can edit existing translations. See
+:ref:`workflow-language-restrictions` for the available controls.
+
+If unexpected languages appear in a glossary, check
+:ref:`glossary-language-sync`: Weblate automatically adds glossary languages
+for languages used in the project.
+
 .. _auto-workflow:
 
 How to create an automated workflow?
@@ -52,13 +71,39 @@ actions.
 
 .. note::
 
+   If you resolve the conflict in a pull request, merge it with a regular merge
+   commit. Do not squash merge it. Squash merging creates a new commit instead
+   of preserving the Weblate commits, so Weblate might not recognize that its
+   local commits are already included upstream and might need a repository
+   reset to recover.
+
+.. note::
+
+   Weblate uses shallow clones by default to reduce cloning time and disk
+   usage. Because of this, the workflow below works best when you start from an
+   up-to-date checkout of the upstream repository. If you clone directly from
+   the exported Weblate repository, or if your upstream checkout is missing
+   recent commits, ``git remote update weblate`` can fail with errors such as
+   ``warning: no common commits``, ``bad revision``, or missing objects. This
+   does not necessarily mean that Weblate and the upstream repository have
+   conflicting changes. Administrators who want to make this workflow more
+   reliable can adjust :setting:`VCS_CLONE_DEPTH`.
+
+.. note::
+
    Depending on your setup, access to the Weblate repository might require
    authentication. When using the built-in :ref:`git-exporter` in Weblate, you
    authenticate with your username and the API key.
 
+.. include:: /snippets/git-export-lfs-note.rst
+
+The workflow usually looks like this when you start from an up-to-date checkout
+of the upstream repository:
+
 .. code-block:: sh
 
-    # Open an existing checkout of the upstream repository or perform a fresh one:
+    # Open an existing up-to-date checkout of the upstream repository or perform
+    # a fresh one:
     git clone UPSTREAM_REPOSITORY_URL
     cd REPO
     # Commit all pending changes in Weblate, you can do this in the UI as well:
@@ -241,6 +286,11 @@ while still having them under version control.
 
         git submodule update --remote path/to/translations
 
+Weblate should be linked to the translation repository directly. It does not
+populate submodules when cloning a parent repository, so translation files
+inside a submodule are not available through the parent repository. See
+:ref:`git-submodules`.
+
 Please consult the `git submodule`_ documentation for more details.
 
 .. _`git submodule`: https://git-scm.com/docs/git-submodule
@@ -263,16 +313,26 @@ open the ``/manage/performance/`` URL directly.
 Why are all commits committed by Weblate <noreply@weblate.org>?
 ---------------------------------------------------------------
 
-This is the default committer name, configured by
-:setting:`DEFAULT_COMMITER_EMAIL` and :setting:`DEFAULT_COMMITER_NAME`.
+Weblate uses ``Weblate <noreply@weblate.org>`` as the default **committer** for all
+commits, which is configured by :setting:`DEFAULT_COMMITER_EMAIL` and
+:setting:`DEFAULT_COMMITER_NAME`. This is a technical identifier showing that
+the commit was processed through Weblate.
 
-The author of every commit (if the underlying VCS supports it) is still recorded
-correctly as the user that made the translation.
+However, the **author** of each commit is correctly recorded as the individual
+user who made the translation (when using Git). This means you can see who
+actually translated each string by examining the commit author field. The same
+applies to Mercurial; only Subversion does not have this capability.
 
-For commits where no authorship is known (for example anonymous suggestions or
-machine translation results), the authorship is credited to the anonymous user
-(see :setting:`ANONYMOUS_USER_NAME`). You can change the name and e-mail in the
-management interface.
+.. note::
+
+   In Git, there is a distinction between the committer (who created the commit
+   object) and the author (who made the changes). Weblate acts as the committer
+   while preserving individual translator attribution as authors.
+
+For commits where authorship cannot be determined (such as automated changes
+from anonymous suggestions or machine translation results), the author is set
+to the anonymous user. You can configure the anonymous user's name and e-mail
+in :setting:`ANONYMOUS_USER_NAME`.
 
 .. seealso::
 
@@ -304,10 +364,10 @@ Usage
 +++++
 
 How do I review the translations of others?
----------------------------------------------
+-------------------------------------------
 
 - There are several review based workflows available in Weblate, see :ref:`workflows`.
-- You can subscribe to any changes made in :ref:`subscriptions` and then check
+- You can subscribe to any changes made in :ref:`notifications` and then check
   others contributions as they come in by e-mail.
 - There is a review tool available at the bottom of the translation view, where you can
   choose to browse translations made by others since a given date.
@@ -360,6 +420,12 @@ keep the file formatted your way, please use a pre-commit hook for that.
 .. seealso::
 
    :ref:`updating-target-files`
+
+How do I merge updated POT file with PO translations?
+-----------------------------------------------------
+
+See :ref:`updating-target-files` for information on updating PO files when
+the POT template changes.
 
 
 Where do language definitions come from and how can I add my own?
@@ -509,11 +575,10 @@ Does Weblate support other VCSes than Git and Mercurial?
 --------------------------------------------------------
 
 Weblate currently does not have native support for anything other than
-:ref:`vcs-git` (with extended support for :ref:`vcs-github`, :ref:`vcs-gerrit`
-and :ref:`vcs-git-svn`) and :ref:`vcs-mercurial`, but it is possible to write
+:ref:`vcs-git` (with extended support for
+:ref:`code-hosting-github-pull-requests`, :ref:`code-hosting-gerrit`, and
+:ref:`vcs-git-svn`) and :ref:`vcs-mercurial`, but it is possible to write
 backends for other VCSes.
-
-You can also use :ref:`vcs-git-helpers` in Git to access other VCSes.
 
 Weblate also supports VCS-less operation, see :ref:`vcs-local`.
 

@@ -94,7 +94,7 @@ Architecture overview
             style=filled];
          wsgi [fillcolor="#144d3f",
             fontcolor=white,
-            label="WSGI server",
+            label="WSGI or ASGI server",
             style=filled];
       }
       subgraph cluster_services {
@@ -102,7 +102,7 @@ Architecture overview
             label=Services,
             style=filled
          ];
-         redis [label="Redis\nTask queue\nCache",
+         redis [label="Datastore\nTask queue\nCache",
             shape=cylinder];
          db [label="PostgreSQL\nDatabase",
             shape=cylinder];
@@ -135,16 +135,16 @@ Celery workers
    Depending on your workload, you might want to customize the number of workers.
 
    Use dedicated node when scaling Weblate horizontally.
-WSGI server
-   A WSGI server serving web pages to users.
+Application server
+   A WSGI or ASGI server serving web pages to users.
 
    Use dedicated node when scaling Weblate horizontally.
 Database
    PostgreSQL database server for storing all the content, see :ref:`database-setup`.
 
    Use dedicated database node for sites with hundreds of millions of hosted words.
-Redis
-   Redis server for cache and tasks queue, see :ref:`celery`.
+Datastore
+   Key/value datastore such as Valkey or Redis server for cache and tasks queue, see :ref:`celery`.
 
    Use dedicated node when scaling Weblate horizontally.
 File system
@@ -156,7 +156,7 @@ E-mail server
 
 .. hint::
 
-   :doc:`/admin/install/docker` includes PostgreSQL and Redis, making the installation easier.
+   :doc:`/admin/install/docker` includes PostgreSQL and Valkey, making the installation easier.
 
 .. _requirements:
 
@@ -182,7 +182,7 @@ Python dependencies
 +++++++++++++++++++
 
 Weblate is written in `Python <https://www.python.org/>`_ and supports Python
-3.11 or newer. You can install dependencies using pip or from your
+3.12 or newer. You can install dependencies using pip or from your
 distribution packages, full list is available in :file:`requirements.txt`.
 
 Most notable dependencies:
@@ -209,74 +209,71 @@ Django REST Framework
        - Python packages
        - Weblate feature
 
-     * - ``alibaba``
-       - | `aliyun-python-sdk-alimt <https://pypi.org/project/aliyun-python-sdk-alimt>`_
-         | `aliyun-python-sdk-core <https://pypi.org/project/aliyun-python-sdk-core>`_
-       - :ref:`mt-alibaba`
-
      * - ``amazon``
-       - | `boto3 <https://pypi.org/project/boto3>`_
-       - :ref:`mt-aws`
+       - | :pypi:`boto3`
+         | :pypi:`django-ses`
+       - :ref:`mt-aws`, AWS SES e-mail backend
 
-     * - ``antispam``
-       - | `python-akismet <https://pypi.org/project/python-akismet>`_
-       - :ref:`spam-protection`
+     * - ``asgi``
+       - | :pypi:`granian`
+       - ASGI server for Weblate
 
      * - ``gelf``
-       - | `logging-gelf <https://pypi.org/project/logging-gelf>`_
+       - | :pypi:`logging-gelf`
        - :ref:`graylog`
 
      * - ``gerrit``
-       - | `git-review <https://pypi.org/project/git-review>`_
-       - :ref:`vcs-gerrit`
+       - | :pypi:`git-review`
+       - :ref:`code-hosting-gerrit`
 
      * - ``google``
-       - | `google-cloud-storage <https://pypi.org/project/google-cloud-storage>`_
-         | `google-cloud-translate <https://pypi.org/project/google-cloud-translate>`_
+       - | :pypi:`google-cloud-storage`
+         | :pypi:`google-cloud-translate`
        - :ref:`mt-google-translate-api-v3` with glossary support
 
+     * - ``google-errors``
+       - | :pypi:`google-cloud-error-reporting`
+       - :ref:`collecting-errors`
+
      * - ``ldap``
-       - | `django-auth-ldap <https://pypi.org/project/django-auth-ldap>`_
+       - | :pypi:`django-auth-ldap`
        - :ref:`ldap-auth`
 
      * - ``mercurial``
-       - | `mercurial <https://pypi.org/project/mercurial>`_
+       - | :pypi:`mercurial`
        - :ref:`vcs-mercurial`
 
-     * - ``mysql``
-       - | `mysqlclient <https://pypi.org/project/mysqlclient>`_
-       - MySQL or MariaDB, see :ref:`database-setup`
-
-     * - ``openai``
-       - | `openai <https://pypi.org/project/openai>`_
-       - :ref:`mt-openai`
+     * - ``oidc``
+       - | :pypi:`django-oauth-toolkit`
+       - :ref:`oidc-provider`
 
      * - ``postgres``
-       - | `psycopg <https://pypi.org/project/psycopg>`_
+       - | :pypi:`psycopg`
        - PostgreSQL, see :ref:`database-setup`
 
+     * - ``rollbar``
+       - | :pypi:`rollbar`
+       - :ref:`collecting-errors`
+
      * - ``saml``
-       - | `python3-saml <https://pypi.org/project/python3-saml>`_
+       - | :pypi:`python3-saml`
+         | :pypi:`xmlsec`
        - :ref:`saml-auth`
 
-     * - ``saml2idp``
-       - | `djangosaml2idp <https://pypi.org/project/djangosaml2idp>`_
-       - Integrating SAML 2 IDP into Weblate
-
-     * - ``wlhosted``
-       - | `wlhosted <https://pypi.org/project/wlhosted>`_
-       - Hosted Weblate integration
+     * - ``sphinx``
+       - | :pypi:`Sphinx`
+       - Needed for :ref:`addon-weblate.gettext.sphinx`
 
      * - ``wllegal``
-       - | `wllegal <https://pypi.org/project/wllegal>`_
+       - | :pypi:`wllegal`
        - Hosted Weblate integration
 
      * - ``wsgi``
-       - | `granian <https://pypi.org/project/granian>`_
-       - wsgi server for Weblate
+       - | :pypi:`granian`
+       - WSGI server for Weblate
 
      * - ``zxcvbn``
-       - | `django-zxcvbn-password-validator <https://pypi.org/project/django-zxcvbn-password-validator>`_
+       - | :pypi:`django-zxcvbn-password-validator`
        - :ref:`password-authentication`
 
 When installing using pip, you can directly specify desired features when installing:
@@ -301,22 +298,6 @@ Or you can install Weblate without any optional features:
 
 Troubleshooting pip install
 +++++++++++++++++++++++++++
-
-``ERROR: Dependency 'gobject-introspection-2.0' is required but not found.``
-   The installed ``PyGobject`` package cannot find a matching GObject
-   Introspection library. Before the 3.52 release, it required
-   ``gobject-introspection-1.0`` and since then, it requires
-   ``gobject-introspection-2.0``.
-
-   In case your operating system provides both, it is recommended to install
-   the newer version and retry the installation.
-
-   When the newer version is not available, please install the older release of
-   PyGobject before installing Weblate:
-
-   .. code-block:: sh
-
-      uv pip install 'PyGobject<3.52'
 
 ``ffi_prep_closure(): bad user_data (it seems that the version of the libffi library seen at runtime is different from the 'ffi.h' file seen at compile-time)``
    This is caused by incompatibility of binary packages distributed via PyPI
@@ -344,16 +325,12 @@ The following dependencies have to be installed on the system:
 
 ``Git``
     https://git-scm.com/
-Pango, Cairo and related header files and GObject introspection data
-    https://cairographics.org/, https://www.gtk.org/docs/architecture/pango, see :ref:`pangocairo`
 ``git-review`` (optional for Gerrit support)
-    https://pypi.org/project/git-review/
+    :pypi:`git-review`
 ``git-svn`` (optional for Subversion support)
     https://git-scm.com/docs/git-svn
 ``tesseract`` (needed only if :program:`tesserocr` binary wheels are not available for your system)
     https://github.com/tesseract-ocr/tesseract
-``licensee`` (optional for detecting license when creating component)
-    https://github.com/licensee/licensee
 
 Build-time dependencies
 +++++++++++++++++++++++
@@ -363,45 +340,15 @@ dependencies. This depends on how you install them, so please consult
 individual packages for documentation. You won't need those if using prebuilt
 ``Wheels`` while installing using ``pip`` or when you use distribution packages.
 
-.. _pangocairo:
-
-Pango and Cairo
-+++++++++++++++
-
-Weblate uses Pango and Cairo for rendering bitmap widgets (see
-:ref:`promotion`) and rendering checks (see :ref:`fonts`). To properly install
-Python bindings for those you need to install system libraries first - you need
-both Cairo and Pango, which in turn need GLib. All those should be installed
-with development files and GObject introspection data.
-
-.. seealso::
-
-   * :doc:`install/venv-debian`
-   * :doc:`install/venv-suse`
-   * :doc:`install/venv-redhat`
-   * :doc:`install/venv-macos`
+.. _hardware:
 
 .. include:: install/steps/hw.rst
 
-.. _verify:
+Verifying release artifacts
+---------------------------
 
-Verifying release signatures
-----------------------------
-
-Weblate release are cryptographically signed using `Sigstore signatures
-<https://www.sigstore.dev/>`_. The signatures are attached to the GitHub
-release.
-
-The verification can be performed using `sigstore package
-<https://pypi.org/project/sigstore/>`_. The following example verifies
-signature of the 5.4 release:
-
-.. code-block:: sh
-
-   sigstore verify github \
-      --cert-identity https://github.com/WeblateOrg/weblate/.github/workflows/setup.yml@refs/tags/weblate-5.4 \
-      --bundle Weblate-5.4-py3-none-any.whl.sigstore \
-      Weblate-5.4-py3-none-any.whl
+Release archives can be verified using the signatures, attestations, and SBOMs
+published with GitHub release assets. See :ref:`verify`.
 
 .. _file-permissions:
 
@@ -418,6 +365,10 @@ you might prefer to move these to a better location such as:
 
 Weblate tries to create these directories automatically, but it will fail
 when it does not have permissions to do so.
+
+The configured :setting:`CACHE_DIR` also has to be writable by the Weblate
+process and has to allow executing generated helper files. Do not mount
+:setting:`CACHE_DIR` with the ``noexec`` option.
 
 You should also take care when running :ref:`manage`, as they should be ran
 under the same user as Weblate itself is running, otherwise permissions on some
@@ -438,15 +389,6 @@ Database setup for Weblate
 It is recommended to run Weblate with a PostgreSQL database server.
 
 PostgreSQL 13 and higher is supported. PostgreSQL 15 or newer is recommended.
-
-:ref:`mysql` is supported, but not recommended for new installs.
-
-
-
-.. note::
-
-   No other database servers are currently supported, but support for other
-   Django supported databases should be possible to implement.
 
 .. seealso::
 
@@ -475,10 +417,10 @@ in this documentation, but the numbers will change once you customize the amount
 WSGI workers or adjust parallelism of Celery.
 
 The actual limit for the number of database connections needs to be higher to
-account following situations:
+account for the following situations:
 
 * :ref:`manage` need their connection as well.
-* If case process is killed (for example by OOM killer), it might block the existing connection until timeout.
+* If a process is killed (for example by OOM killer), it might block the existing connection until timeout.
 
 .. seealso::
    :ref:`celery`,
@@ -530,6 +472,7 @@ It is usually a good idea to run Weblate in a separate database, and separate us
 
         CREATE EXTENSION IF NOT EXISTS pg_trgm;
         CREATE EXTENSION IF NOT EXISTS btree_gin;
+        CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 .. _config-postgresql:
 
@@ -576,122 +519,6 @@ role Weblate should alter during the database migration.
 
    :ref:`db-connections`
 
-.. _mysql:
-
-MySQL and MariaDB
-+++++++++++++++++
-
-.. warning::
-
-   While MySQL and MariaDB support is still maintained in Weblate, our primary
-   focus is PostgreSQL. It is recommended to use PostgreSQL for new installs,
-   and to migrate existing installs to PostgreSQL, see
-   :ref:`database-migration`.
-
-   Some Weblate features will perform better with :ref:`postgresql`. This
-   includes searching and translation memory, which both utilize full-text
-   features in the database and PostgreSQL implementation is superior.
-
-Weblate can be also used with MySQL or MariaDB, please see
-:ref:`django:mysql-notes` and :ref:`django:mariadb-notes` for caveats using
-Django with those. Because of the limitations it is recommended to use
-:ref:`postgresql` for new installations.
-
-Weblate requires MySQL at least 8 or MariaDB at least 10.5.
-
-Following configuration is recommended for Weblate:
-
-* Use the ``utf8mb4`` charset to allow representation of higher Unicode planes (for example emojis).
-* Configure the server with ``innodb_large_prefix`` to allow longer indices on text fields.
-* Set the isolation level to ``READ COMMITTED``.
-* The SQL mode should be set to ``STRICT_TRANS_TABLES``.
-
-MySQL 8.x, MariaDB 10.5.x or newer have reasonable default configuration so
-that no server tweaking should be necessary and all what is needed can be
-configured on the client side.
-
-Below is an example :file:`/etc/my.cnf.d/server.cnf` for a server with 8 GB of
-RAM. These settings should be sufficient for most installs. MySQL and MariaDB
-have tunables that will increase the performance of your server that are
-considered not necessary unless you are planning on having large numbers of
-concurrent users accessing the system. See the various vendors documentation on
-those details.
-
-It is absolutely critical to reduce issues when installing that the setting
-``innodb_file_per_table`` is set properly and MySQL/MariaDB restarted before
-you start your Weblate install.
-
-.. code-block:: ini
-
-   [mysqld]
-   character-set-server = utf8mb4
-   character-set-client = utf8mb4
-   collation-server = utf8mb4_unicode_ci
-
-   datadir=/var/lib/mysql
-
-   log-error=/var/log/mariadb/mariadb.log
-
-   innodb_large_prefix=1
-   innodb_file_format=Barracuda
-   innodb_file_per_table=1
-   innodb_buffer_pool_size=2G
-   sql_mode=STRICT_TRANS_TABLES
-
-.. hint::
-
-   In case you are getting ``#1071 - Specified key was too long; max key length
-   is 767 bytes`` error, please update your configuration to include the ``innodb``
-   settings above and restart your install.
-
-.. hint::
-
-   In case you are getting ``#2006 - MySQL server has gone away`` error,
-   configuring :setting:`django:CONN_MAX_AGE` might help.
-
-.. seealso::
-
-   :ref:`db-connections`
-
-Configuring Weblate to use MySQL/MariaDB
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The :file:`settings.py` snippet for MySQL and MariaDB:
-
-.. code-block:: python
-
-    DATABASES = {
-        "default": {
-            # Database engine
-            "ENGINE": "django.db.backends.mysql",
-            # Database name
-            "NAME": "weblate",
-            # Database user
-            "USER": "weblate",
-            # Database password
-            "PASSWORD": "password",
-            # Set to empty string for localhost
-            "HOST": "127.0.0.1",
-            # Set to empty string for default
-            "PORT": "3306",
-            # In case you wish to use additional
-            # connection options
-            "OPTIONS": {},
-        }
-    }
-
-You should also create the ``weblate`` user account in MySQL or MariaDB before
-you begin the install. Use the commands below to achieve that:
-
-.. code-block:: sh
-
-   GRANT ALL ON weblate.* to 'weblate'@'localhost' IDENTIFIED BY 'password';
-   FLUSH PRIVILEGES;
-
-.. seealso::
-
-   :ref:`db-connections`
-
 Other configurations
 --------------------
 
@@ -732,8 +559,11 @@ Several features in Weblate rely on correct HTTP headers being passed to
 Weblate. When using reverse proxy, please make sure that the needed information
 is correctly passed.
 
+To debug this configuration, you can look at :guilabel:`HTTP environment` in
+:ref:`manage-performance`.
+
 Client IP address
-   This is needed for :ref:`rate-limit`, :ref:`spam-protection` or :ref:`audit-log`.
+   This is needed for :ref:`rate-limit` or :ref:`audit-log`.
 
    Weblate parses IP address from the ``REMOTE_ADDR``, which is set by the WSGI
    handler. This might be empty (when using socket for WSGI) or contain a
@@ -744,6 +574,16 @@ Client IP address
    usual setups, but you might need to adjust :setting:`IP_PROXY_HEADER` and
    :setting:`IP_PROXY_OFFSET` as well (use :envvar:`WEBLATE_IP_PROXY_HEADER`
    and :envvar:`WEBLATE_IP_PROXY_OFFSET` in the Docker container).
+
+   The reverse proxy which connects to Weblate must overwrite the configured
+   header or append a verified peer address at the position selected by
+   :setting:`IP_PROXY_OFFSET`. Do not select a client-supplied address, and do
+   not expose the application server through a path which bypasses the trusted
+   proxy.
+
+   When using ``X-Forwarded-For`` with the Docker container, configure
+   :envvar:`WEBLATE_TRUSTED_PROXY_ADDRESSES` with the reverse proxies allowed
+   to supply client addresses.
 
    .. hint::
 
@@ -757,6 +597,11 @@ Server host name
    reverse proxy (for example use ``ProxyPreserveHost On`` for Apache or
    ``proxy_set_header Host $host;`` with nginx).
 
+   .. hint::
+
+      CSRF verification failed errors are often caused by a mismatch between
+      the :http:header:`Host` header and configured :setting:`SITE_DOMAIN`.
+
 Client protocol
    Not passing correct protocol may cause Weblate to end up in redirection
    loop trying to upgrade client to HTTPS. Make sure it is correctly exposed by
@@ -769,8 +614,8 @@ Client protocol
    .. important::
 
       The header value is case-sensitive in the configuration, so
-      ``WEBLATE_SECURE_PROXY_SSL_HEADER=HTTP_X_CUSTOM_PROTO,https`` and
-      ``WEBLATE_SECURE_PROXY_SSL_HEADER=HTTP_X_CUSTOM_PROTO,HTTPS`` are not
+      ``WEBLATE_SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https`` and
+      ``WEBLATE_SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,HTTPS`` are not
       interchangeable.
 
    .. hint::
@@ -792,7 +637,6 @@ Client protocol
 .. seealso::
 
    * :ref:`docker-ssl-proxy`
-   * :ref:`spam-protection`
    * :ref:`rate-limit`
    * :ref:`audit-log`
    * :ref:`nginx-granian`
@@ -805,13 +649,16 @@ Client protocol
    * :setting:`IP_PROXY_OFFSET`
    * :setting:`django:SECURE_PROXY_SSL_HEADER`
    * :envvar:`WEBLATE_IP_PROXY_HEADER`
+   * :envvar:`WEBLATE_TRUSTED_PROXY_ADDRESSES`
    * :envvar:`WEBLATE_IP_PROXY_OFFSET`
+
+.. _http-proxy:
 
 HTTP proxy
 ++++++++++
 
-Weblate does execute VCS commands and those accept proxy configuration from
-environment. The recommended approach is to define proxy settings in
+Weblate supports per-protocol HTTP proxy configuration for outbound HTTP
+requests and Git repositories. Define the proxy environment variables in
 :file:`settings.py`:
 
 .. code-block:: python
@@ -819,11 +666,15 @@ environment. The recommended approach is to define proxy settings in
    import os
 
    os.environ["http_proxy"] = "http://proxy.example.com:8080"
-   os.environ["HTTPS_PROXY"] = "http://proxy.example.com:8080"
+   os.environ["https_proxy"] = "http://proxy.example.com:8080"
+
+Only ``http_proxy`` and ``https_proxy`` are supported. Generic and bypass
+variables such as ``all_proxy`` and ``no_proxy``, operating-system proxy
+configuration, and VCS-specific proxy configuration are not supported.
 
 .. seealso::
 
-   `Proxy Environment Variables <https://everything.curl.dev/usingcurl/proxies/env.html>`_
+   `Proxy environment variables <https://everything.curl.dev/usingcurl/proxies/env.html>`_
 
 .. _configuration:
 
@@ -886,7 +737,7 @@ options:
     :command:`weblate clearsessions` to remove stale session data from the
     database.
 
-    If you are using Redis as cache (see :ref:`production-cache`) it is
+    If you are using Valkey or Redis as cache (see :ref:`production-cache`) it is
     recommended to use it for sessions as well:
 
     .. code-block:: python
@@ -1024,12 +875,12 @@ of errors, which is not desired in a production setup.
 Properly configure admins
 +++++++++++++++++++++++++
 
-Set the correct admin addresses to the :setting:`ADMINS` setting to defining who will receive
+Set the correct admin addresses to the :setting:`ADMINS` setting to define who will receive
 e-mails in case something goes wrong on the server, for example:
 
 .. code-block:: python
 
-    ADMINS = (("Your Name", "your_email@example.com"),)
+    ADMINS = ("Your Name <your_email@example.com>",)
 
 .. seealso::
 
@@ -1112,6 +963,8 @@ Use a powerful database engine
   performance or reliability might ruin your Weblate experience.
 * Check the database server performance or tweak its configuration, for example
   using `PGTune <https://pgtune.leopard.in.ua/>`_.
+* Weblate deployment checks report non-finite PostgreSQL relation statistics.
+  Run ``ANALYZE`` on the reported relations to rebuild corrupted statistics.
 
 .. seealso::
 
@@ -1122,11 +975,11 @@ Use a powerful database engine
 
 .. _production-cache:
 
-Enable caching
-++++++++++++++
+Configure cache
++++++++++++++++
 
-If possible, use Redis from Django by adjusting the ``CACHES`` configuration
-variable, for example:
+If possible, use Valkey or Redis from Django by adjusting the ``CACHES``
+configuration variable, for example:
 
 .. code-block:: python
 
@@ -1146,8 +999,8 @@ variable, for example:
 
 .. hint::
 
-   In case you change Redis settings for the cache, you might need to adjust
-   them for Celery as well, see :ref:`celery`.
+   In case you change settings for the cache, you might need to adjust them for
+   Celery as well, see :ref:`celery`.
 
 .. seealso::
 
@@ -1311,14 +1164,14 @@ Apache on CentOS uses :file:`/etc/sysconfig/httpd` (or
 Using custom certificate authority
 ++++++++++++++++++++++++++++++++++
 
-Weblate does verify SSL certificates during HTTP requests. In case you are
-using custom certificate authority which is not trusted in default bundles, you
-will have to add its certificate as trusted.
+Weblate verifies SSL certificates during HTTP requests. Requests made using
+HTTPX2 use the system certificate store, so install custom certificate
+authorities there.
 
-The preferred approach is to do this at system level, please check your distro
-documentation for more details (for example on debian this can be done by
-placing the CA certificate into :file:`/usr/local/share/ca-certificates/` and
-running :command:`update-ca-certificates`).
+Check your distribution documentation for more details. For example, on Debian
+this can be done by placing the CA certificate into
+:file:`/usr/local/share/ca-certificates/` and running
+:command:`update-ca-certificates`.
 
 .. hint::
 
@@ -1329,12 +1182,14 @@ running :command:`update-ca-certificates`).
 
       docker compose exec -u root weblate /usr/sbin/update-ca-certificates
 
-Once this is done, system tools will trust the certificate and this includes
-Git.
+Once this is done, Weblate HTTPX2 requests and system tools, including Git, will
+trust the certificate.
 
-For Python code, you will need to configure requests to use system CA bundle
-instead of the one shipped with it. This can be achieved by placing following
-snippet to :file:`settings.py` (the path is Debian specific):
+Some integrations, including OAuth and OpenID Connect authentication, use
+Requests, which does not use the system certificate store by default. When
+these integrations communicate with services using the custom certificate
+authority, configure Requests to use the system CA bundle by adding the
+following to :file:`settings.py` (the path is Debian-specific):
 
 .. code-block:: python
 
@@ -1342,42 +1197,6 @@ snippet to :file:`settings.py` (the path is Debian specific):
 
     os.environ["REQUESTS_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
 
-
-.. _production-compress:
-
-Compressing client assets
-+++++++++++++++++++++++++
-
-Weblate comes with a bunch of JavaScript and CSS files. For performance reasons
-it is good to compress them before sending to a client. In default
-configuration this is done on the fly at cost of little overhead. On big
-installations, it is recommended to enable offline compression mode. This needs
-to be done in the configuration and the compression has to be triggered on
-every Weblate upgrade.
-
-The configuration switch is simple by enabling
-:attr:`compressor:django.conf.settings.COMPRESS_OFFLINE` and configuring
-:attr:`compressor:django.conf.settings.COMPRESS_OFFLINE_CONTEXT` (the latter is
-already included in the example configuration):
-
-.. code-block:: python
-
-    COMPRESS_OFFLINE = True
-
-On each deploy you need to compress the files to match current version:
-
-.. code-block:: sh
-
-    weblate compress
-
-.. hint::
-
-   The official Docker image has this feature already enabled.
-
-.. seealso::
-
-   * :ref:`compressor:scenarios`
-   * :ref:`static-files`
 
 .. _server:
 
@@ -1421,6 +1240,14 @@ Running Weblate is not different from running any other Django based
 program. Django is usually executed as WSGI or fcgi (see examples for
 different webservers below).
 
+.. note::
+
+   The sample configuration files shown below are maintained in the Weblate
+   source tree under :file:`weblate/examples/`. They are included in source
+   distributions and in this documentation, but Python wheels only install
+   runtime files. When installing Weblate from PyPI, get the matching source
+   distribution or source checkout before copying these examples.
+
 For testing purposes, you can use the built-in web server in Django:
 
 .. code-block:: sh
@@ -1451,10 +1278,15 @@ For testing purposes, you can use the built-in web server in Django:
 Serving static files
 ++++++++++++++++++++
 
+.. versionchanged:: 5.15.2
+   :file:`/media/` is no longer used for serving screenshots.
+
 Django needs to collect its static files in a single directory. To do so,
 execute :samp:`weblate collectstatic --noinput`. This will copy the static
 files into a directory specified by the :setting:`django:STATIC_ROOT` setting (this defaults to
-a ``static`` directory inside :setting:`CACHE_DIR`).
+a ``static`` directory inside :setting:`CACHE_DIR`). Production installations
+use content hashes in collected filenames so that updated assets do not reuse
+stale browser or proxy caches.
 
 It is recommended to serve static files directly from your web server, you should
 use that for the following paths:
@@ -1462,10 +1294,8 @@ use that for the following paths:
 :file:`/static/`
     Serves static files for Weblate and the admin interface
     (from defined by :setting:`django:STATIC_ROOT`).
-:file:`/media/`
-    Used for user media uploads (e.g. screenshots).
 :file:`/favicon.ico`
-    Should be rewritten to rewrite a rule to serve :file:`/static/favicon.ico`.
+    Should be rewritten to serve :file:`/static/favicon.ico`.
 
 .. seealso::
 
@@ -1474,7 +1304,6 @@ use that for the following paths:
    * :ref:`uwsgi`
    * :ref:`apache`
    * :ref:`apache-gunicorn`
-   * :ref:`production-compress`
    * :doc:`django:howto/deployment/index`
    * :doc:`django:howto/static-files/deployment`
 
@@ -1500,9 +1329,9 @@ configuration, but this might need customization for your environment.
 .. _nginx-granian:
 
 Sample configuration for NGINX and Granian
-+++++++++++++++++++++++++++++++++++++++++++
+++++++++++++++++++++++++++++++++++++++++++
 
-The following configuration runs Weblate using Granian the NGINX webserver:
+The following configuration runs Weblate using Granian with the NGINX webserver:
 
 .. literalinclude:: ../../weblate/examples/weblate.nginx.granian.conf
     :language: nginx
@@ -1520,7 +1349,7 @@ Sample configuration for NGINX and Gunicorn
 +++++++++++++++++++++++++++++++++++++++++++
 
 The following configuration runs Weblate using Gunicorn under the NGINX webserver
-(also available as :file:`weblate/examples/weblate.nginx.gunicorn.conf`):
+(:file:`weblate/examples/weblate.nginx.gunicorn.conf` in the source tree):
 
 .. literalinclude:: ../../weblate/examples/weblate.nginx.gunicorn.conf
     :language: nginx
@@ -1537,23 +1366,32 @@ Sample configuration for NGINX and uWSGI
 ++++++++++++++++++++++++++++++++++++++++
 
 
-To run production webserver, use the WSGI wrapper installed with Weblate (in
-virtual env case it is installed as
-:file:`~/weblate-env/lib/python3.9/site-packages/weblate/wsgi.py`). Don't
-forget to set the Python search path to your virtualenv as well (for example
-using ``virtualenv = /home/user/weblate-env`` in uWSGI).
+To run production webserver, use the WSGI wrapper installed with Weblate (when
+using a Python environment it is installed as
+:file:`~/weblate-env/lib/python3.14/site-packages/weblate/wsgi.py`). Don't
+forget to set the Python search path to your Python environment as well (for
+example using ``virtualenv = /home/user/weblate-env`` in uWSGI).
 
 The following configuration runs Weblate as uWSGI under the NGINX webserver.
 
-Configuration for NGINX (also available as :file:`weblate/examples/weblate.nginx.conf`):
+Configuration for NGINX (:file:`weblate/examples/weblate.nginx.conf` in the source tree):
 
 .. literalinclude:: ../../weblate/examples/weblate.nginx.conf
     :language: nginx
 
-Configuration for uWSGI (also available as :file:`weblate/examples/weblate.uwsgi.ini`):
+Configuration for uWSGI (:file:`weblate/examples/weblate.uwsgi.ini` in the source tree):
 
 .. literalinclude:: ../../weblate/examples/weblate.uwsgi.ini
     :language: ini
+
+Set ``py-executable`` to the absolute path of :file:`bin/python` inside the
+environment configured by ``virtualenv``. Weblate uses Python's
+``sys.executable`` to launch helper processes, including the SSH connection
+proxy used for Git repositories. uWSGI can otherwise set this value to its own
+executable, causing repository operations to fail with an error such as
+``/usr/bin/uwsgi-core: invalid option -- 'I'``. Setting ``virtualenv`` alone does
+not ensure that ``sys.executable`` points to Python. Restart uWSGI after updating
+the configuration.
 
 .. seealso::
 
@@ -1567,7 +1405,7 @@ Sample configuration for Apache
 It is recommended to use prefork MPM when using WSGI with Weblate.
 
 The following configuration runs Weblate as WSGI, you need to have enabled
-``mod_wsgi`` (available as :file:`weblate/examples/apache.conf`):
+``mod_wsgi`` (:file:`weblate/examples/apache.conf` in the source tree):
 
 .. literalinclude:: ../../weblate/examples/apache.conf
     :language: apache
@@ -1591,7 +1429,7 @@ Sample configuration for Apache and Gunicorn
 ++++++++++++++++++++++++++++++++++++++++++++
 
 The following configuration runs Weblate in Gunicorn and Apache 2.4
-(available as :file:`weblate/examples/apache.gunicorn.conf`):
+(:file:`weblate/examples/apache.gunicorn.conf` in the source tree):
 
 .. literalinclude:: ../../weblate/examples/apache.gunicorn.conf
     :language: apache
@@ -1621,10 +1459,56 @@ system level. The following examples show starting via systemd:
    :caption: /etc/systemd/system/granian.service
    :language: ini
 
+Granian uses worker processes for parallel Python execution, blocking threads
+for concurrent WSGI requests, and runtime threads for network I/O. The sample
+uses two workers with eight blocking threads each, limits each worker to 16
+concurrent connections, and leaves the runtime threads at Granian's default.
+Adjust the workers and blocking threads to the available memory, CPU cores, and
+database connection limit. Keep the backpressure equal to or higher than the
+number of blocking threads.
+
 .. seealso::
 
+   * :ref:`running-granian-asgi`
    * https://github.com/emmett-framework/granian
    * :doc:`django:howto/deployment/wsgi/index`
+
+.. _running-granian-asgi:
+
+Sample configuration to start Granian with ASGI
++++++++++++++++++++++++++++++++++++++++++++++++
+
+.. versionadded:: 2026.8
+
+ASGI deployment is available as an opt-in alternative to WSGI. Install the
+``asgi`` optional dependency:
+
+.. code-block:: shell
+
+   uv pip install Weblate[all,asgi]
+
+The following systemd unit runs the Django ASGI application:
+
+.. literalinclude:: ../../weblate/examples/granian-asgi.service
+   :caption: /etc/systemd/system/granian-asgi.service
+   :language: ini
+
+The sample uses Granian's ASGI interface without lifespan or WebSocket support,
+because Weblate currently exposes HTTP only. Weblate's middleware supports both
+deployment modes and uses thread-sensitive adapters where it still relies on
+synchronous Django APIs. The health check is asynchronous, but most Weblate
+views remain synchronous, and CPU-intensive or long-running work should still
+be handled by :ref:`celery`.
+
+WSGI remains the default deployment mode. Docker images can opt in to ASGI by
+setting :envvar:`WEBLATE_ASGI` to ``1``. Adjust the worker count and
+backpressure to the available memory, CPU cores, and database connection limit.
+
+.. seealso::
+
+   * :ref:`running-granian`
+   * https://github.com/emmett-framework/granian
+   * :doc:`django:howto/deployment/asgi/index`
 
 .. _running-gunicorn:
 
@@ -1660,7 +1544,7 @@ Running Weblate under path
 It is recommended to use prefork MPM when using WSGI with Weblate.
 
 A sample Apache configuration to serve Weblate under ``/weblate``. Again using
-``mod_wsgi`` (also available as :file:`weblate/examples/apache-path.conf`):
+``mod_wsgi`` (:file:`weblate/examples/apache-path.conf` in the source tree):
 
 .. literalinclude:: ../../weblate/examples/apache-path.conf
     :language: apache
@@ -1688,7 +1572,7 @@ for handling following operations (this list is not complete):
 * Offloading expensive operations from the WSGI process.
 * Committing pending changes (see :ref:`lazy-commit`).
 
-A typical setup using Redis as a backend looks like this:
+A typical setup using Valkey or Redis as a backend looks like this:
 
 .. code-block:: python
 
@@ -1700,14 +1584,27 @@ A typical setup using Redis as a backend looks like this:
 
    :ref:`Redis broker configuration in Celery <celery:broker-redis-configuration>`
 
-You should also start the Celery worker to process the tasks and start
-scheduled tasks, this can be done directly on the command-line (which is mostly
-useful when debugging or developing):
+You should also start the Celery worker to process the tasks and start scheduled
+tasks. For debugging or development, this can be done directly on the
+command-line:
 
 .. code-block:: sh
 
-   ./weblate/examples/celery start
-   ./weblate/examples/celery stop
+   celery --app=weblate.utils worker --beat \
+       --queues=celery,notify,memory,translate,backup \
+       --prefetch-multiplier=1
+
+Running all queues in one prefork worker shares the initial application memory
+between its child processes while retaining parallel task execution. Celery
+determines the concurrency from the number of available CPUs by default; use
+``--concurrency`` to adjust it for your workload and available memory.
+
+To reduce startup memory usage, Celery workers do not repeat the Django system
+checks. The Weblate container runs the more comprehensive
+:command:`weblate check --deploy` automatically during container startup. For
+other installation methods, run the command after installation, upgrades, or
+configuration changes. The checks are also available in the
+:ref:`management interface <manage-performance>`.
 
 .. note::
 
@@ -1740,8 +1637,9 @@ Running Celery as system service
 
 Most likely you will want to run Celery as a daemon and that is covered by
 :doc:`celery:userguide/daemonizing`. For the most common Linux setup using
-systemd, you can use the example files shipped in the :file:`examples` folder
-listed below.
+systemd, adapt the example files listed below. These examples are maintained in
+the Weblate source tree under :file:`weblate/examples/`; Python wheels do not
+install these deployment samples.
 
 Systemd unit to be placed as :file:`/etc/systemd/system/celery-weblate.service`:
 
@@ -1809,7 +1707,9 @@ Weblate processes. All Celery tasks can be executed in a single process using:
 
    celery --app=weblate.utils worker --beat --queues=celery,notify,memory,translate,backup --pool=solo
 
-An installation using Docker can be configured to use a single-process Celery setup by setting :envvar:`CELERY_SINGLE_PROCESS`.
+An installation using Docker can be configured to use a single-process Celery
+setup by setting ``CELERY_WORKER_MODE=single``. See
+:envvar:`CELERY_WORKER_MODE`.
 
 .. warning::
 
@@ -1823,7 +1723,9 @@ Monitoring Weblate
 Weblate provides the ``/healthz/`` URL to be used in simple health checks, for example
 using Kubernetes. The Docker container has built-in health check using this URL.
 
-For monitoring metrics of Weblate you can use :http:get:`/api/metrics/` API endpoint.
+For monitoring metrics of Weblate you can use the :http:get:`/api/metrics/` API
+endpoint. Monitoring tools running locally can retrieve the same metrics using
+the :wladmin:`metrics` command.
 
 .. seealso::
 
@@ -1842,6 +1744,19 @@ This is especially useful in case of failing Celery tasks, which would
 otherwise only report error to the logs and you won't get notified on them.
 Weblate has support for the following services:
 
+E-mail
+++++++
+
+The default Weblate configuration instruments Django to send e-mails upon
+server errors via :py:class:`django:django.utils.log.AdminEmailHandler`. This
+is the least effort setup, but you should consider other options for privacy
+reasons, as the error e-mails might include sensitive data. You can read more on
+that in :ref:`django:logging-security-implications`.
+
+To disable this behavior, remove ``mail_admins`` from the
+:setting:`django:LOGGING` in Weblate settings, or disable
+:envvar:`WEBLATE_ADMIN_NOTIFY_ERROR` in the Docker environment.
+
 Sentry
 ++++++
 
@@ -1859,7 +1774,46 @@ and profiles for defined percentage of operations. This can be configured using
 .. seealso::
 
    * `Sentry Performance Monitoring <https://docs.sentry.io/product/sentry-basics/performance-monitoring/>`_
-   * `Sentry Profiling <https://docs.sentry.io/product/explore/profiling/>`_
+   * `Sentry Profiling <https://docs.sentry.io/product/profiling/>`_
+
+Google Cloud Error Reporting
+++++++++++++++++++++++++++++
+
+Weblate can report handled server errors to `Google Cloud Error Reporting`_.
+Install Weblate with the ``google-errors`` extra and configure
+:setting:`GOOGLE_CLOUD_ERROR_REPORTING` in :file:`settings.py`:
+
+.. code-block:: python
+
+   GOOGLE_CLOUD_ERROR_REPORTING = {
+       "project": "your-google-cloud-project",
+   }
+
+Weblate automatically reports errors under the ``weblate`` service and uses the
+current Weblate version or Git revision as the reported version. These values
+can be overridden by setting ``service`` or ``version`` in
+:setting:`GOOGLE_CLOUD_ERROR_REPORTING`.
+
+.. _Google Cloud Error Reporting: https://docs.cloud.google.com/error-reporting/docs/grouping-errors
+
+OpenTelemetry
++++++++++++++
+
+Weblate can export backend traces using `OpenTelemetry <https://opentelemetry.io/>`_.
+It uses OTLP over HTTP and can send traces to an OpenTelemetry Collector or a
+compatible vendor endpoint.
+
+.. code-block:: python
+
+   OPENTELEMETRY_ENABLED = True
+   OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT = "https://collector.example.com/v1/traces"
+   OPENTELEMETRY_TRACES_SAMPLE_RATE = 0.1
+
+The integration traces Django requests, Celery tasks, Redis, outgoing HTTP
+requests, database calls, and Weblate-specific spans. Configure it using
+:setting:`OPENTELEMETRY_ENABLED`,
+:setting:`OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT`, and
+:setting:`OPENTELEMETRY_TRACES_SAMPLE_RATE`.
 
 .. _rollbar-errors:
 
@@ -1918,18 +1872,16 @@ to stop Weblate for the migration.
 Migrating database
 ++++++++++++++++++
 
-Depending on your database backend, you might have several options to migrate
-the database. The most straightforward approach is to use database native
-tools, as they are usually the most effective (e.g. :command:`mysqldump` or
-:command:`pg_dump`). Alternatively you can use replication in
-case your database supports it.
+The most straightforward approach is to use database native tools, as they are
+usually the most effective (e.g. :command:`pg_dump`). Alternatively you can use
+replication if your database supports it.
 
 .. seealso::
 
    Migrating between databases described in :ref:`database-migration`.
 
 Migrating VCS repositories
-+++++++++++++++++++++++++++
+++++++++++++++++++++++++++
 
 The VCS repositories stored under :setting:`DATA_DIR` need to be migrated as
 well. You can simply copy them or use :command:`rsync` to do the migration
@@ -1939,4 +1891,4 @@ Other notes
 +++++++++++
 
 Don't forget to move other services Weblate might have been using like
-Redis, Cron jobs or custom authentication backends.
+Valkey, Redis, Cron jobs or custom authentication backends.

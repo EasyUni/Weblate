@@ -4,14 +4,19 @@
 
 """Tests for suggestion views."""
 
+from __future__ import annotations
+
 from django.conf import settings
+from django.test import TestCase
 from django.urls import reverse
 
+from weblate.auth.results import Denied
 from weblate.trans.models import Suggestion, WorkflowSetting
-from weblate.trans.tests.test_views import ViewTestCase
+from weblate.trans.tests.test_views import ReusableViewTestCase
+from weblate.utils.state import STATE_READONLY
 
 
-class SuggestionsTest(ViewTestCase):
+class SuggestionsTest(ReusableViewTestCase):
     def add_suggestion_1(self):
         return self.edit_unit("Hello, world!\n", "Nazdar svete!\n", suggest="yes")
 
@@ -186,10 +191,17 @@ class SuggestionsTest(ViewTestCase):
         suggestions = list(self.get_unit().suggestions)
         self.assertEqual(len(suggestions), 1)
 
-        self.assertEqual(suggestions[0].user.username, settings.ANONYMOUS_USER_NAME)
+        suggestion = suggestions[0]
+        if suggestion.user is None:
+            msg = "Suggestion user should not be None"
+            raise AssertionError(msg)
+
+        user = suggestion.user
+        self.assertEqual(user.username, settings.ANONYMOUS_USER_NAME)
 
         # Accept one of suggestions
-        response = self.edit_unit("Hello, world!\n", "", accept=suggestions[0].pk)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.edit_unit("Hello, world!\n", "", accept=suggestions[0].pk)
         self.assert_redirects_offset(response, translate_url, 2)
 
         # Reload from database
@@ -212,6 +224,116 @@ class SuggestionsTest(ViewTestCase):
 
         self.assert_vote()
 
+    def test_restrict_direct_editing(self) -> None:
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=self.translation.language,
+            enable_suggestions=True,
+            restrict_direct_editing=True,
+        )
+        unit = self.get_unit()
+
+        permission = self.user.has_perm("unit.edit", unit)
+        self.assertIsInstance(permission, Denied)
+        self.assertEqual(
+            permission.reason,
+            "Only privileged users can edit strings directly in this language because "
+            "of its translation workflow. Add a suggestion instead.",
+        )
+        self.assertTrue(self.user.has_perm("suggestion.add", unit))
+
+        response = self.client.get(self.translation_url)
+        self.assertContains(
+            response,
+            "Direct translation editing is restricted to privileged users.",
+        )
+        self.assertContains(response, "Translation suggestions can be made.")
+        self.assertNotContains(response, "Translations can be made directly.")
+        self.assertContains(self.client.get(unit.get_absolute_url()), permission.reason)
+
+        self.add_suggestion_1()
+        self.assertEqual(unit.suggestion_set.count(), 1)
+        self.assertFalse(self.get_unit().translated)
+
+        self.project.add_user(self.user, "Administration")
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.edit", unit))
+
+    def test_restrict_direct_editing_without_suggestions(self) -> None:
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=self.translation.language,
+            enable_suggestions=False,
+            restrict_direct_editing=True,
+        )
+        unit = self.get_unit()
+
+        permission = self.user.has_perm("unit.edit", unit)
+        self.assertIsInstance(permission, Denied)
+        self.assertEqual(
+            permission.reason,
+            "Only privileged users can edit strings directly in this language because "
+            "of its translation workflow. Ask a project administrator for access.",
+        )
+        suggestion_permission = self.user.has_perm("suggestion.add", unit)
+        self.assertIsInstance(suggestion_permission, Denied)
+        self.assertEqual(
+            suggestion_permission.reason,
+            "Suggestions are turned off for this language. Ask a project administrator "
+            "to enable them.",
+        )
+
+        response = self.client.get(self.translation_url)
+        self.assertContains(
+            response,
+            "Direct translation editing is restricted to privileged users.",
+        )
+        self.assertContains(response, "Translation suggestions are turned off.")
+        self.assertNotContains(response, "Translations can be made directly.")
+        self.assertContains(self.client.get(unit.get_absolute_url()), permission.reason)
+
+        response = self.edit_unit(
+            "Hello, world!\n", "Nazdar svete!\n", suggest="yes", follow=True
+        )
+        self.assertContains(response, suggestion_permission.reason)
+        self.assertEqual(unit.suggestion_set.count(), 0)
+
+    def test_suggestion_readonly_denials(self) -> None:
+        unit = self.get_unit()
+        original_state = unit.state
+        unit.state = STATE_READONLY
+        unit.save(update_fields=["state"])
+
+        permission = self.user.has_perm("suggestion.add", unit)
+        self.assertIsInstance(permission, Denied)
+        self.assertEqual(permission.reason, "The string is read-only.")
+
+        response = self.client.get(unit.get_absolute_url())
+        self.assertContains(response, 'title="The string is read-only."')
+
+        unit.state = original_state
+        unit.save(update_fields=["state"])
+        translation = unit.translation
+        translation.check_flags = "read-only"
+        translation.save(update_fields=["check_flags"])
+        unit = self.get_unit()
+
+        permission = self.user.has_perm("suggestion.add", unit)
+        self.assertIsInstance(permission, Denied)
+        self.assertEqual(permission.reason, "The translation is read-only.")
+
+    def test_restrict_direct_editing_allows_voting(self) -> None:
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=self.translation.language,
+            enable_suggestions=True,
+            restrict_direct_editing=True,
+            suggestion_voting=True,
+            suggestion_autoaccept=0,
+        )
+
+        self.assert_vote()
+
     def test_vote(self) -> None:
         self.component.suggestion_voting = True
         self.component.suggestion_autoaccept = 0
@@ -219,13 +341,51 @@ class SuggestionsTest(ViewTestCase):
 
         self.assert_vote()
 
+    def test_vote_without_autoaccept_keeps_direct_translation(self) -> None:
+        self.component.suggestion_voting = True
+        self.component.suggestion_autoaccept = 0
+        self.component.save()
+
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+
+        unit = self.get_unit()
+        self.assertEqual(unit.target, "Nazdar svete!\n")
+        self.assert_backend(1)
+
+    def test_vote_autoaccept_direct_translation_denied(self) -> None:
+        self.component.suggestion_voting = True
+        self.component.suggestion_autoaccept = 1
+        self.component.save()
+
+        response = self.edit_unit("Hello, world!\n", "Nazdar svete!\n", follow=True)
+
+        self.assertContains(
+            response,
+            "This translation is configured for suggestion voting. Add a suggestion instead of saving a direct translation.",
+        )
+        self.assertFalse(self.get_unit().translated)
+        self.assert_backend(0)
+
+    def test_vote_when_voting_disabled(self) -> None:
+        self.add_suggestion_1()
+        suggestion_id = self.get_unit().suggestions[0].pk
+
+        response = self.edit_unit(
+            "Hello, world!\n", "", upvote=suggestion_id, follow=True
+        )
+
+        self.assertContains(response, "Suggestion voting is disabled.")
+        suggestion = Suggestion.objects.get(pk=suggestion_id)
+        self.assertEqual(suggestion.get_num_votes(), 0)
+
     def assert_vote(self) -> None:
         translate_url = reverse("translate", kwargs=self.kw_translation)
         self.add_suggestion_1()
 
         suggestion_id = self.get_unit().suggestions[0].pk
 
-        response = self.edit_unit("Hello, world!\n", "", upvote=suggestion_id)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.edit_unit("Hello, world!\n", "", upvote=suggestion_id)
         self.assert_redirects_offset(response, translate_url, 2)
 
         suggestion = Suggestion.objects.get(pk=suggestion_id)
@@ -247,7 +407,8 @@ class SuggestionsTest(ViewTestCase):
 
         suggestion_id = self.get_unit().suggestions[0].pk
 
-        response = self.edit_unit("Hello, world!\n", "", upvote=suggestion_id)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.edit_unit("Hello, world!\n", "", upvote=suggestion_id)
         self.assert_redirects_offset(response, translate_url, 2)
 
         # Reload from database
@@ -287,3 +448,81 @@ class SuggestionsTest(ViewTestCase):
 
         # and the suggestion gets an upvote
         self.assertEqual(suggestion.get_num_votes(), 2)
+
+    def test_rendering_check_isolation(self) -> None:
+        """Verify that suggestion checks do not reuse the dirty cache of the unit."""
+        # Force SameCheck to ensure the suggestion system actually runs checks.
+        self.component.checks = "weblate.checks.same.SameCheck"  # type: ignore[attr-defined]
+        self.component.save()
+
+        unit = self.get_unit()
+
+        # Set dirty cache in memory
+        unit.check_cache = {"render": "DIRTY_PARENT_CACHE"}
+
+        # Create suggestion
+        suggestion = Suggestion.objects.create(
+            unit=unit,
+            target=unit.source,
+            user=self.user,
+        )
+
+        # We explicitly assign the dirty unit to the suggestion.
+        suggestion.unit = unit
+
+        # Explicitly trigger check calculation
+        checks = list(suggestion.get_checks())
+        self.assertTrue(checks, "Setup Error: No checks were generated.")
+
+        check_obj = next((check for check in checks if hasattr(check, "unit")), None)
+        if check_obj is None:
+            msg = "No check with a 'unit' attribute found."
+            raise AssertionError(msg)
+
+        fake_unit = check_obj.unit
+
+        # Verification of Isolation
+        self.assertTrue(
+            hasattr(fake_unit, "check_cache"),
+            "Test Failure: Fake unit does not expose 'check_cache' attribute.",
+        )
+
+        # We do not check for empty cache ({}) because running checks fills it.
+        # We check that the parent's dirt is gone.
+        self.assertIsNot(
+            fake_unit, unit, "Fake unit should be a different instance/copy"
+        )
+
+        self.assertIsNot(
+            fake_unit.check_cache,
+            unit.check_cache,
+            "Isolation Failure: check_cache dictionary is shared by reference.",
+        )
+
+        self.assertNotEqual(fake_unit.check_cache.get("render"), "DIRTY_PARENT_CACHE")
+
+        # Ensure the process didn't accidentally wipe the parent's cache
+        self.assertEqual(
+            unit.check_cache.get("render"),
+            "DIRTY_PARENT_CACHE",
+            "Integrity Failure: Parent unit cache was wiped during check execution.",
+        )
+
+
+class SuggestionModelTest(TestCase):
+    def test_target_list(self) -> None:
+        """Test that target_list property correctly splits plurals."""
+        sep = "\x1e\x1e"
+
+        suggestion = Suggestion(target="Hello world")
+        self.assertEqual(suggestion.target_list, ["Hello world"])
+
+        target_string = f"One apple{sep}Two apples{sep}Five apples"
+        suggestion_plural = Suggestion(target=target_string)
+
+        self.assertEqual(
+            suggestion_plural.target_list, ["One apple", "Two apples", "Five apples"]
+        )
+
+        suggestion_empty = Suggestion(target="")
+        self.assertEqual(suggestion_empty.target_list, [""])

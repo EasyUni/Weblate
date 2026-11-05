@@ -1,19 +1,22 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.2.2/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
   "files": {
     "includes": [
       "**",
+      "!**/*.svg",
+      "!**/*.html",
       "!weblate/trans/tests/data/**/*.ts",
       "!weblate/static/vendor",
       "!weblate/trans/tests/data/memory-broken.json",
       "!weblate/templates/site.webmanifest",
       "!weblate/templates/configuration/custom.css",
       "!weblate/static/js/vendor",
-      "!weblate/static/styles/vendor",
-      "!dev-docker/data"
-    ],
-    "experimentalScannerIgnores": [
-      "dev-docker/data"
+      "!weblate/static/styles/vendor"
     ]
   },
   "assist": {
@@ -26,15 +29,20 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true,
+      "preset": "recommended",
       "style": {
         "noParameterAssign": "error",
         "useDefaultParameterLast": "error",
         "useSelfClosingElements": "error",
         "useSingleVarDeclarator": "error",
         "useNumberNamespace": "error",
+        "useConsistentBuiltinInstantiation": "error",
         "noDescendingSpecificity": "off",
         "noUselessElse": "error"
+      },
+      "suspicious": {
+        "noVar": "error",
+        "useGuardForIn": "error"
       },
       "complexity": {
         "noImportantStyles": "off"
@@ -42,13 +50,15 @@
     }
   },
   "formatter": {
-    "enabled": true,
+    "enabled": false,
     "indentStyle": "space"
   },
   "javascript": {
+    "formatter": {
+      "enabled": true
+    },
     "globals": [
-      "$",
-      "Mousetrap",
+      "hotkeys",
       "gettext",
       "ngettext",
       "Cookies",
@@ -56,12 +66,12 @@
       "autosize",
       "WLT",
       "addAlert",
+      "copyToClipboard",
       "increaseLoading",
       "decreaseLoading",
       "initHighlight",
       "Prism",
       "interpolate",
-      "jQuery",
       "django",
       "slugify",
       "Tribute",
@@ -69,9 +79,9 @@
       "moment"
     ]
   },
-  "json": {
+  "css": {
     "formatter": {
-      "enabled": false
+      "enabled": true
     }
   }
 }

@@ -6,10 +6,12 @@
 
 from django.urls import reverse
 
-from weblate.trans.tests.test_views import ViewTestCase
+from weblate.checks.models import Check
+from weblate.trans.tests.test_views import FixtureTestCase
+from weblate.workspaces.models import Workspace
 
 
-class ChecksViewTest(ViewTestCase):
+class ChecksViewTest(FixtureTestCase):
     """Testing of check views."""
 
     def test_browse(self) -> None:
@@ -39,7 +41,7 @@ class ChecksViewTest(ViewTestCase):
         response = self.client.get(reverse("checks", kwargs={"name": "not-existing"}))
         self.assertEqual(response.status_code, 404)
 
-        response = self.client.get(
+        self.client.get(
             reverse("checks", kwargs={"name": "same"}),
             {"project": self.project.slug},
         )
@@ -77,6 +79,164 @@ class ChecksViewTest(ViewTestCase):
             )
         )
         self.assertEqual(response.status_code, 404)
+
+    def test_workspace(self) -> None:
+        workspace = Workspace.objects.create(name="Checks workspace")
+        self.project.workspace = workspace
+        self.project.save(update_fields=["workspace"])
+
+        response = self.client.get(
+            reverse("checks", kwargs={"path": workspace.get_url_path()})
+        )
+        self.assertContains(response, "/same/")
+
+        response = self.client.get(
+            reverse(
+                "checks",
+                kwargs={"name": "same", "path": workspace.get_url_path()},
+            )
+        )
+        self.assertContains(response, "/same/")
+        self.assertContains(response, self.project.name)
+
+        response = self.client.get(
+            reverse(
+                "checks",
+                kwargs={
+                    "name": "non-existing",
+                    "path": workspace.get_url_path(),
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_workspace_restricted_component(self) -> None:
+        workspace = Workspace.objects.create(name="Restricted checks workspace")
+        self.project.workspace = workspace
+        self.project.save(update_fields=["workspace"])
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+
+        self.assertTrue(Check.objects.filter(name="same").exists())
+
+        response = self.client.get(
+            reverse("checks", kwargs={"path": workspace.get_url_path()})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "/same/", status_code=200)
+
+        response = self.client.get(
+            reverse(
+                "checks",
+                kwargs={"name": "same", "path": workspace.get_url_path()},
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(
+            response,
+            reverse(
+                "checks",
+                kwargs={"name": "same", "path": self.project.get_url_path()},
+            ),
+            status_code=200,
+        )
+
+    def test_restricted_component_hidden_in_existing_scopes(self) -> None:
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+        language = self.translation.language
+        project_language_path = [*self.project.get_url_path(), "-", language.code]
+
+        project_check_url = reverse(
+            "checks",
+            kwargs={"name": "same", "path": self.project.get_url_path()},
+        )
+        language_check_url = reverse(
+            "checks",
+            kwargs={"name": "same", "path": language.get_url_path()},
+        )
+        project_language_check_url = reverse(
+            "checks",
+            kwargs={"name": "same", "path": project_language_path},
+        )
+        translation_check_url = reverse(
+            "checks",
+            kwargs={"name": "same", "path": self.translation.get_url_path()},
+        )
+
+        self.assertTrue(Check.objects.filter(name="same").exists())
+
+        response = self.client.get(
+            reverse("checks", kwargs={"path": self.project.get_url_path()})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, project_check_url, status_code=200)
+
+        response = self.client.get(reverse("checks", kwargs={"name": "same"}))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, project_check_url, status_code=200)
+
+        response = self.client.get(
+            reverse("checks", kwargs={"path": language.get_url_path()})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, language_check_url, status_code=200)
+
+        response = self.client.get(
+            reverse(
+                "checks",
+                kwargs={"name": "same", "path": language.get_url_path()},
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, project_language_check_url, status_code=200)
+
+        response = self.client.get(
+            reverse("checks", kwargs={"path": project_language_path})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, project_language_check_url, status_code=200)
+
+        response = self.client.get(
+            reverse(
+                "checks",
+                kwargs={"name": "same", "path": project_language_path},
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, translation_check_url, status_code=200)
+
+    def test_check_totals_link_to_search(self) -> None:
+        """Totals on the checks overview should link straight into unit search."""
+        same_search_url = reverse("search") + "?q=check:=same OR dismissed_check:=same"
+        response = self.client.get(reverse("checks"))
+        self.assertContains(response, same_search_url)
+
+        project_search_url = (
+            reverse("search", kwargs={"path": self.project.get_url_path()})
+            + "?q=check:=same OR dismissed_check:=same"
+        )
+        response = self.client.get(
+            reverse("checks", kwargs={"path": self.project.get_url_path()})
+        )
+        self.assertContains(response, project_search_url)
+
+        component_search_url = (
+            reverse(
+                "search",
+                kwargs={"path": self.component.get_url_path()},
+            )
+            + "?q=check:=same"
+        )
+        response = self.client.get(
+            reverse(
+                "checks",
+                kwargs={"name": "same", "path": self.project.get_url_path()},
+            )
+        )
+        self.assertContains(response, component_search_url)
 
     def test_component(self) -> None:
         response = self.client.get(

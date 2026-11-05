@@ -12,7 +12,6 @@ from django.urls import reverse
 from django.utils.translation import gettext
 from django.views.generic import ListView
 
-from weblate.auth.models import AuthenticatedHttpRequest
 from weblate.checks.models import CHECKS, Check
 from weblate.lang.models import Language
 from weblate.trans.models import Component, Project, Translation, Unit
@@ -20,9 +19,31 @@ from weblate.utils.random import get_random_identifier
 from weblate.utils.state import STATE_TRANSLATED
 from weblate.utils.stats import ProjectLanguage
 from weblate.utils.views import PathViewMixin
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
     from weblate.auth.models import AuthenticatedHttpRequest
+
+
+def get_check_search_urls(path_object, check_id: str) -> dict[str, str]:
+    """
+    Build search URLs jumping straight to units failing a given check.
+
+    Lets a checks-overview cell link directly into the unit search
+    (scoped to path_object, or site-wide when None) instead of requiring a
+    separate drilldown click per project/component/language.
+    """
+    kwargs = {}
+    if path_object is not None:
+        kwargs["path"] = path_object.get_url_path()
+    base = reverse("search", kwargs=kwargs)
+    url_id = f"check:={check_id}"
+    return {
+        "total": f"{base}?q={url_id} OR dismissed_{url_id}",
+        "dismissed": f"{base}?q=dismissed_{url_id}",
+        "active": f"{base}?q={url_id}",
+        "translated": f"{base}?q={url_id} AND state:>=translated",
+    }
 
 
 class CheckWrapper:
@@ -52,12 +73,14 @@ class CheckWrapper:
         if path_object is not None:
             kwargs["path"] = path_object.get_url_path()
         self.row_url = reverse("checks", kwargs=kwargs)
+        self.search_urls = get_check_search_urls(path_object, self.name)
 
 
 class CheckList(PathViewMixin, ListView):
     supported_path_types = (
         None,
         Project,
+        Workspace,
         Component,
         Translation,
         Language,
@@ -112,6 +135,8 @@ class CheckList(PathViewMixin, ListView):
                         "path": item.get_url_path(),
                     },
                 )
+            if not hasattr(item, "search_urls"):
+                item.search_urls = get_check_search_urls(item, self.check_obj.check_id)
         return result
 
     def get_queryset(self):
@@ -119,8 +144,12 @@ class CheckList(PathViewMixin, ListView):
             if self.path_object is None:
                 all_checks = Check.objects.filter_access(self.request.user)
             elif isinstance(self.path_object, Project):
-                all_checks = Check.objects.filter(
+                all_checks = Check.objects.filter_access(self.request.user).filter(
                     unit__translation__component__project=self.path_object
+                )
+            elif isinstance(self.path_object, Workspace):
+                all_checks = Check.objects.filter_access(self.request.user).filter(
+                    unit__translation__component__project__workspace=self.path_object
                 )
             elif isinstance(self.path_object, Component):
                 all_checks = Check.objects.filter(
@@ -129,11 +158,11 @@ class CheckList(PathViewMixin, ListView):
             elif isinstance(self.path_object, Translation):
                 all_checks = Check.objects.filter(unit__translation=self.path_object)
             elif isinstance(self.path_object, Language):
-                all_checks = Check.objects.filter(
+                all_checks = Check.objects.filter_access(self.request.user).filter(
                     unit__translation__language=self.path_object
                 )
             elif isinstance(self.path_object, ProjectLanguage):
-                all_checks = Check.objects.filter(
+                all_checks = Check.objects.filter_access(self.request.user).filter(
                     unit__translation__language=self.path_object.language,
                     unit__translation__component__project=self.path_object.project,
                 )
@@ -153,9 +182,13 @@ class CheckList(PathViewMixin, ListView):
                 )
             ]
         elif self.path_object is None:
+            accessible_components = Component.objects.filter_access(
+                self.request.user
+            ).filter(translation__unit__check__name=self.check_obj.check_id)
             result = self.annotate(
                 self.request.user.allowed_projects.filter(
-                    component__translation__unit__check__name=self.check_obj.check_id
+                    component__in=accessible_components,
+                    component__translation__unit__check__name=self.check_obj.check_id,
                 ),
                 "component__translation__",
             ).order()
@@ -169,6 +202,18 @@ class CheckList(PathViewMixin, ListView):
                 .prefetch_related("project"),
                 "translation__",
             ).order()
+        elif isinstance(self.path_object, Workspace):
+            accessible_components = Component.objects.filter_access(
+                self.request.user
+            ).filter(project__workspace=self.path_object)
+            result = self.annotate(
+                self.request.user.allowed_projects.filter(
+                    component__in=accessible_components,
+                    component__translation__unit__check__name=self.check_obj.check_id,
+                    workspace=self.path_object,
+                ),
+                "component__translation__",
+            ).order()
         elif isinstance(self.path_object, Component):
             result = self.annotate(
                 Translation.objects.filter(
@@ -180,10 +225,17 @@ class CheckList(PathViewMixin, ListView):
                 "",
             ).order_by("language__code")
         elif isinstance(self.path_object, Language):
+            accessible_components = Component.objects.filter_access(
+                self.request.user
+            ).filter(
+                translation__language=self.path_object,
+                translation__unit__check__name=self.check_obj.check_id,
+            )
             result = [
                 ProjectLanguage(project=obj, language=self.path_object)
                 for obj in self.annotate(
                     self.request.user.allowed_projects.filter(
+                        component__in=accessible_components,
                         component__translation__language=self.path_object,
                         component__translation__unit__check__name=self.check_obj.check_id,
                     ),
@@ -198,7 +250,8 @@ class CheckList(PathViewMixin, ListView):
                 item.translated_check_count = item.project.translated_check_count
         elif isinstance(self.path_object, ProjectLanguage):
             result = self.annotate(
-                Translation.objects.filter(
+                Translation.objects.filter_access(self.request.user)
+                .filter(
                     component__project=self.path_object.project,
                     language=self.path_object.language,
                     unit__check__name=self.check_obj.check_id,
@@ -229,23 +282,22 @@ class CheckList(PathViewMixin, ListView):
             context["title"] = f"{self.check_obj.name} / {self.path_object}"
         if self.check_obj is None:
             context["column_title"] = gettext("Check")
-        elif self.path_object is None:
+        elif self.path_object is None or isinstance(self.path_object, Workspace):
             context["column_title"] = gettext("Project")
         elif isinstance(self.path_object, Project):
             context["column_title"] = gettext("Component")
         elif isinstance(self.path_object, Component):
             context["column_title"] = gettext("Translation")
-            context["translate_links"] = True
         elif isinstance(self.path_object, Language):
             context["column_title"] = gettext("Project")
         elif isinstance(self.path_object, ProjectLanguage):
             context["column_title"] = gettext("Component")
-            context["translate_links"] = True
         else:
             msg = f"Type not supported: {self.path_object}"
             raise TypeError(msg)
         return context
 
+    # pylint: disable-next=arguments-differ
     def setup(self, request: AuthenticatedHttpRequest, **kwargs) -> None:
         super().setup(request, **kwargs)
         self.check_obj = None

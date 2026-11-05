@@ -12,13 +12,20 @@ from django.db import models
 from django.db.models import Q
 from django.utils.functional import cached_property
 
+from weblate.checks.defaults import DEFAULT_CHECK_LIST
 from weblate.utils.classloader import ClassLoader
 
 from .base import BaseCheck
 
 if TYPE_CHECKING:
+    from collections.abc import Generator, Iterable
+
+    from django_stubs_ext import StrOrPromise
+
     from weblate.auth.models import User
     from weblate.trans.models import Unit
+
+    from .base import FixupType
 
 
 class ChecksLoader(ClassLoader[BaseCheck]):
@@ -34,6 +41,10 @@ class ChecksLoader(ClassLoader[BaseCheck]):
         return {k: v for k, v in self.items() if v.target}
 
     @cached_property
+    def target_untranslated(self):
+        return {k: v for k, v in self.target.items() if not v.ignore_untranslated}
+
+    @cached_property
     def glossary(self):
         return {k: v for k, v in self.items() if v.glossary}
 
@@ -44,100 +55,25 @@ CHECKS = ChecksLoader()
 
 class WeblateChecksConf(AppConf):
     # List of quality checks
-    CHECK_LIST = (
-        "weblate.checks.same.SameCheck",
-        "weblate.checks.chars.BeginNewlineCheck",
-        "weblate.checks.chars.EndNewlineCheck",
-        "weblate.checks.chars.BeginSpaceCheck",
-        "weblate.checks.chars.EndSpaceCheck",
-        "weblate.checks.chars.DoubleSpaceCheck",
-        "weblate.checks.chars.EndStopCheck",
-        "weblate.checks.chars.EndColonCheck",
-        "weblate.checks.chars.EndQuestionCheck",
-        "weblate.checks.chars.EndExclamationCheck",
-        "weblate.checks.chars.EndInterrobangCheck",
-        "weblate.checks.chars.EndEllipsisCheck",
-        "weblate.checks.chars.EndSemicolonCheck",
-        "weblate.checks.chars.MaxLengthCheck",
-        "weblate.checks.chars.KashidaCheck",
-        "weblate.checks.chars.PunctuationSpacingCheck",
-        "weblate.checks.chars.KabyleCharactersCheck",
-        "weblate.checks.format.PythonFormatCheck",
-        "weblate.checks.format.PythonBraceFormatCheck",
-        "weblate.checks.format.PHPFormatCheck",
-        "weblate.checks.format.CFormatCheck",
-        "weblate.checks.format.PerlFormatCheck",
-        "weblate.checks.format.PerlBraceFormatCheck",
-        "weblate.checks.format.JavaScriptFormatCheck",
-        "weblate.checks.format.LuaFormatCheck",
-        "weblate.checks.format.ObjectPascalFormatCheck",
-        "weblate.checks.format.SchemeFormatCheck",
-        "weblate.checks.format.CSharpFormatCheck",
-        "weblate.checks.format.JavaFormatCheck",
-        "weblate.checks.format.JavaMessageFormatCheck",
-        "weblate.checks.format.PercentPlaceholdersCheck",
-        "weblate.checks.format.VueFormattingCheck",
-        "weblate.checks.format.I18NextInterpolationCheck",
-        "weblate.checks.format.ESTemplateLiteralsCheck",
-        "weblate.checks.format.AutomatticComponentsCheck",
-        "weblate.checks.angularjs.AngularJSInterpolationCheck",
-        "weblate.checks.icu.ICUMessageFormatCheck",
-        "weblate.checks.icu.ICUSourceCheck",
-        "weblate.checks.qt.QtFormatCheck",
-        "weblate.checks.qt.QtPluralCheck",
-        "weblate.checks.ruby.RubyFormatCheck",
-        "weblate.checks.consistency.PluralsCheck",
-        "weblate.checks.consistency.SamePluralsCheck",
-        "weblate.checks.consistency.ConsistencyCheck",
-        "weblate.checks.consistency.ReusedCheck",
-        "weblate.checks.consistency.TranslatedCheck",
-        "weblate.checks.chars.EscapedNewlineCountingCheck",
-        "weblate.checks.chars.NewLineCountCheck",
-        "weblate.checks.markup.BBCodeCheck",
-        "weblate.checks.chars.ZeroWidthSpaceCheck",
-        "weblate.checks.render.MaxSizeCheck",
-        "weblate.checks.markup.XMLValidityCheck",
-        "weblate.checks.markup.XMLTagsCheck",
-        "weblate.checks.markup.MarkdownRefLinkCheck",
-        "weblate.checks.markup.MarkdownLinkCheck",
-        "weblate.checks.markup.MarkdownSyntaxCheck",
-        "weblate.checks.markup.URLCheck",
-        "weblate.checks.markup.SafeHTMLCheck",
-        "weblate.checks.markup.RSTReferencesCheck",
-        "weblate.checks.markup.RSTSyntaxCheck",
-        "weblate.checks.placeholders.PlaceholderCheck",
-        "weblate.checks.placeholders.RegexCheck",
-        "weblate.checks.duplicate.DuplicateCheck",
-        "weblate.checks.source.OptionalPluralCheck",
-        "weblate.checks.source.EllipsisCheck",
-        "weblate.checks.source.MultipleFailingCheck",
-        "weblate.checks.source.LongUntranslatedCheck",
-        "weblate.checks.format.MultipleUnnamedFormatsCheck",
-        "weblate.checks.glossary.GlossaryCheck",
-        "weblate.checks.glossary.ProhibitedInitialCharacterCheck",
-        "weblate.checks.fluent.syntax.FluentSourceSyntaxCheck",
-        "weblate.checks.fluent.syntax.FluentTargetSyntaxCheck",
-        "weblate.checks.fluent.parts.FluentPartsCheck",
-        "weblate.checks.fluent.references.FluentReferencesCheck",
-        "weblate.checks.fluent.inner_html.FluentSourceInnerHTMLCheck",
-        "weblate.checks.fluent.inner_html.FluentTargetInnerHTMLCheck",
-    )
+    CHECK_LIST = DEFAULT_CHECK_LIST
 
     class Meta:
         prefix = ""
 
 
-class CheckQuerySet(models.QuerySet):
+class CheckQuerySet(models.QuerySet["Check", "Check"]):
+    def order(self):
+        return self.order_by("name")
+
     def filter_access(self, user: User):
         result = self
         if user.needs_project_filter:
             result = result.filter(
-                unit__translation__component__project__in=user.allowed_projects
+                user.get_project_access_query("unit__translation__component__project")
             )
         if user.needs_component_restrictions_filter:
             result = result.filter(
-                Q(unit__translation__component__restricted=False)
-                | Q(unit__translation__component_id__in=user.component_permissions)
+                user.get_component_access_query("unit__translation__component")
             )
         return result
 
@@ -148,11 +84,25 @@ class Check(models.Model):
     )
     name = models.CharField(max_length=50, choices=CHECKS.get_choices())
     dismissed = models.BooleanField(db_index=True, default=False)
+    # Provider diagnostics and freshness data, not user-editable configuration.
+    metadata = models.JSONField(default=dict, blank=True)
 
     objects = CheckQuerySet.as_manager()
 
     class Meta:
-        unique_together = [("unit", "name")]
+        required_db_vendor = "postgresql"
+        # ruff: ignore[mutable-class-default]
+        unique_together = [
+            ("unit", "name"),
+        ]
+        # ruff: ignore[mutable-class-default]
+        indexes = [
+            models.Index(
+                fields=["unit"],
+                condition=Q(dismissed=False),
+                name="checks_active_unit_idx",
+            ),
+        ]
         verbose_name = "Quality check"
         verbose_name_plural = "Quality checks"
 
@@ -166,31 +116,39 @@ class Check(models.Model):
         except KeyError:
             return None
 
-    def is_enforced(self):
-        return self.name in self.unit.translation.component.enforced_checks
+    def is_enforced(self) -> bool:
+        """Return whether this check is enforced (inherited or local)."""
+        component = self.unit.translation.component
+        effective = component.get_effective_setting("enforced_checks")
+        return self.name in effective
 
-    def get_description(self):
+    def get_description(self) -> StrOrPromise:
         if self.check_obj:
             return self.check_obj.get_description(self)
         return self.name
 
-    def get_fixup(self):
+    def get_plain_description(self) -> str:
+        if self.check_obj:
+            return self.check_obj.get_plain_description(self)
+        return self.name
+
+    def get_fixup(self) -> Iterable[FixupType] | None:
         if self.check_obj:
             return self.check_obj.get_fixup(self.unit)
         return None
 
-    def get_fixup_json(self):
+    def get_fixup_json(self) -> str | None:
         fixup = self.get_fixup()
         if not fixup:
             return None
         return json.dumps(fixup)
 
-    def get_name(self):
+    def get_name(self) -> StrOrPromise:
         if self.check_obj:
             return self.check_obj.name
         return self.name
 
-    def get_doc_url(self, user=None):
+    def get_doc_url(self, user: User | None = None) -> str:
         if self.check_obj:
             return self.check_obj.get_doc_url(user=user)
         return ""
@@ -204,13 +162,13 @@ class Check(models.Model):
         if recurse:
             for child in Check.objects.filter(
                 name=self.name,
-                unit__in=self.unit.propagated_units,
+                unit__in=self.unit.propagated_units.filter_restricted_peers(self.unit),
                 dismissed=not state,
             ).select_for_update():
                 child.set_dismiss(state=state, recurse=False)
 
 
-def get_display_checks(unit: Unit):
+def get_display_checks(unit: Unit) -> Generator[Check]:
     check_objects = {check.name: check for check in unit.all_checks}
     for check, check_obj in CHECKS.target.items():
         if check_obj.should_display(unit):

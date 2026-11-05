@@ -33,8 +33,14 @@ releases should work, but is not as well tested as single version upgrades!
     Always back up the full database before upgrading, so that you
     can roll back the database if the upgrade fails, see :doc:`backup`.
 
-#. Stop the WSGI and Celery processes to avoid old processes running while upgrading.
-   Otherwise incompatible changes in the database might occur.
+#. Wait for the Celery queues to become empty, then stop the WSGI and Celery
+   processes to avoid old processes running while upgrading. Otherwise
+   incompatible changes in the database might occur.
+
+   The Celery task queue is not a stable interface across releases, so queued
+   tasks from the old version are not guaranteed to work after the upgrade. You
+   can monitor queue length in the :ref:`management-interface` or by using
+   :wladmin:`celery_queues`.
 
 #. Upgrade Weblate
 
@@ -62,11 +68,11 @@ releases should work, but is not as well tested as single version upgrades!
 
         cd weblate-src
         git pull
-        # Update Weblate inside your virtualenv
+        # Update Weblate inside your Python environment
         . ~/weblate-env/bin/uv pip install -e '.[all]'
-        # Install dependencies directly when not using virtualenv
+        # Install dependencies directly when not using Python environment
         uv pip install --upgrade -e .
-        # Install optional dependencies directly when not using virtualenv
+        # Install optional dependencies directly when not using a Python environment
         uv pip install --upgrade -e '.[all]'
 
 #. New Weblate releases might have new :ref:`python-deps`, check if they cover
@@ -85,13 +91,7 @@ releases should work, but is not as well tested as single version upgrades!
 
    .. code-block:: sh
 
-        weblate collectstatic --noinput --clear
-
-#. Compress JavaScript and CSS files (optional, see :ref:`production-compress`):
-
-   .. code-block:: sh
-
-        weblate compress
+        weblate collectstatic --noinput
 
 #. If you are running an installation from Git, you should also regenerate locale
    files every time you upgrade. You can do this by invoking:
@@ -108,6 +108,11 @@ releases should work, but is not as well tested as single version upgrades!
 
 #. Restart the Celery worker (see :ref:`celery`).
 
+   Some upgrades run translation-memory scope backfill and consolidation in
+   the background using periodic Celery tasks. Keep Celery running after the
+   upgrade and monitor progress in :guilabel:`Administration` >
+   :guilabel:`Performance report`. See :ref:`memory-scopes` for details.
+
 .. _version-specific-instructions:
 
 Version-specific instructions
@@ -118,16 +123,19 @@ Version-specific instructions
    Version specific instructions are now included in the release notes, see :doc:`/changes`.
 
 
-Upgrade from an older major version
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Upgrade from an older unsupported release
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Upgrades across major versions are not supported. Always upgrade to the latest
-patch level for the initial major release. Upgrades skipping this step are not
+Direct upgrades are only supported for releases from the current or previous
+calendar year. If you need to upgrade across this boundary, upgrade first to an
+intermediate version as listed below. Upgrades skipping this step are not
 supported and will break.
 
 * If you are upgrading from the 2.x release, always first upgrade to 3.0.1.
 * If you are upgrading from the 3.x release, always first upgrade to 4.0.4.
 * If you are upgrading from the 4.x release, always first upgrade to 5.0.2.
+* If you are upgrading from 5.0.x-5.9.x, always first upgrade to 5.10.4.
+* Upgrades from 5.10.x and newer are currently directly supported.
 
 .. seealso::
 
@@ -140,7 +148,12 @@ supported and will break.
 Migrating from other databases to PostgreSQL
 --------------------------------------------
 
-If you are running Weblate with a different database than PostgreSQL,
+.. warning::
+
+   MySQL and MariaDB are no longer supported in Weblate. You must migrate
+   to PostgreSQL before upgrading.
+
+If you are running Weblate with MySQL or MariaDB,
 consider migrating to PostgreSQL for better performance by doing the following steps.
 Remember to stop both, the web and Celery servers beforehand,
 otherwise you might end up with inconsistent data.

@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import django_otp_webauthn.views
 from django.conf import settings
 from django.urls import include, path
 from django.views.i18n import JavaScriptCatalog
@@ -15,10 +14,9 @@ register_weblate_converters()
 
 
 # Follows copy of social_django.urls with few changes:
-# - authentication requires POST (issue submitted upstream)
-# - authentication stores current user (to avoid CSRF on complete)
+# - authentication stores current user and requested account action
 # - removed some configurability (just to avoid additional deps)
-# - the association_id has to be numeric (patch accepted upstream)
+# - SAML metadata is exposed with Weblate's default IdP handling
 social_urls = [
     # user authentication / association
     path("login/<slug:backend>/", weblate.accounts.views.social_auth, name="begin"),
@@ -47,12 +45,12 @@ social_urls = [
 webauthn_urls = [
     path(
         "registration/begin/",
-        django_otp_webauthn.views.BeginCredentialRegistrationView.as_view(),
+        weblate.accounts.views.WeblateBeginCredentialRegistrationView.as_view(),
         name="credential-registration-begin",
     ),
     path(
         "registration/complete/",
-        django_otp_webauthn.views.CompleteCredentialRegistrationView.as_view(),
+        weblate.accounts.views.WeblateCompleteCredentialRegistrationView.as_view(),
         name="credential-registration-complete",
     ),
     path(
@@ -79,11 +77,26 @@ urlpatterns = [
         name="email-sent",
     ),
     path("password/", weblate.accounts.views.password, name="password"),
+    path(
+        "auth/first-factor/verify/",
+        weblate.accounts.views.first_factor_verify,
+        name="first-factor-verify",
+    ),
+    path(
+        "auth/verify-second-factor/",
+        weblate.accounts.views.verify_second_factor,
+        name="verify-second-factor",
+    ),
     path("reset-api-key/", weblate.accounts.views.reset_api_key, name="reset-api-key"),
     path("reset/", weblate.accounts.views.reset_password, name="password_reset"),
     path("logout/", weblate.accounts.views.WeblateLogoutView.as_view(), name="logout"),
     path("profile/", weblate.accounts.views.user_profile, name="profile"),
     path("userdata/", weblate.accounts.views.userdata, name="userdata"),
+    path(
+        "userdata/import/",
+        weblate.accounts.views.import_userdata,
+        name="import-userdata",
+    ),
     path("unsubscribe/", weblate.accounts.views.unsubscribe, name="unsubscribe"),
     path("subscribe/", weblate.accounts.views.subscribe, name="subscribe"),
     path("watch/<object_path:path>/", weblate.accounts.views.watch, name="watch"),
@@ -103,6 +116,11 @@ urlpatterns = [
         "auth/second-factor/<slug:backend>/",
         weblate.accounts.views.SecondFactorLoginView.as_view(),
         name="2fa-login",
+    ),
+    path(
+        "auth/tokens/webauthn/",
+        weblate.accounts.views.WebAuthnRegistrationView.as_view(),
+        name="webauthn-register",
     ),
     path(
         "auth/tokens/webauthn/<int:pk>/",

@@ -9,7 +9,8 @@ from __future__ import annotations
 import os
 from glob import glob
 from itertools import chain
-from typing import TYPE_CHECKING, Any, BinaryIO, NoReturn
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, NoReturn
 
 from django.utils.functional import cached_property
 from django.utils.translation import gettext, gettext_lazy
@@ -20,10 +21,17 @@ from weblate.formats.base import (
     TranslationFormat,
     TranslationUnit,
 )
+from weblate.trans.exceptions import is_expected_parse_error
 from weblate.utils.errors import report_error
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
+
+    from lxml import etree
+
+    from weblate.checks.flags import Flags
+    from weblate.lang.models import Language
+    from weblate.trans.file_format_params import FileFormatParams
 
 
 class MultiparserError(Exception):
@@ -44,6 +52,7 @@ class TextItem(BaseItem):
         self.line = line
         self.text = text
         self.flags = flags
+        self.needs_save: bool = False
 
     @cached_property
     def location(self) -> str:
@@ -57,8 +66,7 @@ class TextParser:
     """Simple text parser returning all content as single unit."""
 
     def __init__(self, storefile, filename=None, flags: str | None = None) -> None:
-        with open(storefile) as handle:
-            content = handle.read()
+        content = Path(storefile).read_text(encoding="utf-8")
         if filename:
             self.filename = filename
         else:
@@ -70,7 +78,7 @@ class TextSerializer:
     def __init__(self, filename, units) -> None:
         self.units = [unit for unit in units if unit.filename == filename]
 
-    def __call__(self, handle):
+    def __call__(self, handle: IO[bytes]) -> None:
         for unit in self.units:
             handle.write(unit.text.encode())
             handle.write(b"\n")
@@ -80,7 +88,7 @@ class MultiParser(BaseStore):
     filenames: tuple[tuple[str, str], ...] = ()
     units: list[TextItem]
 
-    def __init__(self, storefile) -> None:
+    def __init__(self, storefile, file_validator: Callable[[str], str]) -> None:
         if not isinstance(storefile, str):
             msg = "Needs string as a storefile!"
             raise TypeError(msg)
@@ -89,6 +97,7 @@ class MultiParser(BaseStore):
             raise ValueError(gettext("Should be a directory with metadata files!"))
 
         self.base = storefile
+        self.file_validator = file_validator
         self.parsers = self.load_parser()
         self.units = list(
             chain.from_iterable(parser.units for parser in self.parsers.values())
@@ -106,6 +115,7 @@ class MultiParser(BaseStore):
                 if match in result:
                     continue
                 try:
+                    match = self.file_validator(match)
                     result[match] = TextParser(
                         match, os.path.relpath(match, self.base), flags
                     )
@@ -124,7 +134,7 @@ class AppStoreParser(MultiParser):
         ("short[_-]description.txt", "max-length:80"),
         ("summary.txt", "max-length:80"),
         ("full[_-]description.txt", "max-length:4000"),
-        ("subtitle.txt", "max-length:80"),
+        ("subtitle.txt", "max-length:30"),
         ("description.txt", "max-length:4000"),
         ("keywords.txt", "max-length:100"),
         ("video.txt", "max-length:256, url"),
@@ -140,7 +150,7 @@ class AppStoreParser(MultiParser):
         parts = filename.rsplit("changelogs/", 1)
         if len(parts) == 2:
             try:
-                return "-{}".format(int(parts[1].split(".")[0]))
+                return f"-{int(parts[1].split('.')[0])}"
             except ValueError:
                 pass
         return filename
@@ -166,7 +176,7 @@ class TextUnit(TranslationUnit):
     @cached_property
     def target(self):
         """Return target string from a ttkit unit."""
-        if self.unit is None:
+        if not self.has_unit():
             return ""
         return self.unit.text
 
@@ -175,18 +185,16 @@ class TextUnit(TranslationUnit):
         """Return context of message."""
         return self.mainunit.location
 
-    @cached_property
-    def flags(self):
-        """Return flags from unit."""
-        flags = super().flags
+    def get_extra_flags(self) -> Generator[str | etree._Element | Flags]:
+        yield from super().get_extra_flags()
         if self.mainunit.flags:
-            flags.merge(self.mainunit.flags)
-        return flags
+            yield self.mainunit.flags
 
     def set_target(self, target: str | list[str]) -> None:
         """Set translation unit target."""
         self._invalidate_target()
         self.unit.text = target
+        self.unit.needs_save = True
 
     def set_state(self, state) -> None:
         """Set fuzzy /approved flag on translated unit."""
@@ -204,14 +212,18 @@ class AppStoreFormat(TranslationFormat):
     simple_filename = False
     language_format = "googleplay"
     create_style = "directory"
+    parse_version = 1
     store: AppStoreParser
 
     def load(
         self,
-        storefile: str | BinaryIO,
+        storefile: str | IO[bytes],
         template_store: TranslationFormat | None,
     ) -> AppStoreParser:
-        return AppStoreParser(storefile)
+        if self.file_validator is None:
+            msg = gettext("File validation is required for directory-based formats.")
+            raise ValueError(msg)
+        return AppStoreParser(storefile, self.file_validator)
 
     def create_unit(
         self,
@@ -226,10 +238,14 @@ class AppStoreFormat(TranslationFormat):
     def create_new_file(
         cls,
         filename: str,
-        language: str,  # noqa: ARG003
-        base: str,  # noqa: ARG003
-        callback: Callable | None = None,  # noqa: ARG003
-        file_format_params: dict[str, Any] | None = None,  # noqa: ARG003
+        # ruff: ignore[unused-class-method-argument]
+        language: Language,
+        # ruff: ignore[unused-class-method-argument]
+        base: str,
+        # ruff: ignore[unused-class-method-argument]
+        callback: Callable | None = None,
+        # ruff: ignore[unused-class-method-argument]
+        file_format_params: FileFormatParams | None = None,
     ) -> None:
         """Handle creation of new translation file."""
         os.makedirs(filename)
@@ -241,6 +257,8 @@ class AppStoreFormat(TranslationFormat):
     def save(self) -> None:
         """Save underlying store to disk."""
         for unit in self.store.units:
+            if not unit.needs_save:
+                continue
             filename = self.store.get_filename(unit.filename)
             if not unit.text:
                 if os.path.exists(filename):
@@ -249,34 +267,45 @@ class AppStoreFormat(TranslationFormat):
             self.save_atomic(
                 filename,
                 TextSerializer(unit.filename, self.store.units),
+                repo_temp_dir=self.repo_temp_dir,
             )
 
     def get_filenames(self):
         return [self.store.get_filename(unit.filename) for unit in self.store.units]
 
     @classmethod
-    def get_class(cls) -> None:
-        return None
-
-    @classmethod
     def is_valid_base_for_new(
         cls,
         base: str,
-        monolingual: bool,  # noqa: ARG003
+        # ruff: ignore[unused-class-method-argument]
+        monolingual: bool,
         errors: list[Exception] | None = None,
         fast: bool = False,
-        file_format_params: dict[str, Any] | None = None,  # noqa: ARG003
+        # ruff: ignore[unused-class-method-argument]
+        file_format_params: FileFormatParams | None = None,
+        file_validator: Callable[[str], str] | None = None,
     ) -> bool:
         """Check whether base is valid."""
         if not base:
             return True
+        if file_validator is None:
+            if errors is not None:
+                errors.append(
+                    ValueError(
+                        gettext(
+                            "File validation is required for directory-based formats."
+                        )
+                    )
+                )
+            return False
         try:
             if not fast:
-                AppStoreParser(base)
+                AppStoreParser(base, file_validator)
         except Exception as exception:
             if errors is not None:
                 errors.append(exception)
-            report_error("File-parsing error")
+            if not is_expected_parse_error(exception):
+                report_error("File-parsing error")
             return False
         return True
 

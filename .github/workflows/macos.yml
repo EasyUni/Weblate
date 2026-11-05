@@ -6,10 +6,14 @@ name: macOS
 
 on:
   push:
-    branches-ignore:
-    - renovate/**
-    - weblate
+    branches:
+    - main
+    - stable
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,61 +22,99 @@ jobs:
   macos:
     # This verifies that installation instructions works, any changes here
     # need to be reflected in docs/admin/install/venv-macos.rst
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       PYTHONUNBUFFERED: 1
       PYTHONWARNINGS: default,ignore:unclosed:ResourceWarning
-      CI_DATABASE: postgresql
       CI_REDIS_HOST: localhost
       CI_DB_HOST: localhost
       DJANGO_SETTINGS_MODULE: weblate.settings_test
       CI_SKIP_SAML: 1
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      # renovate-homebrew-brew
+      HOMEBREW_BREW_REF: 856ce8c40ae1d336da27940b08bb549798454ba1
+      # renovate-homebrew-core
+      HOMEBREW_CORE_REF: 184a6c38682139b48cdb80d5f3db0df843cae326
+      # renovate-homebrew-cask
+      HOMEBREW_CASK_REF: 0805ced0344660ce0cf9c60be424cd83350de15e
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    - run: brew update
-    - run: brew uninstall openssl@1.1
-    - run: brew uninstall python@3.12 azure-cli
-    - run: brew untap homebrew/cask
-    - run: brew untap homebrew/core
-    - run: brew untap aws/tap
-    - run: brew upgrade
-    - run: brew cleanup
+    - name: Pin Homebrew snapshot
+      run: |
+        brew_repo="$(brew --repo)"
+        git -C "${brew_repo}" reset --hard
+        git -C "${brew_repo}" clean -fd
+        git -C "${brew_repo}" fetch --no-tags --depth=1 origin "${HOMEBREW_BREW_REF}"
+        git -C "${brew_repo}" checkout --force -B stable FETCH_HEAD
+
+        # Core and cask migration maps must come from the same snapshot.
+        brew tap --force homebrew/cask
+        cask_repo="$(brew --repo homebrew/cask)"
+        git -C "${cask_repo}" reset --hard
+        git -C "${cask_repo}" clean -fd
+        git -C "${cask_repo}" fetch --no-tags --depth=1 origin "${HOMEBREW_CASK_REF}"
+        git -C "${cask_repo}" checkout --force --detach FETCH_HEAD
+        git -C "${cask_repo}" rev-parse HEAD
+
+        brew tap --force homebrew/core
+        core_repo="$(brew --repo homebrew/core)"
+        git -C "${core_repo}" reset --hard
+        git -C "${core_repo}" clean -fd
+        git -C "${core_repo}" fetch --no-tags --depth=1 origin "${HOMEBREW_CORE_REF}"
+        git -C "${core_repo}" checkout --force --detach FETCH_HEAD
+        git -C "${core_repo}" rev-parse HEAD
+        echo "HOMEBREW_NO_INSTALL_FROM_API=1" >> "${GITHUB_ENV}"
+        brew --version
     - run: brew list --versions
-    - run: brew deps --tree --installed
     - run: brew config
     - run: brew doctor
       continue-on-error: true
     - name: Install brew dependencies
       run: |
-        brew install pango cairo gobject-introspection glib libyaml pkgconf zstd xxhash librsvg uv libxmlsec1
+        # Pin Python until all dependencies support Python 3.15.
+        brew install python@3.14 libyaml pkgconf zstd lz4 xxhash libxmlsec1 uv
     - name: Install test dependencies
       run: |
-        brew install mysql icu4c redis postgresql
+        brew install icu4c valkey postgresql
         brew link --force icu4c
+    - name: Show brew dependency tree
+      run: brew deps --tree python@3.14 libyaml pkgconf zstd lz4 xxhash libxmlsec1 uv icu4c valkey postgresql
     - name: Start services
       run: |
         brew services start postgresql
-        brew services start redis
+        brew services start valkey
     - name: Install Weblate
       run: |
-        uv venv --python python3.13 .venv
+        uv venv --python "$(brew --prefix python@3.14)/bin/python3.14" .venv
         source .venv/bin/activate
         uv sync --frozen --all-extras --dev --no-binary-package lxml --no-binary-package xmlsec
     - name: Test with Django
       run: |
+        sysctl machdep.cpu.brand_string hw.logicalcpu > test-cpu.txt
         # shellcheck disable=SC2155
         export CI_DB_USER="$(id -nu)"
         source .venv/bin/activate
-        pytest --junitxml=junit.xml --cov=weblate --cov-report=xml --numprocesses=auto weblate
-    - uses: codecov/codecov-action@fdcc8476540edceab3de004e990f80d881c6cc00 # v5.5.0
+        /usr/bin/time -l -o test-resources.txt pytest --junitxml=junit.xml --cov=weblate --cov-report=xml --numprocesses=auto weblate
+    - name: Upload test timing and resource evidence
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        token: ${{secrets.CODECOV_TOKEN}}
+        name: test-evidence-macos
+        path: |
+          junit.xml
+          test-cpu.txt
+          test-resources.txt
+        if-no-files-found: warn
+    - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{secrets.CODECOV_TOKEN}} # zizmor: ignore[secrets-outside-env]
         flags: unittests
         name: Tests macos
     - name: Upload test results to Codecov
       if: ${{ !cancelled() }}
-      uses: codecov/test-results-action@47f89e9acb64b76debcd5ea40642d25a4adced9f # v1.1.1
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
-        token: ${{ secrets.CODECOV_TOKEN }}
+        token: ${{ secrets.CODECOV_TOKEN }} # zizmor: ignore[secrets-outside-env]
+        report_type: test_results

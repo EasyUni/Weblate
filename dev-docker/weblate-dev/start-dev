@@ -6,25 +6,59 @@
 
 set -e
 
-cd /app/src
+cd "${WEBLATE_SOURCE_DIR:-/app/src}"
+
+# Docker allocates the host port when the container starts. The shared host
+# launcher delivers the domain before any application settings are imported.
+if [ -n "${WEBLATE_SITE_DOMAIN_FILE:-}" ]; then
+    remaining=120
+    while [ ! -s "$WEBLATE_SITE_DOMAIN_FILE" ]; do
+        if [ "$remaining" -eq 0 ]; then
+            echo "Application activation timed out; rerun rundev.sh restart." >&2
+            exit 1
+        fi
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+    WEBLATE_SITE_DOMAIN=$(cat "$WEBLATE_SITE_DOMAIN_FILE")
+    export WEBLATE_SITE_DOMAIN
+fi
+
+install_deps() {
+    uv pip install \
+        --no-config \
+        --no-binary xmlsec \
+        --no-binary lxml \
+        -r /tmp/requirements.txt \
+        supervisor \
+        watchfiles
+}
+
+# Prune unused uv cache entries
+uv cache prune
 
 echo "Exporting Weblate requirements..."
-uv export --no-config --format requirements-txt --python /usr/bin/python3 --all-extras > /tmp/requirements.txt
+uv export --no-config --format requirements-txt --python "python${PYVERSION}" --all-extras > /tmp/requirements.txt
 
 echo "Checking /app/venv..."
-if [ ! -f /app/venv/bin/activate ]; then
-    uv venv --no-config /app/venv
+# A named volume can outlive the image's managed Python interpreter. Recreate
+# environments from another Python minor version, including broken symlinks.
+if [ ! -f /app/venv/bin/activate ] || ! /app/venv/bin/python -c \
+    'import sys; sys.exit("%s.%s" % sys.version_info[:2] != sys.argv[1])' "$PYVERSION"; then
+    uv venv --no-config --clear --python "/usr/local/bin/python3" /app/venv
 fi
 echo "/app/data/python" > "/app/venv/lib/python${PYVERSION}/site-packages/weblate-docker.pth"
 # shellcheck disable=SC1091
 . /app/venv/bin/activate
 
 echo "Installing Weblate requirements..."
-uv pip install \
-    --no-config \
-    --no-binary xmlsec \
-    --no-binary lxml \
-    -r /tmp/requirements.txt
+install_deps
+if ! python -c "import xmlsec" 2> /dev/null; then
+    # Clean uv cache in case xmlsec (and related lxml/libxml bindings) does not work
+    # (typically caused by upgrade of underlying system or otherwise mixed up libxml versions)
+    uv cache clean
+    install_deps
+fi
 
 echo "Starting Weblate..."
 exec /app/bin/start "$@"

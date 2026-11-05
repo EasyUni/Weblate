@@ -4,84 +4,162 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
-from typing import TYPE_CHECKING
+from math import floor
+from typing import TYPE_CHECKING, TypedDict
 
+import httpx2
 import jsonschema.exceptions
-import requests
+from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.template.loader import render_to_string
-from django.utils import timezone as dj_timezone
-from django.utils.translation import gettext_lazy
-from drf_spectacular.utils import OpenApiResponse, OpenApiWebhook, extend_schema
-from standardwebhooks.webhooks import Webhook
+from django.utils import timezone
+from django.utils.translation import gettext_lazy, override
+from drf_spectacular.utils import OpenApiWebhook
 from weblate_schemas import load_schema, validate_schema
 
 from weblate.addons.base import ChangeBaseAddon
 from weblate.addons.forms import BaseWebhooksAddonForm, WebhooksAddonForm
 from weblate.trans.util import split_plural
-from weblate.utils.requests import request
+from weblate.utils.const import WEBHOOKS_SECRET_PREFIX
+from weblate.utils.requests import open_validated_url
 from weblate.utils.site import get_site_url
 from weblate.utils.views import key_name
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from datetime import datetime
+
+    from django.http import HttpRequest
+
     from weblate.addons.models import AddonActivityLog
+    from weblate.auth.models import User
     from weblate.trans.models import Change
+
+    PayloadType = Mapping[str, int | str | list["PayloadType"] | "PayloadType"]
+
+
+def standard_webhooks_sign(
+    secret: str, msg_id: str, timestamp: datetime, data: str
+) -> str:
+    # Base 64 encode the secret (without prefix if included)
+    whsecret = base64.b64decode(secret.removeprefix(WEBHOOKS_SECRET_PREFIX))
+
+    timestamp_str = str(floor(timestamp.timestamp()))
+    to_sign = f"{msg_id}.{timestamp_str}.{data}".encode()
+    signature = hmac.new(whsecret, to_sign, hashlib.sha256).digest()
+    return f"v1,{base64.b64encode(signature).decode('utf-8')}"
+
+
+MAX_WEBHOOK_RESPONSE_BODY = 1024 * 1024
+MAX_WEBHOOK_RESPONSE_HEADERS = 64 * 1024
+
+
+class WebhookResponse(TypedDict):
+    status_code: int
+    content: str
+    headers: dict[str, str]
 
 
 class MessageNotDeliveredError(Exception):
     """Exception raised when a message could not be delivered."""
 
 
+def read_webhook_response(response: httpx2.Response) -> WebhookResponse:
+    """Read a webhook response within the fixed activity-log limits."""
+    header_size = sum(
+        len(name) + len(value) + 4 for name, value in response.headers.raw
+    )
+    if header_size > MAX_WEBHOOK_RESPONSE_HEADERS:
+        msg = "Unable to deliver webhook: response headers exceed 64 KiB."
+        raise MessageNotDeliveredError(msg)
+
+    # Reject compression before HTTPX can allocate decoded response data.
+    if (
+        response.headers.get("Content-Encoding", "identity").strip().lower()
+        != "identity"
+    ):
+        msg = "Unable to deliver webhook: encoded response bodies are not supported."
+        raise MessageNotDeliveredError(msg)
+
+    content = bytearray()
+    for chunk in response.iter_bytes():
+        if len(content) + len(chunk) > MAX_WEBHOOK_RESPONSE_BODY:
+            msg = "Unable to deliver webhook: response body exceeds 1 MiB."
+            raise MessageNotDeliveredError(msg)
+        content.extend(chunk)
+
+    # Retain HTTPX's charset handling for the bounded response body.
+    decoded = httpx2.Response(
+        response.status_code,
+        content=bytes(content),
+        headers={"Content-Type": response.headers.get("Content-Type", "")},
+    )
+    return {
+        "status_code": response.status_code,
+        "content": decoded.text,
+        "headers": dict(response.headers),
+    }
+
+
 class JSONWebhookBaseAddon(ChangeBaseAddon):
     icon = "webhook.svg"
+    multiple = True
 
-    def build_webhook_payload(self, change: Change) -> dict[str, int | str | list]:
+    def build_webhook_payload(self, change: Change) -> PayloadType:
         raise NotImplementedError
 
-    def build_headers(
-        self, change: Change, payload: dict[str, int | str | list]
-    ) -> dict[str, str]:
+    def build_headers(self, change: Change, payload: PayloadType) -> dict[str, str]:
         return {}
 
     def render_activity_log(self, activity: AddonActivityLog) -> str:
         return render_to_string(
             "addons/webhook_log.html",
-            {"activity": activity, "details": activity.details["result"]},
+            {"activity": activity, "details": activity.details.get("result")},
         )
 
     def send_message(
-        self, change: Change, headers: dict, payload: dict[str, int | str | list[str]]
-    ) -> requests.Response:
+        self, change: Change, headers: dict, payload: PayloadType
+    ) -> WebhookResponse:
+        request_headers = httpx2.Headers(headers)
+        request_headers["Accept-Encoding"] = "identity"
         try:
-            return request(
+            with open_validated_url(
                 method="post",
                 url=self.instance.configuration["webhook_url"],
                 json=payload,
-                headers=headers,
+                headers=request_headers,
                 timeout=15,
                 raise_for_status=False,
-            )
-        except requests.exceptions.ConnectionError as error:
-            raise MessageNotDeliveredError from error
+                allow_private_targets=not settings.WEBHOOK_RESTRICT_PRIVATE,
+                private_allowlist=settings.WEBHOOK_PRIVATE_ALLOWLIST,
+            ) as response:
+                return read_webhook_response(response)
+        except ValidationError as error:
+            raise MessageNotDeliveredError("; ".join(error.messages)) from error
+        except httpx2.TransportError as error:
+            msg = "Unable to deliver webhook: could not connect to the remote server."
+            raise MessageNotDeliveredError(msg) from error
 
-    def change_event(self, change: Change) -> dict | None:
+    def change_event(
+        self, change: Change, activity_log_id: int | None = None
+    ) -> dict | None:
         """Deliver notification message."""
-        config = self.instance.configuration
-        events = {int(event) for event in config["events"]}
-        if change.action in events:
+        with override("en"):
             payload = self.build_webhook_payload(change)
             headers = self.build_headers(change, payload)
             response = self.send_message(change, headers, payload)
 
             return {
-                "request": {"headers": headers, "payload": payload},
-                "response": {
-                    "status_code": response.status_code,
-                    "content": response.text,
-                    "headers": dict(response.headers),
+                "request": {
+                    "headers": headers,
+                    "payload": payload,
                 },
+                "response": response,
             }
-        return None
 
 
 class WebhookAddon(JSONWebhookBaseAddon):
@@ -92,10 +170,24 @@ class WebhookAddon(JSONWebhookBaseAddon):
     description = gettext_lazy(
         "Sends notifications to external services based on selected events, following the Standard Webhooks specification."
     )
+    version_added = "5.11"
+    versions_changed = (
+        (
+            "5.15",
+            "Compliance of the secret length with the specification is now validated.",
+        ),
+    )
 
     settings_form = WebhooksAddonForm
 
-    def build_webhook_payload(self, change: Change) -> dict[str, int | str | list]:
+    def get_integration_instructions(
+        self, user: User, request: HttpRequest | None = None
+    ) -> str:
+        return render_to_string(
+            "addons/webhook_integration.html", {"addon": self, "user": user}
+        )
+
+    def build_webhook_payload(self, change: Change) -> PayloadType:
         """Build a Schema-valid payload from change event."""
         data: dict[str, int | str | list] = {
             "change_id": change.id,
@@ -108,6 +200,7 @@ class WebhookAddon(JSONWebhookBaseAddon):
             data["old"] = split_plural(change.old)
         if change.unit:
             data["source"] = split_plural(change.unit.source)
+            data["context"] = change.unit.context
         if url := change.get_absolute_url():
             data["url"] = url
         if change.author:
@@ -130,20 +223,21 @@ class WebhookAddon(JSONWebhookBaseAddon):
         self.validate_payload(data)
         return data
 
-    def build_headers(
-        self, change: Change, payload: dict[str, int | str | list]
-    ) -> dict[str, str]:
+    def build_headers(self, change: Change, payload: PayloadType) -> dict[str, str]:
         """Build headers following Standard Webhooks specifications."""
         webhook_id = change.get_uuid().hex
-        attempt_time = dj_timezone.now()
+        attempt_time = timezone.now()
         headers: dict[str, str] = {
             "webhook-timestamp": str(attempt_time.timestamp()),
             "webhook-id": webhook_id,
             "webhook-signature": "",
         }
         if secret := self.instance.configuration.get("secret", ""):
-            headers["webhook-signature"] = Webhook(secret).sign(
-                webhook_id, attempt_time, json.dumps(payload)
+            headers["webhook-signature"] = standard_webhooks_sign(
+                secret,
+                webhook_id,
+                attempt_time,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             )
 
         return headers
@@ -160,15 +254,34 @@ class WebhookAddon(JSONWebhookBaseAddon):
 
 change_event_webhook = OpenApiWebhook(
     name="AddonWebhook",
-    decorator=extend_schema(
-        summary="A Webhook event for an addon",
-        description="Pushes events to a notification URL.",
-        tags=["webhooks", "addons"],
-        request={"application/json": load_schema("weblate-messaging.schema.json")},
-        responses={
-            "2XX": OpenApiResponse(),
+    # The receiver is not a DRF view. A raw operation keeps API error examples
+    # from being attached to the outgoing webhook request by our AutoSchema.
+    decorator={
+        "post": {
+            "operationId": "addon_webhook_event",
+            "summary": "A webhook event for an add-on",
+            "description": "Pushes events to a notification URL.",
+            "tags": ["webhooks", "addons"],
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": load_schema("weblate-messaging.schema.json"),
+                        "examples": {
+                            "TranslationChanged": {
+                                "summary": "Translation changed",
+                                "value": {
+                                    "change_id": 123,
+                                    "action": "Translation changed",
+                                    "timestamp": "2026-01-01T00:00:00Z",
+                                },
+                            }
+                        },
+                    }
+                }
+            },
+            "responses": {"2XX": {"description": "No response body"}},
         },
-    ),
+    },
 )
 
 
@@ -180,36 +293,45 @@ class SlackWebhookAddon(JSONWebhookBaseAddon):
     )
     icon = "slack.svg"
     settings_form = BaseWebhooksAddonForm
+    version_added = "5.12"
 
-    def build_webhook_payload(self, change: Change) -> dict[str, int | str | list]:
+    def get_integration_instructions(
+        self, user: User, request: HttpRequest | None = None
+    ) -> str:
+        return render_to_string(
+            "addons/slack_integration.html", {"addon": self, "user": user}
+        )
+
+    def build_webhook_payload(self, change: Change) -> PayloadType:
         message_header = ""
         if change.path_object:
-            message_header += key_name(change.path_object) + " - "
+            message_header += f"{key_name(change.path_object)} - "
         message_header += change.get_action_display()
-        payload: dict[str, list] = {
+        return {
             "blocks": [
                 {
                     "type": "header",
-                    "text": {"type": "plain_text", "text": message_header},
+                    "text": {
+                        "type": "plain_text",
+                        "text": message_header,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "plain_text",
+                        "text": str(change.get_details_display(trusted=True))
+                        or "No details",
+                    },
+                    "accessory": {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "View",
+                        },
+                        "value": "view-change",
+                        "url": get_site_url(change.get_absolute_url()),
+                    },
                 },
             ]
         }
-
-        change_details = change.get_details_display() or "No details"
-
-        payload["blocks"].append(
-            {
-                "type": "section",
-                "text": {"type": "plain_text", "text": change_details},
-                "accessory": {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "View",
-                    },
-                    "value": "view-change",
-                    "url": get_site_url(change.get_absolute_url()),
-                },
-            }
-        )
-        return payload

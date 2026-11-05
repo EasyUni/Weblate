@@ -6,17 +6,53 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TYPE_CHECKING, ClassVar
 
 from django import forms
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext, gettext_lazy, pgettext_lazy
 
+from weblate.lang.forms import validate_language_code
+from weblate.lang.models import Language
 from weblate.utils.forms import WeblateServiceURLField
+from weblate.utils.validators import validate_machinery_hostname, validate_machinery_url
 
 from .types import SourceLanguageChoices
 
+if TYPE_CHECKING:
+    from django_stubs_ext import StrOrPromise
+
+LLM_LANGUAGE_INSTRUCTION_LENGTH = 1000
+MICROSOFT_REGION_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+ETRANSLATION_DOMAIN_LABELS = {
+    "GEN": pgettext_lazy("eTranslation domain", "General Text (GEN)"),
+    "SPD": pgettext_lazy("eTranslation domain", "EU Formal Language (SPD)"),
+    "ECB": pgettext_lazy("eTranslation domain", "Finance (ECB)"),
+    "ECJ": pgettext_lazy("eTranslation domain", "European Court of Justice (ECJ)"),
+    "IPO": pgettext_lazy(
+        "eTranslation domain", "EIP Case Law (Intellectual Property) (IPO)"
+    ),
+    "QE": pgettext_lazy("eTranslation domain", "Quality Estimation (QE)"),
+}
+
+
+class EmptyMappingJSONField(forms.JSONField):
+    def prepare_value(self, value):
+        if value is None or value == {}:
+            return ""
+        return super().prepare_value(value)
+
 
 class BaseMachineryForm(forms.Form):
+    # Explicitly opt in safe summary fields. Credentials, URLs (which can contain
+    # credentials), and free-form prompts must never be included.
+    public_configuration_fields: ClassVar[frozenset[str]] = frozenset(
+        {"source_language"}
+    )
+
+    network_host_fields = frozenset({"base_url", "endpoint_url"})
+
     source_language = forms.ChoiceField(
         label=pgettext_lazy(
             "Automatic suggestion service configuration", "Source language selection"
@@ -26,22 +62,97 @@ class BaseMachineryForm(forms.Form):
         required=False,
     )
 
-    def __init__(self, machinery, *args, **kwargs) -> None:
+    def __init__(
+        self, machinery, *args, allow_private_targets: bool = True, **kwargs
+    ) -> None:
         self.machinery = machinery
+        self.allow_private_targets = allow_private_targets
         super().__init__(*args, **kwargs)
+
+    def get_settings_fields(self) -> list[tuple[StrOrPromise, StrOrPromise]]:
+        """Describe saved, non-sensitive settings without validating or contacting the provider."""
+        result = []
+        for field in self:
+            if field.name not in self.public_configuration_fields or field.is_hidden:
+                continue
+            value = field.value()
+            if value is None or (isinstance(value, str) and not value):
+                continue
+            if isinstance(value, bool):
+                value = gettext("enabled") if value else gettext("disabled")
+            elif choices := getattr(field.field.widget, "choices", None):
+                value = dict(choices).get(value, value)
+            result.append((field.label, value))
+        return result
 
     def serialize_form(self):
         return self.cleaned_data
 
-    def clean(self) -> None:
-        settings = self.serialize_form()
+    @staticmethod
+    def is_private_target_error(error: ValidationError | BaseException | None) -> bool:
+        """Check whether validation failed because the target is private."""
+        if error is None:
+            return False
+        if isinstance(error, ValidationError):
+            if hasattr(error, "error_dict"):
+                return any(
+                    item.code == "private_target"
+                    for errors in error.error_dict.values()
+                    for item in errors
+                ) or BaseMachineryForm.is_private_target_error(error.__cause__)
+            if any(item.code == "private_target" for item in error.error_list):
+                return True
+            return BaseMachineryForm.is_private_target_error(error.__cause__)
+        return BaseMachineryForm.is_private_target_error(error.__cause__)
+
+    @staticmethod
+    def get_private_target_error() -> ValidationError:
+        if settings.OFFER_HOSTING:
+            message = gettext(
+                "Project-level machine translation cannot use internal or non-public addresses."
+            )
+        else:
+            message = gettext(
+                "Project-level machine translation cannot use internal or non-public addresses. Contact the site administrator if this service should be configured site-wide or allowlisted."
+            )
+        return ValidationError(message)
+
+    def validate_configuration(self) -> None:
+        configuration = self.serialize_form()
         for field, data in self.fields.items():
             if not data.required:
                 continue
-            if field not in settings:
+            if field not in configuration:
                 return
-        machinery = self.machinery(settings)
+        self.validate_endpoint_fields(configuration)
+        if not self.allow_private_targets:
+            configuration = {**configuration, "_project": True}
+        machinery = self.machinery(configuration)
         machinery.validate_settings()
+
+    def clean(self) -> None:
+        if self.errors:
+            return
+        try:
+            self.validate_configuration()
+        except ValidationError as error:
+            if not self.allow_private_targets and self.is_private_target_error(error):
+                raise self.get_private_target_error() from error
+            raise
+
+    def validate_endpoint_fields(self, configuration) -> None:
+        for field_name, field in self.fields.items():
+            value = configuration.get(field_name)
+            if value is None or (isinstance(value, str) and not value):
+                continue
+            if isinstance(field, WeblateServiceURLField):
+                validate_machinery_url(
+                    value, allow_private_targets=self.allow_private_targets
+                )
+            elif field_name in self.network_host_fields and isinstance(value, str):
+                validate_machinery_hostname(
+                    value, allow_private_targets=self.allow_private_targets
+                )
 
 
 class KeyMachineryForm(BaseMachineryForm):
@@ -71,6 +182,105 @@ class KeyURLMachineryForm(KeyMachineryForm, URLMachineryForm):
     pass
 
 
+class ETranslationMachineryForm(KeySecretMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "domain",
+        "other_domain",
+    }
+
+    DOCUMENTED_DOMAINS = ("GEN", "SPD", "ECB", "ECJ", "IPO")
+    OTHER_DOMAIN = "_OTHER"
+
+    key = forms.CharField(
+        label=pgettext_lazy("eTranslation configuration", "Application name"),
+    )
+    secret = forms.CharField(
+        label=pgettext_lazy("eTranslation configuration", "Password"),
+    )
+    domain = forms.ChoiceField(
+        label=pgettext_lazy("eTranslation configuration", "Default language domain"),
+        initial="GEN",
+        choices=(
+            *((code, ETRANSLATION_DOMAIN_LABELS[code]) for code in DOCUMENTED_DOMAINS),
+            (
+                OTHER_DOMAIN,
+                pgettext_lazy("eTranslation domain", "Other domain code"),
+            ),
+        ),
+    )
+    other_domain = forms.CharField(
+        label=pgettext_lazy("eTranslation configuration", "Other domain code"),
+        required=False,
+        help_text=gettext_lazy(
+            "Enter a domain code from eTranslation when selecting Other domain code."
+        ),
+    )
+    component_domains = EmptyMappingJSONField(
+        label=pgettext_lazy("eTranslation configuration", "Component language domains"),
+        widget=forms.Textarea,
+        required=False,
+        help_text=gettext_lazy(
+            "JSON object mapping full component paths to domain codes, for example "
+            '{"my-project/privacy-policy": "SPD"}.'
+        ),
+    )
+
+    def __init__(self, machinery, *args, **kwargs) -> None:
+        initial = kwargs.get("initial")
+        if initial and (domain := initial.get("domain")) not in self.DOCUMENTED_DOMAINS:
+            kwargs["initial"] = {
+                **initial,
+                "domain": self.OTHER_DOMAIN,
+                "other_domain": domain,
+            }
+        super().__init__(machinery, *args, **kwargs)
+        if (
+            self.is_bound
+            and isinstance(domain := self.data.get("domain"), str)
+            and domain not in {*self.DOCUMENTED_DOMAINS, self.OTHER_DOMAIN}
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,31}", domain)
+        ):
+            self.data = self.data.copy()
+            self.data["domain"] = self.OTHER_DOMAIN
+            self.data["other_domain"] = domain
+
+    def clean(self) -> None:
+        if self.cleaned_data.get("domain") == self.OTHER_DOMAIN:
+            domain = self.cleaned_data.get("other_domain", "").strip().upper()
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,31}", domain):
+                self.add_error(
+                    "other_domain", gettext("Invalid eTranslation domain code.")
+                )
+            else:
+                self.cleaned_data["domain"] = domain
+        self.cleaned_data.pop("other_domain", None)
+        super().clean()
+
+    def clean_component_domains(self) -> dict[str, str]:
+        value = self.cleaned_data["component_domains"]
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValidationError(
+                gettext("Component language domains must be a JSON object.")
+            )
+        result = {}
+        for path, domain in value.items():
+            if (
+                not isinstance(path, str)
+                or len(path) > 500
+                or len(path.split("/")) < 2
+                or any(not part or part in {".", ".."} for part in path.split("/"))
+                or not isinstance(domain, str)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,31}", domain)
+            ):
+                raise ValidationError(
+                    gettext("Invalid component path or eTranslation domain code.")
+                )
+            result[path] = domain.upper()
+        return result
+
+
 class LibreTranslateMachineryForm(KeyURLMachineryForm):
     key = forms.CharField(
         label=pgettext_lazy("Automatic suggestion service configuration", "API key"),
@@ -96,6 +306,11 @@ class MyMemoryMachineryForm(BaseMachineryForm):
 
 
 class SAPMachineryForm(URLMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "enable_mt",
+        "domain",
+    }
+
     key = forms.CharField(
         label=pgettext_lazy("Automatic suggestion service configuration", "API key"),
         required=False,
@@ -144,6 +359,11 @@ class SAPMachineryForm(URLMachineryForm):
 
 
 class MicrosoftMachineryForm(KeyMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "region",
+        "category",
+    }
+
     base_url = forms.ChoiceField(
         label=pgettext_lazy(
             "Automatic suggestion service configuration", "Application base URL"
@@ -192,8 +412,19 @@ class MicrosoftMachineryForm(KeyMachineryForm):
         required=False,
     )
 
+    def clean_region(self) -> str:
+        region = self.cleaned_data["region"]
+        if region and MICROSOFT_REGION_RE.fullmatch(region) is None:
+            raise ValidationError(gettext("Enter a valid Azure region name."))
+        return region
+
 
 class GoogleV3MachineryForm(BaseMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "project",
+        "location",
+    }
+
     credentials = forms.CharField(
         label=pgettext_lazy(
             "Automatic suggestion service configuration",
@@ -225,8 +456,8 @@ class GoogleV3MachineryForm(BaseMachineryForm):
         ),
         widget=forms.Select(
             choices=(
-                ("global ", pgettext_lazy("Google Cloud region", "Global")),
-                ("europe-west1 ", pgettext_lazy("Google Cloud region", "Europe")),
+                ("global", pgettext_lazy("Google Cloud region", "Global")),
+                ("europe-west1", pgettext_lazy("Google Cloud region", "Europe")),
                 ("us-west1", pgettext_lazy("Google Cloud region", "US")),
             )
         ),
@@ -253,6 +484,13 @@ class GoogleV3MachineryForm(BaseMachineryForm):
 
 
 class AWSMachineryForm(KeySecretMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "region",
+        "formality",
+        "brevity",
+        "profanity",
+    }
+
     key = forms.CharField(
         label=pgettext_lazy("AWS Translate configuration", "Access key ID")
     )
@@ -262,9 +500,40 @@ class AWSMachineryForm(KeySecretMachineryForm):
     region = forms.CharField(
         label=pgettext_lazy("AWS Translate configuration", "Region name")
     )
+    formality = forms.ChoiceField(
+        label=pgettext_lazy("AWS Translate configuration", "Formality"),
+        required=False,
+        choices=(
+            ("", pgettext_lazy("AWS Translate configuration", "Default")),
+            ("FORMAL", pgettext_lazy("AWS Translate configuration", "Formal")),
+            ("INFORMAL", pgettext_lazy("AWS Translate configuration", "Informal")),
+        ),
+    )
+    brevity = forms.ChoiceField(
+        label=pgettext_lazy("AWS Translate configuration", "Brevity"),
+        required=False,
+        help_text=gettext_lazy("Prefer shorter translations when supported."),
+        choices=(
+            ("", pgettext_lazy("AWS Translate configuration", "Default")),
+            ("ON", pgettext_lazy("AWS Translate configuration", "Enabled")),
+        ),
+    )
+    profanity = forms.ChoiceField(
+        label=pgettext_lazy("AWS Translate configuration", "Profanity"),
+        required=False,
+        help_text=gettext_lazy("Mask profane words in translated text."),
+        choices=(
+            ("", pgettext_lazy("AWS Translate configuration", "Default")),
+            ("MASK", pgettext_lazy("AWS Translate configuration", "Mask profanity")),
+        ),
+    )
 
 
 class AlibabaMachineryForm(KeySecretMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "region"
+    }
+
     key = forms.CharField(
         label=pgettext_lazy("Alibaba Translate configuration", "Access key ID")
     )
@@ -309,9 +578,14 @@ class ModernMTMachineryForm(KeyURLMachineryForm):
 
 
 class DeepLMachineryForm(KeyURLMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "formality",
+        "next_gen",
+    }
+
     url = WeblateServiceURLField(
         label=pgettext_lazy("Automatic suggestion service configuration", "API URL"),
-        initial="https://api.deepl.com/v2/",
+        initial="https://api.deepl.com/",
     )
     formality = forms.CharField(
         label=pgettext_lazy("Automatic suggestion service configuration", "Formality"),
@@ -320,7 +594,7 @@ class DeepLMachineryForm(KeyURLMachineryForm):
         ),
         widget=forms.Select(
             choices=(
-                ("default ", "Default"),
+                ("default", "Default"),
                 ("prefer_more", "Formal"),
                 ("prefer_less", "Informal"),
             )
@@ -351,7 +625,22 @@ class DeepLMachineryForm(KeyURLMachineryForm):
     )
 
 
-class BaseOpenAIMachineryForm(KeyMachineryForm):
+class LLMBasicMachineryForm(BaseMachineryForm):
+    public_configuration_fields = BaseMachineryForm.public_configuration_fields | {
+        "model"
+    }
+
+    base_url = WeblateServiceURLField(
+        label=pgettext_lazy("Automatic suggestion service configuration", "API URL"),
+        required=False,
+    )
+    model = forms.CharField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "LLM model",
+        ),
+        required=False,
+    )
     persona = forms.CharField(
         label=pgettext_lazy(
             "Automatic suggestion service configuration",
@@ -359,40 +648,118 @@ class BaseOpenAIMachineryForm(KeyMachineryForm):
         ),
         widget=forms.Textarea,
         help_text=gettext_lazy(
-            "Describe the persona of translator to improve the accuracy of the translation. For example: “You are a squirrel breeder.”"
+            "Describe the translator’s role or expertise. For example: “You are an experienced medical translator.”"
         ),
         required=False,
     )
     style = forms.CharField(
         label=pgettext_lazy(
             "Automatic suggestion service configuration",
-            "Translator style",
+            "Translation style",
         ),
         widget=forms.Textarea,
         help_text=gettext_lazy(
-            "Describe the style of translation. For example: “Use informal language.”"
+            "Describe the desired translation style. For example: “Use informal language.”"
+        ),
+        required=False,
+    )
+    language_instructions = EmptyMappingJSONField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Language-specific instructions",
+        ),
+        widget=forms.Textarea,
+        help_text=(
+            gettext_lazy(
+                'Enter a JSON object mapping target language codes recognized by Weblate to additional translation instructions. Each instruction can contain up to %(limit)d characters. For example: {"de": "Use formal address."}'
+            )
+            % {"limit": LLM_LANGUAGE_INSTRUCTION_LENGTH}
         ),
         required=False,
     )
 
+    def clean_language_instructions(self) -> dict[str, str]:
+        value = self.cleaned_data["language_instructions"]
+        if value is None or (isinstance(value, str) and not value):
+            return {}
+        if not isinstance(value, dict):
+            raise ValidationError(
+                gettext("Language-specific instructions must be a JSON object.")
+            )
+
+        result: dict[str, str] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not isinstance(item, str):
+                raise ValidationError(
+                    gettext("Language-specific instructions must be a JSON object.")
+                )
+
+            language = key
+            try:
+                validate_language_code(language)
+            except ValidationError as error:
+                raise ValidationError(
+                    gettext(
+                        'Language-specific instructions contain invalid language code "%s".'
+                    )
+                    % language
+                ) from error
+
+            if Language.objects.fuzzy_get_strict(language) is None:
+                raise ValidationError(
+                    gettext(
+                        'Language-specific instructions contain unknown language code "%s".'
+                    )
+                    % language
+                )
+
+            instruction = item.strip()
+            if len(instruction) > LLM_LANGUAGE_INSTRUCTION_LENGTH:
+                raise ValidationError(
+                    gettext(
+                        'Language-specific instructions for "%(language)s" must be at most %(limit)d characters.'
+                    )
+                    % {
+                        "language": language,
+                        "limit": LLM_LANGUAGE_INSTRUCTION_LENGTH,
+                    }
+                )
+
+            if instruction:
+                result[language] = instruction
+        return result
+
+
+class BaseOpenAIMachineryForm(KeyMachineryForm, LLMBasicMachineryForm):
+    public_configuration_fields = LLMBasicMachineryForm.public_configuration_fields | {
+        "custom_model"
+    }
+
 
 class OpenAIMachineryForm(BaseOpenAIMachineryForm):
-    # Ordering choices here defines priority for automatic selection
+    # Ordering defines automatic selection priority. Prefer current general-purpose
+    # models that balance translation quality, latency, and price instead of
+    # optimizing for price alone. Keep legacy compatibility choices last.
     MODEL_CHOICES = (
         ("auto", pgettext_lazy("OpenAI model selection", "Automatic selection")),
-        ("gpt-5-nano", "GPT-5-nano"),
-        ("gpt-5-mini", "GPT-5-mini"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+        ("gpt-5.4-mini", "GPT-5.4 mini"),
+        ("gpt-5-mini", "GPT-5 mini"),
+        ("gpt-5.4-nano", "GPT-5.4 nano"),
+        ("gpt-5-nano", "GPT-5 nano"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.4", "GPT-5.4"),
         ("gpt-5", "GPT-5"),
-        ("gpt-4.1-nano", "GPT-4.1-nano"),
-        ("gpt-4.1-mini", "GPT-4.1-mini"),
-        ("gpt-4.1", "GPT-4.1"),
+        ("gpt-5.6", "GPT-5.6 Sol"),
+        ("gpt-5.5", "GPT-5.5"),
+        ("gpt-4.1-mini", "GPT-4.1 mini"),
         ("gpt-4o-mini", "GPT-4o mini"),
+        ("gpt-4.1-nano", "GPT-4.1 nano"),
+        ("gpt-4.1", "GPT-4.1"),
         ("gpt-4o", "GPT-4o"),
-        ("o3-mini", "o3-mini"),
-        ("o3", "o3"),
-        ("o1-mini", "o1-mini"),
-        ("o1", "o1"),
-        ("o1-pro", "o1-pro"),
+        ("gpt-4-turbo", "GPT-4 Turbo"),
+        ("gpt-4", "GPT-4"),
+        ("gpt-3.5-turbo", "GPT-3.5 Turbo"),
         ("custom", pgettext_lazy("OpenAI model selection", "Custom model")),
     )
     base_url = WeblateServiceURLField(
@@ -411,6 +778,9 @@ class OpenAIMachineryForm(BaseOpenAIMachineryForm):
             "Automatic suggestion service configuration",
             "OpenAI model",
         ),
+        help_text=gettext_lazy(
+            "With ‘Automatic selection’, Weblate selects the first model available through the API from its predefined preference list."
+        ),
         initial="auto",
         choices=MODEL_CHOICES,
     )
@@ -419,7 +789,9 @@ class OpenAIMachineryForm(BaseOpenAIMachineryForm):
             "OpenAI model selection",
             "Custom model name",
         ),
-        help_text=gettext_lazy("Only needed when model is set to 'Custom model'"),
+        help_text=gettext_lazy(
+            "Required when ‘Custom model’ is selected. Enter the model identifier used by the API."
+        ),
         required=False,
     )
 
@@ -438,7 +810,73 @@ class OpenAIMachineryForm(BaseOpenAIMachineryForm):
         super().clean()
 
 
+class MistralMachineryForm(BaseOpenAIMachineryForm):
+    # Ordering defines automatic selection priority. Prefer current general-purpose
+    # models that balance translation quality, latency, and price instead of
+    # optimizing for price alone.
+    MODEL_CHOICES = (
+        ("auto", pgettext_lazy("Mistral model selection", "Automatic selection")),
+        ("mistral-small-latest", "Mistral Small 4"),
+        ("ministral-14b-latest", "Ministral 3 14B"),
+        ("ministral-8b-latest", "Ministral 3 8B"),
+        ("ministral-3b-latest", "Ministral 3 3B"),
+        ("mistral-large-latest", "Mistral Large 3"),
+        ("mistral-medium-latest", "Mistral Medium 3.5"),
+        ("custom", pgettext_lazy("Mistral model selection", "Custom model")),
+    )
+    base_url = WeblateServiceURLField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Mistral API base URL",
+        ),
+        widget=forms.TextInput,
+        help_text=gettext_lazy(
+            "Base URL of the Mistral API, if it differs from the Mistral default URL"
+        ),
+        required=False,
+    )
+    model = forms.ChoiceField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Mistral model",
+        ),
+        help_text=gettext_lazy(
+            "With ‘Automatic selection’, Weblate selects the first model available through the API from its predefined preference list."
+        ),
+        initial="auto",
+        choices=MODEL_CHOICES,
+    )
+    custom_model = forms.CharField(
+        label=pgettext_lazy(
+            "Mistral model selection",
+            "Custom model name",
+        ),
+        help_text=gettext_lazy(
+            "Required when ‘Custom model’ is selected. Enter the model identifier used by the API."
+        ),
+        required=False,
+    )
+
+    def clean(self) -> None:
+        """Validate custom_model and model fields."""
+        has_custom_model = bool(self.cleaned_data.get("custom_model"))
+        model = self.cleaned_data.get("model")
+        if model == "custom" and not has_custom_model:
+            raise ValidationError(
+                {"custom_model": gettext("Missing custom model name.")}
+            )
+        if model != "custom" and has_custom_model:
+            raise ValidationError(
+                {"model": gettext("Choose custom model here to enable it.")}
+            )
+        super().clean()
+
+
 class AzureOpenAIMachineryForm(BaseOpenAIMachineryForm):
+    public_configuration_fields = (
+        BaseOpenAIMachineryForm.public_configuration_fields | {"deployment"}
+    )
+
     azure_endpoint = WeblateServiceURLField(
         label=pgettext_lazy(
             "Automatic suggestion service configuration",
@@ -457,3 +895,93 @@ class AzureOpenAIMachineryForm(BaseOpenAIMachineryForm):
         widget=forms.TextInput,
         help_text=gettext_lazy("The model's unique deployment name."),
     )
+
+
+class OllamaMachineryForm(LLMBasicMachineryForm):
+    base_url = WeblateServiceURLField(
+        label=pgettext_lazy("Automatic suggestion service configuration", "API URL"),
+        help_text=gettext_lazy(
+            "Base URL of the Ollama API, reachable from the Weblate server. The default is http://localhost:11434; localhost refers to the environment where Weblate runs."
+        ),
+        initial="http://localhost:11434",
+    )
+    model = forms.CharField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Ollama model",
+        ),
+        help_text=gettext_lazy("Name of the model described in Ollama catalogue."),
+        initial="llama3.2:3b",
+    )
+
+
+class AnthropicMachineryForm(KeyMachineryForm, LLMBasicMachineryForm):
+    public_configuration_fields = LLMBasicMachineryForm.public_configuration_fields | {
+        "custom_model",
+        "max_tokens",
+    }
+
+    # Current models are ordered from cheapest to most expensive. Previously offered
+    # legacy models remain available until retirement for configuration compatibility.
+    MODEL_CHOICES = (
+        ("claude-haiku-4-5", "Claude Haiku 4.5"),
+        ("claude-sonnet-5", "Claude Sonnet 5"),
+        ("claude-opus-5", "Claude Opus 5"),
+        ("claude-fable-5-1", "Claude Fable 5.1"),
+        ("claude-opus-4-8", "Claude Opus 4.8"),
+        ("claude-fable-5", "Claude Fable 5"),
+        ("custom", pgettext_lazy("Anthropic model selection", "Custom model")),
+    )
+    base_url = WeblateServiceURLField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Anthropic API URL",
+        ),
+        help_text=gettext_lazy(
+            "Base URL of the Anthropic API. Leave empty to use the default URL."
+        ),
+        initial="https://api.anthropic.com",
+        required=False,
+    )
+    model = forms.ChoiceField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Anthropic model",
+        ),
+        initial="claude-haiku-4-5",
+        choices=MODEL_CHOICES,
+    )
+    custom_model = forms.CharField(
+        label=pgettext_lazy(
+            "Anthropic model selection",
+            "Custom model name",
+        ),
+        help_text=gettext_lazy(
+            "Required when ‘Custom model’ is selected. Enter the model identifier used by the API."
+        ),
+        required=False,
+    )
+    max_tokens = forms.IntegerField(
+        label=pgettext_lazy(
+            "Automatic suggestion service configuration",
+            "Max tokens",
+        ),
+        help_text=gettext_lazy("Maximum number of tokens in the generated response."),
+        initial=4096,
+        min_value=1,
+        max_value=64000,
+    )
+
+    def clean(self) -> None:
+        """Validate custom_model and model fields."""
+        has_custom_model = bool(self.cleaned_data.get("custom_model"))
+        model = self.cleaned_data.get("model")
+        if model == "custom" and not has_custom_model:
+            raise ValidationError(
+                {"custom_model": gettext("Missing custom model name.")}
+            )
+        if model != "custom" and has_custom_model:
+            raise ValidationError(
+                {"model": gettext("Choose custom model here to enable it.")}
+            )
+        super().clean()

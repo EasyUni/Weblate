@@ -4,24 +4,98 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from django.conf import settings
 from django.contrib.syndication.views import Feed
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
+from django.utils.cache import add_never_cache_headers
 from django.utils.translation import gettext
 
+from weblate.accounts.visibility import (
+    prepare_contributor_visibility,
+    public_profile_render,
+)
 from weblate.lang.models import Language
 from weblate.trans.models import Change, Component, Project, Translation, Unit
+from weblate.utils.site import get_site_url
 from weblate.utils.stats import ProjectLanguage
 from weblate.utils.views import parse_path
 
 if TYPE_CHECKING:
+    from django.contrib.auth.models import AnonymousUser
+    from django.http import HttpRequest, HttpResponse
+    from django.utils.feedgenerator import SyndicationFeed
+
     from weblate.auth.models import AuthenticatedHttpRequest, User
 
 
-class ChangesFeed(Feed):
+type FeedObject = Translation | Component | Project | Language | Unit | ProjectLanguage
+
+
+_feed_viewer: ContextVar[User | AnonymousUser | None] = ContextVar(
+    "contribution_feed_viewer", default=None
+)
+
+
+@dataclass(frozen=True)
+class ChangeFeedScope:
+    user: User
+    obj: FeedObject
+
+
+def get_change_feed_guid(change: Change) -> str:
+    return get_site_url(reverse("show_change", kwargs={"pk": change.pk}))
+
+
+def get_change_feed_description(item: Change) -> str:
+    return gettext("%(action)s at %(time)s on %(translation)s") % {
+        "action": item.get_action_display(),
+        "time": item.timestamp,
+        "translation": item.translation
+        or item.component
+        or item.project
+        or item.workspace,
+    }
+
+
+class BaseFeed(Feed):
+    def __call__(self, request, *args, **kwargs) -> HttpResponse:
+        response = super().__call__(request, *args, **kwargs)
+        add_never_cache_headers(response)
+        return response
+
+    @public_profile_render()
+    def get_feed(self, obj: object, request: HttpRequest) -> SyndicationFeed:
+        token = _feed_viewer.set(request.user)
+        try:
+            return super().get_feed(obj, request)
+        finally:
+            _feed_viewer.reset(token)
+
+    def item_title(self, item):
+        return item.get_action_display()
+
+    def item_description(self, item):
+        return get_change_feed_description(item)
+
+    def item_author_name(self, item):
+        return item.get_user_display(False, viewer=_feed_viewer.get())
+
+    def item_pubdate(self, item):
+        return item.timestamp
+
+    def item_guid(self, item):
+        return get_change_feed_guid(item)
+
+    def item_guid_is_permalink(self, item) -> bool:
+        return False
+
+
+class ChangesFeed(BaseFeed):
     """Generic RSS feed for Weblate changes."""
 
     def get_object(self, request: AuthenticatedHttpRequest, *args, **kwargs) -> User:
@@ -41,48 +115,65 @@ class ChangesFeed(Feed):
         return reverse("home")
 
     def items(self, obj):
-        return Change.objects.last_changes(obj).recent()
-
-    def item_title(self, item):
-        return item.get_action_display()
-
-    def item_description(self, item):
-        return str(item)
-
-    def item_author_name(self, item):
-        return item.get_user_display(False)
-
-    def item_pubdate(self, item):
-        return item.timestamp
+        changes = Change.objects.last_changes(obj).recent()
+        prepare_contributor_visibility(obj, changes)
+        return changes
 
 
-class TranslationChangesFeed(ChangesFeed):
+class ObjectChangesFeed(BaseFeed):
+    def title(self, scope: ChangeFeedScope):
+        # Translators: %s is translation name
+        return gettext("Recent changes in %s") % scope.obj
+
+    def description(self, scope: ChangeFeedScope):
+        # Translators: %s is translation name
+        return gettext("All recent changes made using Weblate in %s.") % scope.obj
+
+    def link(self, scope: ChangeFeedScope):
+        return scope.obj.get_absolute_url()
+
+    def items(self, scope: ChangeFeedScope):
+        obj = scope.obj
+        if isinstance(obj, Translation):
+            changes = Change.objects.last_changes(scope.user, translation=obj)
+            result = changes.recent(skip_preload="translation")
+            prepare_contributor_visibility(scope.user, result)
+            return result
+        if isinstance(obj, Component):
+            changes = Change.objects.last_changes(scope.user, component=obj)
+        elif isinstance(obj, Project):
+            changes = Change.objects.last_changes(scope.user, project=obj)
+        elif isinstance(obj, Language):
+            changes = Change.objects.last_changes(scope.user, language=obj)
+        elif isinstance(obj, Unit):
+            changes = Change.objects.last_changes(scope.user, unit=obj)
+        else:
+            changes = Change.objects.last_changes(
+                scope.user, project=obj.project, language=obj.language
+            )
+        result = changes.recent()
+        prepare_contributor_visibility(scope.user, result)
+        return result
+
+
+class TranslationChangesFeed(ObjectChangesFeed):
     """RSS feed for changes in translation."""
 
+    # pylint: disable-next=arguments-differ
     def get_object(self, request: AuthenticatedHttpRequest, path):
-        return parse_path(
-            request,
-            path,
-            (Translation, Component, Project, Language, Unit, ProjectLanguage),
+        return ChangeFeedScope(
+            request.user,
+            parse_path(
+                request,
+                path,
+                (Translation, Component, Project, Language, Unit, ProjectLanguage),
+            ),
         )
 
-    def title(self, obj):
-        # Translators: %s is translation name
-        return gettext("Recent changes in %s") % obj
 
-    def description(self, obj):
-        # Translators: %s is translation name
-        return gettext("All recent changes made using Weblate in %s.") % obj
-
-    def link(self, obj):
-        return obj.get_absolute_url()
-
-    def items(self, obj):
-        return obj.change_set.prefetch().recent(skip_preload="translation")
-
-
-class LanguageChangesFeed(TranslationChangesFeed):
+class LanguageChangesFeed(ObjectChangesFeed):
     """RSS feed for changes in language."""
 
+    # pylint: disable-next=arguments-differ
     def get_object(self, request: AuthenticatedHttpRequest, lang):
-        return get_object_or_404(Language, code=lang)
+        return ChangeFeedScope(request.user, get_object_or_404(Language, code=lang))

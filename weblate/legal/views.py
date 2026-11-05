@@ -3,40 +3,50 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from django.conf import settings
+from django.contrib.auth.decorators import login_not_required
+from django.http import Http404
 from django.shortcuts import redirect, render
-from django.urls import reverse
-from django.utils.translation import gettext_lazy
+from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 from django.views.generic import TemplateView
 
-from weblate.auth.models import AuthenticatedHttpRequest, User
+from weblate.auth.models import User
 from weblate.legal.forms import TOSForm
 from weblate.legal.models import Agreement
+from weblate.legal.utils import (
+    get_document_context,
+    get_legal_menu,
+    is_document_hidden,
+)
 from weblate.trans.util import redirect_next
 
-MENU = (
-    ("index", "legal:index", gettext_lazy("Overview")),
-    ("terms", "legal:terms", gettext_lazy("General Terms and Conditions")),
-    ("cookies", "legal:cookies", gettext_lazy("Cookies")),
-    ("privacy", "legal:privacy", gettext_lazy("Privacy Policy")),
-    ("contracts", "legal:contracts", gettext_lazy("Subcontractors")),
-)
+if TYPE_CHECKING:
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 
+@method_decorator(login_not_required, name="dispatch")
 class LegalView(TemplateView):
     page = "index"
+
+    def dispatch(self, request, *args, **kwargs):
+        if is_document_hidden(self.page):
+            raise Http404
+        return super().dispatch(request, *args, **kwargs)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
 
-        context["legal_menu"] = MENU
+        context["legal_menu"] = get_legal_menu()
         context["legal_page"] = self.page
-        context["privacy_url"] = reverse("legal:privacy")
-        context["terms_url"] = reverse("legal:terms")
+        context["legal_document_css_class"] = settings.LEGAL_DOCUMENT_CSS_CLASS
+        context.update(get_document_context())
 
         return context
 
-    def get_template_names(self):
+    def get_template_names(self) -> list[str]:
         return [f"legal/{self.page}.html"]
 
 
@@ -57,6 +67,7 @@ class ContractsView(LegalView):
 
 
 @never_cache
+@login_not_required
 def tos_confirm(request: AuthenticatedHttpRequest):
     user = None
     if request.user.is_authenticated:
@@ -71,16 +82,25 @@ def tos_confirm(request: AuthenticatedHttpRequest):
     if agreement.is_current():
         return redirect_next(request.GET.get("next"), "home")
 
+    document_context = get_document_context()
+    include_privacy_policy = bool(document_context["privacy_url"])
     if request.method == "POST":
-        form = TOSForm(request.POST)
+        form = TOSForm(request.POST, include_privacy_policy=include_privacy_policy)
         if form.is_valid():
             agreement.make_current(request)
             return redirect_next(form.cleaned_data["next"], "home")
     else:
-        form = TOSForm(initial={"next": request.GET.get("next")})
+        form = TOSForm(
+            initial={"next": request.GET.get("next")},
+            include_privacy_policy=include_privacy_policy,
+        )
 
     return render(
         request,
         "legal/confirm.html",
-        {"form": form, "privacy_url": reverse("legal:privacy")},
+        {
+            "form": form,
+            "legal_document_css_class": settings.LEGAL_DOCUMENT_CSS_CLASS,
+            **document_context,
+        },
     )

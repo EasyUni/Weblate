@@ -3,7 +3,7 @@ Configuring Weblate
 
 .. note::
 
-   The following assumes the virtualenv used by Weblate is activated
+   The following assumes the Python environment used by Weblate is activated
    (by executing ``. ~/weblate-env/bin/activate``). If not, specify the full path
    to the :command:`weblate` command as ``~/weblate-env/bin/weblate``.
 
@@ -49,18 +49,14 @@ Configuring Weblate
 
         weblate collectstatic
 
-#. Compress the JavaScript and CSS files (optional, see :ref:`production-compress`):
-
-   .. code-block:: sh
-
-        weblate compress
-
 #. Start the Celery workers. This is not necessary for development purposes, but
    strongly recommended otherwise. :ref:`celery` has more info:
 
    .. code-block:: sh
 
-         ~/weblate-env/lib/python3.9/site-packages/weblate/examples/celery start
+         celery --app=weblate.utils worker --beat \
+             --queues=celery,notify,memory,translate,backup \
+             --prefetch-multiplier=1
 
 #. Start the development server (:ref:`server` details a production setup):
 

@@ -20,8 +20,10 @@ with (what is most often the) English strings.
    * :ref:`addon-weblate.json.customize`
    * :ref:`addon-weblate.cleanup.generic`
 
-.. _Internationalization of Flutter apps: https://docs.flutter.dev/ui/accessibility-and-internationalization/internationalization
+.. _Internationalization of Flutter apps: https://docs.flutter.dev/ui/internationalization
 .. _Application Resource Bundle Specification: https://github.com/google/app-resource-bundle/wiki/ApplicationResourceBundleSpecification
+
+.. include:: /snippets/format-features/arb-features.rst
 
 Weblate configuration
 +++++++++++++++++++++

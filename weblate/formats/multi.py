@@ -14,11 +14,16 @@ from django.utils.translation import gettext_lazy
 from weblate.trans.util import get_string
 
 from .base import TranslationFormat, TranslationUnit
-from .ttkit import CSVUtf8Format
+from .ttkit import CSVFormat
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from lxml import etree
     from translate.storage.base import TranslationStore
     from translate.storage.base import TranslationUnit as TranslateToolkitUnit
+
+    from weblate.checks.flags import Flags
 
 
 class MultiUnit(TranslationUnit):
@@ -65,16 +70,16 @@ class MultiUnit(TranslationUnit):
     def notes(self):
         return "\n".join(unit.notes for unit in self.units if unit.notes)
 
-    def is_translated(self):
+    def is_translated(self) -> bool:
         return any(unit.is_translated() for unit in self.units)
 
-    def is_fuzzy(self, fallback=False):
+    def is_fuzzy(self, fallback: bool = False) -> bool:
         return any(unit.is_fuzzy(fallback) for unit in self.units)
 
-    def has_content(self):
+    def has_content(self) -> bool:
         return any(unit.has_content() for unit in self.units)
 
-    def is_readonly(self):
+    def is_readonly(self) -> bool:
         return any(unit.is_readonly() for unit in self.units)
 
     def set_target(self, target: str | list[str]) -> None:
@@ -94,7 +99,9 @@ class MultiUnit(TranslationUnit):
         while len(target) > len(self.units):
             new = self.parent.create_unit(self.context, self.units[0].source)
             self.units.append(
-                self.parent.unit_class(self.parent, new, self.units[0].template)
+                self.parent.get_unit_class(self.parent.file_format_params)(
+                    self.parent, new, self.units[0].template
+                )
             )
             self.parent.store.addunit(new)
 
@@ -105,12 +112,11 @@ class MultiUnit(TranslationUnit):
         for unit in self.units:
             unit.set_state(state)
 
-    @cached_property
-    def flags(self):
-        flags = super().flags
+    def get_extra_flags(self) -> Generator[str | etree._Element | Flags]:
+        yield from super().get_extra_flags()
+
         for unit in self.units:
-            flags.merge(unit.flags)
-        return flags
+            yield unit.flags
 
     def has_unit(self) -> bool:
         return all(unit.has_unit() for unit in self.units)
@@ -153,13 +159,25 @@ class MultiFormatMixin(TranslationFormat):
         try:
             matching = self._template_index[unit.id_hash]
         except KeyError:
-            return MultiUnit(self, self.unit_class(self, None, unit.units[0].template))
+            return MultiUnit(
+                self,
+                self.get_unit_class(self.file_format_params)(
+                    self, None, unit.units[0].template
+                ),
+            )
         matching_units = [unit.template for unit in matching.units]
         result = MultiUnit(
-            self, self.unit_class(self, matching_units[0], unit.units[0].template)
+            self,
+            self.get_unit_class(self.file_format_params)(
+                self, matching_units[0], unit.units[0].template
+            ),
         )
         for extra in matching_units[1:]:
-            result.merge(self.unit_class(self, extra, unit.units[0].template))
+            result.merge(
+                self.get_unit_class(self.file_format_params)(
+                    self, extra, unit.units[0].template
+                )
+            )
         return result
 
     def _get_all_monolingual_units(self):
@@ -173,6 +191,7 @@ class MultiFormatMixin(TranslationFormat):
             super().add_unit(unit)
 
 
-class MultiCSVUtf8Format(MultiFormatMixin, CSVUtf8Format):
-    name = gettext_lazy("Multivalue CSV file (UTF-8)")
-    format_id = "csv-multi-utf-8"
+class MultiCSVFormat(MultiFormatMixin, CSVFormat):
+    name = gettext_lazy("Multivalue CSV file")
+    format_id = "csv-multi"
+    autoload: tuple[str, ...] = ()

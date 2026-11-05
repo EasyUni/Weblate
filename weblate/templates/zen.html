@@ -1,42 +1,57 @@
 {% extends "base.html" %}
 
-{% load compress crispy_forms_tags i18n icons static translations %}
+{% load crispy_forms_tags i18n icons static translations %}
 
 {% block extra_script %}
-  {% compress js %}
-    <script defer data-cfasync="false" src="{% static 'editor/base.js' %}{{ cache_param }}"></script>
-    <script defer data-cfasync="false" src="{% static 'editor/zen.js' %}{{ cache_param }}"></script>
-  {% endcompress %}
+  <script defer src="{% static 'editor/base.js' %}"></script>
+  <script defer src="{% static 'editor/zen.js' %}"></script>
+  <script defer src="{% static 'js/bulk-accept-suggestions.js' %}"></script>
 {% endblock extra_script %}
+
+{% block extra_styles %}
+  <link rel="stylesheet" href="{% static 'styles/bulk-accept.css' %}" />
+{% endblock extra_styles %}
 
 {% block breadcrumbs %}
   {% path_object_breadcrumbs path_object %}
-  <li>
+  <li class="breadcrumb-item">
     <a href="{% url 'zen' path=object.get_url_path %}">{% translate "Zen" %}</a>
   </li>
-  <a class="pull-right flip" href="{{ object.get_widgets_url }}">
-    <img src="{% url 'widget-image' path=object.get_url_path widget='svg' color='badge' extension='svg' %}?native=1" />
-  </a>
+  {% if object.get_widgets_url %}
+    <a class="float-end ms-auto" href="{{ object.get_widgets_url }}">
+      <img src="{% url 'widget-image' path=object.get_url_path widget='svg' color='badge' extension='svg' %}?native=1"
+           alt="{% translate "Translation status widgets" %}" />
+    </a>
+  {% endif %}
 {% endblock breadcrumbs %}
 
 {% block content_class %}js-editor{% endblock %}
 
 {% block content %}
 
-  {% if object.component.slug == "-" %}
-    {% for component in project.component_set.prefetch %}
+  {% if object.component and object.component.slug == "-" %}
+    {% for component in state_components %}
       {% include "snippets/component/state.html" with object=component %}
     {% endfor %}
-  {% else %}
+  {% elif object.component %}
     {% include "snippets/component/state.html" with object=object.component %}
   {% endif %}
 
-  <div class="btn-group pull-right flip btn-group-settings" role="group">
+  <div class="btn-group float-end btn-group-settings" role="group">
 
-    <a href="{% url 'translate' path=object.get_url_path %}?{{ search_url }}"
+    <a href="{% url 'translate' path=object.get_url_path %}{% querystring query_params %}"
        data-params="{{ search_url }}"
        title="{% translate "Edit in single string mode" %}"
-       class="btn btn-link">{% icon "close.svg" %} {% translate "Exit Zen" %}</a>
+       class="btn btn-link">{% icon "close.svg" %} <span class="d-none d-md-inline">{% translate "Exit Zen" %}</span></a>
+
+    <button type="button"
+            class="btn btn-link"
+            id="zen-toggle-suggestions"
+            title="{% translate "Show suggestions" %}"
+            aria-label="{% translate "Show suggestions" %}">
+      {% icon "suggest.svg" %}
+      <span id="zen-toggle-suggestions-label" class="d-none d-md-inline">{% translate "Show suggestions" %}</span>
+    </button>
 
     <a href="{% url 'profile' %}#preferences"
        class="btn btn-link"
@@ -44,18 +59,21 @@
   </div>
 
   <div class="query-container">
-    <form method="get" class="result-page-form">
+    <form method="get" class="result-page-form double-submission">
       {% crispy search_form %}
+      <p id="search-cache-help" class="form-text mb-0">
+        {% translate "Search results stay fixed while you translate. Refresh results to show strings matching the filters now." %}
+      </p>
     </form>
   </div>
 
-  <table class="zen table table-condensed {% if user.profile.zen_mode == user.profile.ZEN_HORIZONTAL %}zen-horizontal{% endif %}">
-    {% include 'zen-units.html' %}
+  <table class="zen zen-hide-suggestions table table-sm {% if user.profile.zen_mode == user.profile.ZEN_HORIZONTAL %}zen-horizontal{% endif %}">
+    {% include "zen-units.html" %}
     <tfoot>
       <tr>
         <td colspan="3" class="loading-icon">
           {% loading_icon "next" %}
-          <a href="{% url 'load_zen' path=object.get_url_path %}?{{ search_url }}"
+          <a href="{% url 'load_zen' path=object.get_url_path %}{% querystring query_params %}"
              class="hidden"
              id="zen-load"
              data-offset="{{ offset }}"></a>

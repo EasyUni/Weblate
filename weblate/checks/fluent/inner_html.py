@@ -6,19 +6,24 @@ from __future__ import annotations
 
 import html
 import re
+from bisect import bisect_right
 from typing import TYPE_CHECKING
 
 from django.utils.translation import gettext, gettext_lazy
 
-from weblate.checks.base import SourceCheck, TargetCheck
+from weblate.checks.base import Highlight, SourceCheck, TargetCheck
 from weblate.checks.fluent.utils import (
+    FLUENT_COMPLEXITY_ERRORS,
     FluentPatterns,
     FluentUnitConverter,
+    bounded_branch_paths,
+    fluent_complexity_description,
     format_html_code,
     format_html_error_list,
     translation_from_check,
     variant_name,
 )
+from weblate.checks.utils import pair_markup_highlights
 from weblate.utils.html import format_html_join_comma, list_to_tuples
 
 if TYPE_CHECKING:
@@ -46,6 +51,7 @@ _VOID_ELEMENTS = [
     "track",
     "wbr",
 ]
+_MAX_HTML_DEPTH = 32
 
 
 class _HTMLNode:
@@ -57,6 +63,7 @@ class _HTMLNode:
         self.tag = tag
         # Keep attributes as a list to keep duplicates.
         self.attributes: dict[str, str] = {}
+        self._key: tuple | None = None
         if parent:
             parent.children.append(self)
 
@@ -66,18 +73,20 @@ class _HTMLNode:
             yield child
             yield from child.descendants()
 
+    @property
+    def key(self) -> tuple:
+        """Identity including ancestors, only valid once the node is parsed."""
+        if self._key is None:
+            self._key = (
+                self.tag,
+                frozenset(self.attributes.items()),
+                self.parent.key if self.parent else None,
+            )
+        return self._key
+
     def matches(self, other: _HTMLNode) -> bool:
         """Whether the two nodes match."""
-        if self.tag != other.tag:
-            return False
-        if self.attributes != other.attributes:
-            return False
-        # Two nodes are only match if their ancestors match.
-        if self.parent is None:
-            return other.parent is None
-        if other.parent is None:
-            return False
-        return self.parent.matches(other.parent)
+        return self.key == other.key
 
     def tags(self) -> tuple[str, str]:
         """Get the start and end tags for this node."""
@@ -100,7 +109,7 @@ class _HTMLNode:
 
         serialized, end = self.tags()
         if end:
-            serialized += "…" + end
+            serialized += f"…{end}"
 
         node = self.parent
         while node and node.parent:
@@ -126,7 +135,7 @@ class _HTMLFluentReferenceTagError(_HTMLParseError):
     def description(self) -> SafeString:
         return format_html_code(
             gettext(
-                "The Fluent reference in {sequence} may expand into a HTML "
+                "The Fluent reference in {sequence} may expand into an HTML "
                 "tag. Maybe use {suggestion}."
             ),
             sequence=self.sequence,
@@ -141,7 +150,7 @@ class _HTMLFluentReferenceCharacterReferenceError(_HTMLParseError):
     def description(self) -> SafeString:
         return format_html_code(
             gettext(
-                "The Fluent reference in {sequence} may expand into a HTML "
+                "The Fluent reference in {sequence} may expand into an HTML "
                 "character reference. Maybe use {suggestion}."
             ),
             sequence=self.sequence,
@@ -153,7 +162,7 @@ class _HTMLInvalidTagSequenceError(_HTMLParseError):
     """
     Base class for parsing errors in a tag-like sequence.
 
-    We assume the user may not have wanted to create a HTML tag, so we will show
+    We assume the user may not have wanted to create an HTML tag, so we will show
     a suggestion on how to avoid it.
     """
 
@@ -169,7 +178,7 @@ class _HTMLInvalidEndTagError(_HTMLInvalidTagSequenceError):
     def description(self) -> SafeString:
         return format_html_code(
             gettext(
-                "The sequence {sequence} begins with a HTML closing tag, "
+                "The sequence {sequence} begins with an HTML closing tag, "
                 "but the name or syntax is not valid. "
                 "If you do not want a closing tag, use {suggestion}."
             ),
@@ -182,9 +191,9 @@ class _HTMLInvalidStartTagNameError(_HTMLInvalidTagSequenceError):
     def description(self) -> SafeString:
         return format_html_code(
             gettext(
-                "The sequence {sequence} begins with a HTML tag, "
+                "The sequence {sequence} begins with an HTML tag, "
                 "but the name is not valid. "
-                "If you do not want to begin a HTML tag, use {suggestion}."
+                "If you do not want to begin an HTML tag, use {suggestion}."
             ),
             sequence=self.sequence,
             suggestion=self.suggestion,
@@ -195,9 +204,9 @@ class _HTMLStartTagNotClosedError(_HTMLInvalidTagSequenceError):
     def description(self) -> SafeString:
         return format_html_code(
             gettext(
-                "The sequence {sequence} begins with a HTML tag, "
+                "The sequence {sequence} begins with an HTML tag, "
                 "but the tag is never closed by {close}. "
-                "If you do not want to begin a HTML tag, use {suggestion}."
+                "If you do not want to begin an HTML tag, use {suggestion}."
             ),
             sequence=self.sequence,
             close=">",
@@ -225,10 +234,10 @@ class _HTMLUnexpectedAttributeError(_HTMLInvalidTagSequenceError):
     def description(self) -> SafeString:
         return format_html_code(
             gettext(
-                "The sequence {sequence} begins with a HTML tag, "
+                "The sequence {sequence} begins with an HTML tag, "
                 "but the sequence {attribute} is not a valid attribute "
                 "with a value. "
-                "If you do not want to begin a HTML tag, use {suggestion}."
+                "If you do not want to begin an HTML tag, use {suggestion}."
             ),
             sequence=self.sequence,
             attribute=self.attribute,
@@ -329,6 +338,17 @@ class _HTMLMissingEndTagError(_HTMLParseError):
         )
 
 
+class _HTMLTooDeeplyNestedError(_HTMLParseError):
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def description(self) -> SafeString:
+        return format_html_code(
+            gettext("The HTML {tag} tag is nested too deeply."),
+            tag=f"<{self.tag}>",
+        )
+
+
 class _HTMLUnexpectedCharacterReferenceError(_HTMLParseError):
     def __init__(self, sequence: str) -> None:
         self.sequence = sequence
@@ -339,7 +359,7 @@ class _HTMLUnexpectedCharacterReferenceError(_HTMLParseError):
         suggestion = self.sequence.replace("&", "&amp;", 1)
         return format_html_code(
             gettext(
-                "The sequence {sequence} will begin a HTML character "
+                "The sequence {sequence} will begin an HTML character "
                 "reference, but does not end with {semicolon}. "
                 "If you do not want a character reference, use {suggestion}."
             ),
@@ -367,8 +387,10 @@ class _HTMLSourcePosition:
 
     def __init__(self, serialized: str) -> None:
         self.pos = 0
-        self.source = ""
-        self._start_end_literals: list[tuple[int, int]] = []
+        chunks: list[str] = []
+        length = 0
+        self._literal_starts: list[int] = []
+        self._literal_ends: list[int] = []
 
         # Since FluentPatternVariants correspond to flat Patterns, we
         # don't expect any SelectExpressions, but it might contain other
@@ -377,11 +399,14 @@ class _HTMLSourcePosition:
         #
         # We need this to be valid HTML *after* expanding the literals.
         for _pos, text, literal in FluentPatterns.split_literal_expressions(serialized):
-            self.source += text
+            chunks.append(text)
+            length += len(text)
             if literal:
-                start = len(self.source)
-                self._start_end_literals.append((start, start + len(literal)))
-                self.source += literal
+                chunks.append(literal)
+                self._literal_starts.append(length)
+                length += len(literal)
+                self._literal_ends.append(length)
+        self.source = "".join(chunks)
 
     def reset(self) -> None:
         """Reset the position back to the start."""
@@ -389,10 +414,8 @@ class _HTMLSourcePosition:
 
     def at_literal(self) -> bool:
         """Whether the current position is within a Fluent literal or not."""
-        return any(
-            self.pos >= start and self.pos < end
-            for start, end in self._start_end_literals
-        )
+        index = bisect_right(self._literal_starts, self.pos) - 1
+        return index >= 0 and self.pos < self._literal_ends[index]
 
     def match(self, regex: re.Pattern) -> re.Match | None:
         """
@@ -444,18 +467,15 @@ class _CountedNodes:
     """
 
     def __init__(self, node_list: Iterable[_HTMLNode]) -> None:
+        self._nodes_by_key: dict[tuple, list[_HTMLNode]] = {}
+        for node in node_list:
+            self._nodes_by_key.setdefault(node.key, []).append(node)
         # Each entry in matching_nodes is a list of nodes that all match. The
         # length of this list is the count.
-        self.matching_nodes: list[list[_HTMLNode]] = []
-        for node in node_list:
-            add = True
-            for other_nodes in self.matching_nodes:
-                if other_nodes[0].matches(node):
-                    add = False
-                    other_nodes.append(node)
-                    break
-            if add:
-                self.matching_nodes.append([node])
+        self.matching_nodes = list(self._nodes_by_key.values())
+        self.signature = frozenset(
+            (key, len(nodes)) for key, nodes in self._nodes_by_key.items()
+        )
 
     def matches(self, other: _CountedNodes) -> bool:
         """
@@ -464,28 +484,11 @@ class _CountedNodes:
         This will match if the two instances have matching _HTMLNodes with the
         same count in both.
         """
-        if len(self.matching_nodes) != len(other.matching_nodes):
-            return False
-        for nodes in self.matching_nodes:
-            has_match = False
-            for _index, other_nodes in enumerate(other.matching_nodes):
-                if nodes[0].matches(other_nodes[0]):
-                    if len(nodes) != len(other_nodes):
-                        return False
-                    has_match = True
-                    break
-            if not has_match:
-                return False
-        # Both are the same length and each node in self was matched, so there
-        # shouldn't be any nodes in other that were not matched once.
-        return True
+        return self.signature == other.signature
 
     def count(self, node: _HTMLNode) -> int:
         """Count how many nodes match the given node."""
-        for other_nodes in self.matching_nodes:
-            if node.matches(other_nodes[0]):
-                return len(other_nodes)
-        return 0
+        return len(self._nodes_by_key.get(node.key, ()))
 
 
 class _VariantNodes:
@@ -541,7 +544,7 @@ class _FluentInnerHTMLCheck:
     # "-".
     _TAG_FIRST_CHAR = r"[a-zA-Z]"
     _TAG_FIRST_CHAR_REGEX = re.compile(_TAG_FIRST_CHAR)
-    _TAG_PATTERN = _TAG_FIRST_CHAR + r"[a-zA-Z0-9-]*"
+    _TAG_PATTERN = f"{_TAG_FIRST_CHAR}[a-zA-Z0-9-]*"
 
     # Only allow a limited set of "blank" characters within a tag.
     _BLANK_CHAR = r"[ \t\n]"
@@ -559,7 +562,7 @@ class _FluentInnerHTMLCheck:
         + r")"
     )
     _START_TAG_REGEX = re.compile(
-        r"(?P<tag>" + _TAG_PATTERN + r")" + _CLOSE_BLANK_OR_END_PATTERN
+        rf"(?P<tag>{_TAG_PATTERN}){_CLOSE_BLANK_OR_END_PATTERN}"
     )
     # Only allow a limited set of characters for attribute names, which should
     # cover HTML attributes and "data-" attributes.
@@ -575,7 +578,7 @@ class _FluentInnerHTMLCheck:
         # Followed by a blank or the closing character.
         + _CLOSE_BLANK_OR_END_PATTERN
     )
-    _END_TAG_REGEX = re.compile(r"(?P<tag>" + _TAG_PATTERN + r")" + _BLANK_CHAR + r"*>")
+    _END_TAG_REGEX = re.compile(rf"(?P<tag>{_TAG_PATTERN}){_BLANK_CHAR}*>")
 
     # Pattern used to pull text within a suspected tag up until the next
     # attribute or the tag closes.
@@ -610,7 +613,7 @@ class _FluentInnerHTMLCheck:
         """
         Get all the non-blank and non ">" characters found at the start.
 
-        This is used to grab some joined sequence of characters within a HTML
+        This is used to grab some joined sequence of characters within an HTML
         tag to show back to the user.
         """
         return source.get(cls._NON_BLANK_OR_CLOSE_REGEX)
@@ -638,7 +641,8 @@ class _FluentInnerHTMLCheck:
             #
             # Some parsing errors, like eof-before-tag-name, will not lead to a
             # loss of content, but aren't allowed here for consistency.
-            raise _HTMLInvalidEndTagError("</" + cls._non_blank_or_close(source))
+            msg = f"</{cls._non_blank_or_close(source)}"
+            raise _HTMLInvalidEndTagError(msg)
 
         tag = end_tag_match.group("tag")
 
@@ -663,7 +667,8 @@ class _FluentInnerHTMLCheck:
             non_blank = cls._non_blank_or_close(source)
             if "=" not in non_blank:
                 # Doesn't look like an attribute with a value.
-                raise _HTMLUnexpectedAttributeError("<" + node.tag, non_blank)
+                msg = f"<{node.tag}"
+                raise _HTMLUnexpectedAttributeError(msg, non_blank)
             raise _HTMLInvalidAttributeNameError(
                 node.tag,
                 non_blank[: non_blank.index("=")],
@@ -714,11 +719,13 @@ class _FluentInnerHTMLCheck:
             # still cause problems when it is expanded with the value. E.g. if
             # the value closes the quotes and injects parts, but we are not
             # trying to protect against this.
-            raise _HTMLFluentReferenceTagError("<" + source.get(cls._FLUENT_REF_REGEX))
+            msg = f"<{source.get(cls._FLUENT_REF_REGEX)}"
+            raise _HTMLFluentReferenceTagError(msg)
 
         tag_not_allowed_match = source.match(cls._TAG_NOT_ALLOWED_FIRST_CHAR_REGEX)
         if tag_not_allowed_match:
-            raise _HTMLTagTypeNotAllowedError("<" + tag_not_allowed_match.group())
+            msg = f"<{tag_not_allowed_match.group()}"
+            raise _HTMLTagTypeNotAllowedError(msg)
 
         if not source.peak_matches(cls._TAG_FIRST_CHAR_REGEX):
             # Corresponds to the HTML parsing errors
@@ -730,7 +737,8 @@ class _FluentInnerHTMLCheck:
 
         tag_match = source.match(cls._START_TAG_REGEX)
         if not tag_match:
-            raise _HTMLInvalidStartTagNameError("<" + cls._non_blank_or_close(source))
+            msg = f"<{cls._non_blank_or_close(source)}"
+            raise _HTMLInvalidStartTagNameError(msg)
 
         tag = tag_match.group("tag")
 
@@ -746,6 +754,8 @@ class _FluentInnerHTMLCheck:
                     # Non-void elements should not be self-closing.
                     if closing_part == "/>":
                         raise _HTMLNonVoidSelfClosedError(tag)
+                    if len(open_nodes) > _MAX_HTML_DEPTH:
+                        raise _HTMLTooDeeplyNestedError(tag)
                     open_nodes.append(node)
                 return
 
@@ -753,7 +763,8 @@ class _FluentInnerHTMLCheck:
                 # Corresponds to HTML parsing error eof-in-tag.
                 # We have some blank, but then reach the end of the string
                 # before the tag is closed.
-                raise _HTMLStartTagNotClosedError("<" + tag)
+                msg = f"<{tag}"
+                raise _HTMLStartTagNotClosedError(msg)
 
             end_match = cls._parse_attribute(source, node)
 
@@ -811,7 +822,11 @@ class _FluentInnerHTMLCheck:
                     sequence + source.get(cls._FLUENT_REF_REGEX)
                 )
 
-            expanded = html.unescape(sequence)
+            try:
+                expanded = html.unescape(sequence)
+            except ValueError as error:
+                # Too many digits to convert to an integer.
+                raise _HTMLInvalidCharacterReferenceError(sequence) from error
             if not closes_with_semicolon and expanded != sequence:
                 # Roughly corresponds to the parse error
                 # missing-semicolon-after-character-reference
@@ -879,14 +894,13 @@ class _FluentInnerHTMLCheck:
             if not part.name:
                 # We only want to process the Fluent value part as HTML since
                 # the attributes will not likely become inner HTML.
+                top_branch = part.top_branch
                 return [
                     _VariantNodes(
                         path,
-                        cls._parse_basic_inner_html(
-                            part.top_branch.to_flat_string(path)
-                        ),
+                        cls._parse_basic_inner_html(top_branch.to_flat_string(path)),
                     )
-                    for path in part.top_branch.branch_paths()
+                    for path in bounded_branch_paths(top_branch, len(unit_source))
                 ]
         # No value part.
         return None
@@ -901,7 +915,7 @@ class FluentSourceInnerHTMLCheck(_FluentInnerHTMLCheck, SourceCheck):
     for some HTML element. For example, when using the Fluent DOM package.
 
     The aim of this check is to predict how the value will be parsed as inner
-    HTML, assuming a HTML5 conforming parser, to catch cases where there would
+    HTML, assuming an HTML5 conforming parser, to catch cases where there would
     be some "unintended" loss of the string, without being too strict about
     technical parsing errors that do *not* lead to a loss of the string.
 
@@ -915,7 +929,7 @@ class FluentSourceInnerHTMLCheck(_FluentInnerHTMLCheck, SourceCheck):
     Therefore, this check does not expect or want translators and developers to
     have to care about strictly avoiding *any* technical HTML5 parsing errors
     (let alone XHTML parsing errors). Instead, this check will just want to warn
-    them when they may have unintentionally opened a HTML tag or inserted a
+    them when they may have unintentionally opened an HTML tag or inserted a
     character reference.
 
     Moreover, for the Fluent values that intentionally contain HTML tags or
@@ -944,21 +958,24 @@ class FluentSourceInnerHTMLCheck(_FluentInnerHTMLCheck, SourceCheck):
     name = gettext_lazy("Fluent source inner HTML")
     description = gettext_lazy("Fluent source should be valid inner HTML.")
     default_disabled = True
+    version_added = "5.0"
 
     def check_source_unit(self, sources: list[str], unit: TransUnitModel) -> bool:
         try:
             self.get_fluent_inner_html(unit, sources[0])
-        except _HTMLParseError:
+        except (_HTMLParseError, *FLUENT_COMPLEXITY_ERRORS):
             return True
         return False
 
-    def get_description(self, check_model: CheckModel) -> StrOrPromise:
-        unit, source, _target = translation_from_check(check_model)
+    def get_description(self, check_obj: CheckModel) -> StrOrPromise:
+        unit, source, _target = translation_from_check(check_obj)
         try:
             self.get_fluent_inner_html(unit, source)
         except _HTMLParseError as err:
             return err.description()
-        return super().get_description(check_model)
+        except FLUENT_COMPLEXITY_ERRORS:
+            return fluent_complexity_description()
+        return super().get_description(check_obj)
 
 
 class _VariantNodesDifference:
@@ -983,25 +1000,22 @@ class _VariantNodesDifference:
         self._source_variants = source_variant_nodes
         self._target_variants = target_variant_nodes
 
+        source_signatures = {
+            variant.counted_nodes.signature for variant in self._source_variants
+        }
+        target_signatures = {
+            variant.counted_nodes.signature for variant in self._target_variants
+        }
         self._missing_variants = [
             variant
             for variant in self._source_variants
-            if not self._has_match(variant, self._target_variants)
+            if variant.counted_nodes.signature not in target_signatures
         ]
         self._extra_variants = [
             variant
             for variant in self._target_variants
-            if not self._has_match(variant, self._source_variants)
+            if variant.counted_nodes.signature not in source_signatures
         ]
-
-    @staticmethod
-    def _has_match(
-        variant: _VariantNodes,
-        search_list: list[_VariantNodes],
-    ) -> bool:
-        return any(
-            variant.counted_nodes.matches(other.counted_nodes) for other in search_list
-        )
 
     def __bool__(self) -> bool:
         return bool(self._missing_variants or self._extra_variants)
@@ -1013,12 +1027,12 @@ class _VariantNodesDifference:
     ) -> SafeString:
         if not variants:
             return format_html_code(
-                gettext("Fluent value is missing a HTML {tag} tag."),
+                gettext("Fluent value is missing an HTML {tag} tag."),
                 tag=tag,
             )
         return format_html_code(
             gettext(
-                "Fluent value is missing a HTML {tag} tag "
+                "Fluent value is missing an HTML {tag} tag "
                 "for the following variants: {variant_list}."
             ),
             tag=tag,
@@ -1055,16 +1069,11 @@ class _VariantNodesDifference:
         )
 
     def _unique_target_nodes(self) -> Iterator[_HTMLNode]:
-        unique_nodes: list[_HTMLNode] = []
+        unique_keys: set[tuple] = set()
         for variant in self._target_variants:
             for node in variant.nodes:
-                add = True
-                for other in unique_nodes:
-                    if other.matches(node):
-                        add = False
-                        break
-                if add:
-                    unique_nodes.append(node)
+                if node.key not in unique_keys:
+                    unique_keys.add(node.key)
                     yield node
 
     def _errors_relative_to(
@@ -1222,6 +1231,7 @@ class FluentTargetInnerHTMLCheck(_FluentInnerHTMLCheck, TargetCheck):
     name = gettext_lazy("Fluent translation inner HTML")
     description = gettext_lazy("Fluent target should be valid inner HTML that matches.")
     default_disabled = True
+    version_added = "5.0"
 
     @classmethod
     def _compare_inner_html(
@@ -1262,19 +1272,21 @@ class FluentTargetInnerHTMLCheck(_FluentInnerHTMLCheck, TargetCheck):
     ) -> bool:
         try:
             difference = self._compare_inner_html(unit, source, target)
-        except _HTMLParseError:
+        except (_HTMLParseError, *FLUENT_COMPLEXITY_ERRORS):
             return True
         return bool(difference)
 
-    def get_description(self, check_model: CheckModel) -> StrOrPromise:
-        unit, source, target = translation_from_check(check_model)
+    def get_description(self, check_obj: CheckModel) -> StrOrPromise:
+        unit, source, target = translation_from_check(check_obj)
         try:
             difference = self._compare_inner_html(unit, source, target)
         except _HTMLParseError as err:
             return err.description()
+        except FLUENT_COMPLEXITY_ERRORS:
+            return fluent_complexity_description()
 
         if not difference:
-            return super().get_description(check_model)
+            return super().get_description(check_obj)
 
         return difference.description()
 
@@ -1288,7 +1300,10 @@ class FluentTargetInnerHTMLCheck(_FluentInnerHTMLCheck, TargetCheck):
 
         # We simply highlight all HTML tags that are valid tags according to our
         # parser, regardless of whether it matches a tag found in the source.
-        return [
-            (match.start(), match.end(), match.group())
-            for match in self.ALL_TAGS_REGEX.finditer(source)
-        ]
+        return pair_markup_highlights(
+            [
+                Highlight(match.start(), match.end(), match.group(), kind="markup")
+                for match in self.ALL_TAGS_REGEX.finditer(source)
+            ],
+            group_prefix="fluent-html",
+        )

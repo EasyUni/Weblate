@@ -7,55 +7,78 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import time
-from contextlib import suppress
-from typing import TYPE_CHECKING, BinaryIO, cast
-from zipfile import ZipFile
+from contextlib import contextmanager, suppress
+from pathlib import Path
+from time import monotonic
+
+# pylint: disable-next=unused-import
+from typing import IO, TYPE_CHECKING, cast
+from uuid import UUID
+from zipfile import ZipFile, ZipInfo
 
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.core.paginator import EmptyPage, Paginator
 from django.http import (
     FileResponse,
     Http404,
-    HttpRequest,
     HttpResponse,
-    HttpResponseBase,
     HttpResponseRedirect,
+    StreamingHttpResponse,
 )
-from django.shortcuts import get_object_or_404
+from django.shortcuts import aget_object_or_404, get_object_or_404
 from django.utils.cache import get_conditional_response
-from django.utils.http import http_date
+from django.utils.http import content_disposition_header, http_date
 from django.utils.translation import activate, gettext, gettext_lazy, pgettext_lazy
 from django.views.decorators.gzip import gzip_page
 from django.views.generic.base import View
 from django.views.generic.edit import FormView
 
+from weblate.formats.base import is_identity_safe_exporter
 from weblate.formats.models import EXPORTERS, FILE_FORMATS
 from weblate.lang.models import Language
 from weblate.trans.models import Category, Component, Project, Translation, Unit
 from weblate.utils import messages
 from weblate.utils.errors import report_error
+from weblate.utils.files import (
+    is_managed_vcs_metadata_path,
+    is_path_within_resolved_directory,
+    is_unsafe_path,
+)
 from weblate.utils.stats import (
-    BaseStats,
     CategoryLanguage,
     ProjectLanguage,
+    WorkspaceLanguage,
     prefetch_stats,
 )
 from weblate.vcs.git import LocalRepository
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Mapping
+
     from django.db.models import Model
+    from django.http import HttpRequest, HttpResponseBase, QueryDict
 
     from weblate.auth.models import AuthenticatedHttpRequest
     from weblate.trans.mixins import BaseURLMixin
+    from weblate.utils.lock import WeblateLockTimeoutError
+    from weblate.utils.stats import BaseStats
 
 
 class UnsupportedPathObjectError(Http404):
     pass
 
 
+REPOSITORY_LOCK_REFRESH_INTERVAL = 300
+DOWNLOAD_COPY_CHUNK_SIZE = 1024 * 1024
+
+
 def key_name(instance):
-    from weblate.trans.templatetags.translations import get_breadcrumbs
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.formatting import get_breadcrumbs
 
     return "/".join(
         str(item) for item in get_breadcrumbs(instance, flags=False, only_names=True)
@@ -64,6 +87,26 @@ def key_name(instance):
 
 def key_translated(instance):
     return instance.stats.translated_percent
+
+
+def key_approved(instance):
+    stats = instance.stats
+    # Mixed listings can include objects without review workflow enabled.
+    if stats.has_review:
+        return stats.approved_percent + stats.readonly_percent
+    return 0
+
+
+def key_unreviewed(instance):
+    stats = instance.stats
+    # Mixed listings can include objects without review workflow enabled.
+    if stats.has_review:
+        return stats.waiting_review
+    return 0
+
+
+def key_total(instance):
+    return instance.stats.all
 
 
 def key_untranslated(instance):
@@ -96,7 +139,10 @@ def key_comments(instance):
 
 SORT_KEYS = {
     "name": key_name,
+    "approved": key_approved,
     "translated": key_translated,
+    "unreviewed": key_unreviewed,
+    "total": key_total,
     "untranslated": key_untranslated,
     "untranslated_words": key_untranslated_words,
     "untranslated_chars": key_untranslated_chars,
@@ -115,13 +161,13 @@ def optional_form(form, perm_user, perm, perm_obj, **kwargs):
 
 def get_percent_color(percent) -> str:
     if percent >= 85:
-        return "#2eccaa"
+        return "#158068"
     if percent >= 50:
-        return "#38f"
-    return "#f6664c"
+        return "#1565c0"
+    return "#cc3d20"
 
 
-def get_page_limit(request: AuthenticatedHttpRequest, default: int) -> tuple[int, int]:
+def get_page_limit(request: HttpRequest, default: int) -> tuple[int, int]:
     """Return page and limit as integers."""
     try:
         limit = int(request.GET.get("limit", default))
@@ -157,10 +203,10 @@ def get_paginator(
     *,
     page_limit: int | None = None,
     stats: bool = False,
+    sort_by: str | None = None,
 ):
     """Return paginator and current page."""
     page, limit = get_page_limit(request, page_limit or settings.DEFAULT_PAGE_LIMIT)
-    sort_by = request.GET.get("sort_by")
     stats_fetched = False
     if sort_by:
         # All but ordering by name needs stats
@@ -220,15 +266,28 @@ SORT_CHOICES = {
 SORT_LOOKUP = {key.replace("-", ""): value for key, value in SORT_CHOICES.items()}
 
 
-def get_sort_name(request: AuthenticatedHttpRequest, obj=None):
+def get_sort_name(
+    request: AuthenticatedHttpRequest, obj=None, query_data: QueryDict | None = None
+):
     """Get sort name."""
-    if isinstance(obj, Project | Category):
+    if isinstance(
+        obj,
+        (
+            Project,
+            Category,
+            ProjectLanguage,
+            CategoryLanguage,
+            Workspace,
+            WorkspaceLanguage,
+        ),
+    ):
         default = "component,-priority"
     elif hasattr(obj, "component") and obj.component.is_glossary:
         default = "source"
     else:
         default = "-priority,position"
-    sort_query = request.GET.get("sort_by", default)
+    data = request.GET if query_data is None else query_data
+    sort_query = data.get("sort_by", default)
     sort_params = sort_query.replace("-", "")
     sort_name = SORT_LOOKUP.get(sort_params, gettext("Position and priority"))
     return {
@@ -237,7 +296,8 @@ def get_sort_name(request: AuthenticatedHttpRequest, obj=None):
     }
 
 
-def parse_path(  # noqa: C901
+# ruff: ignore[complex-structure]
+def parse_path(
     request: AuthenticatedHttpRequest | None,
     path: list[str] | tuple[str, ...] | None,
     types: tuple[type[Model | BaseURLMixin] | None, ...],
@@ -246,7 +306,6 @@ def parse_path(  # noqa: C901
         return None
 
     allowed_types = {x for x in types if x is not None}
-    acting_user = request.user if request else None
 
     def check_type(cls) -> None:
         if cls not in allowed_types:
@@ -259,6 +318,27 @@ def parse_path(  # noqa: C901
 
     path = list(path)
 
+    # Workspace URL
+    if path[:2] == ["-", "workspace"]:
+        language_scope = len(path) == 5 and path[3] == "-"
+        check_type(WorkspaceLanguage if language_scope else Workspace)
+        if len(path) != 3 and not language_scope:
+            msg = "Invalid workspace path"
+            raise UnsupportedPathObjectError(msg)
+        try:
+            workspace_id = UUID(path[2])
+        except ValueError as error:
+            msg = "Invalid workspace id"
+            raise Http404(msg) from error
+        workspace = get_object_or_404(Workspace, pk=workspace_id)
+        if request is not None and not workspace.can_view(request.user):
+            msg = "Access denied"
+            raise Http404(msg)
+        if language_scope:
+            language = get_object_or_404(Language, code=path[4])
+            return WorkspaceLanguage(workspace, language)
+        return workspace
+
     # Language URL
     if path[:2] == ["-", "-"] and len(path) == 3:
         if path[2] == "-" and None in types:
@@ -267,10 +347,11 @@ def parse_path(  # noqa: C901
         return get_object_or_404(Language, code=path[2])
 
     # First level is always project
-    project = get_object_or_404(Project, slug=path.pop(0))
+    project = get_object_or_404(
+        Project.objects.select_related("workspace"), slug=path.pop(0)
+    )
     if request is not None:
         request.user.check_access(project)
-    project.acting_user = acting_user
     if not path:
         check_type(Project)
         return project
@@ -304,7 +385,6 @@ def parse_path(  # noqa: C901
             current = current.component_set.get(slug=slug, **category_args)
             if request is not None:
                 request.user.check_access_component(current)
-            current.acting_user = acting_user
             break
 
         # Try category
@@ -312,7 +392,6 @@ def parse_path(  # noqa: C901
             current = cast("Project | Category", current).category_set.get(
                 slug=slug, **category_args
             )
-            current.acting_user = acting_user
             category_args = {}
             continue
 
@@ -332,7 +411,8 @@ def parse_path(  # noqa: C901
         raise UnsupportedPathObjectError(msg)
 
     translation = get_object_or_404(
-        cast("Component", current).translation_set, language__code=path.pop(0)
+        cast("Component", current).translation_set.select_related("language", "plural"),
+        language__code=path.pop(0),
     )
     if not path:
         check_type(Translation)
@@ -352,6 +432,193 @@ def parse_path(  # noqa: C901
     return get_object_or_404(translation.unit_set, pk=int(unitid))
 
 
+def parse_path_for_public_sharing(
+    request: AuthenticatedHttpRequest,
+    path: list[str] | tuple[str, ...] | None,
+    types: tuple[type[Model | BaseURLMixin] | None, ...],
+):
+    """Parse a path using ACL unless its project permits public sharing."""
+    if path and tuple(path[:2]) == ("-", "workspace"):
+        return parse_path(request, path, types)
+    if path and path[0] != "-":
+        is_publicly_shared = (
+            Project.objects.publicly_shared().filter(slug=path[0]).exists()
+        )
+        if not is_publicly_shared:
+            return parse_path(request, path, types)
+    return parse_path(None, path, types)
+
+
+async def _workspace_can_view(
+    request: AuthenticatedHttpRequest, workspace: Workspace
+) -> bool:
+    user = request.user
+    if await user.allowed_projects.filter(workspace=workspace).aexists():
+        return True
+    if any(
+        user.has_perm(permission, workspace)
+        for permission in (
+            "workspace.edit",
+            "workspace.add_project",
+            "workspace.edit_members",
+        )
+    ):
+        return True
+    if user.has_perm("management.use"):
+        return True
+    if "weblate.billing" in settings.INSTALLED_APPS:
+        with suppress(AttributeError, ObjectDoesNotExist):
+            return bool(user.has_perm("meta:billing.view", workspace.billing))
+    return False
+
+
+# ruff: ignore[complex-structure]
+async def aparse_path(
+    request: AuthenticatedHttpRequest | None,
+    path: list[str] | tuple[str, ...] | None,
+    types: tuple[type[Model | BaseURLMixin] | None, ...],
+):
+    if None in types and not path:
+        return None
+
+    allowed_types = {x for x in types if x is not None}
+    if request is not None:
+        await request.user.aprepare_permissions()
+
+    def check_type(cls) -> None:
+        if cls not in allowed_types:
+            msg = f"Not supported object type: {cls}"
+            raise UnsupportedPathObjectError(msg)
+
+    if path is None:
+        msg = "Missing path"
+        raise UnsupportedPathObjectError(msg)
+
+    path = list(path)
+
+    # Workspace URL
+    if path[:2] == ["-", "workspace"]:
+        language_scope = len(path) == 5 and path[3] == "-"
+        check_type(WorkspaceLanguage if language_scope else Workspace)
+        if len(path) != 3 and not language_scope:
+            msg = "Invalid workspace path"
+            raise UnsupportedPathObjectError(msg)
+        try:
+            workspace_id = UUID(path[2])
+        except ValueError as error:
+            msg = "Invalid workspace id"
+            raise Http404(msg) from error
+        workspaces = (
+            Workspace.objects.select_related("billing")
+            if "weblate.billing" in settings.INSTALLED_APPS
+            else Workspace.objects.all()
+        )
+        workspace = await aget_object_or_404(workspaces, pk=workspace_id)
+        if request is not None and not await _workspace_can_view(request, workspace):
+            msg = "Access denied"
+            raise Http404(msg)
+        if language_scope:
+            language = await aget_object_or_404(Language, code=path[4])
+            return WorkspaceLanguage(workspace, language)
+        return workspace
+
+    # Language URL
+    if path[:2] == ["-", "-"] and len(path) == 3:
+        if path[2] == "-" and None in types:
+            return None
+        check_type(Language)
+        return await aget_object_or_404(Language, code=path[2])
+
+    # First level is always project
+    project = await aget_object_or_404(
+        Project.objects.select_related("workspace"), slug=path.pop(0)
+    )
+    if request is not None:
+        request.user.check_access(project)
+    if not path:
+        check_type(Project)
+        return project
+
+    # Project/language special case
+    if path[0] == "-" and len(path) == 2:
+        check_type(ProjectLanguage)
+        language = await aget_object_or_404(Language, code=path[1])
+        return ProjectLanguage(project, language)
+
+    if not allowed_types & {Component, Category, Translation, Unit}:
+        msg = "No remaining supported object type"
+        raise UnsupportedPathObjectError(msg)
+
+    # Component/category structure
+    current: Project | Category | Component = project
+    category_args = {"category": None}
+    while path:
+        slug = path.pop(0)
+
+        # Category/language special case
+        if slug == "-" and len(path) == 1:
+            language = await aget_object_or_404(Language, code=path[0])
+            check_type(CategoryLanguage)
+            if not isinstance(current, Category):
+                raise TypeError
+            return CategoryLanguage(current, language)
+
+        # Try component first
+        with suppress(Component.DoesNotExist):
+            current = await current.component_set.select_related("project").aget(
+                slug=slug, **category_args
+            )
+            if request is not None:
+                request.user.check_access_component(current)
+            break
+
+        # Try category
+        with suppress(Category.DoesNotExist):
+            current = (
+                await cast("Project | Category", current)
+                .category_set.select_related("project", "category")
+                .aget(slug=slug, **category_args)
+            )
+            category_args = {}
+            continue
+
+        # Nothing more to try
+        msg = f"Object {slug} not found in {current}"
+        raise Http404(msg)
+
+    # Nothing left, return current object
+    if not path:
+        if not isinstance(current, tuple(allowed_types)):
+            msg = f"Not supported object type: {current.__class__}"
+            raise UnsupportedPathObjectError(msg)
+        return current
+
+    if not allowed_types & {Translation, Unit}:
+        msg = "No remaining supported object type"
+        raise UnsupportedPathObjectError(msg)
+
+    translation = await aget_object_or_404(
+        cast("Component", current).translation_set.select_related("language", "plural"),
+        language__code=path.pop(0),
+    )
+    if not path:
+        check_type(Translation)
+        return translation
+
+    if len(path) > 1:
+        msg = f"Invalid path left: {'/'.join(path)}"
+        raise UnsupportedPathObjectError(msg)
+
+    unitid = path.pop(0)
+
+    if not unitid.isdigit():
+        msg = f"Invalid unit id: {unitid}"
+        raise Http404(msg)
+
+    check_type(Unit)
+    return await aget_object_or_404(translation.unit_set, pk=int(unitid))
+
+
 def parse_path_units(
     request: AuthenticatedHttpRequest,
     path: list[str] | tuple[str, ...],
@@ -359,49 +626,61 @@ def parse_path_units(
 ):
     obj = parse_path(request, path, types)
 
+    access_units = Unit.objects.filter_access(request.user)
+
     context = {"components": None, "path_object": obj}
     if isinstance(obj, Translation):
+        # Not using access_units because parse_path performed the permission check
         unit_set = obj.unit_set.all()
         context["translation"] = obj
         context["component"] = obj.component
         context["project"] = obj.component.project
         context["components"] = [obj.component]
     elif isinstance(obj, Component):
+        # Not using access_units because parse_path performed the permission check
         unit_set = Unit.objects.filter(translation__component=obj).prefetch()
         context["component"] = obj
         context["project"] = obj.project
         context["components"] = [obj]
     elif isinstance(obj, Project):
-        unit_set = Unit.objects.filter(translation__component__project=obj).prefetch()
+        unit_set = access_units.filter(translation__component__project=obj).prefetch()
         context["project"] = obj
+    elif isinstance(obj, WorkspaceLanguage):
+        unit_set = access_units.filter(
+            translation__component__project__workspace=obj.workspace,
+            translation__language=obj.language,
+        ).prefetch()
+        context["workspace"] = obj.workspace
+        context["language"] = obj.language
+    elif isinstance(obj, Workspace):
+        unit_set = access_units.filter(
+            translation__component__project__workspace=obj
+        ).prefetch()
+        context["workspace"] = obj
     elif isinstance(obj, ProjectLanguage):
-        unit_set = Unit.objects.filter(
+        unit_set = access_units.filter(
             translation__component__project=obj.project,
             translation__language=obj.language,
         ).prefetch()
         context["project"] = obj.project
         context["language"] = obj.language
     elif isinstance(obj, Category):
-        unit_set = Unit.objects.filter(
+        unit_set = access_units.filter(
             translation__component_id__in=obj.all_component_ids
         ).prefetch()
         context["project"] = obj.project
     elif isinstance(obj, CategoryLanguage):
-        unit_set = Unit.objects.filter(
+        unit_set = access_units.filter(
             translation__component_id__in=obj.category.all_component_ids,
             translation__language=obj.language,
         ).prefetch()
         context["project"] = obj.category.project
         context["language"] = obj.language
     elif isinstance(obj, Language):
-        unit_set = (
-            Unit.objects.filter_access(request.user)
-            .filter(translation__language=obj)
-            .prefetch()
-        )
+        unit_set = access_units.filter(translation__language=obj).prefetch()
         context["language"] = obj
     elif obj is None:
-        unit_set = Unit.objects.filter_access(request.user)
+        unit_set = access_units.prefetch()
     else:
         msg = f"Unsupported result: {obj}"
         raise TypeError(msg)
@@ -423,7 +702,7 @@ def guess_filemask_from_doc(data, docfile=None) -> None:
     if not ext and "file_format" in data and data["file_format"] in FILE_FORMATS:
         ext = FILE_FORMATS[data["file_format"]].extension()
 
-    data["filemask"] = "{}/{}{}".format(data.get("slug", "translations"), "*", ext)
+    data["filemask"] = f"{data.get('slug', 'translations')}/*{ext}"
 
 
 def create_component_from_doc(data, docfile, target_language: Language | None = None):
@@ -492,13 +771,93 @@ def import_message(
         messages.success(request, message)
 
 
-def iter_files(filenames):
+def _get_allowed_roots(
+    root: str, allowed_roots: list[str] | None
+) -> list[tuple[Path, Path]]:
+    roots = [root] if allowed_roots is None else allowed_roots
+    result = []
+    for allowed_root in roots:
+        absolute_root = Path(os.path.abspath(allowed_root))
+        try:
+            resolved_root = absolute_root.resolve(strict=False)
+        except OSError:
+            continue
+        result.append((absolute_root, resolved_root))
+    result.sort(key=lambda paths: len(paths[0].parts), reverse=True)
+    return result
+
+
+def _get_containing_root(
+    filename: str, allowed_roots: list[tuple[Path, Path]]
+) -> tuple[Path, Path] | None:
+    absolute_filename = Path(os.path.abspath(filename))
+    for absolute_root, resolved_root in allowed_roots:
+        if absolute_filename.is_relative_to(absolute_root):
+            return absolute_root, resolved_root
+    return None
+
+
+def _is_download_path(
+    filename: str, root: str, allowed_roots: list[tuple[Path, Path]]
+) -> bool:
+    relative_filename = os.path.relpath(filename, root)
+    if is_unsafe_path(relative_filename) or is_managed_vcs_metadata_path(
+        relative_filename
+    ):
+        return False
+
+    containing_root = _get_containing_root(filename, allowed_roots)
+    if containing_root is None:
+        return False
+    _absolute_root, resolved_root = containing_root
+
+    try:
+        resolved_filename = Path(filename).resolve(strict=False)
+    except OSError:
+        return False
+    resolved_relative_filename = os.path.relpath(resolved_filename, resolved_root)
+
+    return (
+        is_path_within_resolved_directory(filename, resolved_root)
+        and not is_unsafe_path(resolved_relative_filename)
+        and not is_managed_vcs_metadata_path(resolved_relative_filename)
+    )
+
+
+def iter_files(
+    filenames: list[str],
+    root: str,
+    allowed_roots: list[str] | None = None,
+    *,
+    refresh_lock: Callable[[], None] | None = None,
+) -> Generator[str]:
+    prepared_allowed_roots = _get_allowed_roots(root, allowed_roots)
+    if not prepared_allowed_roots:
+        return
+
     for filename in filenames:
+        if refresh_lock is not None:
+            refresh_lock()
+        if not _is_download_path(filename, root, prepared_allowed_roots):
+            continue
         if os.path.isdir(filename):
-            for root, _unused, files in os.walk(filename):
-                if "/.git/" in root or "/.hg/" in root:
+            for current_root, dirs, files in os.walk(filename):
+                if refresh_lock is not None:
+                    refresh_lock()
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if _is_download_path(
+                        os.path.join(current_root, name), root, prepared_allowed_roots
+                    )
+                ]
+                if not _is_download_path(current_root, root, prepared_allowed_roots):
                     continue
-                yield from (os.path.join(root, name) for name in files)
+                for name in files:
+                    fullname = os.path.join(current_root, name)
+                    if not _is_download_path(fullname, root, prepared_allowed_roots):
+                        continue
+                    yield fullname
         else:
             yield filename
 
@@ -508,19 +867,206 @@ def zip_download(
     filenames: list[str],
     name: str = "translations",
     extra: dict[str, bytes | str] | None = None,
-):
-    response = HttpResponse(content_type="application/zip")
-    with ZipFile(cast("BinaryIO", response), "w", strict_timestamps=False) as zipfile:
-        for filename in iter_files(filenames):
-            try:
-                zipfile.write(filename, arcname=os.path.relpath(filename, root))
-            except FileNotFoundError:
-                continue
+    allowed_roots: list[str] | None = None,
+    refresh_lock: Callable[[], None] | None = None,
+) -> FileResponse:
+    with zip_download_archive(name) as (response, zipfile):
+        write_zip_files(zipfile, root, filenames, allowed_roots, refresh_lock)
         if extra:
             for filename, content in extra.items():
                 zipfile.writestr(filename, content)
-    response["Content-Disposition"] = f'attachment; filename="{name}.zip"'
+
     return response
+
+
+@contextmanager
+def zip_download_archive(name: str) -> Generator[tuple[FileResponse, ZipFile]]:
+    """Build a disk-backed ZIP before streaming the completed archive."""
+    snapshot = tempfile.TemporaryFile()  # ruff: ignore[open-file-with-context-handler]
+    try:
+        response = FileResponse(
+            snapshot,
+            content_type="application/zip",
+            as_attachment=True,
+            filename=f"{name}.zip",
+        )
+        with ZipFile(snapshot, "w", strict_timestamps=False) as zipfile:
+            yield response, zipfile
+        # FileResponse initially saw an empty file. Update the completed size.
+        response["Content-Length"] = str(snapshot.tell())
+        snapshot.seek(0)
+    except BaseException:
+        snapshot.close()
+        raise
+
+
+def write_zip_files(
+    zipfile: ZipFile,
+    root: str,
+    filenames: list[str],
+    allowed_roots: list[str] | None = None,
+    refresh_lock: Callable[[], None] | None = None,
+) -> None:
+    """Write validated files into an open ZIP archive."""
+    if refresh_lock is None:
+        refresh_repository_lock = None
+    else:
+        refresh_repository_lock = _periodic_lock_refresher(refresh_lock)
+
+    for filename in iter_files(
+        filenames,
+        root,
+        allowed_roots,
+        refresh_lock=refresh_repository_lock,
+    ):
+        try:
+            archive_path = os.path.relpath(filename, root)
+            if refresh_repository_lock is None:
+                zipfile.write(filename, arcname=archive_path)
+                continue
+            _write_zip_file_with_refresh(
+                zipfile, filename, archive_path, refresh_repository_lock
+            )
+        except FileNotFoundError:
+            continue
+
+
+def _periodic_lock_refresher(
+    refresh_lock: Callable[[], None],
+) -> Callable[[], None]:
+    """Create a callback which periodically refreshes a lock lease."""
+    refresh_at = monotonic() + REPOSITORY_LOCK_REFRESH_INTERVAL
+
+    def refresh() -> None:
+        nonlocal refresh_at
+        now = monotonic()
+        if now >= refresh_at:
+            refresh_lock()
+            refresh_at = now + REPOSITORY_LOCK_REFRESH_INTERVAL
+
+    return refresh
+
+
+def _copy_file_with_refresh(
+    source: IO[bytes], output: IO[bytes], refresh_lock: Callable[[], None]
+) -> None:
+    """Copy a file while periodically refreshing a lock lease."""
+    while chunk := source.read(DOWNLOAD_COPY_CHUNK_SIZE):
+        output.write(chunk)
+        refresh_lock()
+
+
+def _write_zip_file_with_refresh(
+    zipfile: ZipFile,
+    filename: str,
+    archive_path: str,
+    refresh_lock: Callable[[], None],
+) -> None:
+    """Write a file to a ZIP archive while refreshing a lock lease."""
+    refresh_lock()
+    file_info = ZipInfo.from_file(
+        filename,
+        archive_path,
+        strict_timestamps=getattr(zipfile, "_strict_timestamps", True),
+    )
+    file_info.compress_type = zipfile.compression
+    # TODO: Use compress_level after dropping Python 3.12 support.
+    # ruff: ignore[private-member-access]
+    file_info._compresslevel = zipfile.compresslevel  # type: ignore[attr-defined]
+    with open(filename, "rb") as source, zipfile.open(file_info, "w") as output:
+        _copy_file_with_refresh(source, output, refresh_lock)
+
+
+def repository_lock_timeout_response(error: WeblateLockTimeoutError) -> HttpResponse:
+    """Return a retryable response when a repository is busy."""
+    return HttpResponse(
+        gettext("Could not obtain the repository lock for %s to perform the operation.")
+        % error.lock.origin,
+        content_type="text/plain",
+        status=423,
+    )
+
+
+def snapshot_file_response(
+    filename: str,
+    content_type: str,
+    refresh_lock: Callable[[], None],
+    *,
+    as_attachment: bool = False,
+) -> FileResponse:
+    """Copy a file into a stable disk-backed download response."""
+    refresh_repository_lock = _periodic_lock_refresher(refresh_lock)
+    snapshot = tempfile.TemporaryFile()  # ruff: ignore[open-file-with-context-handler]
+    try:
+        with open(filename, "rb") as source:
+            _copy_file_with_refresh(source, snapshot, refresh_repository_lock)
+        snapshot.seek(0)
+        return FileResponse(
+            snapshot,
+            content_type=content_type,
+            as_attachment=as_attachment,
+            filename=os.path.basename(filename) if as_attachment else "",
+        )
+    except Exception:
+        snapshot.close()
+        raise
+
+
+def _head_file_response(filename: str, content_type: str) -> StreamingHttpResponse:
+    """Create file download headers without reading the response body."""
+    response = StreamingHttpResponse((), content_type=content_type)
+    response["Content-Length"] = os.path.getsize(filename)
+    return response
+
+
+def _download_translation_file_locked(
+    translation: Translation, *, head: bool = False
+) -> tuple[HttpResponseBase, str]:
+    repository = translation.component.effective_repo_component.repository
+    with repository.lock:
+        # Force flushing pending units
+        try:
+            translation.commit_pending("download", None)
+        except Exception:
+            report_error("Download commit", project=translation.component.project)
+
+        filenames = translation.filenames
+        response: HttpResponseBase
+
+        if len(filenames) == 1:
+            filename = filenames[0]
+            extension = (
+                os.path.splitext(filename)[1]
+                or f".{translation.component.file_format_cls.extension()}"
+            )
+            if not os.path.exists(filename):
+                msg = "File not found"
+                raise Http404(msg)
+            content_type = translation.component.file_format_cls.mimetype()
+            if head:
+                response = _head_file_response(filename, content_type)
+            else:
+                # Materialize the response while holding the lock. An open checkout
+                # file can still change when rewritten in place.
+                response = snapshot_file_response(
+                    filename,
+                    content_type,
+                    repository.lock.reacquire,
+                )
+        else:
+            extension = ".zip"
+            root = translation.get_filename()
+            if not root:
+                msg = "No file to download"
+                raise Http404(msg)
+            response = zip_download(
+                root,
+                filenames,
+                translation.full_slug.replace("/", "-"),
+                refresh_lock=repository.lock.reacquire,
+            )
+
+    return response, extension
 
 
 def handle_last_modified(
@@ -543,6 +1089,12 @@ def download_translation_file(
     fmt: str | None = None,
     query_string: str | None = None,
 ):
+    from weblate.accounts.visibility import can_view_contributor  # ruff: ignore[import-outside-top-level]
+
+    if not is_identity_safe_exporter(
+        EXPORTERS.get(fmt or "")
+    ) and not can_view_contributor(request.user, translation):
+        raise PermissionDenied
     response = handle_last_modified(request, translation.stats)
     if response is not None:
         return response
@@ -559,42 +1111,13 @@ def download_translation_file(
         exporter = exporter_cls(translation=translation)
         units = translation.unit_set.prefetch_full().order_by("position")
         if query_string:
-            units = units.search(query_string)
+            units = units.search(query_string, user=request.user)
         exporter.add_units(units)
         response = exporter.get_response()
     else:
-        # Force flushing pending units
-        try:
-            translation.commit_pending("download", None)
-        except Exception:
-            report_error("Download commit", project=translation.component.project)
-
-        filenames = translation.filenames
-
-        if len(filenames) == 1:
-            extension = (
-                os.path.splitext(translation.filename)[1]
-                or f".{translation.component.file_format_cls.extension()}"
-            )
-            if not os.path.exists(filenames[0]):
-                msg = "File not found"
-                raise Http404(msg)
-            # Create response
-            response = FileResponse(
-                open(filenames[0], "rb"),  # noqa: SIM115
-                content_type=translation.component.file_format_cls.mimetype(),
-            )
-        else:
-            extension = ".zip"
-            filename = translation.get_filename()
-            if not filename:
-                msg = "No file to download"
-                raise Http404(msg)
-            response = zip_download(
-                filename,
-                filenames,
-                translation.full_slug.replace("/", "-"),
-            )
+        response, extension = _download_translation_file_locked(
+            translation, head=request.method == "HEAD"
+        )
 
         # Construct filename (do not use real filename as it is usually not
         # that useful)
@@ -604,7 +1127,9 @@ def download_translation_file(
         filename = f"{project_slug}-{component_slug}-{language_code}{extension}"
 
         # Fill in response headers
-        response["Content-Disposition"] = f"attachment; filename={filename}"
+        response["Content-Disposition"] = content_disposition_header(
+            as_attachment=True, filename=filename
+        )
 
     # Last-Modified timestamp
     if last_changed := translation.stats.last_changed:
@@ -617,17 +1142,22 @@ def download_translation_file(
     return response
 
 
-def get_form_data(data: dict[str, str | int | None]) -> dict[str, str | int]:
+def get_form_data[ValueT](
+    data: Mapping[str, ValueT | None],
+) -> dict[str, ValueT | str]:
     return {key: "" if value is None else value for key, value in data.items()}
 
 
 def get_form_errors(form):
-    for error in form.non_field_errors():
-        yield error
+    yield from form.non_field_errors()
     for field in form:
         for error in field.errors:
             yield gettext("Error in parameter %(field)s: %(error)s") % {
-                "field": field.name,
+                "field": (
+                    field.label
+                    if field.name in {"review", "initial_state"}
+                    else field.name
+                ),
                 "error": error,
             }
 

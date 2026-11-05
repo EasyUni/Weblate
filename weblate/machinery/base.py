@@ -7,48 +7,76 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import math
 import random
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from hashlib import md5
 from html import escape, unescape
 from itertools import chain
-from typing import TYPE_CHECKING
-from urllib.parse import quote
+from typing import TYPE_CHECKING, ClassVar
+from urllib.parse import quote, quote_plus, urlparse
 
+import ahocorasick_rs
+import httpx2
+from asgiref.sync import sync_to_async
+from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils.functional import cached_property
+from django.utils.http import parse_http_date_safe
 from django.utils.translation import gettext
-from requests.exceptions import HTTPError, JSONDecodeError, RequestException
 
 from weblate.checks.utils import highlight_string
 from weblate.lang.models import Language, PluralMapper
 from weblate.machinery.forms import BaseMachineryForm
-from weblate.utils.errors import report_error
+from weblate.utils.docs import DocVersionsMixin
+from weblate.utils.errors import log_handled_exception, report_error
+from weblate.utils.forms import WeblateServiceURLField
 from weblate.utils.hash import calculate_dict_hash, calculate_hash, hash_to_checksum
-from weblate.utils.requests import request
+from weblate.utils.outbound import is_allowlisted_hostname
+from weblate.utils.requests import (
+    JSON_RESPONSE_ERRORS,
+    async_fetch_url,
+    async_fetch_validated_url,
+    fetch_url,
+    fetch_validated_url,
+)
 from weblate.utils.similarity import Comparer
 from weblate.utils.site import get_site_url
 
 from .types import (
-    DownloadMultipleTranslations,
-    DownloadTranslations,
-    SettingsDict,
     SourceLanguageChoices,
-    TranslationResultDict,
-    UnitMemoryResultDict,
 )
 
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+MACHINERY_DEFAULT_THRESHOLD = 80
+ERROR_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-    from requests.auth import AuthBase
+
+def sanitize_machinery_error(message: str) -> str:
+    """Hide URLs that can contain provider credentials or user information."""
+    return ERROR_URL_RE.sub("[redacted URL]", message)
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
     from weblate.auth.models import User
+    from weblate.checks.base import Highlight
     from weblate.trans.models import Translation, Unit
     from weblate.trans.models.unit import UnitQuerySet
+
+    from .types import (
+        DownloadMultipleTranslations,
+        DownloadTranslations,
+        SettingsDict,
+        TranslationResultDict,
+        UnitMemoryResultDict,
+    )
 
 
 def get_machinery_language(language: Language) -> Language:
@@ -64,6 +92,12 @@ class MachineTranslationError(Exception):
 class MachineryRateLimitError(MachineTranslationError):
     """Raised when rate limiting is detected."""
 
+    def __init__(
+        self, message: object, *, response: httpx2.Response | None = None
+    ) -> None:
+        super().__init__(message)
+        self.response = response
+
 
 class UnsupportedLanguageError(MachineTranslationError):
     """Raised when language is not supported."""
@@ -77,42 +111,78 @@ class GlossaryDoesNotExistError(MachineTranslationError):
     """Raised when glossary deletion fails because it does not exist."""
 
 
-class BatchMachineTranslation:
+@dataclass
+class TranslationDownloadPlan:
+    output: list[list[TranslationResultDict]]
+    pending: dict[str, list[tuple[int, Unit | None, str, dict[str, str]]]]
+    pending_units: dict[str, Unit | None]
+    pending_texts: dict[str, str]
+    pending_occurrences: dict[str, int]
+    cache_keys: dict[str, str | None]
+
+
+class BatchMachineTranslation(DocVersionsMixin):
     """Generic object for machine translation services."""
 
     name = "MT"
     max_score = 100
     rank_boost = 0
     cache_translations = True
-    language_map: dict[str, str] = {}
+    language_map: ClassVar[dict[str, str]] = {}
     same_languages = False
     do_cleanup = True
-    # Batch size is currently used in autotranslate
+    # Unit limit for automatic translation and quality evaluation requests.
     batch_size = 20
     accounting_key = "external"
     force_uncleanup = False
     highlight_syntax = False
+    glossary_support = False
+    llm_context_support = False
+    sends_data_to_third_party = True
     settings_form: type[BaseMachineryForm] | None = BaseMachineryForm
     request_timeout = 5
+    # Cooldown in seconds after detecting a rate limit or service failure.
+    rate_limit_window = 1800
     is_available = True
     replacement_start = "[X"
     replacement_end = "X]"
     # Cache results for 30 days
     cache_expiry = 30 * 24 * 3600
 
+    validate_source_language = "en"
+    validate_target_language = "de"
+    trusted_error_hosts: ClassVar[set[str]] = set()
+
     @classmethod
     def get_rank(cls):
         return cls.max_score + cls.rank_boost
 
-    def __init__(self, settings: SettingsDict) -> None:
+    def __init__(self, configuration: SettingsDict) -> None:
         """Create new machine translation object."""
         self.mtid = self.get_identifier()
-        self.rate_limit_cache = f"{self.mtid}-rate-limit"
+        if installation_id := configuration.get("_installation_id"):
+            self.mtid = f"{self.mtid}:{installation_id}"
+        self.rate_limit_cache = self.get_rate_limit_cache_keys(configuration)[0]
         self.languages_cache = f"{self.mtid}-languages"
         self.comparer = Comparer()
         self.supported_languages_error: Exception | None = None
         self.supported_languages_error_age: float = 0
-        self.settings = settings
+        self.settings = configuration
+
+    @classmethod
+    def get_rate_limit_cache_keys(cls, configuration: SettingsDict) -> tuple[str, ...]:
+        """Identify cooldowns independently of the project consuming an installation."""
+        identifier = cls.get_identifier()
+        if installation_id := configuration.get("_installation_id"):
+            identifier = f"{identifier}:{installation_id}"
+        else:
+            cache_configuration = {
+                key: value
+                for key, value in configuration.items()
+                if not key.startswith("_")
+            }
+            identifier = f"{identifier}:{calculate_dict_hash(cache_configuration)}"
+        return (f"{identifier}-rate-limit",)
 
     def delete_cache(self) -> None:
         cache.delete_many([self.rate_limit_cache, self.languages_cache])
@@ -125,7 +195,13 @@ class BatchMachineTranslation:
                 gettext("Could not fetch supported languages: %s") % error
             ) from error
         try:
-            self.download_multiple_translations("en", "de", [("test", None)], None, 75)
+            self.download_multiple_translations(
+                self.validate_source_language,
+                self.validate_target_language,
+                [("test", None)],
+                None,
+                MACHINERY_DEFAULT_THRESHOLD,
+            )
         except Exception as error:
             raise ValidationError(
                 gettext("Could not fetch translation: %s") % error
@@ -145,7 +221,7 @@ class BatchMachineTranslation:
         )
 
     @classmethod
-    def get_identifier(cls):
+    def get_identifier(cls) -> str:
         return cls.name.lower().replace(" ", "-")
 
     @classmethod
@@ -163,40 +239,122 @@ class BatchMachineTranslation:
         """Add authentication headers to request."""
         return {}
 
-    def get_auth(self) -> tuple[str, str] | AuthBase | None:
+    def get_auth(self) -> tuple[str, str] | httpx2.Auth | None:
         return None
 
-    def check_failure(self, response) -> None:
+    def check_failure(self, response: httpx2.Response) -> None:
         # Directly raise error as last resort, subclass can prepend this
         # with something more clever
         try:
             response.raise_for_status()
-        except HTTPError as error:
-            detail = response.text
-            try:
-                payload = response.json()
-            except JSONDecodeError:
-                pass
-            else:
-                if isinstance(payload, dict) and payload:
-                    if detail_error := payload.get("error"):
-                        if isinstance(detail_error, str):
-                            detail = detail_error
-                        elif isinstance(detail_error, dict):
-                            if "message" in detail_error:
-                                detail = detail_error["message"]
-                            else:
-                                detail = str(detail_error)
-                    else:
-                        detail = str(payload)
-
-            if detail:
+        except httpx2.HTTPStatusError as error:
+            if detail := self.get_error_detail(response):
                 message = f"{error.args[0]}: {detail[:200]}"
-                raise HTTPError(message, response=response) from error
+                raise httpx2.HTTPStatusError(
+                    message, request=response.request, response=response
+                ) from error
             raise
 
-    def request(self, method, url, skip_auth=False, **kwargs):
-        """Perform JSON request."""
+    @property
+    def allow_private_targets(self) -> bool:
+        return "_project" not in self.settings
+
+    @staticmethod
+    def get_host_from_setting(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        if "://" in value:
+            return urlparse(value).hostname
+        return value or None
+
+    def get_trusted_error_hosts(self) -> set[str]:
+        hosts = set(settings.ALLOWED_MACHINERY_DOMAINS)
+        hosts.update(self.trusted_error_hosts)
+        if self.allow_private_targets or self.settings_form is None:
+            return hosts
+
+        form = self.settings_form(self.__class__)
+        for field_name, field in form.fields.items():
+            is_endpoint_field = isinstance(field, WeblateServiceURLField) or (
+                field_name in form.network_host_fields
+            )
+            if not is_endpoint_field:
+                continue
+
+            values: set[str] = set()
+            if initial := getattr(field, "initial", None):
+                values.add(initial)
+            values.update(value for value, _label in getattr(field, "choices", ()))
+
+            current_value = self.settings.get(field_name)
+            if current_value in values and (
+                host := self.get_host_from_setting(current_value)
+            ):
+                hosts.add(host)
+
+            for value in values:
+                if host := self.get_host_from_setting(value):
+                    hosts.add(host)
+        return hosts
+
+    @classmethod
+    def has_configurable_outbound_target(cls) -> bool:
+        if cls.settings_form is None:
+            return False
+
+        form = cls.settings_form(cls)
+        for field_name, field in form.fields.items():
+            if isinstance(field, WeblateServiceURLField):
+                return True
+            if field_name in form.network_host_fields:
+                return True
+        return False
+
+    def can_display_error_detail(self, response: httpx2.Response) -> bool:
+        if self.allow_private_targets:
+            return True
+        return self.is_trusted_error_host(response)
+
+    def is_trusted_error_host(self, response: httpx2.Response) -> bool:
+        if (
+            self.settings_form is not None
+            and not self.has_configurable_outbound_target()
+        ):
+            return True
+        hostname = response.url.host
+        return is_allowlisted_hostname(hostname, list(self.get_trusted_error_hosts()))
+
+    def get_error_detail(self, response: httpx2.Response) -> str | None:
+        if not self.can_display_error_detail(response):
+            return None
+        trusted_host = self.is_trusted_error_host(response)
+
+        try:
+            payload = response.json()
+        except JSON_RESPONSE_ERRORS:
+            if trusted_host:
+                return response.text or None
+            return None
+
+        if isinstance(payload, dict):
+            if (message := payload.get("message")) and isinstance(message, str):
+                return message
+            if (detail := payload.get("detail")) and isinstance(detail, str):
+                return detail
+            if error := payload.get("error"):
+                if isinstance(error, str):
+                    return error
+                if isinstance(error, dict):
+                    detail_message = error.get("message")
+                    if isinstance(detail_message, str):
+                        return detail_message
+        elif isinstance(payload, str) and trusted_host:
+            return payload
+        if trusted_host:
+            return response.text or None
+        return None
+
+    def _prepare_request_kwargs(self, skip_auth: bool, kwargs: dict) -> dict:
         # Create custom headers
         headers = {
             "Referer": get_site_url(),
@@ -207,17 +365,52 @@ class BatchMachineTranslation:
         # Optional authentication
         if not skip_auth:
             headers.update(self.get_headers())
-
-        # Fire request
-        response = request(
-            method,
-            url,
-            headers=headers,
-            timeout=self.request_timeout,
-            auth=self.get_auth(),
-            raise_for_status=False,
+        return {
             **kwargs,
+            "headers": headers,
+            "timeout": self.request_timeout,
+            "auth": self.get_auth(),
+            "raise_for_status": False,
+        }
+
+    def request(self, method, url, skip_auth=False, **kwargs):
+        """Perform JSON request."""
+        request_kwargs = self._prepare_request_kwargs(skip_auth, kwargs)
+        # Fire request
+        if self.allow_private_targets:
+            response = fetch_url(
+                method,
+                url,
+                **request_kwargs,
+            )
+        else:
+            response = fetch_validated_url(
+                method,
+                url,
+                allow_private_targets=False,
+                private_allowlist=settings.ALLOWED_MACHINERY_DOMAINS,
+                **request_kwargs,
+            )
+
+        self.check_failure(response)
+
+        return response
+
+    async def arequest(self, method, url, skip_auth=False, **kwargs):
+        """Perform JSON request without blocking the event loop."""
+        request_kwargs = await sync_to_async(self._prepare_request_kwargs)(
+            skip_auth, kwargs
         )
+        if self.allow_private_targets:
+            response = await async_fetch_url(method, url, **request_kwargs)
+        else:
+            response = await async_fetch_validated_url(
+                method,
+                url,
+                allow_private_targets=False,
+                private_allowlist=settings.ALLOWED_MACHINERY_DOMAINS,
+                **request_kwargs,
+            )
 
         self.check_failure(response)
 
@@ -235,12 +428,110 @@ class BatchMachineTranslation:
         return code
 
     def report_error(
-        self, cause: str, extra_log: str | None = None, message: bool = False
+        self,
+        cause: str,
+        exception: BaseException,
+        extra_log: str | None = None,
     ) -> None:
         """Report error situations."""
+        self._save_machinery_error(exception, cause)
         report_error(
-            f"machinery[{self.name}]: {cause}", extra_log=extra_log, message=message
+            f"machinery[{self.name}]: {cause}",
+            extra_log=extra_log,
+            exception=exception,
         )
+
+    def _get_machinery_error(self, exc: BaseException, cause: str) -> str:
+        """Format bounded diagnostics with private configuration redacted."""
+        response = getattr(exc, "response", None)
+        try:
+            if isinstance(
+                response, httpx2.Response
+            ) and not self.can_display_error_detail(response):
+                message = str(exc)
+            else:
+                message = (
+                    self.get_error_message(exc)
+                    if isinstance(exc, Exception)
+                    else str(exc)
+                )
+        except Exception:
+            # Provider response parsing must not hide the original error.
+            message = f"{type(exc).__name__}: {exc}"
+        status = (
+            str(response.status_code) if isinstance(response, httpx2.Response) else ""
+        )
+        if not isinstance(message, str) or not message.strip():
+            message = str(exc)
+        message = message.removeprefix(f"{type(exc).__name__}: ")
+        message = ": ".join(filter(None, [cause, type(exc).__name__, status, message]))
+        message = sanitize_machinery_error(message)
+
+        # Only explicitly public configuration may be echoed in diagnostics.
+        # Include nested credentials and encoded values used in provider errors.
+        public_fields = (
+            self.settings_form.public_configuration_fields
+            if self.settings_form is not None
+            else frozenset()
+        )
+        secrets: set[str] = set()
+
+        def collect_values(value: object) -> None:
+            if isinstance(value, str) and value:
+                secrets.update((value, quote(value, safe=""), quote_plus(value)))
+                # Providers can echo individual fields from serialized service
+                # account documents instead of the complete credentials string.
+                if value.lstrip().startswith(("{", "[")):
+                    with contextlib.suppress(json.JSONDecodeError):
+                        collect_values(json.loads(value))
+            elif isinstance(value, dict):
+                for nested in value.values():
+                    collect_values(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect_values(nested)
+
+        for key, value in self.settings.items():
+            if not key.startswith("_") and key not in public_fields:
+                collect_values(value)
+        if secrets:
+            message = re.sub(
+                "|".join(
+                    re.escape(value) for value in sorted(secrets, key=len, reverse=True)
+                ),
+                "[redacted]",
+                message,
+            )
+        return message[:2000]
+
+    def _save_machinery_error(self, exc: BaseException, cause: str) -> None:
+        """Persist diagnostics without interfering with provider failures."""
+        # ruff: ignore[import-outside-top-level]
+        from weblate.machinery.models import MachineryError, MachineryInstallation
+
+        installation_id = self.settings.get("_installation_id")
+        if installation_id is None:
+            return
+        try:
+            message = self._get_machinery_error(exc, cause)
+            # Lock the installation against deletion. A savepoint also keeps a
+            # failed write from breaking the caller's transaction.
+            with transaction.atomic():
+                if (
+                    not MachineryInstallation.objects.select_for_update()
+                    .filter(pk=installation_id)
+                    .exists()
+                ):
+                    return
+                MachineryError.objects.create(
+                    installation_id=installation_id, error=message
+                )
+        except Exception:
+            log_handled_exception("Could not save machinery error")
+
+    def log_handled_error(self, cause: str, extra_log: str | None = None) -> None:
+        """Log a handled error without reporting it to external services."""
+        log_handled_exception(f"machinery[{self.name}]: {cause}", extra_log=extra_log)
 
     @cached_property
     def supported_languages(self):
@@ -257,34 +548,105 @@ class BatchMachineTranslation:
         # Download
         try:
             languages = set(self.download_languages())
-        except Exception as exc:
-            self.supported_languages_error = exc
+        except Exception as error:
+            self.supported_languages_error = error
             self.supported_languages_error_age = time.time()
-            self.report_error("Could not fetch languages, using defaults")
+            self.report_error("Could not fetch languages, using defaults", error)
             return set()
 
         # Update cache
         cache.set(self.languages_cache, languages, 3600 * 48)
         return languages
 
-    def is_supported(self, source, language):
+    def is_supported(self, source_language, target_language) -> bool:
         """Check whether given language combination is supported."""
         return (
-            language in self.supported_languages
-            and source in self.supported_languages
-            and source != language
+            target_language in self.supported_languages
+            and source_language in self.supported_languages
+            and source_language != target_language
         )
 
-    def is_rate_limited(self):
+    def is_rate_limited(self) -> bool:
         return cache.get(self.rate_limit_cache, False)
 
-    def set_rate_limit(self):
-        return cache.set(self.rate_limit_cache, True, 1800)
+    @staticmethod
+    def parse_retry_delay(value: str) -> int | None:
+        """Parse seconds, rounding up so a retry never precedes the delay."""
+        try:
+            delay = float(value)
+        except (ValueError, OverflowError):
+            return None
+        # Keep the timeout representable as a signed 64-bit millisecond value
+        # for cache backends, including the current Unix timestamp.
+        if (
+            not math.isfinite(delay)
+            or not 0 <= delay <= (2**63 - 1) // 1000 - time.time()
+        ):
+            return None
+        return math.ceil(delay)
 
-    def is_rate_limit_error(self, exc) -> bool:
+    @classmethod
+    def get_retry_after(cls, headers: Mapping[str, str]) -> int | None:
+        """Read HTTP retry hints, preferring the more precise millisecond form."""
+        headers = {key.lower(): value for key, value in headers.items()}
+        if value := headers.get("retry-after-ms"):
+            try:
+                delay = cls.parse_retry_delay(str(float(value) / 1000))
+            except (ValueError, OverflowError):
+                delay = None
+            if delay is not None:
+                return delay
+        if value := headers.get("retry-after"):
+            if (delay := cls.parse_retry_delay(value)) is not None:
+                return delay
+            if (timestamp := parse_http_date_safe(value)) is not None:
+                return cls.parse_retry_delay(str(timestamp - time.time()))
+        return None
+
+    @classmethod
+    def parse_retry_info(cls, detail: object) -> int | None:
+        """Read a Google RetryInfo JSON detail without inferring free-form text."""
+        if (
+            isinstance(detail, dict)
+            and detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo"
+            and isinstance(value := detail.get("retryDelay"), str)
+            and re.fullmatch(r"[0-9]+(?:\.[0-9]{1,9})?s", value)
+        ):
+            return cls.parse_retry_delay(value[:-1])
+        return None
+
+    def get_rate_limit_timeout(self, exc: Exception) -> int:
+        """Use the provider's retry hint, falling back to the service window."""
+        response = getattr(exc, "response", None)
+        if not isinstance(response, httpx2.Response):
+            return self.rate_limit_window
+        if (delay := self.get_retry_after(response.headers)) is not None:
+            return delay
+        try:
+            payload = response.json()
+        except JSON_RESPONSE_ERRORS:
+            return self.rate_limit_window
+        if isinstance(payload, dict) and isinstance(
+            error := payload.get("error"), dict
+        ):
+            details = error.get("details")
+            if isinstance(details, list):
+                for detail in details:
+                    if (delay := self.parse_retry_info(detail)) is not None:
+                        return delay
+        return self.rate_limit_window
+
+    def set_rate_limit(self, timeout: int | None = None) -> None:
+        cache.set(
+            self.rate_limit_cache,
+            True,
+            self.rate_limit_window if timeout is None else timeout,
+        )
+
+    def is_rate_limit_error(self, exc: Exception) -> bool:
         if isinstance(exc, MachineryRateLimitError):
             return True
-        if not isinstance(exc, HTTPError):
+        if not isinstance(exc, httpx2.HTTPStatusError):
             return False
         # Apply rate limiting for following status codes:
         # HTTP 456 Client Error: Quota Exceeded (DeepL)
@@ -317,32 +679,35 @@ class BatchMachineTranslation:
 
         return ":".join(str(part) for part in key)
 
-    def unescape_text(self, text: str):
+    def unescape_text(self, text: str) -> str:
         """Unescaping of the text with replacements."""
         return text
 
-    def escape_text(self, text: str):
+    def escape_text(self, text: str) -> str:
         """Escaping of the text with replacements."""
         return text
 
-    def make_re_placeholder(self, text: str):
-        """Convert placeholder into a regular expression."""
-        # Allow additional space before ]
-        return re.escape(text[:-1]) + " *" + re.escape(text[-1:])
+    def get_placeholder_pattern(self) -> re.Pattern[str]:
+        """Match numbered placeholders, allowing space before the last delimiter."""
+        return re.compile(
+            f"{re.escape(self.replacement_start)}(?P<id>[0-9]+)"
+            f"{re.escape(self.replacement_end[:-1])} *"
+            f"{re.escape(self.replacement_end[-1:])}"
+        )
 
     def format_replacement(
-        self, h_start: int, h_end: int, h_text: str, h_kind: Unit | None
+        self, h_start: int, h_end: int, h_text: str, h_kind: Highlight | Unit | None
     ) -> str:
         """Generate a single replacement."""
         return f"{self.replacement_start}{h_start}{self.replacement_end}"
 
     def get_highlights(
         self, text: str, unit
-    ) -> Iterable[tuple[int, int, str, Unit | None]]:
-        for h_start, h_end, h_text in highlight_string(
+    ) -> Iterable[tuple[int, int, str, Highlight | Unit | None]]:
+        for highlight in highlight_string(
             text, unit, highlight_syntax=self.highlight_syntax
         ):
-            yield h_start, h_end, h_text, None
+            yield highlight.start, highlight.end, highlight.text, highlight
 
     def cleanup_text(self, text: str, unit: Unit) -> tuple[str, dict[str, str]]:
         """Remove placeholder to avoid confusing the machine translation."""
@@ -364,18 +729,32 @@ class BatchMachineTranslation:
 
         return "".join(parts), replacements
 
+    def build_placeholder_restorer(
+        self, replacements: dict[str, str]
+    ) -> Callable[[str], str]:
+        """Build a restorer that scans each result only once."""
+        if not replacements:
+            return lambda text: text
+
+        pattern = self.get_placeholder_pattern()
+
+        def replace(match: re.Match[str]) -> str:
+            key = f"{self.replacement_start}{match['id']}{self.replacement_end}"
+            return replacements.get(key, match.group(0))
+
+        return lambda text: pattern.sub(replace, text)
+
     def uncleanup_text(self, replacements: dict[str, str], text: str) -> str:
-        for source, target in replacements.items():
-            text = re.sub(self.make_re_placeholder(source), target, text)
-        return self.unescape_text(text)
+        return self.unescape_text(self.build_placeholder_restorer(replacements)(text))
 
     def uncleanup_results(
         self, replacements: dict[str, str], results: list[TranslationResultDict]
     ) -> None:
         """Reverts replacements done by cleanup_text."""
+        restore = self.build_placeholder_restorer(replacements)
         for result in results:
-            result["text"] = self.uncleanup_text(replacements, result["text"])
-            result["source"] = self.uncleanup_text(replacements, result["source"])
+            result["text"] = self.unescape_text(restore(result["text"]))
+            result["source"] = self.unescape_text(restore(result["source"]))
 
     def get_language_possibilities(self, language: Language) -> Iterator[str]:
         code = language.code
@@ -388,6 +767,12 @@ class BatchMachineTranslation:
             code = code.rsplit("_", 1)[0]
             yield self.map_language_code(code)
 
+    def get_source_language_possibilities(self, language: Language) -> Iterator[str]:
+        return self.get_language_possibilities(language)
+
+    def get_target_language_possibilities(self, language: Language) -> Iterator[str]:
+        return self.get_language_possibilities(language)
+
     def get_languages(
         self, source_language: Language, target_language: Language
     ) -> tuple[str, str]:
@@ -395,14 +780,16 @@ class BatchMachineTranslation:
             msg = "Same languages"
             raise UnsupportedLanguageError(msg)
 
-        for source in self.get_language_possibilities(source_language):
-            for target in self.get_language_possibilities(target_language):
+        for source in self.get_source_language_possibilities(source_language):
+            for target in self.get_target_language_possibilities(target_language):
                 if self.is_supported(source, target):
                     return source, target
 
         if self.supported_languages_error:
             if self.supported_languages_error_age + 3600 > time.time():
-                raise MachineTranslationError(repr(self.supported_languages_error))
+                raise MachineTranslationError(
+                    sanitize_machinery_error(repr(self.supported_languages_error))
+                )
             self.supported_languages_error = None
             self.supported_languages_error_age = 0
 
@@ -418,38 +805,149 @@ class BatchMachineTranslation:
         threshold,
         replacements,
         *extra_parts,
+        source_occurrence: int = 0,
     ) -> tuple[str | None, list[TranslationResultDict] | None]:
         if not self.cache_translations:
             return None, None
-        cache_key = self.get_cache_key(
-            "translation",
-            parts=(source_language, target_language, threshold, *extra_parts),
-            text=text,
+        cache_key = self.get_translation_cache_key(
+            unit,
+            source_language,
+            target_language,
+            text,
+            threshold,
+            replacements,
+            *extra_parts,
+            source_occurrence=source_occurrence,
         )
         result = cache.get(cache_key)
+        if result:
+            result = [item.copy() for item in result]
         if result and (replacements or self.force_uncleanup):
             self.uncleanup_results(replacements, result)
         return cache_key, result
 
-    def search(self, unit, text, user: User | None):
-        """Search for known translations of `text`."""
+    def get_translation_cache_parts(
+        self,
+        unit,
+        source_language,
+        target_language,
+        text,
+        threshold,
+        replacements,
+        *,
+        source_occurrence: int = 0,
+    ) -> tuple[str, ...]:
+        return ()
+
+    def tsv_checksum(self, tsv: str) -> str:
+        """Calculate checksum of given TSV glossary."""
+        return hash_to_checksum(calculate_hash(tsv)) if tsv else ""
+
+    def get_glossary_cache_part(self, unit: Unit) -> str:
+        from weblate.glossary.models import get_glossary_tsv  # ruff: ignore[import-outside-top-level]
+
+        if self.uses_custom_source(unit):
+            return self.tsv_checksum(
+                get_glossary_tsv(
+                    unit.translation, source_language=unit.effective_source_language
+                )
+            )
+        return self.tsv_checksum(get_glossary_tsv(unit.translation))
+
+    def get_uncached_pending_key(self, index: int, text: str, unit: Unit | None) -> str:
+        if unit is None:
+            return f"pending:none:{calculate_hash(text)}"
+        translation = getattr(unit, "translation", None)
+        translation_id = getattr(translation, "id", None) or getattr(
+            translation, "pk", None
+        )
+        if translation_id is None:
+            return f"pending:{index}"
+        return f"pending:{translation_id}:{calculate_hash(text)}"
+
+    def get_translation_cache_extra_parts(
+        self,
+        index: int,
+        text: str,
+        unit: Unit | None,
+        source_occurrence: int,
+    ) -> tuple[str | int, ...]:
+        return ()
+
+    def get_translation_cache_key(
+        self,
+        unit,
+        source_language,
+        target_language,
+        text,
+        threshold,
+        replacements,
+        *extra_parts,
+        source_occurrence: int = 0,
+    ) -> str:
+        translation_cache_parts: tuple[str, ...] = ()
+        if unit is not None:
+            translation_cache_parts = self.get_translation_cache_parts(
+                unit,
+                source_language,
+                target_language,
+                text,
+                threshold,
+                replacements,
+                source_occurrence=source_occurrence,
+            )
+        return self.get_cache_key(
+            "translation",
+            parts=(
+                source_language,
+                target_language,
+                threshold,
+                *translation_cache_parts,
+                *extra_parts,
+            ),
+            text=text,
+        )
+
+    def _prepare_search(self, unit, text):
         translation = unit.translation
+        source_language = self.get_unit_source_language(unit)
         try:
-            source_language, target_language = self.get_languages(
-                translation.component.source_language, translation.language
+            mapped_source_language, target_language = self.get_languages(
+                source_language, translation.language
             )
         except UnsupportedLanguageError:
             unit.translation.log_debug(
-                "machinery failed: not supported language pair: %s - %s",
-                translation.component.source_language.code,
+                "machinery %s failed: not supported language pair: %s - %s",
+                self.__class__.__name__,
+                source_language.code,
                 translation.language.code,
             )
-            return []
+            return None
 
         self.account_usage(translation.component.project)
-        return self._translate(
-            source_language, target_language, [(text, unit)], user, threshold=10
-        )[text]
+        return mapped_source_language, target_language, [(text, unit)]
+
+    def search(self, unit, text, user: User | None):
+        """Search for known translations of `text`."""
+        prepared = self._prepare_search(unit, text)
+        if prepared is None:
+            return []
+        source_language, target_language, sources = prepared
+        return self._translate_sources(
+            source_language, target_language, sources, user, threshold=10
+        )[0]
+
+    async def asearch(self, unit, text, user: User | None):
+        """Search for known translations without blocking the event loop."""
+        prepared = await sync_to_async(self._prepare_search)(unit, text)
+        if prepared is None:
+            return []
+        source_language, target_language, sources = prepared
+        return (
+            await self._atranslate_sources(
+                source_language, target_language, sources, user, threshold=10
+            )
+        )[0]
 
     def get_default_source_language(self, translation: Translation) -> Language:
         """Return default source language for the translation."""
@@ -461,28 +959,38 @@ class BatchMachineTranslation:
         if selection == SourceLanguageChoices.SOURCE:
             return translation.component.source_language
 
-        if selection == SourceLanguageChoices.SECONDARY:
-            # Use secondary if configured
-            if translation.component.secondary_language:
-                return translation.component.secondary_language
-            if translation.component.project.secondary_language:
-                return translation.component.project.secondary_language
+        if selection == SourceLanguageChoices.SECONDARY and (
+            secondary_language := translation.component.effective_secondary_language
+        ):
+            return secondary_language
 
         return self.get_default_source_language(translation)
 
-    def translate(
+    def uses_custom_source(self, unit: Unit) -> bool:
+        """Apply the workflow source only when machinery selects its source automatically."""
+        return (
+            unit.translation_parent_id is not None
+            or unit.missing_source_snapshot is not None
+        ) and self.settings.get(
+            "source_language", SourceLanguageChoices.AUTO
+        ) == SourceLanguageChoices.AUTO
+
+    def get_unit_source_language(self, unit: Unit) -> Language:
+        if self.uses_custom_source(unit):
+            return unit.effective_source_language
+        return self.get_source_language(unit.translation)
+
+    def _prepare_translate(
         self,
         unit: Unit,
-        user: User | None = None,
-        threshold: int = 75,
         *,
         source_language: Language | None = None,
     ):
-        """Return list of machine translations."""
         translation = unit.translation
+        if self.uses_custom_source(unit) and unit.missing_source_snapshot is not None:
+            return None
         if source_language is None:
-            # Fall back to component source language
-            source_language = self.get_source_language(translation)
+            source_language = self.get_unit_source_language(unit)
         translating_from_source: bool = (
             translation.component.source_language == source_language
         )
@@ -493,15 +1001,21 @@ class BatchMachineTranslation:
             )
         except UnsupportedLanguageError:
             unit.translation.log_debug(
-                "machinery failed: not supported language pair: %s - %s",
+                "machinery %s failed: not supported language pair: %s - %s",
+                self.__class__.__name__,
                 source_language.code,
                 translation.language.code,
             )
-            return []
+            return None
 
         self.account_usage(translation.component.project)
 
-        source_plural = source_language.plural
+        source_plural = (
+            unit.effective_source_plural
+            if unit.translation_parent_id
+            and source_language == unit.effective_source_language
+            else source_language.plural
+        )
         target_plural = translation.plural
         plural_mapper = PluralMapper(source_plural, target_plural)
         alternate_units: dict[int, Unit] | None = None
@@ -509,14 +1023,68 @@ class BatchMachineTranslation:
             alternate_units = plural_mapper.get_other_units([unit], source_language)
 
         plural_mapper.map_units([unit], alternate_units)
-        translations = self._translate(
+        return (
             mapped_source_language,
             target_language,
             [(text, unit) for text in unit.plural_map],
+        )
+
+    def translate(
+        self,
+        unit: Unit,
+        user: User | None = None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+        *,
+        source_language: Language | None = None,
+    ):
+        """Return list of machine translations."""
+        prepared = self._prepare_translate(unit, source_language=source_language)
+        if prepared is None:
+            return []
+        mapped_source_language, target_language, sources = prepared
+        return self._translate_sources(
+            mapped_source_language,
+            target_language,
+            sources,
             user,
             threshold=threshold,
         )
-        return [translations[text] for text in unit.plural_map]
+
+    async def atranslate(
+        self,
+        unit: Unit,
+        user: User | None = None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+        *,
+        source_language: Language | None = None,
+    ):
+        """Return machine translations without blocking the event loop."""
+        prepared = await sync_to_async(self._prepare_translate)(
+            unit, source_language=source_language
+        )
+        if prepared is None:
+            return []
+        mapped_source_language, target_language, sources = prepared
+        return await self._atranslate_sources(
+            mapped_source_language,
+            target_language,
+            sources,
+            user,
+            threshold=threshold,
+        )
+
+    async def adownload_multiple_translations(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        user: User | None = None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadMultipleTranslations:
+        """Download translations while keeping synchronous backends usable."""
+        return await sync_to_async(
+            self.download_multiple_translations, thread_sensitive=False
+        )(source_language, target_language, sources, user, threshold)
 
     def download_multiple_translations(
         self,
@@ -524,7 +1092,7 @@ class BatchMachineTranslation:
         target_language,
         sources: list[tuple[str, Unit | None]],
         user: User | None = None,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadMultipleTranslations:
         """
         Download dictionary of a lists of possible translations from a service.
@@ -542,79 +1110,338 @@ class BatchMachineTranslation:
         self,
         source_language,
         target_language,
-        sources: list[tuple[str, Unit]],
+        sources: list[tuple[str, Unit | None]],
         user=None,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadMultipleTranslations:
-        output: DownloadMultipleTranslations = {}
-        pending = defaultdict(list)
+        return {
+            text: result
+            for (text, _unit), result in zip(
+                sources,
+                self._translate_sources(
+                    source_language, target_language, sources, user, threshold
+                ),
+                strict=True,
+            )
+        }
+
+    def _translate_sources(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        user=None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> list[list[TranslationResultDict]]:
+        plan = self._prepare_translation_download(
+            source_language, target_language, sources, threshold
+        )
+        if plan.pending:
+            self._download_pending_translations(
+                plan,
+                source_language=source_language,
+                target_language=target_language,
+                user=user,
+                threshold=threshold,
+            )
+        return plan.output
+
+    async def _atranslate_sources(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        user=None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> list[list[TranslationResultDict]]:
+        plan = await sync_to_async(self._prepare_translation_download)(
+            source_language, target_language, sources, threshold
+        )
+        if plan.pending:
+            await self._adownload_pending_translations(
+                plan,
+                source_language=source_language,
+                target_language=target_language,
+                user=user,
+                threshold=threshold,
+            )
+        return plan.output
+
+    def _prepare_translation_download(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        threshold: int,
+    ) -> TranslationDownloadPlan:
+        output: list[list[TranslationResultDict]] = [[] for _source in sources]
+        pending: dict[str, list[tuple[int, Unit | None, str, dict[str, str]]]] = (
+            defaultdict(list)
+        )
+        pending_units: dict[str, Unit | None] = {}
+        pending_texts: dict[str, str] = {}
+        pending_occurrences: dict[str, int] = {}
         cache_keys: dict[str, str | None] = {}
+        source_occurrences: dict[tuple[int | None, str], int] = defaultdict(int)
         result: list[TranslationResultDict] | None
-        for text, unit in sources:
+        for index, (text, unit) in enumerate(sources):
             original_source = text
-            text, replacements = self.cleanup_text(text, unit)
+            replacements: dict[str, str]
+            if unit is None:
+                replacements = {}
+            else:
+                text, replacements = self.cleanup_text(text, unit)
 
             if not text or self.is_rate_limited():
-                output[original_source] = []
                 continue
+
+            occurrence_key = (id(unit) if unit is not None else None, text)
+            source_occurrence = source_occurrences[occurrence_key]
+            source_occurrences[occurrence_key] += 1
+            cache_extra_parts = (
+                self.get_translation_cache_extra_parts(
+                    index, text, unit, source_occurrence
+                )
+                if self.cache_translations
+                else ()
+            )
 
             # Try cached results
-            cache_keys[text], result = self.get_cached(
-                unit, source_language, target_language, text, threshold, replacements
+            cache_key, result = self.get_cached(
+                unit,
+                source_language,
+                target_language,
+                text,
+                threshold,
+                replacements,
+                *cache_extra_parts,
+                source_occurrence=source_occurrence,
+            )
+            pending_key = (
+                self.get_uncached_pending_key(index, text, unit)
+                if cache_key is None
+                else cache_key
             )
             if result is not None:
-                output[original_source] = result
+                for item in result:
+                    item["original_source"] = original_source
+                output[index] = result
                 continue
 
-            pending[text].append((unit, original_source, replacements))
+            pending[pending_key].append((index, unit, original_source, replacements))
+            pending_units[pending_key] = unit
+            pending_texts[pending_key] = text
+            pending_occurrences[pending_key] = source_occurrence
+            cache_keys[pending_key] = cache_key
 
-        # Fetch pending strings to translate
-        if pending:
+        return TranslationDownloadPlan(
+            output=output,
+            pending=pending,
+            pending_units=pending_units,
+            pending_texts=pending_texts,
+            pending_occurrences=pending_occurrences,
+            cache_keys=cache_keys,
+        )
+
+    def _download_pending_translations(
+        self,
+        plan: TranslationDownloadPlan,
+        *,
+        source_language,
+        target_language,
+        user=None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> None:
+        remaining_keys = list(plan.pending)
+        while remaining_keys:
+            batch_keys, remaining_keys = self._get_pending_batch(
+                remaining_keys, plan.pending_texts
+            )
+
             # Unit is only used in WeblateMemory and it is used only to get a project
             # so it doesn't matter we potentially flatten this.
             try:
-                translations = self.download_multiple_translations(
+                translations = self.download_pending_translations(
                     source_language,
                     target_language,
                     [
-                        (text, occurrences[0][0])
-                        for text, occurrences in pending.items()
+                        (
+                            plan.pending_texts[pending_key],
+                            plan.pending_units[pending_key],
+                            plan.pending_occurrences[pending_key],
+                        )
+                        for pending_key in batch_keys
                     ],
                     user,
                     threshold,
                 )
             except Exception as exc:
-                if self.is_rate_limit_error(exc):
-                    self.set_rate_limit()
+                self._handle_download_error(exc)
 
-                self.report_error("Could not fetch translations")
-                if isinstance(exc, MachineTranslationError):
-                    raise
-                raise MachineTranslationError(self.get_error_message(exc)) from exc
+            self._apply_downloaded_translations(plan, batch_keys, translations)
 
-            # Postprocess translations
-            for text, result in translations.items():
-                for _unit, original_source, replacements in pending[text]:
-                    # Always operate on copy of the dictionaries
-                    partial = [x.copy() for x in result]
+    async def _adownload_pending_translations(
+        self,
+        plan: TranslationDownloadPlan,
+        *,
+        source_language,
+        target_language,
+        user=None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> None:
+        remaining_keys = list(plan.pending)
+        while remaining_keys:
+            batch_keys, remaining_keys = self._get_pending_batch(
+                remaining_keys, plan.pending_texts
+            )
+            try:
+                translations = await self.adownload_pending_translations(
+                    source_language,
+                    target_language,
+                    [
+                        (
+                            plan.pending_texts[pending_key],
+                            plan.pending_units[pending_key],
+                            plan.pending_occurrences[pending_key],
+                        )
+                        for pending_key in batch_keys
+                    ],
+                    user,
+                    threshold,
+                )
+            except Exception as exc:
+                await sync_to_async(self._handle_download_error)(exc)
 
-                    for item in partial:
-                        item["original_source"] = original_source
-                    if cache_key := cache_keys[text]:
-                        cache.set(cache_key, partial, self.cache_expiry)
-                    if replacements or self.force_uncleanup:
-                        self.uncleanup_results(replacements, partial)
-                    output[original_source] = partial
-        return output
+            await sync_to_async(self._apply_downloaded_translations)(
+                plan, batch_keys, translations
+            )
+
+    @staticmethod
+    def _get_pending_batch(
+        remaining_keys: list[str], pending_texts: dict[str, str]
+    ) -> tuple[list[str], list[str]]:
+        batch_keys: list[str] = []
+        batch_texts: set[str] = set()
+        next_remaining_keys: list[str] = []
+        for pending_key in remaining_keys:
+            text = pending_texts[pending_key]
+            if text in batch_texts:
+                next_remaining_keys.append(pending_key)
+                continue
+            batch_keys.append(pending_key)
+            batch_texts.add(text)
+        return batch_keys, next_remaining_keys
+
+    def _handle_download_error(self, exc: Exception) -> None:
+        if self.is_rate_limit_error(exc):
+            self.set_rate_limit(self.get_rate_limit_timeout(exc))
+
+        if isinstance(exc, MachineTranslationError):
+            self.report_error("Could not fetch translations", exception=exc)
+            raise exc
+
+        original_message = sanitize_machinery_error(str(exc))
+        fallback = f"{exc.__class__.__name__}: {original_message}"
+        try:
+            error_message = self.get_error_message(exc)
+        except Exception:
+            # Provider response parsing must not hide the original failure.
+            error_message = fallback
+        if not isinstance(error_message, str) or not error_message.strip():
+            error_message = fallback
+        error_message = sanitize_machinery_error(error_message)
+
+        extra_log = error_message.removeprefix(f"{exc.__class__.__name__}: ")
+        extra_log = extra_log.removeprefix(original_message).strip(" :\r\n\t")
+        extra_log = extra_log[:200]
+        if extra_log in original_message:
+            extra_log = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, httpx2.Response) and not self.can_display_error_detail(
+            response
+        ):
+            extra_log = ""
+
+        self.report_error(
+            "Could not fetch translations", exception=exc, extra_log=extra_log or None
+        )
+        raise MachineTranslationError(error_message) from exc
+
+    def _apply_downloaded_translations(
+        self,
+        plan: TranslationDownloadPlan,
+        batch_keys: list[str],
+        translations: DownloadMultipleTranslations,
+    ) -> None:
+        for pending_key in batch_keys:
+            text = plan.pending_texts[pending_key]
+            result = translations[text]
+            for index, _unit, original_source, replacements in plan.pending[
+                pending_key
+            ]:
+                # Always operate on copy of the dictionaries
+                partial = [x.copy() for x in result]
+
+                for item in partial:
+                    item["original_source"] = original_source
+                if cache_key := plan.cache_keys[pending_key]:
+                    cache.set(cache_key, partial, self.cache_expiry)
+                if replacements or self.force_uncleanup:
+                    self.uncleanup_results(replacements, partial)
+                plan.output[index] = partial
+
+    def download_pending_translations(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None, int]],
+        user: User | None = None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadMultipleTranslations:
+        return self.download_multiple_translations(
+            source_language,
+            target_language,
+            [(text, unit) for text, unit, _occurrence in sources],
+            user,
+            threshold,
+        )
+
+    async def adownload_pending_translations(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None, int]],
+        user: User | None = None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadMultipleTranslations:
+        if (
+            type(self).download_pending_translations
+            is BatchMachineTranslation.download_pending_translations
+        ):
+            return await self.adownload_multiple_translations(
+                source_language,
+                target_language,
+                [(text, unit) for text, unit, _occurrence in sources],
+                user,
+                threshold,
+            )
+        return await sync_to_async(
+            self.download_pending_translations, thread_sensitive=False
+        )(source_language, target_language, sources, user, threshold)
 
     def get_error_message(self, exc: Exception) -> str:
-        if isinstance(exc, RequestException) and exc.response and exc.response.text:
-            return f"{exc.__class__.__name__}: {exc}: {exc.response.text}"
-        return f"{exc.__class__.__name__}: {exc}"
+        message = sanitize_machinery_error(f"{exc.__class__.__name__}: {exc}")
+        response = getattr(exc, "response", None)
+        if isinstance(exc, httpx2.HTTPError) and response is not None:
+            detail = self.get_error_detail(response)
+            if detail and detail not in str(exc):
+                return sanitize_machinery_error(f"{message}: {detail}")
+        return message
 
     def signed_salt(self, appid, secret, text):
         """Generate salt and sign as used by Chinese services."""
-        salt = str(random.randint(0, 10000000000))  # noqa: S311
+        # ruff: ignore[suspicious-non-cryptographic-random-usage]
+        salt = str(random.randint(0, 10000000000))
 
         payload = appid + text + salt + secret
         digest = md5(payload.encode(), usedforsecurity=False).hexdigest()
@@ -625,7 +1452,7 @@ class BatchMachineTranslation:
         self,
         units: list[Unit] | UnitQuerySet,
         user: User | None = None,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
         *,
         source_language: Language | None = None,
     ) -> None:
@@ -634,9 +1461,27 @@ class BatchMachineTranslation:
         except IndexError:
             return
 
+        if source_language is None and any(
+            self.uses_custom_source(unit) for unit in units
+        ):
+            # Alternate-unit lookup and plural mapping are translation-specific.
+            # Keep canonical fallbacks separate from custom sources as well.
+            groups: dict[tuple[int, Language, int], list[Unit]] = {}
+            for unit in units:
+                key = (
+                    unit.translation_id,
+                    unit.effective_source_language,
+                    unit.effective_source_plural.pk,
+                )
+                groups.setdefault(key, []).append(unit)
+            for (_, group_language, _), group in groups.items():
+                self.batch_translate(
+                    group, user, threshold, source_language=group_language
+                )
+            return
+
         if source_language is None:
-            # Fall back to component source language
-            source_language = self.get_source_language(translation)
+            source_language = self.get_unit_source_language(units[0])
 
         translating_from_source: bool = (
             translation.component.source_language == source_language
@@ -647,9 +1492,12 @@ class BatchMachineTranslation:
         except UnsupportedLanguageError:
             return
 
-        self.account_usage(translation.component.project, delta=len(units))
-
-        source_plural = source_language.plural
+        source_plural = (
+            units[0].effective_source_plural
+            if units[0].translation_parent_id
+            and source_language == units[0].effective_source_language
+            else source_language.plural
+        )
         target_plural = translation.plural
         plural_mapper = PluralMapper(source_plural, target_plural)
         alternate_units: dict[int, Unit] | None = None
@@ -657,17 +1505,42 @@ class BatchMachineTranslation:
             alternate_units = plural_mapper.get_other_units(units, source_language)
         plural_mapper.map_units(units, alternate_units)
 
-        # TODO: fetch source from other units
-        sources = [(text, unit) for unit in units for text in unit.plural_map]
-        translations = self._translate(source, language, sources, user, threshold)
+        if translation.component.is_multivalue:
+            # Independent alternatives have no one-to-one source/target mapping.
+            # Keep existing alternatives until automatic translation can merge them.
+            units = [
+                unit
+                for unit in units
+                if unit.plural_map
+                and not unit.has_multiple_values(
+                    unit.plural_map, unit.get_target_plurals()
+                )
+            ]
+            if not units:
+                return
+
+        self.account_usage(translation.component.project, delta=len(units))
+
+        # Fetch source from other units
+        sources: list[tuple[str, Unit | None]] = [
+            (text, unit) for unit in units for text in unit.plural_map
+        ]
+        translations = self._translate_sources(
+            source, language, sources, user, threshold
+        )
+        translations_index = 0
 
         for unit in units:
             result: UnitMemoryResultDict = unit.machinery
             if min(result.get("quality", ()), default=0) >= self.max_score:
+                translations_index += len(unit.plural_map)
                 continue
-            translation_lists = [translations[text] for text in unit.plural_map]
+            translation_lists = translations[
+                translations_index : translations_index + len(unit.plural_map)
+            ]
+            translations_index += len(unit.plural_map)
             plural_count = len(translation_lists)
-            translation = result.setdefault("translation", [""] * plural_count)
+            result_translations = result.setdefault("translation", [""] * plural_count)
             quality = result.setdefault("quality", [0] * plural_count)
             origin = result.setdefault("origin", [None] * plural_count)
             for plural, possible_translations in enumerate(translation_lists):
@@ -675,12 +1548,13 @@ class BatchMachineTranslation:
                     if quality[plural] > item["quality"]:
                         continue
                     quality[plural] = item["quality"]
-                    translation[plural] = item["text"]
+                    result_translations[plural] = item["text"]
                     origin[plural] = self
 
     @cached_property
     def user(self):
         """Weblate user used to track changes by this engine."""
+        # ruff: ignore[import-outside-top-level]
         from weblate.auth.models import User
 
         return User.objects.get_or_create_bot(
@@ -691,6 +1565,30 @@ class BatchMachineTranslation:
 
 
 class MachineTranslation(BatchMachineTranslation):
+    async def adownload_translations(
+        self,
+        source_language,
+        target_language,
+        text: str,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadTranslations:
+        """Download one translation using a synchronous backend as fallback."""
+        return await sync_to_async(
+            lambda: list(
+                self.download_translations(
+                    source_language,
+                    target_language,
+                    text,
+                    unit,
+                    user,
+                    threshold=threshold,
+                )
+            ),
+            thread_sensitive=False,
+        )()
+
     def download_translations(
         self,
         source_language,
@@ -698,7 +1596,7 @@ class MachineTranslation(BatchMachineTranslation):
         text: str,
         unit: Unit | None,
         user: User | None,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """
         Download list of possible translations from a service.
@@ -718,7 +1616,7 @@ class MachineTranslation(BatchMachineTranslation):
         target_language,
         sources: list[tuple[str, Unit | None]],
         user: User | None = None,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadMultipleTranslations:
         return {
             text: list(
@@ -734,11 +1632,34 @@ class MachineTranslation(BatchMachineTranslation):
             for text, unit in sources
         }
 
+    async def adownload_multiple_translations(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        user: User | None = None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> DownloadMultipleTranslations:
+        result: DownloadMultipleTranslations = {}
+        for text, unit in sources:
+            result[text] = list(
+                await self.adownload_translations(
+                    source_language,
+                    target_language,
+                    text,
+                    unit,
+                    user,
+                    threshold=threshold,
+                )
+            )
+        return result
+
 
 class InternalMachineTranslation(MachineTranslation):
     do_cleanup = False
     accounting_key = "internal"
     cache_translations = False
+    sends_data_to_third_party = False
     settings_form: type[BaseMachineryForm] | None = None
 
     def is_supported(
@@ -762,6 +1683,7 @@ class GlossaryMachineTranslationMixin(MachineTranslation):
     glossary_name_format_pattern = (
         r"weblate:(\d+):([A-z0-9@_-]+):([A-z0-9@_-]+):([a-f0-9]+)"
     )
+    glossary_support = True
 
     glossary_count_limit = 0
 
@@ -811,11 +1733,7 @@ class GlossaryMachineTranslationMixin(MachineTranslation):
         cache.set(cache_key, result, 24 * 3600)
         return result
 
-    def tsv_checksum(self, tsv: str) -> str:
-        """Calculate checksum of given TSV glossary."""
-        return hash_to_checksum(calculate_hash(tsv)) if tsv else ""
-
-    def get_cached(
+    def get_translation_cache_parts(
         self,
         unit,
         source_language,
@@ -823,30 +1741,41 @@ class GlossaryMachineTranslationMixin(MachineTranslation):
         text,
         threshold,
         replacements,
-        *extra_parts,
-    ):
-        """Retrieve cached translation with glossary checksum."""
-        from weblate.glossary.models import get_glossary_tsv
-
-        return super().get_cached(
-            unit,
-            source_language,
-            target_language,
-            text,
-            threshold,
-            replacements,
-            self.tsv_checksum(get_glossary_tsv(unit.translation)),
-            *extra_parts,
+        *,
+        source_occurrence: int = 0,
+    ) -> tuple[str, ...]:
+        return (
+            self.get_glossary_cache_part(unit),
+            *super().get_translation_cache_parts(
+                unit,
+                source_language,
+                target_language,
+                text,
+                threshold,
+                replacements,
+                source_occurrence=source_occurrence,
+            ),
         )
 
     def get_glossary_count_limit(self) -> int:
         return self.glossary_count_limit
 
+    def get_glossary_tsv(self, source_language: str, unit: Unit) -> str:
+        from weblate.glossary.models import get_glossary_tsv  # ruff: ignore[import-outside-top-level]
+
+        if (
+            self.uses_custom_source(unit)
+            and self.map_language_code(unit.effective_source_language.code)
+            == source_language
+        ):
+            return get_glossary_tsv(
+                unit.translation, source_language=unit.effective_source_language
+            )
+        return get_glossary_tsv(unit.translation)
+
     def get_glossary_id(
         self, source_language: str, target_language: str, unit: Unit | None
     ) -> str | None:
-        from weblate.glossary.models import get_glossary_tsv
-
         if unit is None:
             return None
 
@@ -857,7 +1786,7 @@ class GlossaryMachineTranslationMixin(MachineTranslation):
             return None
 
         # Check if there is a glossary
-        glossary_tsv = get_glossary_tsv(translation)
+        glossary_tsv = self.get_glossary_tsv(source_language, unit)
         if not glossary_tsv:
             return None
 
@@ -934,30 +1863,423 @@ class XMLMachineTranslationMixin(BatchMachineTranslation):
         return escape(text)
 
     def format_replacement(
-        self, h_start: int, h_end: int, h_text: str, h_kind: Unit | None
+        self, h_start: int, h_end: int, h_text: str, h_kind: Highlight | Unit | None
     ) -> str:
         """Generate a single replacement."""
         raise NotImplementedError
 
-    def make_re_placeholder(self, text: str) -> str:
-        return re.escape(text)
+    def build_placeholder_restorer(
+        self, replacements: dict[str, str]
+    ) -> Callable[[str], str]:
+        if not replacements:
+            return lambda text: text
+
+        keys = list(replacements)
+        automaton = ahocorasick_rs.AhoCorasick(
+            keys,
+            matchkind=ahocorasick_rs.MatchKind.LeftmostLongest,
+            store_patterns=False,
+        )
+
+        def restore(text: str) -> str:
+            parts: list[str] = []
+            previous_end = 0
+            for index, start, end in automaton.find_matches_as_indexes(text):
+                parts.extend((text[previous_end:start], replacements[keys[index]]))
+                previous_end = end
+            parts.append(text[previous_end:])
+            return "".join(parts)
+
+        return restore
+
+
+class RephraseMachineTranslationMixin(MachineTranslation):
+    """Mixin for machine translation services that can rephrase existing targets."""
+
+    def _translate_sources(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        user=None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> list[list[TranslationResultDict]]:
+        results = super()._translate_sources(
+            source_language, target_language, sources, user, threshold
+        )
+        return self._append_rephrase_suggestions(results, sources, target_language)
+
+    @property
+    def rephrase_score(self) -> int:
+        # kept below translation max_score so MT gets precedence over rephrase
+        return max(0, self.max_score - 1)
+
+    def is_rephrase_enabled(self) -> bool:
+        return True
+
+    def get_rephrase_target_language(self, target_language: str) -> str | None:
+        """Map a translate target language code to the rephrase API form."""
+        return target_language
+
+    def download_rephrased_translations(
+        self, texts: list[str], write_lang: str
+    ) -> list[str]:
+        """Improve existing translations using the service rephrase API."""
+        raise NotImplementedError
+
+    async def adownload_rephrased_translations(
+        self, texts: list[str], write_lang: str
+    ) -> list[str]:
+        """Async variant of rephrase download."""
+        raise NotImplementedError
+
+    async def _atranslate_sources(
+        self,
+        source_language,
+        target_language,
+        sources: list[tuple[str, Unit | None]],
+        user=None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
+    ) -> list[list[TranslationResultDict]]:
+        results = await super()._atranslate_sources(
+            source_language, target_language, sources, user, threshold
+        )
+        return await self._aappend_rephrase_suggestions(
+            results, sources, target_language
+        )
+
+    def _collect_rephrase_candidates(
+        self,
+        sources: list[tuple[str, Unit | None]],
+        target_language: str,
+    ) -> tuple[str, list[tuple[int, str, str]]] | None:
+        """
+        Collect existing targets eligible for rephrasing.
+
+        Returns write language code and list of
+        (source_index, source_text, target_text), or None.
+
+        No XML cleanup is applied to the targets as Rephrase API may not support XML e.g DeepL Write.
+        Occurrences are counted over the full ``sources`` list (after MT cache
+        hits), so a cached first plural does not reset the target form index.
+        """
+        if not self.is_rephrase_enabled():
+            return None
+
+        candidates: list[tuple[int, str, str]] = []
+        seen: dict[int, int] = {}
+        for index, (source_text, unit) in enumerate(sources):
+            if unit is None or not unit.translated or unit.readonly:
+                continue
+            targets = unit.get_target_plurals()
+            occurrence = seen.get(id(unit), 0)
+            seen[id(unit)] = occurrence + 1
+            if occurrence >= len(targets):
+                continue
+            target_text = targets[occurrence]
+            if not target_text:
+                continue
+            candidates.append((index, source_text, target_text))
+
+        if not candidates:
+            return None
+
+        if write_lang := self.get_rephrase_target_language(target_language):
+            return write_lang, candidates
+
+        return None
+
+    def delete_cache(self) -> None:
+        super().delete_cache()
+        cache.delete(self.get_rephrase_rate_limit_cache_key())
+        version_key = self.get_rephrase_cache_version_key()
+        try:
+            cache.incr(version_key)
+        except ValueError:
+            cache.set(version_key, 1, None)
+
+    @classmethod
+    def get_rate_limit_cache_keys(cls, configuration: SettingsDict) -> tuple[str, ...]:
+        keys = super().get_rate_limit_cache_keys(configuration)
+        return (*keys, f"{keys[0]}-rephrase")
+
+    def get_rephrase_rate_limit_cache_key(self) -> str:
+        return self.get_rate_limit_cache_keys(self.settings)[1]
+
+    def is_rephrase_rate_limited(self) -> bool:
+        return bool(cache.get(self.get_rephrase_rate_limit_cache_key()))
+
+    async def ais_rephrase_rate_limited(self) -> bool:
+        return bool(await cache.aget(self.get_rephrase_rate_limit_cache_key()))
+
+    def set_rephrase_rate_limit(self, timeout: int | None = None) -> None:
+        cache.set(
+            self.get_rephrase_rate_limit_cache_key(),
+            True,
+            self.rate_limit_window if timeout is None else timeout,
+        )
+
+    def _handle_rephrase_error(self, exc: Exception) -> None:
+        if self.is_rate_limit_error(exc) or isinstance(exc, httpx2.TimeoutException):
+            self.set_rephrase_rate_limit(self.get_rate_limit_timeout(exc))
+        self._save_machinery_error(exc, "Could not rephrase translations")
+        self.log_handled_error("Could not rephrase translations")
+
+    def get_rephrase_cache_version_key(self) -> str:
+        return self.get_cache_key("rephrase-version")
+
+    def get_rephrase_cache_version(self) -> int:
+        version = cache.get(self.get_rephrase_cache_version_key())
+        return int(version) if version else 0
+
+    async def aget_rephrase_cache_version(self) -> int:
+        version = await cache.aget(self.get_rephrase_cache_version_key())
+        return int(version) if version else 0
+
+    def get_rephrase_cache_key(
+        self, write_lang: str, target_text: str, *, version: int
+    ) -> str:
+        return self.get_cache_key(
+            "rephrase",
+            parts=(version, write_lang),
+            text=target_text,
+        )
+
+    def _usable_rephrase(self, target_text: str, improved: str) -> str:
+        if not improved or improved == target_text:
+            return ""
+        return improved
+
+    def _store_rephrase_cache_value(
+        self,
+        write_lang: str,
+        target_text: str,
+        improved: str,
+        *,
+        version: int,
+    ) -> str:
+        stored = self._usable_rephrase(target_text, improved)
+        if self.cache_translations and stored:
+            cache.set(
+                self.get_rephrase_cache_key(write_lang, target_text, version=version),
+                stored,
+                self.cache_expiry,
+            )
+        return stored
+
+    async def _astore_rephrase_cache_value(
+        self,
+        write_lang: str,
+        target_text: str,
+        improved: str,
+        *,
+        version: int,
+    ) -> str:
+        stored = self._usable_rephrase(target_text, improved)
+        if self.cache_translations and stored:
+            await cache.aset(
+                self.get_rephrase_cache_key(write_lang, target_text, version=version),
+                stored,
+                self.cache_expiry,
+            )
+        return stored
+
+    def _download_unique_rephrases(
+        self, unique_targets: list[str], write_lang: str
+    ) -> dict[str, str]:
+        downloaded_by_target: dict[str, str] = {}
+        for start in range(0, len(unique_targets), self.batch_size):
+            batch = unique_targets[start : start + self.batch_size]
+            downloaded = self.download_rephrased_translations(batch, write_lang)
+            downloaded_by_target.update(zip(batch, downloaded, strict=True))
+        return downloaded_by_target
+
+    async def _adownload_unique_rephrases(
+        self, unique_targets: list[str], write_lang: str
+    ) -> dict[str, str]:
+        downloaded_by_target: dict[str, str] = {}
+        for start in range(0, len(unique_targets), self.batch_size):
+            batch = unique_targets[start : start + self.batch_size]
+            downloaded = await self.adownload_rephrased_translations(batch, write_lang)
+            downloaded_by_target.update(zip(batch, downloaded, strict=True))
+        return downloaded_by_target
+
+    def _unique_rephrase_targets(self, misses: list[tuple[int, str]]) -> list[str]:
+        unique_targets: list[str] = []
+        seen_targets: set[str] = set()
+        for _candidate_index, target_text in misses:
+            if target_text not in seen_targets:
+                seen_targets.add(target_text)
+                unique_targets.append(target_text)
+        return unique_targets
+
+    def _resolve_rephrased_texts(
+        self,
+        write_lang: str,
+        candidates: list[tuple[int, str, str]],
+    ) -> list[str]:
+        rephrased_texts: list[str | None] = [None] * len(candidates)
+        misses: list[tuple[int, str]] = []
+        version = self.get_rephrase_cache_version() if self.cache_translations else 0
+
+        for candidate_index, (_index, _source, target_text) in enumerate(candidates):
+            if self.cache_translations:
+                cached = cache.get(
+                    self.get_rephrase_cache_key(
+                        write_lang, target_text, version=version
+                    )
+                )
+                if cached is not None:
+                    rephrased_texts[candidate_index] = cached
+                    continue
+            misses.append((candidate_index, target_text))
+
+        if misses and not self.is_rephrase_rate_limited():
+            downloaded_by_target = self._download_unique_rephrases(
+                self._unique_rephrase_targets(misses), write_lang
+            )
+            for candidate_index, target_text in misses:
+                rephrased_texts[candidate_index] = self._store_rephrase_cache_value(
+                    write_lang,
+                    target_text,
+                    downloaded_by_target[target_text],
+                    version=version,
+                )
+
+        return [text or "" for text in rephrased_texts]
+
+    async def _aresolve_rephrased_texts(
+        self,
+        write_lang: str,
+        candidates: list[tuple[int, str, str]],
+    ) -> list[str]:
+        rephrased_texts: list[str | None] = [None] * len(candidates)
+        misses: list[tuple[int, str]] = []
+        cache_version = (
+            await self.aget_rephrase_cache_version() if self.cache_translations else 0
+        )
+
+        for candidate_index, (_index, _source, target_text) in enumerate(candidates):
+            if self.cache_translations:
+                cached = await cache.aget(
+                    self.get_rephrase_cache_key(
+                        write_lang, target_text, version=cache_version
+                    )
+                )
+                if cached is not None:
+                    rephrased_texts[candidate_index] = cached
+                    continue
+            misses.append((candidate_index, target_text))
+
+        if misses and not await self.ais_rephrase_rate_limited():
+            downloaded_by_target = await self._adownload_unique_rephrases(
+                self._unique_rephrase_targets(misses), write_lang
+            )
+            for candidate_index, target_text in misses:
+                rephrased_texts[
+                    candidate_index
+                ] = await self._astore_rephrase_cache_value(
+                    write_lang,
+                    target_text,
+                    downloaded_by_target[target_text],
+                    version=cache_version,
+                )
+
+        return [text or "" for text in rephrased_texts]
+
+    def _merge_rephrase_results(
+        self,
+        results: list[list[TranslationResultDict]],
+        candidates: list[tuple[int, str, str]],
+        improved_texts: list[str],
+    ) -> list[list[TranslationResultDict]]:
+        for (index, source_text, target_text), improved in zip(
+            candidates, improved_texts, strict=True
+        ):
+            if not improved or improved == target_text:
+                continue
+            existing = {item["text"] for item in results[index]}
+            if improved in existing:
+                continue
+            original_source = source_text
+            if results[index]:
+                original_source = results[index][0].get("original_source", source_text)
+            results[index].append(
+                {
+                    "text": improved,
+                    "quality": self.rephrase_score,
+                    "service": self.name,
+                    "source": source_text,
+                    "original_source": original_source,
+                }
+            )
+        return results
+
+    def _append_rephrase_suggestions(
+        self,
+        results: list[list[TranslationResultDict]],
+        sources: list[tuple[str, Unit | None]],
+        target_language: str,
+    ) -> list[list[TranslationResultDict]]:
+        """Optionally append rephrased existing translations for supported targets."""
+        try:
+            prepared = self._collect_rephrase_candidates(sources, target_language)
+            if prepared is None:
+                return results
+            write_lang, candidates = prepared
+            improved_texts = self._resolve_rephrased_texts(write_lang, candidates)
+        except Exception as exc:
+            self._handle_rephrase_error(exc)
+            return results
+        return self._merge_rephrase_results(results, candidates, improved_texts)
+
+    async def _aappend_rephrase_suggestions(
+        self,
+        results: list[list[TranslationResultDict]],
+        sources: list[tuple[str, Unit | None]],
+        target_language: str,
+    ) -> list[list[TranslationResultDict]]:
+        """Async variant of rephrase suggestion append."""
+        try:
+            prepared = await sync_to_async(self._collect_rephrase_candidates)(
+                sources, target_language
+            )
+            if prepared is None:
+                return results
+            write_lang, candidates = prepared
+            improved_texts = await self._aresolve_rephrased_texts(
+                write_lang, candidates
+            )
+        except Exception as exc:
+            await sync_to_async(self._handle_rephrase_error)(exc)
+            return results
+        return self._merge_rephrase_results(results, candidates, improved_texts)
 
 
 class ResponseStatusMachineTranslation(MachineTranslation):
-    def check_failure(self, response) -> None:
-        payload = response.json()
+    def check_failure(self, response: httpx2.Response) -> None:
+        try:
+            payload = response.json()
+        except JSON_RESPONSE_ERRORS:
+            super().check_failure(response)
+            return
+
+        if not isinstance(payload, dict):
+            super().check_failure(response)
+            return
 
         # Check response status
         response_status = payload.get("responseStatus", payload.get("code", None))
         if response_status and response_status != 200:
-            raise MachineTranslationError(
+            error_text = payload.get(
+                "responseDetails",
                 payload.get(
-                    "responseDetails",
-                    payload.get(
-                        "message",
-                        payload.get("status", f"Response status {response_status}"),
-                    ),
-                )
+                    "message",
+                    payload.get("status", f"Response status {response_status}"),
+                ),
             )
+            if response_status == 429:
+                raise MachineryRateLimitError(error_text, response=response)
+            raise MachineTranslationError(error_text)
 
         super().check_failure(response)

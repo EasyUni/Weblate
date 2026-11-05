@@ -6,21 +6,383 @@ from __future__ import annotations
 
 from collections import defaultdict
 from functools import reduce
-from typing import TYPE_CHECKING, Literal
+from itertools import batched
+from typing import TYPE_CHECKING, ClassVar, Literal, NotRequired, TypedDict, cast
 
-from django.db.models import Count, Prefetch, Q, Value
+from django.db import connection
+from django.db.models import (
+    BooleanField,
+    Case,
+    Exists,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+    Value,
+    When,
+)
 from django.db.models.functions import MD5, Lower
+from django.db.models.lookups import In
+from django.utils.html import format_html
 from django.utils.translation import gettext, gettext_lazy, ngettext
 
 from weblate.checks.base import BatchCheckMixin, TargetCheck
 from weblate.trans.actions import ACTIONS_REVERTABLE, ActionEvents
+from weblate.trans.propagation import (
+    get_propagation_scope,
+    propagation_filter,
+    propagation_uses_custom_sources,
+    workspace_propagation,
+)
+from weblate.trans.util import split_plural
 from weblate.utils.html import format_html_join_comma
 from weblate.utils.state import STATE_TRANSLATED
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from weblate.trans.models import Change, Component, Unit
+    from weblate.checks.models import Check
+    from weblate.trans.models import Change, Component, Project, Unit
+    from weblate.trans.models.unit import UnitQuerySet
+
+    from .base import FixupType
+
+
+class BatchCheckMatch(TypedDict):
+    check_source_language: int
+    plural_id: int
+    id_hash: NotRequired[int]
+    target: NotRequired[str]
+    target_hash: NotRequired[str]
+
+
+def _case_insensitive_languages() -> list[int]:
+    from weblate.lang.models import Language  # ruff: ignore[import-outside-top-level]
+
+    return [
+        language.pk
+        for language in Language.objects.all()
+        if not language.is_case_sensitive()
+    ]
+
+
+def project_batch_matches(
+    project: Project, check_id: Literal["inconsistent", "reused"]
+) -> list[BatchCheckMatch]:
+    """
+    Select bounded conflict groups using project-scoped translation arrays.
+
+    This path requires canonical sources and project-only propagation. Build
+    eligible peer arrays once so the planner cannot probe units in unrelated
+    projects before checking their component's visibility.
+    """
+    reused = check_id == "reused"
+    language_group = "" if reused else "language_id,"
+    language_join = "" if reused else "AND g.language_id = t.language_id"
+    restricted_language_join = "" if reused else "AND r.language_id = t.language_id"
+    plural_join = "JOIN lang_plural p ON p.id = t.plural_id" if reused else ""
+    plural_filter = "AND p.number > 1" if reused else ""
+    outer_filter = (
+        "AND u.state >= %(translated)s AND MD5(LOWER(u.target)) <> MD5('')"
+        if reused
+        else ""
+    )
+    peer_filter = (
+        """AND peer.state >= %(translated)s
+           AND MD5(LOWER(peer.target)) = MD5(LOWER(u.target))
+           AND peer.target = u.target
+           AND CASE WHEN t.language_id = ANY (%(insensitive)s::integer[])
+               THEN MD5(LOWER(peer.source)) <> MD5(LOWER(u.source))
+               ELSE peer.source <> u.source END"""
+        if reused
+        else """AND peer.id_hash = u.id_hash
+                AND peer.context = u.context AND peer.source = u.source
+                AND peer.target <> u.target
+                AND (u.state >= %(translated)s OR peer.state >= %(translated)s)"""
+    )
+    columns = (
+        "u.target, t.plural_id, t.source_language_id AS check_source_language, "
+        "MD5(LOWER(u.target)) AS target_hash"
+        if reused
+        else "u.id_hash, t.source_language_id AS check_source_language, t.plural_id"
+    )
+    ordering = (
+        "target_hash, u.target, t.plural_id, t.source_language_id"
+        if reused
+        else "u.id_hash, t.plural_id, t.source_language_id"
+    )
+    limit = 20 if reused else 100
+    # All interpolated fragments are fixed SQL; runtime values are parameters.
+    sql = f"""
+        WITH eligible_translations AS MATERIALIZED (
+            SELECT t.id, t.component_id, t.language_id, t.plural_id,
+                   c.source_language_id, c.restricted
+            FROM trans_translation t
+            JOIN trans_component c ON c.id = t.component_id
+            {plural_join}
+            WHERE c.project_id = %(project_id)s
+              AND c.allow_translation_propagation {plural_filter}
+        ),
+        public_peer_groups AS MATERIALIZED (
+            SELECT {language_group} plural_id, source_language_id,
+                   ARRAY_AGG(id) FILTER (WHERE NOT restricted) AS translation_ids
+            FROM eligible_translations
+            GROUP BY {language_group} plural_id, source_language_id
+        ),
+        restricted_peer_groups AS MATERIALIZED (
+            SELECT component_id, {language_group} plural_id, source_language_id,
+                   ARRAY_AGG(id) AS translation_ids
+            FROM eligible_translations
+            WHERE restricted
+            GROUP BY component_id, {language_group} plural_id, source_language_id
+        )
+        SELECT DISTINCT {columns}
+        FROM trans_unit u
+        JOIN eligible_translations t ON t.id = u.translation_id
+        JOIN public_peer_groups g
+          ON g.plural_id = t.plural_id
+         AND g.source_language_id = t.source_language_id {language_join}
+        LEFT JOIN restricted_peer_groups r
+          ON t.restricted AND r.component_id = t.component_id
+         AND r.plural_id = t.plural_id
+         AND r.source_language_id = t.source_language_id {restricted_language_join}
+        WHERE u.translation_id = ANY (ARRAY(SELECT id FROM eligible_translations))
+          {outer_filter}
+          AND EXISTS(
+              SELECT 1 FROM trans_unit peer
+              WHERE peer.translation_id = ANY (
+                  g.translation_ids || r.translation_ids
+              ) {peer_filter}
+          )
+        ORDER BY {ordering}
+        LIMIT {limit}
+    """  # ruff: ignore[hardcoded-sql-expression]
+    with connection.cursor() as cursor:
+        cursor.execute(
+            sql,
+            {
+                "project_id": project.pk,
+                "translated": STATE_TRANSLATED,
+                "insensitive": _case_insensitive_languages() if reused else [],
+            },
+        )
+        fields = (
+            ("target", "plural_id", "check_source_language", "target_hash")
+            if reused
+            else ("id_hash", "check_source_language", "plural_id")
+        )
+        return [
+            cast("BatchCheckMatch", dict(zip(fields, row, strict=True)))
+            for row in cursor.fetchall()
+        ]
+
+
+def _visible_peer_query(project: Project, *, custom_sources: bool) -> UnitQuerySet:
+    """Build a peer query relative to an outer unit in its propagation group."""
+    from weblate.trans.models import Project, Unit  # ruff: ignore[import-outside-top-level]
+
+    public = (Project.ACCESS_PUBLIC, Project.ACCESS_PROTECTED)
+    return (
+        Unit.objects.exclude_blocked(custom_sources=custom_sources)
+        .with_effective_source(custom_sources=custom_sources, select=False)
+        .filter(
+            propagation_filter(
+                project,
+                "translation__component__",
+                OuterRef("translation__component__name"),
+            ),
+            translation__component__allow_translation_propagation=True,
+            translation__plural_id=OuterRef("translation__plural_id"),
+            check_source_language=OuterRef("check_source_language"),
+        )
+        .filter(
+            Q(
+                translation__component__project_id=OuterRef(
+                    "translation__component__project_id"
+                )
+            )
+            | (
+                Q(translation__component__project__access_control__in=public)
+                & Q(
+                    In(
+                        OuterRef("translation__component__project__access_control"),
+                        public,
+                    )
+                )
+            )
+        )
+        .filter(
+            Q(translation__component__restricted=False)
+            | Q(translation__component_id=OuterRef("translation__component_id"))
+        )
+    )
+
+
+def inconsistent_peer_exists(
+    project: Project, *, custom_sources: bool, translated_only: bool = False
+) -> Exists:
+    """Whether an outer unit has an accessible peer with a different target."""
+    peers = (
+        _visible_peer_query(project, custom_sources=custom_sources)
+        .filter(
+            translation__language_id=OuterRef("translation__language_id"),
+            context=OuterRef("context"),
+        )
+        .filter(Q(check_source=OuterRef("check_source")))
+    )
+    if custom_sources:
+        for field in ("number", "formula", "type"):
+            peers = peers.filter(
+                **{f"check_source_{field}": OuterRef(f"check_source_{field}")}
+            )
+    else:
+        peers = peers.filter(id_hash=OuterRef("id_hash"))
+    if translated_only:
+        peers = peers.filter(state__gte=STATE_TRANSLATED)
+    return Exists(peers.exclude(target=OuterRef("target")))
+
+
+def reused_peer_exists(
+    project: Project, *, custom_sources: bool, folded: bool = False
+) -> Exists:
+    """Whether an outer unit has an accessible peer with a different source."""
+    peers = _visible_peer_query(project, custom_sources=custom_sources).filter(
+        state__gte=STATE_TRANSLATED,
+        target=OuterRef("target"),
+        target__lower__md5=MD5(Lower(OuterRef("target"))),
+        translation__plural__number__gt=1,
+    )
+    if custom_sources:
+        for field in ("number", "formula", "type"):
+            peers = peers.filter(
+                **{f"check_source_{field}": OuterRef(f"check_source_{field}")}
+            )
+    if folded:
+        peers = peers.exclude(
+            Q(check_source__lower__md5=MD5(Lower(OuterRef("check_source"))))
+        )
+    else:
+        peers = peers.exclude(Q(check_source=OuterRef("check_source")))
+    return Exists(peers)
+
+
+def reused_peer_condition(project: Project, *, custom_sources: bool) -> Case:
+    """Apply target-language case sensitivity to the reused peer lookup."""
+    return Case(
+        When(
+            translation__language_id__in=_case_insensitive_languages(),
+            then=reused_peer_exists(
+                project, custom_sources=custom_sources, folded=True
+            ),
+        ),
+        default=reused_peer_exists(project, custom_sources=custom_sources),
+        output_field=BooleanField(),
+    )
+
+
+def propagated_peer_condition(
+    project: Project, check_id: str, *, custom_sources: bool
+) -> Case:
+    if check_id == "inconsistent":
+        return Case(
+            When(
+                state__gte=STATE_TRANSLATED,
+                then=inconsistent_peer_exists(project, custom_sources=custom_sources),
+            ),
+            default=inconsistent_peer_exists(
+                project, custom_sources=custom_sources, translated_only=True
+            ),
+            output_field=BooleanField(),
+        )
+    return reused_peer_condition(project, custom_sources=custom_sources)
+
+
+def workspace_check_units(component: Component, check_id: str) -> UnitQuerySet:
+    """Evaluate workspace groups with visibility applied before the group limit."""
+    from weblate.trans.models import Unit  # ruff: ignore[import-outside-top-level]
+
+    units = (
+        Unit.objects.exclude_blocked()
+        .with_effective_source()
+        .filter(
+            propagation_filter(
+                component.project, "translation__component__", component.name
+            ),
+            translation__component__allow_translation_propagation=True,
+        )
+        .annotate(
+            has_peer=propagated_peer_condition(
+                component.project, check_id, custom_sources=True
+            )
+        )
+        .filter(has_peer=True)
+    )
+    fields: tuple[str, ...] = (
+        "translation__plural_id",
+        "check_source_language",
+        "check_source_number",
+        "check_source_formula",
+        "check_source_type",
+    )
+    if get_propagation_scope(component.project) == "component_name":
+        fields += ("translation__component__name",)
+    if check_id == "inconsistent":
+        fields += ("check_source", "context")
+        limit = 100
+    else:
+        units = units.filter(
+            state__gte=STATE_TRANSLATED, translation__plural__number__gt=1
+        ).exclude(target="")
+        fields += ("target",)
+        limit = 20
+    groups = list(units.values(*fields).order_by(*fields).distinct()[:limit])
+    if not groups:
+        return units.none()
+    return (
+        units.filter(reduce(lambda query, group: query | Q(**group), groups, Q()))
+        .prefetch()
+        .prefetch_bulk()
+    )
+
+
+def evaluate_workspace_checks(
+    units: UnitQuerySet, check: ConsistencyCheck | ReusedCheck
+) -> Iterable[tuple[Unit, bool]]:
+    """Use correlated peers so every unit retains its own visibility boundary."""
+    first = units.first()
+    if first is None:
+        return
+    project = first.translation.component.project
+    units = units.annotate(
+        has_peer=propagated_peer_condition(project, check.check_id, custom_sources=True)
+    )
+    for unit in units.iterator(chunk_size=500):
+        yield (
+            unit,
+            (
+                check.applies_to_propagated_unit(unit)
+                and not check.ignore_state(unit)
+                and not check.should_skip(unit)
+                and unit.has_peer
+            ),
+        )
+
+
+def stale_project_check_units(project: Project, check_id: str) -> UnitQuerySet:
+    """Find stored-check units without a peer visible after a boundary change."""
+    from weblate.trans.models import Unit  # ruff: ignore[import-outside-top-level]
+
+    custom_sources = propagation_uses_custom_sources(project)
+    units = Unit.objects.with_effective_source(
+        custom_sources=custom_sources, select=False
+    ).filter(translation__component__project=project)
+    condition = propagated_peer_condition(
+        project, check_id, custom_sources=custom_sources
+    )
+    return units.annotate(has_visible_peer=condition).filter(
+        Q(has_visible_peer=False)
+        | Q(translation__component__allow_translation_propagation=False)
+    )
 
 
 class PluralsCheck(TargetCheck):
@@ -35,9 +397,11 @@ class PluralsCheck(TargetCheck):
             return True
         return super().should_skip(unit)
 
-    def check_target_unit(self, sources: list[str], targets: list[str], unit: Unit):
-        # Is this plural?
-        if len(sources) == 1:
+    def check_target_unit(
+        self, sources: list[str], targets: list[str], unit: Unit
+    ) -> bool:
+        # Required target forms are independent of the effective source's forms.
+        if len(targets) <= 1:
             return False
         # Is at least something translated?
         if targets == len(targets) * [""]:
@@ -57,11 +421,15 @@ class SamePluralsCheck(TargetCheck):
     name = gettext_lazy("Same plurals")
     description = gettext_lazy("Some plural forms are translated in the same way.")
 
-    def check_target_unit(self, sources: list[str], targets: list[str], unit: Unit):
+    def check_target_unit(
+        self, sources: list[str], targets: list[str], unit: Unit
+    ) -> bool:
+        if unit.has_multiple_values(sources, targets):
+            return False
         # Is this plural?
         if len(sources) == 1 or len(targets) == 1:
             return False
-        if not targets[0]:
+        if not targets or not targets[0]:
             return False
         return len(set(targets)) == 1
 
@@ -76,13 +444,60 @@ class ConsistencyCheck(TargetCheck, BatchCheckMixin):
     check_id = "inconsistent"
     name = gettext_lazy("Inconsistent")
     description = gettext_lazy(
-        "This string has more than one translation in this project "
+        "This string has more than one translation in its propagation group "
         "or is untranslated in some components."
     )
     ignore_untranslated = False
     propagates = "source"
     batch_project_wide = True
     skip_suggestions = True
+
+    def evaluate_propagated(self, units: UnitQuerySet) -> Iterable[tuple[Unit, bool]]:
+        if "workspace_propagation" in units.query.annotations:
+            yield from evaluate_workspace_checks(units, self)
+            return
+        public_targets = set()
+        public_translated_targets = set()
+        restricted_targets: dict[int, set[str]] = defaultdict(set)
+        restricted_translated_targets: dict[int, set[str]] = defaultdict(set)
+        for target, state, component_id, restricted in units.values_list(
+            "target",
+            "state",
+            "translation__component_id",
+            "translation__component__restricted",
+        ):
+            if restricted:
+                restricted_targets[component_id].add(target)
+                if state >= STATE_TRANSLATED:
+                    restricted_translated_targets[component_id].add(target)
+            else:
+                public_targets.add(target)
+                if state >= STATE_TRANSLATED:
+                    public_translated_targets.add(target)
+        for unit in units.iterator(chunk_size=500):
+            component = unit.translation.component
+            if unit.translated:
+                others = (
+                    public_targets | restricted_targets[component.pk]
+                    if component.restricted
+                    else public_targets
+                )
+            else:
+                others = (
+                    public_translated_targets
+                    | restricted_translated_targets[component.pk]
+                    if component.restricted
+                    else public_translated_targets
+                )
+            yield (
+                unit,
+                (
+                    self.applies_to_propagated_unit(unit)
+                    and not self.ignore_state(unit)
+                    and not self.should_skip(unit)
+                    and (len(others) > 1 or bool(others and unit.target not in others))
+                ),
+            )
 
     def check_target_unit(
         self, sources: list[str], targets: list[str], unit: Unit
@@ -95,7 +510,9 @@ class ConsistencyCheck(TargetCheck, BatchCheckMixin):
         if component.batch_checks:
             return self.handle_batch(unit, component)
 
-        others = unit.propagated_units.exclude(target=unit.target)
+        others = unit.propagated_units.filter_restricted_peers(unit).exclude(
+            target=unit.target
+        )
         if not unit.translated:
             # Look only for translated units
             others = others.filter(state__gte=STATE_TRANSLATED)
@@ -106,40 +523,161 @@ class ConsistencyCheck(TargetCheck, BatchCheckMixin):
         return False
 
     def check_component(self, component: Component) -> Iterable[Unit]:
-        from weblate.trans.models import Unit
+        if workspace_propagation(component.project):
+            return workspace_check_units(component, self.check_id)
 
-        units = Unit.objects.filter(
-            translation__component__project=component.project,
-            translation__component__allow_translation_propagation=True,
-        )
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models import Translation, Unit
 
-        # List strings with different targets
-        # Limit this to 100 strings, otherwise the resulting query is way too complex
-        matches = (
-            units.values("id_hash", "translation__plural_id")
-            .annotate(Count("target", distinct=True))
-            .filter(target__count__gt=1)
-            .order_by("id_hash")[:100]
-        )
+        custom_sources = bool(component.project.translation_parent_language_ids)
+        translation_groups: dict[tuple[int, int | None], list[int]] = defaultdict(list)
+        for translation_id, plural_id, source_language_id in Translation.objects.filter(
+            component__project=component.project,
+            component__allow_translation_propagation=True,
+        ).values_list("id", "plural_id", "component__source_language_id"):
+            # Effective source languages can vary within a translation. Canonical
+            # languages can be partitioned here without joining the aggregate query.
+            key = (plural_id, None if custom_sources else source_language_id)
+            translation_groups[key].append(translation_id)
 
-        if not matches:
-            return []
-
-        return (
-            units.filter(
-                reduce(
-                    lambda x, y: x
-                    | (
-                        Q(id_hash=y["id_hash"])
-                        & Q(translation__plural_id=y["translation__plural_id"])
-                    ),
-                    matches,
-                    Q(),
-                )
+        fields = (
+            (
+                "check_source",
+                "context",
+                "check_source_language",
+                "check_source_number",
+                "check_source_formula",
+                "check_source_type",
             )
-            .prefetch()
-            .prefetch_bulk()
+            if custom_sources
+            else ("id_hash", "check_source_language")
         )
+        ordering = (
+            (*fields, "plural_id")
+            if custom_sources
+            else ("id_hash", "plural_id", "check_source_language")
+        )
+        # Select only groups with an accessible conflicting peer before limiting.
+        # This keeps rejected restricted-only groups out of the bounded result.
+        if custom_sources:
+            matches = (
+                Unit.objects.exclude_blocked(custom_sources=custom_sources)
+                .filter(
+                    translation__component__project=component.project,
+                    translation__component__allow_translation_propagation=True,
+                )
+                .with_effective_source(custom_sources=custom_sources)
+                .annotate(
+                    has_peer=Case(
+                        When(
+                            state__gte=STATE_TRANSLATED,
+                            then=inconsistent_peer_exists(
+                                component.project, custom_sources=custom_sources
+                            ),
+                        ),
+                        default=inconsistent_peer_exists(
+                            component.project,
+                            custom_sources=custom_sources,
+                            translated_only=True,
+                        ),
+                        output_field=BooleanField(),
+                    )
+                )
+                .filter(has_peer=True)
+                .values(*fields)
+                .annotate(plural_id=F("translation__plural_id"))
+                .order_by(*ordering)
+                .distinct()[:100]
+            )
+            match_rows = matches.iterator(chunk_size=100)
+        else:
+            match_rows = iter(project_batch_matches(component.project, "inconsistent"))
+
+        found: list[Unit] = []
+        valid_groups = 0
+        for match_batch in batched(match_rows, 100):
+            query = Q()
+            if custom_sources:
+                for match in match_batch:
+                    query |= Q(
+                        translation_id__in=translation_groups[match["plural_id"], None],
+                        **{field: match[field] for field in fields},
+                    )
+                result = (
+                    Unit.objects.exclude_blocked()
+                    .with_effective_source()
+                    .filter(query)
+                    .prefetch()
+                    .prefetch_bulk()
+                )
+            else:
+                id_hashes_by_group: dict[tuple[int, int], list[int]] = defaultdict(list)
+                for match in match_batch:
+                    id_hashes_by_group[
+                        match["plural_id"], match["check_source_language"]
+                    ].append(match["id_hash"])
+                for group_key, id_hashes in id_hashes_by_group.items():
+                    query |= Q(
+                        translation_id__in=translation_groups[group_key],
+                        id_hash__in=id_hashes,
+                    )
+                result = Unit.objects.filter(query).prefetch().prefetch_bulk()
+
+            public_targets: dict[tuple, set[str]] = defaultdict(set)
+            restricted_targets: dict[tuple, set[str]] = defaultdict(set)
+            candidates: dict[tuple, list[Unit]] = defaultdict(list)
+            for unit in result:
+                source_key: tuple
+                if custom_sources:
+                    source_key = (
+                        unit.translation.plural_id,
+                        unit.check_source,
+                        unit.context,
+                        unit.check_source_language,
+                        unit.check_source_number,
+                        unit.check_source_formula,
+                        unit.check_source_type,
+                    )
+                else:
+                    source_key = (
+                        unit.translation.plural_id,
+                        unit.translation.component.source_language_id,
+                        unit.id_hash,
+                    )
+                peer = unit.translation.component
+                if peer.restricted:
+                    restricted_targets[source_key, peer.pk].add(unit.target)
+                else:
+                    public_targets[source_key].add(unit.target)
+                candidates[source_key].append(unit)
+
+            for match in match_batch:
+                source_key = (
+                    (match["plural_id"], *(match[field] for field in fields))
+                    if custom_sources
+                    else (
+                        match["plural_id"],
+                        match["check_source_language"],
+                        match["id_hash"],
+                    )
+                )
+                eligible = [
+                    unit
+                    for unit in candidates[source_key]
+                    if len(
+                        public_targets[source_key]
+                        | restricted_targets[source_key, unit.translation.component_id]
+                        if unit.translation.component.restricted
+                        else public_targets[source_key]
+                    )
+                    > 1
+                ]
+                if eligible:
+                    found.extend(eligible)
+                    valid_groups += 1
+                    if valid_groups == 100:
+                        return found
+        return found
 
 
 class ReusedCheck(TargetCheck, BatchCheckMixin):
@@ -156,6 +694,65 @@ class ReusedCheck(TargetCheck, BatchCheckMixin):
     propagates = "target"
     batch_project_wide = True
     skip_suggestions = True
+    version_added = "4.18"
+
+    def evaluate_propagated(self, units: UnitQuerySet) -> Iterable[tuple[Unit, bool]]:
+        if "workspace_propagation" in units.query.annotations:
+            yield from evaluate_workspace_checks(units, self)
+            return
+        source_field = (
+            "check_source" if "check_source" in units.query.annotations else "source"
+        )
+        units = units.annotate(
+            propagated_source=F(source_field),
+            propagated_source_folded=Lower(source_field),
+        )
+        public_sources = set()
+        public_folded_sources = set()
+        restricted_sources: dict[int, set[str]] = defaultdict(set)
+        restricted_folded_sources: dict[int, set[str]] = defaultdict(set)
+        for source, folded, component_id, restricted in units.filter(
+            state__gte=STATE_TRANSLATED
+        ).values_list(
+            "propagated_source",
+            "propagated_source_folded",
+            "translation__component_id",
+            "translation__component__restricted",
+        ):
+            if restricted:
+                restricted_sources[component_id].add(source)
+                restricted_folded_sources[component_id].add(folded)
+            else:
+                public_sources.add(source)
+                public_folded_sources.add(folded)
+        for unit in units.iterator(chunk_size=500):
+            component = unit.translation.component
+            if unit.translation.language.is_case_sensitive():
+                distinct_sources = (
+                    public_sources | restricted_sources[component.pk]
+                    if component.restricted
+                    else public_sources
+                )
+                source = unit.propagated_source
+            else:
+                distinct_sources = (
+                    public_folded_sources | restricted_folded_sources[component.pk]
+                    if component.restricted
+                    else public_folded_sources
+                )
+                source = unit.propagated_source_folded
+            yield (
+                unit,
+                (
+                    self.applies_to_propagated_unit(unit)
+                    and not self.ignore_state(unit)
+                    and not self.should_skip(unit)
+                    and (
+                        len(distinct_sources) > 1
+                        or bool(distinct_sources and source not in distinct_sources)
+                    )
+                ),
+            )
 
     def should_skip(self, unit: Unit):
         if unit.translation.plural.number <= 1 or not any(unit.get_target_plurals()):
@@ -163,10 +760,14 @@ class ReusedCheck(TargetCheck, BatchCheckMixin):
         return super().should_skip(unit)
 
     def check_target_unit(self, sources: list[str], targets: list[str], unit: Unit):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Unit
 
         translation = unit.translation
         component = translation.component
+
+        if not component.allow_translation_propagation:
+            return False
 
         # Use last result if checks are batched
         if component.batch_checks:
@@ -174,19 +775,24 @@ class ReusedCheck(TargetCheck, BatchCheckMixin):
 
         return Unit.objects.same_target(unit).exists()
 
-    def get_description(self, check_obj):
+    def get_description(self, check_obj: Check):
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Unit
 
         other_sources = (
             Unit.objects.same_target(check_obj.unit)
-            .values_list("source", flat=True)
+            .values_list(F("check_source"), flat=True)
             .distinct()
         )
 
-        return ngettext(
-            "Other source string: %s", "Other source strings: %s", len(other_sources)
-        ) % format_html_join_comma(
-            "{}", ((gettext("“%s”") % source,) for source in other_sources)
+        return format_html(
+            "{} {}",
+            ngettext(
+                "Other source string:", "Other source strings:", len(other_sources)
+            ),
+            format_html_join_comma(
+                "{}", ((gettext("“%s”") % source,) for source in other_sources)
+            ),
         )
 
     def check_single(self, source: str, target: str, unit: Unit) -> bool:
@@ -194,61 +800,136 @@ class ReusedCheck(TargetCheck, BatchCheckMixin):
         return False
 
     def check_component(self, component: Component) -> Iterable[Unit]:
+        if workspace_propagation(component.project):
+            yield from workspace_check_units(component, self.check_id)
+            return
+
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Unit
 
-        units = Unit.objects.filter(
+        custom_sources = bool(component.project.translation_parent_language_ids)
+        units = Unit.objects.exclude_blocked(custom_sources=custom_sources).filter(
             translation__component__project=component.project,
             translation__component__allow_translation_propagation=True,
             state__gte=STATE_TRANSLATED,
         )
         # Lower has no effect here, but we want to utilize index
-        units = units.exclude(target__lower__md5=MD5(Value("")))
+        source_units = units.with_effective_source(
+            custom_sources=custom_sources
+        ).exclude(target__lower__md5=MD5(Value("")))
 
         # List strings with different sources
         # Limit this to 20 strings, otherwise the resulting query is too slow
         # Use ordering to make the limit deterministic
-        matches = (
-            units.values("target", "translation__plural_id")
-            .annotate(source__count=Count("source", distinct=True))
-            .filter(source__count__gt=1)
-            .order_by("target__lower__md5")[:20]
+        plural_fields = (
+            ("check_source_number", "check_source_formula", "check_source_type")
+            if custom_sources
+            else ()
         )
-
-        if not matches:
-            return
-
-        result = (
-            units.filter(
-                reduce(
-                    lambda x, y: x
-                    | (
-                        Q(target__lower__md5=MD5(Lower(Value(y["target"]))))
-                        & Q(target=y["target"])
-                        & Q(translation__plural_id=y["translation__plural_id"])
-                    ),
-                    matches,
-                    Q(),
+        if custom_sources:
+            matches = (
+                source_units.annotate(
+                    has_peer=reused_peer_condition(
+                        component.project, custom_sources=custom_sources
+                    )
                 )
+                .filter(has_peer=True)
+                .annotate(plural_id=F("translation__plural_id"))
+                .values(
+                    "target",
+                    "plural_id",
+                    "check_source_language",
+                    *plural_fields,
+                )
+                .annotate(target_hash=MD5(Lower("target")))
+                .order_by(
+                    "target_hash",
+                    "target",
+                    "translation__plural_id",
+                    "check_source_language",
+                    *plural_fields,
+                )
+                .distinct()[:20]
             )
-            .prefetch()
-            .prefetch_bulk()
-        )
+            match_rows = matches.iterator(chunk_size=20)
+        else:
+            match_rows = iter(project_batch_matches(component.project, "reused"))
 
-        # Filter out case differing source for case insensitive languages
-        found: dict[tuple[str, str], set[str]] = defaultdict(set)
-        remaining: list[tuple[str, Unit]] = []
-        for unit in result:
-            if not unit.translation.language.is_case_sensitive():
-                key = (unit.translation.language.code, unit.target)
-                lower_source = unit.source.lower()
-                found[key].add(lower_source)
-                remaining.append((key, unit))
-            else:
-                yield unit
+        valid_groups = 0
+        for match_batch in batched(match_rows, 20):
+            result = (
+                source_units.filter(
+                    reduce(
+                        lambda x, y: (
+                            x
+                            | (
+                                Q(target__lower__md5=MD5(Lower(Value(y["target"]))))
+                                & Q(target=y["target"])
+                                & Q(translation__plural_id=y["plural_id"])
+                                & Q(check_source_language=y["check_source_language"])
+                                & Q(**{field: y[field] for field in plural_fields})
+                            )
+                        ),
+                        match_batch,
+                        Q(),
+                    )
+                )
+                .prefetch()
+                .prefetch_bulk()
+            )
 
-        for key, unit in remaining:
-            if len(found[key]) > 1:
-                yield unit
+            # Keep the same visibility boundary as same_target().
+            public: dict[tuple, set[str]] = defaultdict(set)
+            restricted: dict[tuple, set[str]] = defaultdict(set)
+            public_folded: dict[tuple, set[str]] = defaultdict(set)
+            restricted_folded: dict[tuple, set[str]] = defaultdict(set)
+            candidates: dict[tuple, list[Unit]] = defaultdict(list)
+            for unit in result:
+                peer = unit.translation.component
+                key = (
+                    unit.translation.plural_id,
+                    unit.effective_source_language.pk,
+                    unit.target,
+                    *(getattr(unit, field) for field in plural_fields),
+                )
+                source = unit.effective_source
+                if peer.restricted:
+                    restricted[key, peer.pk].add(source)
+                    restricted_folded[key, peer.pk].add(source.lower())
+                else:
+                    public[key].add(source)
+                    public_folded[key].add(source.lower())
+                candidates[key].append(unit)
+
+            for match in match_batch:
+                key = (
+                    match["plural_id"],
+                    match["check_source_language"],
+                    match["target"],
+                    *(match[field] for field in plural_fields),
+                )
+                eligible = []
+                for unit in candidates[key]:
+                    peer = unit.translation.component
+                    if unit.translation.language.is_case_sensitive():
+                        sources = (
+                            public[key] | restricted[key, peer.pk]
+                            if peer.restricted
+                            else public[key]
+                        )
+                    else:
+                        sources = (
+                            public_folded[key] | restricted_folded[key, peer.pk]
+                            if peer.restricted
+                            else public_folded[key]
+                        )
+                    if len(sources) > 1:
+                        eligible.append(unit)
+                if eligible:
+                    yield from eligible
+                    valid_groups += 1
+                    if valid_groups == 20:
+                        return
 
 
 class TranslatedCheck(TargetCheck, BatchCheckMixin):
@@ -260,28 +941,27 @@ class TranslatedCheck(TargetCheck, BatchCheckMixin):
     ignore_untranslated = False
     skip_suggestions = True
 
-    SOURCE_ACTIONS = {
+    SOURCE_ACTIONS: ClassVar[set[ActionEvents]] = {
         ActionEvents.SOURCE_CHANGE,
         ActionEvents.MARKED_EDIT,
     }
 
-    TRACK_ACTIONS = ACTIONS_REVERTABLE | SOURCE_ACTIONS
+    TRACK_ACTIONS: ClassVar[set[ActionEvents]] = ACTIONS_REVERTABLE | SOURCE_ACTIONS
 
     def get_description(self, check_obj):
         unit = check_obj.unit
-        target = self.check_target_unit(unit.source, unit.target, unit)
+        target = self.check_target_unit(
+            unit.get_effective_source_plurals(), unit.get_target_plurals(), unit
+        )
         if not target:
             return super().get_description(check_obj)
         return gettext('Previous translation was "%s".') % target
 
-    def should_skip_change(self, change: Change, unit: Unit):
-        # Skip automatic translation entries adding needs editing string
-        return (
-            change.action == ActionEvents.AUTO
-            and change.details.get("state", STATE_TRANSLATED) < STATE_TRANSLATED
-        )
+    def should_skip_change(self, change: Change, unit: Unit) -> bool:
+        # Skip translation entries adding needs editing string
+        return change.details.get("state", STATE_TRANSLATED) < STATE_TRANSLATED
 
-    def should_break_changes(self, change: Change):
+    def should_break_changes(self, change: Change) -> bool:
         # Stop changes processing on source string change or on
         # intentional marking as needing edit
         return change.action in self.SOURCE_ACTIONS
@@ -317,15 +997,16 @@ class TranslatedCheck(TargetCheck, BatchCheckMixin):
         """Target strings are checked in check_target_unit."""
         return False
 
-    def get_fixup(self, unit: Unit):
+    def get_fixup(self, unit: Unit) -> Iterable[FixupType] | None:
         target = self.check_target_unit(
-            unit.get_source_plurals(), unit.get_target_plurals(), unit
+            unit.get_effective_source_plurals(), unit.get_target_plurals(), unit
         )
         if not target:
             return None
-        return [(".*", target, "u")]
+        return [("plurals", split_plural(target))]
 
     def check_component(self, component: Component) -> Iterable[Unit]:
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Change, Unit
 
         units = (
@@ -338,7 +1019,7 @@ class TranslatedCheck(TargetCheck, BatchCheckMixin):
                 Prefetch(
                     "change_set",
                     queryset=Change.objects.filter(
-                        action__in=self.TRACK_ACTIONS,
+                        action__in=self.TRACK_ACTIONS
                     ).order(),
                     to_attr="recent_consistency_changes",
                 )

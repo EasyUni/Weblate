@@ -16,12 +16,16 @@ from django.utils.translation import gettext, gettext_lazy
 from weblate.checks.base import TargetCheckParametrized
 from weblate.checks.parser import multi_value_flag
 from weblate.fonts.utils import check_render_size
+from weblate.utils.hash import calculate_hash
 
 if TYPE_CHECKING:
     from weblate.auth.models import AuthenticatedHttpRequest
+    from weblate.checks.models import Check
     from weblate.trans.models import Unit
 
-IMAGE = '<a href="{0}" class="thumbnail img-check"><img class="img-responsive" src="{0}" /></a>'
+IMAGE = (
+    '<a href="{0}" class="thumbnail img-check"><img class="img-fluid" src="{0}" /></a>'
+)
 
 
 class MaxSizeCheck(TargetCheckParametrized):
@@ -29,12 +33,11 @@ class MaxSizeCheck(TargetCheckParametrized):
 
     check_id = "max-size"
     name = gettext_lazy("Maximum size of translation")
-    description = gettext_lazy(
-        "Translation rendered text should not exceed given size."
-    )
+    description = gettext_lazy("Rendered text should not exceed given size.")
     default_disabled = True
     last_font = None
     always_display = True
+    source = True
 
     @property
     def param_type(self):
@@ -49,47 +52,77 @@ class MaxSizeCheck(TargetCheckParametrized):
             all_flags.get_value_fallback("font-spacing", 0),
         )
 
-    def load_font(self, project, language, name: str) -> str:
+    def load_font(self, project, language, name: str) -> tuple[str, tuple[str, ...]]:
         try:
             group = project.fontgroup_set.get(name=name)
         except ObjectDoesNotExist:
-            return "sans"
+            return "sans", ()
         try:
             override = group.fontoverride_set.get(language=language)
         except ObjectDoesNotExist:
-            return f"{group.font.family} {group.font.style}"
-        return f"{override.font.family} {override.font.style}"
+            selected_font = group.font
+        else:
+            selected_font = override.font
+        sibling_paths = tuple(
+            font.font.path
+            for font in project.font_set.filter(family=selected_font.family).exclude(
+                pk=selected_font.pk
+            )
+        )
+        return selected_font.font.path, sibling_paths
 
-    def check_target_params(
-        self, sources: list[str], targets: list[str], unit: Unit, value
-    ):
+    def get_render_cache_key(self, unit: Unit, pos: int, text: str) -> str:
+        return f"{self.get_cache_key(unit, pos)}:{calculate_hash(text)}"
+
+    def check_text_params(self, texts: list[str], unit: Unit, value) -> bool:
         if len(value) == 2:
             width, lines = value
         else:
             width = value[0]
             lines = 1
         font_group, weight, size, spacing = self.get_params(unit)
-        font = self.last_font = self.load_font(
+        font, font_siblings = self.load_font(
             unit.translation.component.project, unit.translation.language, font_group
         )
+        self.last_font = font
         replace = self.get_replacement_function(unit)
-        return any(
-            (
-                not check_render_size(
-                    text=replace(target),
-                    font=font,
-                    weight=weight,
-                    size=size,
-                    spacing=spacing,
-                    width=width,
-                    lines=lines,
-                    cache_key=self.get_cache_key(unit, i),
-                )
-                for i, target in enumerate(targets)
-            )
-        )
+        failed = False
+        for i, text in enumerate(texts):
+            rendered_text = replace(text)
+            if not check_render_size(
+                text=rendered_text,
+                font=font,
+                font_siblings=font_siblings,
+                weight=weight,
+                size=size,
+                spacing=spacing,
+                width=width,
+                lines=lines,
+                cache_key=self.get_render_cache_key(unit, i, rendered_text),
+            ):
+                failed = True
+        return failed
 
-    def get_description(self, check_obj):
+    def check_target_params(
+        self, sources: list[str], targets: list[str], unit: Unit, value
+    ):
+        return self.check_text_params(targets, unit, value)
+
+    def check_source_unit(self, sources: list[str], unit: Unit) -> bool:
+        if unit.all_flags.has_value(self.enable_string):
+            try:
+                value = self.get_value(unit)
+            except ValueError:
+                return True
+            return self.check_text_params(sources, unit, value)
+        return False
+
+    def get_render_plurals(self, unit: Unit) -> list[str]:
+        if unit.is_source:
+            return unit.get_effective_source_plurals()
+        return unit.get_target_plurals()
+
+    def get_description(self, check_obj: Check):
         url = reverse(
             "render-check",
             kwargs={"check_id": self.check_id, "unit_id": check_obj.unit_id},
@@ -99,7 +132,7 @@ class MaxSizeCheck(TargetCheckParametrized):
             IMAGE,
             (
                 (f"{url}?pos={i}",)
-                for i in range(len(check_obj.unit.get_target_plurals()))
+                for i in range(len(self.get_render_plurals(check_obj.unit)))
             ),
         )
         if not check_obj.id:
@@ -117,12 +150,23 @@ class MaxSizeCheck(TargetCheckParametrized):
             pos = int(request.GET.get("pos", "0"))
         except ValueError:
             pos = 0
-        key = self.get_cache_key(unit, pos)
+        texts = self.get_render_plurals(unit)
+        try:
+            text = texts[pos]
+        except IndexError:
+            msg = "Invalid check"
+            raise Http404(msg) from None
+        key = self.get_render_cache_key(
+            unit, pos, self.get_replacement_function(unit)(text)
+        )
         result = cache.get(key)
         if result is None:
-            self.check_target_unit(
-                unit.get_source_plurals(), unit.get_target_plurals(), unit
-            )
+            if unit.is_source:
+                self.check_source_unit(unit.get_effective_source_plurals(), unit)
+            else:
+                self.check_target_unit(
+                    unit.get_effective_source_plurals(), unit.get_target_plurals(), unit
+                )
             result = cache.get(key)
         if result is None:
             msg = "Invalid check"

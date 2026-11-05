@@ -3,45 +3,70 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+import html
 import re
-import threading
 from functools import reduce
+from typing import TYPE_CHECKING
 
 import mistletoe
 from django.db.models import Q
+from django.utils.html import linebreaks
 from django.utils.safestring import mark_safe
 from mistletoe import span_token
 
+from weblate.accounts.visibility import can_view_profile
 from weblate.auth.models import User
+from weblate.utils.errors import report_error
+
+from .concurrency import MARKDOWN_LOCK
+
+if TYPE_CHECKING:
+    from django.contrib.auth.models import AnonymousUser
+    from django.db.models import QuerySet
 
 MENTION_RE = re.compile(r"(?<!\w)(@[\w.@+-]+)\b")
-MARKDOWN_LOCK = threading.Lock()
+MAX_MENTION_USERS = 100
+PLAIN_AUTOLINK_CHAR = r"A-Za-z0-9.!#$%&'*+/=?^_`{|}~:-"
+PLAIN_AUTOLINK_END = r"A-Za-z0-9/_~=#&+-"
+PLAIN_AUTOLINK_PAREN = rf"\([{PLAIN_AUTOLINK_CHAR}]+\)"
 
 
-def get_mention_users(text):
+def get_mention_users(text: str) -> QuerySet[User]:
     """Return IDs of users mentioned in the text."""
-    matches = MENTION_RE.findall(text)
-    if not matches:
+    usernames: dict[str, str] = {}
+    for match in MENTION_RE.finditer(text):
+        username = match[1][1:]
+        usernames.setdefault(username.lower(), username)
+        if len(usernames) == MAX_MENTION_USERS:
+            break
+    if not usernames:
         return User.objects.none()
     return User.objects.filter(
-        reduce(lambda acc, x: acc | Q(username=x[1:]), matches, Q())
+        reduce(
+            lambda query, username: query | Q(username=username),
+            usernames.values(),
+            Q(),
+        )
     )
 
 
 class SkipHtmlSpan(span_token.HtmlSpan):
     """A token that strips HTML tags from the content."""
 
-    pattern = re.compile(f"{span_token._open_tag}|{span_token._closing_tag}")  # noqa: SLF001
+    # ruff: ignore[private-member-access]
+    pattern = re.compile(f"{span_token._open_tag}|{span_token._closing_tag}")
     parse_inner = False
     content: str
 
-    def __init__(self, match) -> None:
+    def __init__(self, match: re.Match[str]) -> None:
+        super().__init__(match)
         self.content = ""
 
 
 class PlainAutoLink(span_token.AutoLink):
     pattern = re.compile(
-        r"\b(https?://[A-Za-z0-9.!#$%&'*+/=?^_`{|})(~-]+[A-Za-z0-9})])(?=\W|$)"
+        rf"\b((https?)://(?:[{PLAIN_AUTOLINK_CHAR}]|{PLAIN_AUTOLINK_PAREN})*"
+        rf"(?:[{PLAIN_AUTOLINK_END}]|{PLAIN_AUTOLINK_PAREN}))(?=\W|$)"
     )
 
 
@@ -52,6 +77,8 @@ class SaferWeblateHtmlRenderer(mistletoe.HtmlRenderer):
     1. Check if the URL is valid based on scheme and content
     2. Strip HTML tags from the content.
     """
+
+    unlinked_mentions: frozenset[str] = frozenset()
 
     _allowed_url_re = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -84,7 +111,12 @@ class SaferWeblateHtmlRenderer(mistletoe.HtmlRenderer):
         If the URL is valid, add the necessary attributes to make it open in a new tab.
         """
         if self.check_url(token.target):
-            return self.convert_link(super().render_link(token))
+            rendered = self.convert_link(super().render_link(token))
+            if token.target.startswith("/user/"):
+                # Bidi-isolate mentions so that the leading @ stays next to
+                # the username when surrounded by right-to-left text.
+                return f"<bdi>{rendered}</bdi>"
+            return rendered
         return self.escape_html_text(f"[{token.title}]({token.target})")
 
     def render_auto_link(self, token: span_token.AutoLink | PlainAutoLink) -> str:
@@ -114,18 +146,35 @@ class SaferWeblateHtmlRenderer(mistletoe.HtmlRenderer):
         Otherwise, escape the URL.
         """
         if self.check_url(token.src):
-            return super().render_image(token)
+            template = '<img src="{}" alt="{}"{} />'
+            title = f' title="{html.escape(token.title)}"' if token.title else ""
+            return template.format(
+                self.escape_url(token.src), self.render_to_plain(token), title
+            )
         return self.escape_html_text(f"![{token.title}]({token.src})")
 
+    def render_strong(self, token: span_token.Strong) -> str:
+        rendered = super().render_strong(token)
+        children = list(token.children or ())
+        if (
+            len(children) == 1
+            and isinstance(children[0], span_token.RawText)
+            and children[0].content in self.unlinked_mentions
+        ):
+            return f"<bdi>{rendered}</bdi>"
+        return rendered
+
     def check_url(self, url: str) -> bool:
-        """Check if an url is valid or not  the scheme."""
+        """Check whether a URL uses an allowed scheme."""
         if url.startswith("/user/"):
             return True
         return bool(self._allowed_url_re.match(url))
 
 
-def render_markdown(text: str) -> str:
+def render_markdown(text: str, *, viewer: User | AnonymousUser | None = None) -> str:
+    original_text = text
     users = {u.username.lower(): u for u in get_mention_users(text)}
+    unlinked_mentions: set[str] = set()
     parts = MENTION_RE.split(text)
     for pos, part in enumerate(parts):
         if not part.startswith("@"):
@@ -133,9 +182,21 @@ def render_markdown(text: str) -> str:
         username = part[1:].lower()
         if username in users:
             user = users[username]
-            parts[pos] = (
-                f'**[{part}]({user.get_absolute_url()} "{user.get_visible_name()}")**'
-            )
+            if can_view_profile(viewer, user):
+                parts[pos] = (
+                    f'**[{part}]({user.get_absolute_url()} "{user.get_visible_name()}")**'
+                )
+            else:
+                # Keep mentions isolated in RTL text even without a profile link.
+                unlinked_mentions.add(part)
+                parts[pos] = f"**{part}**"
     text = "".join(parts)
-    with MARKDOWN_LOCK, SaferWeblateHtmlRenderer() as renderer:
-        return mark_safe(renderer.render(mistletoe.Document(text)))  # noqa: S308
+    try:
+        with MARKDOWN_LOCK, SaferWeblateHtmlRenderer() as renderer:
+            renderer.unlinked_mentions = frozenset(unlinked_mentions)
+            # ruff: ignore[suspicious-mark-safe-usage]
+            return mark_safe(renderer.render(mistletoe.Document(text)))
+    except Exception:
+        report_error("Markdown rendering failed")
+        # ruff: ignore[suspicious-mark-safe-usage]
+        return mark_safe(linebreaks(original_text, autoescape=True))

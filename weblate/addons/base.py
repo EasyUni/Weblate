@@ -5,36 +5,76 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import shutil
+import subprocess  # ruff: ignore[suspicious-subprocess-import]
+import tempfile
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from copy import deepcopy
 from itertools import chain
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, ClassVar, Self, TypedDict, TypeGuard, cast
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.template.defaultfilters import linebreaksbr
 from django.utils.functional import cached_property
 from django.utils.translation import gettext
 
-from weblate.addons.events import POST_CONFIGURE_EVENTS, AddonEvent
+from weblate.addons.events import (
+    POST_CONFIGURE_EVENTS,
+    AddonActivityLogReason,
+    AddonActivityLogStatus,
+    AddonEvent,
+    AddonEventOutcome,
+    AddonEventResult,
+)
+from weblate.trans.actions import ACTIONS_CONTENT
 from weblate.trans.exceptions import FileParseError
 from weblate.trans.models import Component
-from weblate.trans.templatetags.translations import format_json
-from weblate.trans.util import get_clean_env
 from weblate.utils import messages
+from weblate.utils.bulk_regex import regex_session
+from weblate.utils.change_origin import acting_user_context, get_acting_user
+from weblate.utils.commands import get_clean_env
+from weblate.utils.docs import DocVersionsMixin
 from weblate.utils.errors import report_error
-from weblate.utils.files import cleanup_error_message
+from weblate.utils.files import cleanup_error_message, get_repo_temp_dir
+from weblate.utils.formatting import format_json
+from weblate.utils.html import format_html_join_comma, list_to_tuples
 from weblate.utils.render import render_template
 from weblate.utils.validators import validate_filename
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator, Iterable
 
+    from django.forms import Form
+    from django.forms.boundfield import BoundField
+    from django.http import HttpRequest
+    from django.urls.resolvers import URLPattern
     from django_stubs_ext import StrOrPromise
 
     from weblate.addons.forms import BaseAddonForm
     from weblate.addons.models import Addon, AddonActivityLog
     from weblate.auth.models import AuthenticatedHttpRequest, User
-    from weblate.trans.models import Change, Project, Translation, Unit
+    from weblate.trans.models import Category, Change, Project, Translation, Unit
+
+
+type AddonConfigurationScalar = str | int | float | bool | None
+type AddonConfigurationValue = (
+    AddonConfigurationScalar
+    | Sequence[AddonConfigurationValue]
+    | Mapping[str, AddonConfigurationValue]
+)
+type AddonConfiguration = dict[str, AddonConfigurationValue]
+
+ADDON_CHANGE_DETAILS_SCHEMA = "weblate-addon-configuration-v1"
+
+
+class AddonChangeDetails(TypedDict):
+    schema: str
+    configuration: AddonConfiguration
+    changed_fields: list[str]
+    redacted_fields: list[str]
 
 
 class CompatDict(TypedDict, total=False):
@@ -43,21 +83,118 @@ class CompatDict(TypedDict, total=False):
     edit_template: set[bool]
 
 
-class BaseAddon:
+CHANGE_EVENT_FILTER_CONTENT = "content"
+CHANGE_EVENT_FILTER_ALL = "all"
+CHANGE_EVENT_FILTER_CUSTOM = "custom"
+CHANGE_EVENT_FILTERS = frozenset(
+    (
+        CHANGE_EVENT_FILTER_CONTENT,
+        CHANGE_EVENT_FILTER_ALL,
+        CHANGE_EVENT_FILTER_CUSTOM,
+    )
+)
+
+
+def build_addon_change_details(
+    configuration: Mapping[str, AddonConfigurationValue],
+    compared_configuration: Mapping[str, AddonConfigurationValue],
+    public_fields: frozenset[str],
+) -> AddonChangeDetails:
+    """Build a public snapshot of an add-on configuration change."""
+    all_fields = set(configuration) | set(compared_configuration)
+    redacted_fields = all_fields - public_fields
+    public_configuration: AddonConfiguration = {
+        key: deepcopy(value) if key in public_fields else None
+        for key, value in configuration.items()
+    }
+    return {
+        "schema": ADDON_CHANGE_DETAILS_SCHEMA,
+        "configuration": public_configuration,
+        "changed_fields": sorted(
+            key
+            for key in all_fields
+            if configuration.get(key) != compared_configuration.get(key)
+            or (key in configuration) != (key in compared_configuration)
+        ),
+        "redacted_fields": sorted(redacted_fields),
+    }
+
+
+def is_public_addon_change_details(
+    details: object,
+) -> TypeGuard[AddonChangeDetails]:
+    """Return whether details use the public add-on configuration schema."""
+    if not isinstance(details, dict):
+        return False
+    if details.get("schema") != ADDON_CHANGE_DETAILS_SCHEMA:
+        return False
+    configuration = details.get("configuration")
+    changed_fields = details.get("changed_fields")
+    redacted_fields = details.get("redacted_fields")
+    if (
+        not isinstance(configuration, dict)
+        or not isinstance(changed_fields, list)
+        or not isinstance(redacted_fields, list)
+        or not all(isinstance(key, str) for key in changed_fields)
+        or not all(isinstance(key, str) for key in redacted_fields)
+    ):
+        return False
+    return all(
+        key not in configuration or configuration[key] is None
+        for key in redacted_fields
+    )
+
+
+def get_change_event_filter(
+    configuration: Mapping[str, AddonConfigurationValue],
+) -> str:
+    event_filter = configuration.get("event_filter")
+    if isinstance(event_filter, str) and event_filter in CHANGE_EVENT_FILTERS:
+        return event_filter
+    if configuration.get("all_events", False):
+        return CHANGE_EVENT_FILTER_ALL
+    if "events" in configuration:
+        return CHANGE_EVENT_FILTER_CUSTOM
+    return CHANGE_EVENT_FILTER_CONTENT
+
+
+class BaseAddon[StoredConfigurationT, ConfigurationT](DocVersionsMixin):
     """Base class for Weblate add-ons."""
 
-    events: set[AddonEvent] = set()
-    settings_form: type[BaseAddonForm] | None = None
+    events: ClassVar[set[AddonEvent]] = set()
+    settings_form: type[BaseAddonForm[StoredConfigurationT, Self]] | None = None
+    execution_form: type[Form] | None = None
     name = ""
-    compat: CompatDict = {}
+    api_name: str | None = None
+
+    @classmethod
+    def get_api_urls(cls) -> tuple[URLPattern, ...]:
+        """Return named Django URL patterns for this provider's API."""
+        return ()
+
+    @classmethod
+    def api_available(cls, component: Component | None) -> bool:
+        if not cls.api_name:
+            return True
+        return (
+            component is not None
+            and not cls.repo_scope
+            and not component.addon_set.filter(name=cls.name).exists()
+        )
+
+    compat: ClassVar[CompatDict] = {}
     multiple = False
     verbose: StrOrPromise = "Base add-on"
     description: StrOrPromise = "Base add-on"
     icon = "cog.svg"
-    project_scope = False
     repo_scope = False
     needs_component = False
     has_summary = False
+    has_preview = False
+    preview_component_required = True
+    preview_workflow_required = True
+    show_skipped_result = False
+    run_on_configuration = True
     alert: str = ""
     trigger_update = False
     stay_on_create = False
@@ -68,6 +205,10 @@ class BaseAddon:
         self.instance: Addon = storage
         self.alerts: list[dict[str, str]] = []
         self.extra_files: list[str] = []
+        self.documentation_build: bool = False
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__} instance={self.instance}>"
 
     @cached_property
     def doc_anchor(self) -> str:
@@ -75,11 +216,17 @@ class BaseAddon:
 
     @classmethod
     def get_doc_anchor(cls) -> str:
-        return "addon-{}".format(cls.name.replace(".", "-").replace("_", "-"))
+        return f"addon-{cls.name.replace('.', '-').replace('_', '-')}"
 
     @classmethod
     def has_settings(cls) -> bool:
         return cls.settings_form is not None
+
+    def get_integration_instructions(
+        self, user: User, request: HttpRequest | None = None
+    ) -> str:
+        """Render integration instructions independently of the settings form."""
+        return ""
 
     @classmethod
     def get_identifier(cls) -> str:
@@ -90,17 +237,17 @@ class BaseAddon:
         cls,
         *,
         component: Component | None = None,
+        category: Category | None = None,
         project: Project | None = None,
-        acting_user: User | None = None,
         **kwargs,
     ) -> Addon:
-        from weblate.addons.models import Addon
+        from weblate.addons.models import Addon  # ruff: ignore[import-outside-top-level]
 
         result = Addon(
             project=project,
+            category=category,
             component=component,
             name=cls.name,
-            acting_user=acting_user,
             **kwargs,
         )
 
@@ -112,18 +259,25 @@ class BaseAddon:
         cls,
         *,
         component: Component | None = None,
+        category: Category | None = None,
         project: Project | None = None,
         run: bool = True,
         acting_user: User | None = None,
         **kwargs,
-    ) -> BaseAddon:
-        storage = cls.create_object(
-            component=component, project=project, acting_user=acting_user, **kwargs
-        )
-        storage.save(force_insert=True)
-        result = cls(storage)
-        result.post_configure(run=run)
-        return result
+    ) -> Self:
+        with acting_user_context(
+            acting_user if acting_user is not None else get_acting_user()
+        ):
+            storage = cls.create_object(
+                component=component,
+                category=category,
+                project=project,
+                **kwargs,
+            )
+            storage.save(force_insert=True)
+            result = cls(storage)
+            result.post_configure(run=run)
+            return result
 
     @classmethod
     def get_add_form(
@@ -131,84 +285,247 @@ class BaseAddon:
         user: User | None,
         *,
         component: Component | None = None,
+        category: Category | None = None,
         project: Project | None = None,
         **kwargs,
-    ) -> BaseAddonForm | None:
+    ) -> BaseAddonForm[StoredConfigurationT, Self] | None:
         """Return configuration form for adding new add-on."""
         if cls.settings_form is None:
             return None
         storage = cls.create_object(
-            component=component, project=project, acting_user=user
+            component=component, project=project, category=category
         )
         instance = cls(storage)
         return cls.settings_form(user, instance, **kwargs)
 
-    def get_settings_form(self, user: User | None, **kwargs) -> BaseAddonForm | None:
+    def get_settings_form(
+        self, user: User | None, **kwargs
+    ) -> BaseAddonForm[StoredConfigurationT, Self] | None:
         """Return configuration form for this add-on."""
         if self.settings_form is None:
             return None
         if "data" not in kwargs:
-            kwargs["data"] = self.instance.configuration
+            kwargs["data"] = self.get_settings_form_data()
         return self.settings_form(user, self, **kwargs)
 
-    def get_ui_form(self) -> BaseAddonForm | None:
-        return self.get_settings_form(None)
+    def get_settings_form_data(self) -> Mapping[str, AddonConfigurationValue]:
+        return cast("Mapping[str, AddonConfigurationValue]", self.stored_configuration)
 
-    def configure(self, configuration: dict[str, Any]) -> None:
+    @property
+    def stored_configuration(self) -> StoredConfigurationT:
+        return cast("StoredConfigurationT", self.instance.configuration)
+
+    def normalize_configuration(
+        self, configuration: StoredConfigurationT
+    ) -> ConfigurationT:
+        return cast("ConfigurationT", configuration)
+
+    def get_configuration(self) -> ConfigurationT:
+        return self.normalize_configuration(self.stored_configuration)
+
+    @property
+    def configuration(self) -> ConfigurationT:
+        return self.get_configuration()
+
+    @classmethod
+    def get_public_configuration_fields(cls) -> frozenset[str]:
+        """Return configuration fields which are safe for public use."""
+        if cls.settings_form is None:
+            return frozenset()
+        return cls.settings_form.public_configuration_fields
+
+    def get_public_configuration(self) -> AddonConfiguration:
+        """Return configuration with non-public values redacted."""
+        return build_addon_change_details(
+            self.get_settings_form_data(),
+            {},
+            self.get_public_configuration_fields(),
+        )["configuration"]
+
+    def get_change_details(
+        self,
+        compared_configuration: Mapping[str, AddonConfigurationValue],
+    ) -> AddonChangeDetails:
+        """Return a public configuration snapshot and changed field names."""
+        return build_addon_change_details(
+            self.get_settings_form_data(),
+            compared_configuration,
+            self.get_public_configuration_fields(),
+        )
+
+    def show_setting_field(self, field: BoundField) -> bool:
+        return not field.is_hidden and field.value()
+
+    def get_setting_value(self, field: BoundField) -> StrOrPromise:
+        value = field.value()
+        if value is True:
+            return gettext("enabled")
+        if field_choices := getattr(field.field, "choices", None):
+            choices: dict[str, str] = {
+                str(choice): value for choice, value in field_choices
+            }
+            if isinstance(value, list):
+                return format_html_join_comma(
+                    "{}",
+                    list_to_tuples(choices.get(val, val) for val in value),
+                )
+            return choices.get(value, value)
+        return value
+
+    def get_settings_fields(self) -> list[tuple[StrOrPromise, StrOrPromise]]:
+        form = self.get_settings_form(None)
+        if form is None:
+            return []
+
+        return [
+            (
+                field.label,
+                self.get_setting_value(field),
+            )
+            for field in form
+            if self.show_setting_field(field)
+        ]
+
+    def configure(self, configuration: StoredConfigurationT) -> None:
         """Save configuration."""
         self.instance.configuration = configuration
         self.instance.save()
         self.post_configure()
 
+    @property
+    def configured_events(self) -> set[AddonEvent]:
+        return self.events
+
     def post_configure(self, run: bool = True) -> None:
-        from weblate.addons.tasks import postconfigure_addon
+        from weblate.addons.tasks import postconfigure_addon  # ruff: ignore[import-outside-top-level]
 
         self.instance.log_debug("configuring events for %s add-on", self.name)
 
         # Configure events to current status
-        self.instance.configure_events(self.events)
+        self.instance.configure_events(self.configured_events)
 
-        if run:
+        if run and self.run_on_configuration:
             if settings.CELERY_TASK_ALWAYS_EAGER:
                 postconfigure_addon(self.instance.pk, self.instance)
             else:
                 postconfigure_addon.delay_on_commit(self.instance.pk)
 
+    @regex_session()
     def post_configure_run(self) -> None:
         # Trigger post events to ensure direct processing
         if component := self.instance.component:
             if self.repo_scope and component.linked_component:
                 component = component.linked_component
             self.post_configure_run_component(component)
+        elif category := self.instance.category:
+            self.post_configure_run_category(category)
+        elif project := self.instance.project:
+            self.post_configure_run_project(project)
 
-        if project := self.instance.project:
-            for component in project.component_set.iterator():
-                if self.can_install(component, None):
-                    self.post_configure_run_component(component)
+    def post_configure_run_project(self, project: Project) -> None:
+        from weblate.addons.models import execute_addon_event  # ruff: ignore[import-outside-top-level]
 
-    def post_configure_run_component(self, component: Component) -> None:
+        for component in project.component_set.iterator():
+            if self.can_process(component=component):
+                self.post_configure_run_component(component, skip_daily=True)
+
+        if AddonEvent.EVENT_DAILY in self.events:
+            execute_addon_event(
+                self.instance,
+                None,
+                project,
+                AddonEvent.EVENT_DAILY,
+                "daily",
+                kwargs={"component": None, "category": None, "project": project},
+            )
+
+    def post_configure_run_category(self, category: Category) -> None:
+        from weblate.addons.models import execute_addon_event  # ruff: ignore[import-outside-top-level]
+
+        for component in category.all_components.iterator():
+            if self.can_process(component=component):
+                self.post_configure_run_component(component, skip_daily=True)
+
+        if AddonEvent.EVENT_DAILY in self.events:
+            execute_addon_event(
+                self.instance,
+                None,
+                category,
+                AddonEvent.EVENT_DAILY,
+                "daily",
+                kwargs={"component": None, "category": category, "project": None},
+            )
+
+    def post_configure_run_component(
+        self, component: Component, skip_daily: bool = False
+    ) -> None:
+        from weblate.addons.models import execute_addon_event  # ruff: ignore[import-outside-top-level]
+
         # Trigger post configure event for a VCS component
         previous = component.repository.last_revision
-        if not (POST_CONFIGURE_EVENTS & self.events):
+        if (
+            not POST_CONFIGURE_EVENTS & self.events
+            and AddonEvent.EVENT_INSTALL not in self.events
+        ):
             return
 
+        base_event_args = (self.instance, component, component)
+        if AddonEvent.EVENT_INSTALL in self.events:
+            component.log_debug("running post_install add-on: %s", self.name)
+            execute_addon_event(
+                *(base_event_args),
+                AddonEvent.EVENT_INSTALL,
+                "post_install",
+                (
+                    component,
+                    True,
+                ),
+            )
         if AddonEvent.EVENT_POST_COMMIT in self.events:
             component.log_debug("running post_commit add-on: %s", self.name)
-            self.post_commit(component, True)
+            execute_addon_event(
+                *(base_event_args),
+                AddonEvent.EVENT_POST_COMMIT,
+                "post_commit",
+                (
+                    component,
+                    True,
+                ),
+            )
         if AddonEvent.EVENT_POST_UPDATE in self.events:
             component.log_debug("running post_update add-on: %s", self.name)
             # The post_update typically operates on files, so make sure these are updated
             component.commit_pending("add-on", None)
-            self.post_update(component, "", False)
+            execute_addon_event(
+                *(base_event_args),
+                AddonEvent.EVENT_POST_UPDATE,
+                "post_update",
+                (component, "", False, [], True),
+            )
         if AddonEvent.EVENT_COMPONENT_UPDATE in self.events:
             component.log_debug("running component_update add-on: %s", self.name)
-            self.component_update(component)
+            execute_addon_event(
+                *(base_event_args),
+                AddonEvent.EVENT_COMPONENT_UPDATE,
+                "component_update",
+                (component,),
+            )
         if AddonEvent.EVENT_POST_PUSH in self.events:
             component.log_debug("running post_push add-on: %s", self.name)
-            self.post_push(component)
-        if AddonEvent.EVENT_DAILY in self.events:
+            execute_addon_event(
+                *(base_event_args),
+                AddonEvent.EVENT_POST_PUSH,
+                "post_push",
+                (component,),
+            )
+        if AddonEvent.EVENT_DAILY in self.events and not skip_daily:
             component.log_debug("running daily add-on: %s", self.name)
-            self.daily(component)
+            execute_addon_event(
+                *(base_event_args),
+                AddonEvent.EVENT_DAILY,
+                "daily",
+                kwargs={"component": component, "category": None, "project": None},
+            )
 
         current = component.repository.last_revision
         if previous != current:
@@ -220,33 +537,106 @@ class BaseAddon:
     def post_uninstall(self) -> None:
         pass
 
+    def get_component_state(self, component: Component) -> dict[str, object]:
+        key = str(component.pk)
+        state = self.instance.state.setdefault("components", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.instance.state["components"] = state
+        component_state = state.setdefault(key, {})
+        if not isinstance(component_state, dict):
+            component_state = {}
+            state[key] = component_state
+        return component_state
+
     def save_state(self) -> None:
         """Save add-on state information."""
         self.instance.save(update_fields=["state"])
 
-    @classmethod
-    def can_install(cls, component: Component, user: User | None) -> bool:  # noqa: ARG003
-        """Check whether add-on is compatible with given component."""
-        return all(
-            getattr(component, key) in cast("set", values)
-            for key, values in cls.compat.items()
-        )
+    def update_component_state(
+        self,
+        component: Component,
+        updater: Callable[[dict[str, object]], None],
+    ) -> None:
+        """Atomically merge component-scoped add-on state into the shared JSON field."""
+        with transaction.atomic():
+            storage = (
+                type(self.instance).objects.select_for_update().get(pk=self.instance.pk)
+            )
+            state = storage.state
+            if not isinstance(state, dict):
+                state = {}
+                storage.state = state
+            components_state = state.setdefault("components", {})
+            if not isinstance(components_state, dict):
+                components_state = {}
+                state["components"] = components_state
 
-    def pre_push(self, component: Component) -> None:
+            key = str(component.pk)
+            component_state = components_state.setdefault(key, {})
+            if not isinstance(component_state, dict):
+                component_state = {}
+                components_state[key] = component_state
+
+            updater(component_state)
+            storage.save(update_fields=["state"])
+            self.instance.state = storage.state
+
+    @classmethod
+    def can_install(
+        cls,
+        *,
+        component: Component | None = None,
+        # ruff: ignore[unused-class-method-argument]
+        category: Category | None = None,
+        # ruff: ignore[unused-class-method-argument]
+        project: Project | None = None,
+    ) -> bool:
+        """Check whether add-on is compatible with given component."""
+        if component is not None:
+            return all(
+                getattr(component, key) in cast("set", values)
+                for key, values in cls.compat.items()
+            )
+        return not cls.needs_component
+
+    @classmethod
+    def can_process(
+        cls,
+        *,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+    ) -> bool:
+        return cls.can_install(component=component, category=category, project=project)
+
+    def pre_push(
+        self, component: Component, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler before repository is pushed upstream."""
         # To be implemented in a subclass
 
-    def post_push(self, component: Component) -> None:
+    def post_push(
+        self, component: Component, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler after repository is pushed upstream."""
         # To be implemented in a subclass
 
-    def pre_update(self, component: Component) -> None:
+    def pre_update(
+        self, component: Component, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler before repository is updated from upstream."""
         # To be implemented in a subclass
 
     def post_update(
-        self, component: Component, previous_head: str, skip_push: bool
-    ) -> None:
+        self,
+        component: Component,
+        previous_head: str,
+        skip_push: bool,
+        changed_files: list[str],
+        parse_after_update: bool = False,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
         """
         Event handler after repository is updated from upstream.
 
@@ -256,38 +646,242 @@ class BaseAddon:
                                changes upstream. Usually you can pass this to
                                underlying methods as ``commit_and_push`` or
                                ``commit_pending``.
+        :param list[str] changed_files: Files changed by the repository update.
         """
         # To be implemented in a subclass
+        return None
 
     def pre_commit(
-        self, translation: Translation, author: str, store_hash: bool
-    ) -> None:
+        self,
+        translation: Translation,
+        author: str,
+        store_hash: bool,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
         """Event handler before changes are committed to the repository."""
         # To be implemented in a subclass
 
-    def post_commit(self, component: Component, store_hash: bool) -> None:
+    def post_install(
+        self,
+        component: Component,
+        store_hash: bool,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
+        """Event handler after add-on is installed."""
+        # To be implemented in a subclass
+
+    def post_commit(
+        self,
+        component: Component,
+        store_hash: bool,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
         """Event handler after changes are committed to the repository."""
         # To be implemented in a subclass
 
-    def post_add(self, translation: Translation) -> None:
+    def post_add(
+        self, translation: Translation, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler after new translation is added."""
         # To be implemented in a subclass
 
-    def unit_pre_create(self, unit: Unit) -> None:
+    def post_remove(
+        self, translation: Translation, activity_log_id: int | None = None
+    ) -> AddonEventResult:
+        """Event handler after a translation is removed."""
+        # To be implemented in a subclass
+
+    def unit_pre_create(
+        self, unit: Unit, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler before new unit is created."""
         # To be implemented in a subclass
 
-    def daily(self, component: Component) -> None:
-        """Event handler daily."""
-        # To be implemented in a subclass
+    def resolve_components(
+        self,
+        *,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+    ) -> Iterable[Component]:
+        """Resolve scope to components iterator."""
+        if component is not None:
+            return [component]
+        if category is not None:
+            return category.all_components.iterator()
+        if project is not None:
+            return project.component_set.iterator()
+        return Component.objects.iterator()
 
-    def component_update(self, component: Component) -> None:
+    def daily(
+        self,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
+        """
+        Scope-aware daily entry point.
+
+        Override this for project-level logic, or override daily_component()
+        for per-component logic.
+        """
+        return self.handle_scoped_component_event(
+            self.daily_component,
+            component=component,
+            category=category,
+            project=project,
+            activity_log_id=activity_log_id,
+        )
+
+    def daily_component(
+        self,
+        component: Component,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
+        """Per-component daily processing. Override this for component-level logic."""
+        return None
+
+    def manual(
+        self,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
+        """
+        Scope-aware manual entry point.
+
+        By default this mirrors the daily handler and lets add-ons opt in
+        explicitly by subscribing to the manual event.
+        """
+        return self.handle_scoped_component_event(
+            self.manual_component,
+            component=component,
+            category=category,
+            project=project,
+            activity_log_id=activity_log_id,
+        )
+
+    def handle_scoped_component_event(
+        self,
+        handler: Callable[[Component, int | None], AddonEventResult],
+        *,
+        component: Component | None = None,
+        category: Category | None = None,
+        project: Project | None = None,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
+        results: dict[str, dict] = {}
+        outcomes: list[AddonEventOutcome] = []
+        compatible = False
+        for comp in self.resolve_components(
+            component=component, category=category, project=project
+        ):
+            if self.can_process(component=comp):
+                compatible = True
+                result = handler(comp, activity_log_id)
+                if isinstance(result, AddonEventOutcome):
+                    outcomes.append(result)
+                else:
+                    outcomes.append(
+                        AddonEventOutcome(
+                            AddonActivityLogStatus.SUCCESS,
+                            result=result,
+                        )
+                    )
+                    if result is not None:
+                        results[comp.full_slug] = result
+        if not compatible:
+            return AddonEventOutcome.skipped(
+                AddonActivityLogReason.NO_COMPATIBLE_COMPONENTS
+            )
+        selected_outcome = next(
+            outcome
+            for status in (
+                AddonActivityLogStatus.ERROR,
+                AddonActivityLogStatus.PENDING,
+                AddonActivityLogStatus.SUCCESS,
+                AddonActivityLogStatus.SKIPPED,
+            )
+            for outcome in outcomes
+            if outcome.status == status
+        )
+        result: dict | None = None
+        if component is not None and len(results) == 1:
+            result = next(iter(results.values()))
+        elif results:
+            result = {"components": results}
+        if selected_outcome.status == AddonActivityLogStatus.SUCCESS:
+            return result
+        if result is None:
+            return selected_outcome
+        return AddonEventOutcome(
+            selected_outcome.status,
+            reason=selected_outcome.reason,
+            result=result,
+        )
+
+    def get_execution_form(
+        self, data: Mapping[str, object] | None = None
+    ) -> Form | None:
+        """Provide optional component/change context and preview controls."""
+        if self.execution_form is None:
+            return None
+        return self.execution_form(
+            data=data,
+            initial={"component": self.instance.component_id},
+            prefix="execution",
+        )
+
+    def schedule_manual_run(
+        self,
+        user_id: int | None = None,
+        *,
+        component_id: int | None = None,
+        change_id: int | None = None,
+    ) -> None:
+        """Queue the default manual handler; providers can consume run context."""
+        from weblate.addons.tasks import run_addon_manually  # ruff: ignore[import-outside-top-level]
+
+        run_addon_manually.delay_on_commit(self.instance.pk, user_id=user_id)
+
+    def preview(
+        self,
+        workflow: object,
+        component_id: int | None,
+        change_id: int | None = None,
+        actor: User | None = None,
+    ) -> dict[str, object]:
+        """Preview an operation without changing application state, if supported."""
+        msg = "This add-on does not support preview."
+        raise NotImplementedError(msg)
+
+    def manual_component(
+        self,
+        component: Component,
+        activity_log_id: int | None = None,
+    ) -> AddonEventResult:
+        """Per-component manual processing."""
+        return self.daily_component(component, activity_log_id=activity_log_id)
+
+    def component_update(
+        self, component: Component, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler for component update."""
         # To be implemented in a subclass
+        return None
 
-    def change_event(self, change: Change) -> None:
+    def check_change_action(self, change: Change) -> bool:
+        """Early filtering of Change actions before triggering change_event callback."""
+        return True
+
+    def change_event(
+        self, change: Change, activity_log_id: int | None = None
+    ) -> AddonEventResult:
         """Event handler for change event."""
         # To be implemented in a subclass
+        return None
 
     def execute_process(
         self, component: Component, cmd: list[str], env: dict[str, str] | None = None
@@ -319,6 +913,9 @@ class BaseAddon:
 
     def trigger_alerts(self, component: Component) -> None:
         if self.alerts:
+            for alert in self.alerts:
+                alert.setdefault("addon", self.name)
+                alert.setdefault("addon_id", str(self.instance.pk))
             component.add_alert(self.alert, occurrences=self.alerts)
             self.alerts = []
         else:
@@ -329,6 +926,7 @@ class BaseAddon:
         component: Component,
         files: list[str] | None = None,
         skip_push: bool = False,
+        parse_after_update: bool = False,
     ) -> bool:
         if files is None:
             files = list(
@@ -343,7 +941,7 @@ class BaseAddon:
             return False
         with repository.lock:
             component.commit_files(
-                template=component.addon_message,
+                template=component.effective_addon_message,
                 extra_context={"addon_name": self.verbose},
                 files=files,
                 skip_push=skip_push,
@@ -351,12 +949,22 @@ class BaseAddon:
         return True
 
     def render_repo_filename(
-        self, template: str, translation: Translation
+        self,
+        template: str,
+        translation: Translation | None = None,
+        *,
+        component: Component | None = None,
     ) -> str | None:
-        component = translation.component
+        if translation is not None:
+            component = translation.component
+        if component is None:
+            msg = "A translation or component is required"
+            raise ValueError(msg)
 
         # Render the template
-        filename = render_template(template, translation=translation)
+        filename = render_template(
+            template, translation=translation, component=component
+        )
 
         # Validate filename (not absolute or linking to parent dir)
         try:
@@ -367,27 +975,100 @@ class BaseAddon:
         # Absolute path
         filename = os.path.join(component.full_path, filename)
 
-        # Check if parent directory exists
         dirname = os.path.dirname(filename)
-        if not os.path.exists(dirname):
-            os.makedirs(dirname)
 
-        # Validate if there is not a symlink out of the tree
+        # Validate before and after directory creation to avoid following a
+        # symlinked parent outside the repository.
         try:
             component.repository.resolve_symlinks(dirname)
-            if os.path.exists(filename):
-                component.repository.resolve_symlinks(filename)
+            component.repository.resolve_symlinks(filename)
+        except ValueError:
+            component.log_error("refused to write out of repository: %s", filename)
+            return None
+
+        if not os.path.lexists(dirname):
+            os.makedirs(dirname, exist_ok=True)
+
+        try:
+            component.repository.resolve_symlinks(dirname)
         except ValueError:
             component.log_error("refused to write out of repository: %s", filename)
             return None
 
         return filename
 
+    @staticmethod
+    def remove_repo_temp_file(filename: str) -> None:
+        with suppress(OSError):
+            os.unlink(filename)
+
+    @staticmethod
+    def write_binary_repo_temp_file(
+        basename: str, temp_dir: str | os.PathLike[str], content: bytes
+    ) -> str:
+        temp_filename = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=basename, dir=temp_dir, delete=False
+            ) as handle:
+                temp_filename = handle.name
+                handle.write(content)
+        except Exception:
+            if temp_filename:
+                BaseAddon.remove_repo_temp_file(temp_filename)
+            raise
+        return temp_filename
+
+    @staticmethod
+    def write_text_repo_temp_file(
+        basename: str, temp_dir: str | os.PathLike[str], content: str
+    ) -> str:
+        temp_filename = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=basename,
+                dir=temp_dir,
+                delete=False,
+                mode="w",
+                encoding="utf-8",
+            ) as handle:
+                temp_filename = handle.name
+                handle.write(content)
+        except Exception:
+            if temp_filename:
+                BaseAddon.remove_repo_temp_file(temp_filename)
+            raise
+        return temp_filename
+
+    @staticmethod
+    def write_repo_temp_file(
+        basename: str, temp_dir: str | os.PathLike[str], content: bytes | str
+    ) -> str:
+        if isinstance(content, bytes):
+            return BaseAddon.write_binary_repo_temp_file(basename, temp_dir, content)
+        return BaseAddon.write_text_repo_temp_file(basename, temp_dir, content)
+
+    @staticmethod
+    def write_repo_file(filename: str, content: bytes | str) -> None:
+        dirname, basename = os.path.split(filename)
+        temp_dir = get_repo_temp_dir(dirname)
+        temp_filename = BaseAddon.write_repo_temp_file(basename, temp_dir, content)
+        try:
+            with suppress(FileNotFoundError):
+                shutil.copymode(filename, temp_filename)
+            os.replace(temp_filename, filename)
+            temp_filename = ""
+        finally:
+            if temp_filename:
+                BaseAddon.remove_repo_temp_file(temp_filename)
+
     @classmethod
     def pre_install(
-        cls, obj: Component | Project | None, request: AuthenticatedHttpRequest
+        cls,
+        obj: Component | Project | Category | None,
+        request: AuthenticatedHttpRequest,
     ) -> None:
-        from weblate.trans.tasks import perform_update
+        from weblate.trans.tasks import perform_update  # ruff: ignore[import-outside-top-level]
 
         if cls.trigger_update and isinstance(obj, Component):
             perform_update.delay("Component", obj.pk, auto=True)
@@ -403,7 +1084,7 @@ class BaseAddon:
     @cached_property
     def user(self) -> User:
         """Weblate user used to track changes by this add-on."""
-        from weblate.auth.models import User
+        from weblate.auth.models import User  # ruff: ignore[import-outside-top-level]
 
         if not self.user_name or not self.user_verbose:
             msg = f"{self.__class__.__name__} is missing user_name and user_verbose!"
@@ -416,10 +1097,13 @@ class BaseAddon:
         )
 
     def render_activity_log(self, activity: AddonActivityLog) -> str:
-        result = activity.details["result"]
+        # The details might be empty for pending entries
+        result = activity.details.get("result")
         if result is None:
             return ""
         if isinstance(result, str):
+            if "\n" in result:
+                return linebreaksbr(result)
             return result
         if isinstance(result, dict):
             return format_json(result)
@@ -433,7 +1117,7 @@ class UpdateBaseAddon(BaseAddon):
     It hooks to post update and commits all changed translations.
     """
 
-    events: set[AddonEvent] = {
+    events: ClassVar[set[AddonEvent]] = {
         AddonEvent.EVENT_POST_UPDATE,
     }
 
@@ -443,24 +1127,57 @@ class UpdateBaseAddon(BaseAddon):
             if not translation.is_source or component.intermediate:
                 yield translation
 
-    def update_translations(self, component: Component, previous_head: str) -> None:
+    def update_translations(
+        self, component: Component, previous_head: str, changed_files: list[str]
+    ) -> AddonEventOutcome | None:
         raise NotImplementedError
 
     def post_update(
-        self, component: Component, previous_head: str, skip_push: bool
-    ) -> None:
-        # Ignore file parse error, it will be properly tracked as an alert
+        self,
+        component: Component,
+        previous_head: str,
+        skip_push: bool,
+        changed_files: list[str],
+        parse_after_update: bool = False,
+        activity_log_id: int | None = None,
+    ) -> AddonEventOutcome | None:
+        # File parse errors are also tracked as component alerts.
+        result = None
         with component.repository.lock:
-            with suppress(FileParseError):
-                self.update_translations(component, previous_head)
-            self.commit_and_push(component, skip_push=skip_push)
+            try:
+                result = self.update_translations(
+                    component, previous_head, changed_files
+                )
+            except FileParseError as error:
+                result = AddonEventOutcome.error(result=str(error))
+            self.commit_and_push(
+                component,
+                skip_push=skip_push,
+                parse_after_update=parse_after_update,
+            )
+        return result
 
 
 class ChangeBaseAddon(BaseAddon):
     """Base class for add-ons that listen for Change notifications."""
 
-    events: set[AddonEvent] = {
+    events: ClassVar[set[AddonEvent]] = {
         AddonEvent.EVENT_CHANGE,
     }
 
     multiple = False
+
+    @cached_property
+    def configured_change_events(self) -> set[int]:
+        return {int(event) for event in self.instance.configuration.get("events", ())}
+
+    @cached_property
+    def configured_change_event_filter(self) -> str:
+        return get_change_event_filter(self.instance.configuration)
+
+    def check_change_action(self, change: Change) -> bool:
+        if self.configured_change_event_filter == CHANGE_EVENT_FILTER_ALL:
+            return True
+        if self.configured_change_event_filter == CHANGE_EVENT_FILTER_CONTENT:
+            return change.action in ACTIONS_CONTENT
+        return change.action in self.configured_change_events

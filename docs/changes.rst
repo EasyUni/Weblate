@@ -1,5 +1,5 @@
-Weblate 5.13.1
---------------
+Weblate 2026.11.2
+-----------------
 
 *Not yet released.*
 
@@ -7,10 +7,11 @@ Weblate 5.13.1
 
 .. rubric:: Improvements
 
-.. rubric:: Bug fixes
+.. rubric:: Security fixes
 
-* Access control for :http:get:`/api/users/(str:username)/`.
-* :ref:`file_format_params` were not properly applied in some situations.
+* Rejected unsafe fork remote names from merge-request repository credentials before running Git commands.
+
+.. rubric:: Bug fixes
 
 .. rubric:: Compatibility
 
@@ -20,94 +21,585 @@ Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.13.1.rst
+.. include:: /changes/contributors/2026.11.2.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/150?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/179?closed=1>`__.
 
-Weblate 5.13
-------------
+Weblate 2026.11.1
+-----------------
 
-*Released on August 15th 2025.*
+*Released on November 5th 2026.*
 
 .. rubric:: New features
 
-* Enhanced :ref:`translation-memory` management with configurable status control, see :ref:`memory-status`.
-* Added :wladmin:`cleanup_memory` management command to remove obsolete translation memory entries.
-* :doc:`/formats/catkeys`.
-* Some flags are now added to a string by default, based on locations; see :ref:`location-based-flags`.
-* Added :ref:`project-commit_policy` setting to control which translations are included when committing changes.
-* :ref:`file_format_params` can now be configured at the component level.
-* New management command :wladmin:`list_file_format_params` to list all available file format parameters.
-* Tag and attribute names can now be customized for :ref:`flatxml` with :ref:`file_format_params`.
+* Added :ref:`account security findings <account-security-findings>` with CSV leaked-password validation, persistent reports, and bulk password resets or dismissal.
+* Added an upgrade check for legacy lookalike verified e-mail identities, with administrator cleanup in :ref:`account security findings <account-security-findings>`.
+* Added authenticated :http:get:`/api/activity/` for daily activity and recently active projects.
 
 .. rubric:: Improvements
 
-* :ref:`search-strings` supports ``labels_count:NUMBER`` lookup.
-* A new :envvar:`SENTRY_MONITOR_BEAT_TASKS` setting allows disabling Sentry monitoring of Celery Beat tasks.
-* :envvar:`WEBLATE_SOCIAL_AUTH_OIDC_TITLE` and :envvar:`WEBLATE_SOCIAL_AUTH_OIDC_IMAGE` allow configuring the appearance of the generic OIDC authentication.
-* Background commits are now identified by an internal user.
-* Reorganized navigation menu.
-* When editing a language definition, a warning about automated updates is shown; see :ref:`included-languages`.
-* Avatars for API and internal accounts.
-* Adding a new TOTP device removes the existing one by default; checkbox for not removing previous ones available.
-* Creating pull or merge requests to remote repositories is no longer blocked by merge conflicts.
-* :ref:`check-rst-references` correctly handles Unicode punctuation and detects more issues.
-* Migration towards Bootstrap 5 has started, selected views now use Bootstrap 5.
-* :ref:`xliff` now supports starting from scratch when :ref:`adding-projects`.
-* :ref:`mt-openai` compatibility with latest models.
+* Improved user profiles and :doc:`administration <admin/admin>` on large installations by loading team choices on demand and using search for large admin relations.
+* Reduced database queries when :ref:`committing pending translations <lazy-commit>`.
+* Improved performance of :doc:`user profiles <user/profile>`, contribution lists, and author-filtered changes on large installations.
+* Added XML :ref:`file format parameters <file_format_params>` for UTF-8 byte order marks, declaration encoding case, and final newlines.
+* Clarified verification and account recovery guidance when adding an e-mail address in :ref:`account settings <user-profile>`.
+* :ref:`Automation <automation-workflows>` condition groups and branching actions can now be edited in the visual editor.
+* Removed per-event DNS lookups when reusing :ref:`fedora-messaging` publisher connections.
+
+.. rubric:: Security fixes
+
+* Require acceptance of invitations from :ref:`automatic team assignments <autoteam>` to project and workspace teams, including rules restored from project backups.
+* Bound file-mask matching during component validation and repository updates to prevent crafted masks from exhausting workers.
+* Restrict :ref:`font uploads <fonts>` to TrueType and OpenType content.
+* Require review permission to replace translation or :ref:`glossary` files when reviews are enabled.
+* Prevented :ref:`blocked project administrators <block-user>` from gaining workspace ownership when the last billed project is removed, and restricted new blocks and direct administrative grants that would combine those states.
+* Require recent credential verification for browser changes to access rights, user accounts, and project visibility; use a password or linked sign-in provider when two-factor authentication is absent. See :ref:`2fa`.
+* Prevented a removed invitation from granting access, including site-wide superuser status, when it was being accepted at the same time.
+* Prevented excessive CPU and memory use and failed saves in the :ref:`Fluent checks <check-fluent-references>` caused by strings with many variants or deep nesting. Strings exceeding the limits now fail the check.
 
 .. rubric:: Bug fixes
 
-* :ref:`upload` correctly tracks authorship when using :guilabel:`Replace existing translation file`.
-* :ref:`mt-deepl` integration now correctly handles all supported source languages.
-* Possible crash on macOS 15 in :samp:`strxfrm`.
-* Internal server error on permission denied while uploading files.
+* Prevent overlapping :ref:`automatic translation <auto-translation>` operations for the same component and language.
+* Use :ref:`atomic file replacement <atomic-repository-writes>` when creating translation files and updating supporting files in add-ons.
+* Reduced memory use when building ZIP :ref:`downloads <download>` by storing completed archives in temporary files.
+* Fixed lock contention when updating :ref:`inconsistent <check-inconsistent>` and :ref:`reused translation checks <check-reused>` concurrently.
+* Preserve plural forms when :ref:`uploading translations as suggestions <upload-method>`.
 
 .. rubric:: Compatibility
 
-* Some addons have been deprecated and replaced by :ref:`file_format_params`: :ref:`addon-weblate.gettext.customize`, :ref:`addon-weblate.json.customize`, :ref:`addon-weblate.yaml.customize`, :ref:`addon-weblate.xml.customize`.
-* :ref:`machine-translation`, :ref:`addon-weblate.autotranslate.autotranslate` and :http:post:`/api/translations/(string:project)/(string:component)/(string:language)/autotranslate/` now support all search operators, not only limited filters. Existing add-on configuration has been migrated. API users will need to adjust invocation.
+* Removed ``/activity/month.json``; use :http:get:`/api/activity/` instead.
 
 .. rubric:: Upgrading
 
 Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
-* The distributed locking now uses a different implementation and that introduced several changes in :file:`settings_example.py`.
-* There are several changes in :file:`settings_example.py`, most notable are changed settings ``CRISPY_ALLOWED_TEMPLATE_PACKS`` and ``INSTALLED_APPS``; please adjust your settings accordingly.
-* The Docker container is now using :program:`granian`. This now requires explicit configuration of proxy trusted headers, including client protocol.
-  :envvar:`WEBLATE_SECURE_PROXY_SSL_HEADER` typically needs to be added to avoid redirect loop, for example:
+.. rubric:: Contributors
 
-  .. code-block:: yaml
+.. include:: /changes/contributors/2026.11.1.rst
 
-     services:
-       weblate:
-         environment:
-           WEBLATE_IP_PROXY_HEADER: HTTP_X_FORWARDED_FOR
-           WEBLATE_SECURE_PROXY_SSL_HEADER: HTTP_X_FORWARDED_PROTO,https
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/178?closed=1>`__.
 
-  .. seealso::
+Weblate 2026.11
+---------------
 
-     :ref:`reverse-proxy`
+*Released on November 2nd 2026.*
+
+.. rubric:: New features
+
+* Built-in :ref:`roles <default-roles>` can be customized, with permission changes preserved across upgrades and a reset to upstream defaults.
+* Added optional self-hosted :ref:`bot-protection` as a technology preview, with proactive anonymous proof of work and verified crawler exemptions following the robots.txt crawl policy.
+* Added a :guilabel:`Languages` tab to :ref:`workspaces` for translation and review across projects, a contextual menu for users with multiple workspaces, and watched multi-project workspaces in :guilabel:`My workspaces`.
+* Unified :ref:`bulk-edit` with search and replace, adding regular expressions and translation clearing in manual runs, Automations, and the add-on. Manual edits offer previews, with flags and labels grouped by scope and separate add and remove actions.
+* Added permissions for user discovery, profile access, and resource-scoped contributor identities, including editor attribution and identity-safe exports. See :ref:`confidential-collaboration` and :doc:`admin/privacy`.
+* Added :ref:`workspace translation propagation scopes <workspace-propagation-scope>` for sharing translations across projects or components with matching names.
+* Added :ref:`CDN manifests <cdn-manifest>` listing available languages and translation files with checksums and sizes.
+* Added an optional :ref:`OpenID Connect identity provider <oidc-provider>` for signing in to other applications with Weblate accounts.
+* Added :ref:`eTranslation automatic suggestions <mt-etranslation>` with a default language domain and per-component domain mapping.
+* User settings can be imported from a :ref:`user data export <schema-userdata>` on the account page.
+* Added :ref:`string selection <automation-action-weblate.select>` for composing Automation actions with reusable result scopes.
+* Translation services support multiple installations at site, workspace, and project scope, with optional slugs, inherited-installation exclusions, and reversible pause controls. See :ref:`machine-translation-setup`.
+* Added personal and project :ref:`saved-searches` offered in the search filters.
+* :ref:`Automations <automation-workflows>` offer visual and YAML editors, documented change-event identifiers, and a separate execution form with previews and change context for real runs.
+* GitHub pull requests can be assigned to a configured user or the acting user's linked GitHub account, and can have configured labels added using :ref:`vcs_params`.
+
+.. rubric:: Improvements
+
+* :ref:`Translation services <machine-translation-setup>` have detail pages with settings, controls, :ref:`provider error logs <machinery-error-log>`, and rate limit status and reset controls. Cooldowns are per installation, support provider retry delays, and use :ref:`service-specific defaults <machinery-rate-limit-window>`.
+* :doc:`Kotlin SDK integration <devel/kotlin-sdk>` now offers Translation files CDN installation and Gradle configuration for original XML downloads.
+* Sped up :ref:`project backup restoration <projectbackup>` by batching label, comment, and check restoration and reducing source-string linking and author lookup queries.
+* :ref:`fedora-messaging` now publishes using Kombu, removing the Twisted dependency.
+* Sped up :ref:`Git export URL updates <git-export>` for projects with categorized components.
+* Reduced database processing overhead for metadata-only updates during :ref:`repository synchronization <update-vcs>`.
+* Sped up saving :ref:`custom source language workflows <workflow-source-language>` by batching writes, limiting reconciliation to affected translations, reducing author lookups, and running expensive quality checks in background batches.
+* :ref:`Screenshots <screenshots>` recognize image text in the background and cache results, with separate image text suggestions and source string search tabs.
+* :ref:`Project backup restoration <projectbackup>` validates stored parameters, reports skipped unsupported VCS and file format parameters, and corrects screenshot filename extensions using validated image contents.
+* :ref:`Automatic translation <auto-translation>` reports translation service failures in task results, the API, and the user interface while preserving successful translations.
+* Improved project-wide :ref:`inconsistent <check-inconsistent>` and :ref:`reused translation checks <check-reused>` by restricting database searches to eligible peer translations.
+* Reduced database queries during stale repository cleanup by :wladmin:`cleanuptrans` and scheduled maintenance.
+* Grouped related :ref:`add-on settings <addons>` and separated integration instructions, with setup guidance for webhooks, Slack, and Fedora Messaging.
+* Reduced database expression overhead when updating :ref:`translation-memory` entry statuses.
+* PyPI releases include :ref:`publish attestations <verify>` recording package provenance.
+* Docker deployments can :ref:`trust custom CA certificates <docker-custom-ca>` for outgoing connections, including repository operations over HTTPS.
+* Docker deployments support :ref:`signing in through Hosted Weblate or another Weblate installation <docker-weblate-auth>` using OpenID Connect.
+* Project administrators with :guilabel:`Edit project settings` can directly access and manage restricted components in their project; translation and download actions keep their separate permissions.
+* Sped up :ref:`string searches <search-strings>` by language code and related objects, avoiding unnecessary deduplication.
+* :ref:`Component creation <adding-components>` and :ref:`discovery presets <addon-weblate.discovery.discovery>` warn when resource limits might make discovery results incomplete.
+* Renamed provider configuration and selection to :ref:`Translation services <machine-translation-setup>`, while keeping the translation editor's :guilabel:`Automatic suggestions` tab.
+* :ref:`Translation history <translation-history>` records change origins, distinguishing user interface, API, repository, system, and :ref:`automation <automation-reference>` activity, including automation installation and execution identifiers.
+* Bounded :ref:`JSON webhook response bodies and headers <webhook-response-limits>` to limit worker memory use and activity-log growth.
+* Reorganized :doc:`user profile settings <user/profile>` into clearer tabs for public profile, security, and developer access.
+* :ref:`Component creation <adding-components>` loads remote branches only for the selected component, avoiding repository queries when opening the page.
+* :ref:`Automation AI quality evaluation <automation-action-weblate.ai_quality>` now uses the effective add-on's service automatically, with an optional service assertion.
+* Require selecting an :ref:`authenticator app <2fa>` at sign-in when multiple apps are registered, so unsuccessful checks affect only the selected app.
+* Added recovery of missing Git checkouts or :file:`.git` directories, including local glossaries, through :ref:`manage-vcs-reset-reapply`, with clearer alert diagnostics and repository maintenance links.
+* Sped up disk-state snapshot writes during :ref:`file reapply <manage-vcs-reset-reapply>` and cleanup during :ref:`translation commits <lazy-commit>` and :ref:`repository resets <repository-maintenance>`.
+* SVG status badges now use a blurred text shadow to match the shields.io style, improving text contrast.
+* The translation editor remembers whether the string details in the :ref:`translation context <source-context>` are expanded.
+
+.. rubric:: Security fixes
+
+* Prevented arbitrary file overwrite and remote code execution through authenticated :ref:`project backup imports <projectbackup>` (:ghsa:`8jpg-5gm2-hjp6`).
+* Bounded :ref:`bulk-edit` operations to 20,000 matching strings, processed browser edits in background batches, and added submission rate limiting.
+* Signed-out third-party sign-ins can link to an existing account by matching e-mail only when :setting:`REGISTRATION_REBIND` is enabled.
+* Prevented linked components in the :doc:`REST API <api>` and component duplication from revealing repository settings or credentials without repository access.
+* Enforced :setting:`REGISTRATION_EMAIL_MATCH` and disposable e-mail restrictions when importing authentication-provider addresses and selecting public or commit e-mail addresses through the API.
+* Protected template downloads through the :doc:`REST API <api>` against symlink races during concurrent repository updates.
+* Prevented account takeover through Unicode lookalike e-mail addresses in password reset and account linking. See :doc:`user/profile`.
+* Prevented Mercurial option values and Git revisions from being interpreted as command-line options, and rejected invalid revisions in :ref:`project backup imports <projectbackup>`.
+* Require confirmation of an existing sign-in method before first :ref:`two-factor enrollment <2fa>` and a separate second-factor check before creating a project token afterward.
+* Require recent :ref:`two-factor verification <2fa>` for API key disclosure, credential and project token changes, member or token removal, and account deletion. Verification is bound to the signed-in account during third-party sign-in and sensitive actions.
+* Bounded screenshot image text matching to prevent excessive web worker CPU use on large components or dense images.
+* Enforced per-string edit permissions for automatic translation and review permissions for translation reverts and merges.
+* Prevented translation, Zen, project-language, and category-language pages, conflict history, single-project redirects, and component settings forms from disclosing restricted component details, linked repository settings, or private component slugs.
+* Bounded CPU use in interpolation, markup, Markdown link, :ref:`AngularJS <check-angularjs-format>`, :ref:`unchanged translation <check-same>`, AsciiDoc, and Java MessageFormat checks, including Java format detection and highlighting. Hardened translation sanitization and service placeholder restoration against excessive non-breaking spaces and syntax tokens.
+* Bounded diff rendering and edit-distance calculations for large translations in :ref:`translation history <translation-history>`, CSV exports, and :doc:`reports <devel/reporting>`.
+* Applied the :ref:`translation write rate limit <rate-limit>` to the Zen editor save endpoint.
+* Prevented the :ref:`automatic translation add-on <addon-weblate.autotranslate.autotranslate>` from exposing restricted source component IDs in change history.
+* Prevented :ref:`reused <check-reused>` and :ref:`inconsistent <check-inconsistent>` translation checks from exposing restricted component strings or confirming matching translations across access boundaries.
+* Bounded :ref:`search query parsing and regular expression analysis <search-strings>` to prevent excessive CPU and memory use.
+* Restricted sensitive :ref:`background task diagnostics <api-tasks>` to users allowed to view the repository location, retaining general progress and failure messages for members.
+* Prevented translation service credentials in request URLs from appearing in automatic suggestion errors.
+* Rejected invalid language codes from :ref:`project-language_aliases` and automatically created languages.
+* Prevented unintended :ref:`workspace ownership <workspaces>` grants when removing components or translations, and revoked :ref:`project team <access-control>` access when assigned components move to another project.
+* Excluded projects from component creation and management destinations for :ref:`blocked users <block-user>`, including users with project administration permissions.
+* Restricted contributor IP addresses in change API responses to superusers.
+* Bounded :ref:`component discovery preset <addon-weblate.discovery.discovery>` detection work for repositories with many translation layouts.
+* Prevented spreadsheet formulas, including those hidden behind Unicode characters, in :ref:`translation-history`, :doc:`/api`, and :ref:`download` CSV files.
+* Prevented restricted glossary terms from leaking through other components or translation services, and private or restricted translations from leaking through the automatic suggestion cache.
+* Prevented aggregate translation archives from bypassing restricted-component and language-scoped download permissions.
+* Prevented restricted team administrators from granting access through teams covering projects where they are blocked or have not satisfied :ref:`2fa` requirements.
+* Require glossary editing permission when changing :ref:`glossary <glossary>` flags through the string context form or :ref:`bulk-edit`.
+* Fixed role permission revocation through partial API updates.
+
+.. rubric:: Bug fixes
+
+* Fixed a crash when moving :doc:`components <admin/projects>` between projects with incompatible inherited settings.
+* Removed stale :ref:`notification subscriptions <notifications>` through daily cleanup, including after project access changes and component moves.
+* Stopped automatic sign-in retries after :doc:`authentication provider <admin/auth>` errors when only one provider is configured.
+* Fixed missing :ref:`workspace <workspaces>` breadcrumbs on project administration and related pages.
+* Fixed :ref:`custom source language workflows <workflow-source-language>` to display source changes, retain history for strings needing editing, and allow editing newly imported strings when an :ref:`intermediate language file <component-intermediate>` is configured.
+* Fixed :ref:`projectbackup` imports rejecting strings with empty sources.
+* Fixed edits to existing :ref:`subtitle cues <subtitles>` being skipped when committing translation files.
+* Fixed initial installation of the :ref:`AI quality evaluation add-on <addon-weblate.ai.quality>`.
+* Fixed :ref:`Sphinx POT extraction <addon-weblate.gettext.sphinx>` to respect the component's gettext line wrapping setting.
+* Fixed :ref:`legal document <legal>` links to prefer configured external URLs and kept privacy policy confirmation optional when hidden without a URL.
+
+.. rubric:: Compatibility
+
+* The default :setting:`PRIVATE_COMMIT_EMAIL_TEMPLATE` now uses ``user-{user_id}@users.noreply.{site_domain}`` instead of the username. This changes generated addresses for users following the private e-mail default; explicitly selected addresses are preserved. Set the template to ``{username}@users.noreply.{site_domain}`` to retain the previous behavior. See :doc:`admin/privacy`.
+* Custom integrations must use :ref:`acting-user-context` instead of transient model ``acting_user`` attributes; redundant actor task arguments have been removed.
+* Removed the SAML identity provider integration and the ``saml2idp`` extra. Use the :ref:`OpenID Connect identity provider <oidc-provider>` for signing in to other applications with Weblate accounts. SAML sign-in to Weblate remains supported.
+* :ref:`fedora-messaging` broker URLs no longer accept query strings or fragments; configure delivery timing using the add-on fields.
+* :wladmin:`import_project`, :wladmin:`import_json`, :wladmin:`import_demo`, :wladmin:`add_suggestions`, and :wladmin:`install_addon` now require ``--user USERNAME`` to attribute component and configuration changes to an existing account.
+
+.. rubric:: Upgrading
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+* Stop task producers and schedulers, drain queued work and deferred repository follow-ups, and upgrade the application and workers together.
+* Remove ``djangosaml2idp`` from ``INSTALLED_APPS`` and its configuration before upgrading if you used the removed SAML identity provider. See :ref:`oidc-provider` for its replacement.
+* Update custom ``SOCIAL_AUTH_PIPELINE`` configurations in :file:`settings.py` to match :file:`weblate/settings_example.py`. The example configuration and Docker image already include these steps. See :doc:`admin/auth`.
+
+  * Add ``weblate.accounts.pipeline.verify_first_factor_sso`` immediately after ``social_core.pipeline.social_auth.social_user`` to verify the existing sign-in method before first two-factor enrollment.
+  * Replace ``social_core.pipeline.social_auth.associate_by_email`` with ``weblate.accounts.pipeline.associate_by_email`` to enforce :setting:`REGISTRATION_REBIND` for third-party sign-ins.
+  * Add ``weblate.accounts.pipeline.verify_recent_second_factor`` immediately after ``weblate.accounts.pipeline.associate_by_email`` to enforce recent two-factor verification before linking a new sign-in identity.
+
+* If you customize ``CELERY_TASK_ROUTES``, route ``weblate.trans.tasks.bulk_edit_task`` to the ``translate`` queue, following :file:`weblate/settings_example.py`.
+* To enable optional :ref:`bot-protection`, add ``weblate.utils.bot_protection.BotProtectionMiddleware`` after ``django.contrib.sessions.middleware.SessionMiddleware`` and before Weblate's authentication middleware, following the example configuration.
+* The upgrade repairs stored screenshot filename extensions. Screenshot storage must be accessible during migration; see :ref:`projectbackup`.
 
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.13.rst
+.. include:: /changes/contributors/2026.11.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/143?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/174?closed=1>`__.
 
-Weblate 5.12.2
+Weblate 2026.10.1
+-----------------
+
+*Released on October 9th 2026.*
+
+.. rubric:: New features
+
+* Added opt-in :ref:`team synchronization from identity providers <sso-team-sync>`, including GitLab group mapping and group-based login restrictions.
+* Added :setting:`DEFAULT_NOTIFICATIONS` to configure :ref:`notifications` settings for new users.
+* Added :ref:`component-push_on_update` to push only after committing translations, not after upstream updates.
+
+.. rubric:: Improvements
+
+* Improved diagnostics for failed :ref:`GitHub pull request creation <code-hosting-github-pull-requests>`.
+* Added a :doc:`Kotlin SDK quickstart <devel/kotlin-sdk>` and an overview of official and third-party :doc:`libraries and SDKs <devel/libraries>`.
+* Clarified the labels and consequences of reset actions in :ref:`repository-maintenance`.
+* Authentication method names and icons now come from python-social-auth, including current service branding, while existing :doc:`authentication settings <admin/auth>` overrides remain supported.
+* Improved full name initialization from provider names during :doc:`social authentication <admin/auth>`.
+* Made unused components and glossary languages warning :ref:`diagnostics <alerts>` and enabled dismissal for them and suspected monolingual or bilingual file-format misconfiguration.
+* Clarified that contributing to :ref:`shared translation memory <shared-tm>` publishes strings and their origin outside project access control.
+
+.. rubric:: Security fixes
+
+* Prevented :ref:`project backup imports <projectbackup>` from granting site-wide permissions through restored project teams (:ghsa:`pgmx-p3h7-7q8x`).
+* Prevented :ref:`Automation workflow <automation-workflows>` configuration from disclosing references to restricted components in change history.
+* Marked access-controlled :ref:`status widget <promotion>` responses as private to shared caches.
+* Disallowed filesystem paths and the ``file`` scheme for :ref:`version control repository URLs <vcs-repository-url-troubleshooting>`.
+* Added restrictive cache controls to authenticated HTML responses to prevent previously viewed content from being restored after logout.
+* Hardened version control metadata filtering against trailing-dot and trailing-space path aliases.
+* Prevented :ref:`sitemaps <project-public_sharing>` from disclosing restricted component and translation URLs.
+* Restricted stale Git lock cleanup to the repository running the failed command and prevented empty file lists from committing unrelated changes.
+* Enforced e-mail confirmation code expiry through Python Social Auth using :setting:`AUTH_TOKEN_VALID`, independently of scheduled cleanup.
+
+.. rubric:: Bug fixes
+
+* Fixed :ref:`component-key_filter` for JSON and other formats supporting both monolingual and bilingual use.
+* Fixed acting-user attribution and display for administrative account changes in :doc:`audit logs <security/privacy-compliance>`.
+* Removed expired OpenID associations and OIDC login nonces during hourly :doc:`authentication storage cleanup <admin/auth>`.
+* Fixed :ref:`projectbackup` restoration of translation file language aliases and duplicate team names, and improved validation error formatting.
+* Prevented concurrent creation of duplicate project team names and preserved custom teams when enabling features that require conflicting :ref:`built-in team names <project-access_control>`.
+* Prevented duplicate initiation of :doc:`provider authentication <admin/auth>` and improved recovery guidance for authentication failures and token errors.
+* Components using the GitHub App now follow renamed or transferred repositories; existing Apps need to subscribe to the ``Repository`` event, see :ref:`code-hosting-github-app-webhook`.
+
+.. rubric:: Compatibility
+
+* The ``file`` scheme is disabled for security reasons and can no longer be included in :setting:`VCS_ALLOW_SCHEMES`. Weblate now fails to start until it is removed from the setting and existing components are migrated to supported repository URLs.
+
+.. rubric:: Upgrading
+
+Authentication names and provider logos now come from python-social-auth.
+Add ``social_django.finders.SocialAuthIconFinder`` after the standard finders in
+``STATICFILES_FINDERS`` in :file:`settings.py`, then run
+:samp:`weblate collectstatic --noinput`. The example configuration and Docker
+image already include the finder. Existing authentication name and image
+settings remain supported. See :doc:`admin/auth` for details.
+
+If you maintain a custom ``SOCIAL_AUTH_PIPELINE`` in :file:`settings.py`, add
+``social_core.pipeline.social_auth.social_names`` immediately after
+``social_core.pipeline.social_auth.social_details``. Name conversion now runs
+in this shared step, and Weblate no longer joins provider first and last names
+itself. Existing full names are preserved. The example configuration and Docker
+image already include the new step. See :doc:`admin/auth` for details.
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+.. rubric:: Contributors
+
+.. include:: /changes/contributors/2026.10.1.rst
+
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/176?closed=1>`__.
+
+Weblate 2026.10
+---------------
+
+*Released on October 1st 2026.*
+
+.. rubric:: New features
+
+* Added :ref:`enforced-check inheritance <component-enforced_checks>` at workspace, project, category, and component level.
+* DeepL automatic suggestions can include a rephrased version of an existing translation via the DeepL Write API (Pro plans and supported languages only). See :ref:`mt-deepl-rephrase`.
+* Added the :ref:`Automation add-on <addon-weblate.automation.automation>` for conditional translation and editing workflows. See :doc:`admin/automation`.
+* Source strings and translation keys can now be :ref:`edited <edit-source>` in the editor and REST API while preserving translations and history.
+* Added an :ref:`AI quality evaluation add-on <addon-weblate.ai.quality>` that records quality checks for existing translations.
+* Added language-specific :ref:`string flags <additional-flags>` to the editor, Tools menu, bulk editing, and REST API.
+* Added an inherited :ref:`language creation policy <workflow-language-restrictions>` that allows existing project target languages and requires approval for new ones.
+* Added a guided :ref:`first translation <translator-start>` and advice for :doc:`building a translators community <devel/community>`.
+* Added :ref:`custom source languages <workflow-source-language>` to project-language workflows.
+* Added configurable per-user and IP/network :ref:`API rate limits and exemptions <api-rate>`, including Docker configuration.
+* Added :ref:`component-mounted add-on APIs <component-addon-api>`.
+* The :ref:`Statistics generator <addon-weblate.generate.generate>` can now produce component-wide locale lists with native language names, text direction, and translation statistics.
+* Added a testing version of :ref:`addon-weblate.cdn.kotlin`.
+* Added :ref:`SPDX contributor comments <gettext-contributor-comments>` as a PO file format parameter, replacing the contributor comments add-on.
+* Added the ``xml_whitespace_handling`` :ref:`file_format_params` for :ref:`xliff` to follow ``xml:space``, always preserve, or always normalize whitespace.
+* Added the ``xliff_placeables`` :ref:`file_format_params` for :ref:`xliff` and :doc:`/formats/xliff2` to choose between plain text and placeables handling.
+* Added a configurable :setting:`AVATAR_URL_TEMPLATE` to support alternative avatar providers, such as fetching by username instead of e-mail hash.
+* Added selecting individual strings from the :ref:`string list <search-strings>` for :ref:`bulk-edit`.
+
+.. rubric:: Improvements
+
+* Component configuration errors are reported before fetching the repository when repository files are not needed for validation.
+* Clarified that site-wide team management can grant access to private projects independently of the team manager's own project access.
+* Improved checks, automatic fixes, glossary matching, and machine translation for :ref:`independent alternatives in multivalue formats <format-multivalue>`.
+
+* Added a thumbnail picker to associate existing :ref:`screenshots <add-existing-screenshot>` with a string from the translation editor.
+* :ref:`Repository maintenance <repository-maintenance>` now checks permissions on the repository-owning component and explains where missing permissions are required.
+
+* :ref:`Automatic translation <auto-translation>` using other components now prefers translations with matching source text and context.
+* Aligned :ref:`string search filters <search-strings>` with the status overview's order and colors, and added an :guilabel:`All strings` option to clear the query.
+* Added monthly instance activity to the :ref:`data sent with support integration <support-data>` for activity monitoring and discovery ranking.
+* Improved :ref:`repository maintenance <repository-maintenance>` with disabled push controls when push configuration is missing and direct links to component VCS settings.
+* The :ref:`automatic translation add-on <addon-weblate.autotranslate.autotranslate>` can create approved strings, falling back to translated strings when reviews are disabled for the target language.
+* Added independent term alternatives and scoped metadata to :ref:`TBX glossaries <tbx>`, including metadata-preserving TBX exports.
+
+* Whitespace characters are now rendered consistently in the source string display and the translation editor, and different kinds of whitespace are now distinguishable from each other.
+* Added a :ref:`font-monospace <custom-checks>` flag to display a string in the translation editor using a monospace font, useful for aligning command-line or terminal output.
+* History :guilabel:`View details` and :guilabel:`Revert` actions are larger, more widely spaced, and show a hover and focus background.
+* The units API now links to a unit's associated screenshots and supports listing, assigning, and removing them via :http:get:`/api/units/(int:id)/screenshots/`.
+* Added a :ref:`keyboard shortcut <keyboard>` to approve a translation and save and continue.
+* Clarified :ref:`translation quality filter <project-commit_policy>` explanations and effective per-language review settings, with links to workflow configuration.
+* Reworked the :ref:`Automatic suggestions <machine-translation>` tab to use the same layout as suggestions, and it now shows the :ref:`translation memory <translation-memory>` context of each match.
+* The :ref:`xgettext <addon-weblate.gettext.xgettext>` and :ref:`Meson <addon-weblate.gettext.meson>` extraction add-ons now bundle common XML translation rules and support project-local ITS directories for extracting mixed source formats into a shared POT.
+* :ref:`Repository maintenance <repository-maintenance>` now links to the latest pull or merge request opened by Weblate.
+* The project :guilabel:`Files` menu now lists translation download formats from :setting:`WEBLATE_EXPORTERS` instead of a fixed subset.
+* :ref:`LLM automatic suggestions <machine-translation>` now show the model and, for custom API endpoints, the host that produced them.
+* Automation actions can select strings from the triggering change or a previous action's affected units. See :doc:`admin/automation`.
+* Unified browsing and :ref:`searching strings <search-strings>`, aligned search filters with the status overview, and added direct editor access to language-specific lists and an :guilabel:`All strings` filter.
+* Improved :ref:`translation history <translation-history>` with faster browsing, date navigation, and clearer actions.
+* Improved :ref:`screenshot assignment <add-existing-screenshot>` in the editor with a thumbnail picker, predictable ordering, and removal without reloading.
+* The editor now distinguishes whitespace in source and translation strings, supports the :ref:`font-monospace <custom-checks>` flag, and accepts decimal :ref:`font-spacing <custom-checks>` values.
+* Added a Markdown preview to :ref:`comments <user-comments>`, explanations, announcements, and project instructions.
+* Added a :ref:`keyboard shortcut <keyboard>` to approve a translation and continue.
+* Clarified :ref:`translation quality filters <project-commit_policy>` and effective per-language review settings.
+* Improved :ref:`translation memory <translation-memory>` lookup performance and added match context to :ref:`automatic suggestions <machine-translation>`.
+* Reduced aggregation overhead for the :ref:`inconsistent translations check <check-inconsistent>` on large projects.
+* Moved related :ref:`quality check <checks>` updates to background tasks to avoid slow saves when many strings share a source or translation.
+* :ref:`check-md-link` quality check now detects untranslated link titles.
+* :ref:`Automatic translation <auto-translation>` across components now prefers matching source text and context. The :ref:`automatic translation add-on <addon-weblate.autotranslate.autotranslate>` can create approved strings, or translated strings when reviews are disabled.
+* Improved checks, fixes, glossary matching, and machine translation for :ref:`multivalue alternatives <format-multivalue>`.
+* :ref:`TBX glossaries <tbx>` now support independent term alternatives and scoped metadata, preserved on export.
+* The :ref:`xgettext <addon-weblate.gettext.xgettext>` and :ref:`Meson <addon-weblate.gettext.meson>` add-ons now support bundled XML rules and project-local ITS directories.
+* Added :ref:`uploaded file language checking <upload-ignore_language>` with an override in the upload form and API.
+* Translation file uploads through the API accept form field content without a filename.
+* :ref:`Repository maintenance <repository-maintenance>` now checks permissions on the repository-owning component, links to VCS settings, and disables unavailable push controls.
+* :ref:`SSH repository connections <ssh-repos>` now try IPv4 and IPv6 addresses in a staggered sequence and report failed addresses and ports.
+* Add-on error :ref:`diagnostics <alerts>` now link to the responsible add-on configuration.
+* Added monthly instance activity to :ref:`support integration data <support-data>`.
+* :ref:`Suggestions <suggestions>` can be shown in the :ref:`zen-mode` and accepted, rejected, or voted on in place.
+* Added a separate :ref:`repository browser URL <component-repoweb-translations>` for translation files.
+* Docker startup now reports invalid nginx-related environment values before attempting to start nginx.
+* :ref:`addon-weblate.git.squash` now supports squashing together per author and language.
+* The automatic translation API can run as a background task. See :http:post:`/api/translations/(string:project)/(string:component)/(string:language)/autotranslate/`.
+
+.. rubric:: Security fixes
+
+* Prevented repository URLs from injecting executable Mercurial configuration (:ghsa:`7rqp-4x64-cwch`).
+* Prevented :doc:`/formats/appstore` from following symbolic links outside the component repository (:ghsa:`7q8w-w5h2-v3cq`).
+* Project administrators can no longer see blocked users' account e-mail addresses without site-wide user management permission.
+* Removed repositories created from rejected component ZIP and document uploads.
+* Protected translation reverts against cross-site request forgery.
+* Prevented client-supplied forwarded IP headers from bypassing anonymous API rate limits.
+* Prevented whitespace-only username searches from listing users through :http:get:`/api/users/`.
+* Prevented project access managers from assigning users to site-wide teams associated with the project.
+* Invalidated outstanding password reset links after password changes regardless of e-mail address casing.
+* Prevented concurrent requests from exceeding configured web action rate limits.
+* Limited XLIFF language declarations in uploads and the number and size of translation alternatives to prevent resource exhaustion.
+* Enforced language-scoped screenshot permissions and restricted component access in translation consistency and direct automatic translation workflows.
+* Prevented :ref:`project API tokens <api-tokens>` from inheriting permissions through automatic team assignments.
+* Protected Git and Mercurial metadata consistently in repository paths and downloads, and excluded known foreign VCS metadata when importing component ZIP files.
+* Prevented notification subscriptions from exposing inaccessible project and component settings through the REST API and profile settings.
+* Rate-limited password-reset requests for unknown e-mail addresses.
+
+.. rubric:: Bug fixes
+
+* :ref:`Project backups <projectbackup>` now tolerate missing or damaged repositories and preserve available files and translation data during restore.
+* Project MO archive downloads now skip incompatible file formats without failing the download.
+* Made eligible automatic-translation sources consistent across web, API, and Automation add-on configuration.
+* Fixed :wladmin:`move_language` and automatic language alias updates to preserve language-specific settings and permission limits, and detect conflicting translations or settings before moving content.
+* Suppressed OpenSSH post-quantum key exchange warnings that obscured errors from :ref:`SSH repositories <ssh-repos>`.
+* Fixed the :ref:`BBCode markup check <check-bbcode>` for parameterized, nested, and multiline tags.
+* Avoided commits for :ref:`translation state <states>` and metadata changes that the file format cannot store, while preserving :ref:`project-commit_policy` behavior.
+* Fixed commit attribution for needs-editing changes caused by source edits.
+* Improved plain-text :ref:`notification e-mails <notifications>` with readable links and tables instead of Markdown.
+* Project language archive downloads in the REST API now honor language-scoped download permissions consistently with the web interface.
+* Fixed authentication initialization with :ref:`running-granian-asgi` when Sentry instrumentation is enabled.
+* Fixed :ref:`status widgets <promotion>` for categories, category-language pages, and workspaces, and corrected statistics for nested :ref:`categories <category>` and deleted :ref:`labels`.
+* Fixed MIME nesting and reduced the size of inline branding images in :ref:`notification e-mails <notifications>`.
+* :ref:`mt-anthropic` now preserves path prefixes in custom base URLs.
+* Fixed false positives in the :ref:`consecutive duplicated words check <check-duplicate>` for South Asian languages and prevented the :ref:`punctuation spacing check <check-punctuation-spacing>` from inserting spaces in URLs.
+* Fixed the :ref:`maximum size check <check-max-size>` preview shifting text when ``font-spacing`` is set.
+* Fixed :ref:`Docker startup warning checks <docker-startup-warnings>` when the warning directory is missing or inaccessible.
+* Fixed an :ref:`upgrade <generic-upgrade-instructions>` failure when migrating dismissed component alerts from releases before 2026.8.
+* Fixed the :ref:`search results refresh <search-results-cache>` icon color in themes and on hover.
+* Fixed truncated grouped summaries in :ref:`notification e-mails <notifications>`; the 100 entries limit now applies only to listings of individual changes.
+* Fixed bilingual :ref:`glossary terms <glossary-untranslatable>` appearing as untranslatable when translating in their source language.
+* Fixed :ref:`component discovery <addon-weblate.discovery.discovery>` with inherited licenses and other inherited settings.
+* Backups containing legacy component formats (e.g ``plainxliff``, ``csv-utf-8``) are now correctly restored.
+* Fixed switching between singular and plural forms when :ref:`adding new strings <adding-new-strings>`.
+
+.. rubric:: Compatibility
+
+* An explicit source-wide ``read-only`` flag now takes precedence over translation flags. Remove it from the source to allow editing.
+* Existing :ref:`project API tokens <api-tokens>` lose permissions inherited from non-project teams. Assign required permissions through project-specific teams.
+* API throttles now use :setting:`API_RATELIMIT_ANON` and :setting:`API_RATELIMIT_USER` instead of ``REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]``.
+* :ref:`API authentication <api-generic>` now rejects unsupported authentication schemes, such as Basic, with HTTP 401, including when a valid browser session is present.
+* Notification subscription API responses now expose ``project`` and ``component`` as nullable URL strings instead of nested objects.
+* The former ``plainxliff`` and ``xliff2-placeables`` file formats are migrated to :ref:`xliff` / :doc:`/formats/xliff2` with the ``xliff_placeables`` :ref:`file_format_params`.
+* Norwegian Bokmål now uses ``nb`` as its built-in language code while preserving ``nb_NO`` support, see :ref:`languages`.
+
+.. rubric:: Upgrading
+
+* Add ``weblate.automation`` to custom :setting:`django:INSTALLED_APPS` before migrating. If :setting:`WEBLATE_ADDONS` explicitly lists the automation add-on, change its import path to ``weblate.automation.addon.AutomationAddon``. The official Docker image includes the new app.
+* Existing :ref:`contributor comments add-ons <addon-weblate.gettext.authors>` migrate to component file format parameters. Remove the obsolete add-on from custom :setting:`WEBLATE_ADDONS` and :setting:`DEFAULT_ADDONS` settings; new components no longer inherit it.
+* Add ``weblate.api`` and ``weblate.kotlin_sdk`` to :setting:`django:INSTALLED_APPS` before migrating. The official Docker image includes both. Installing the Kotlin app does not enable :ref:`CDN publication <addon-weblate.cdn.kotlin>` on any component.
+* In non-Docker settings, move the ``anon_throttle`` and ``user_throttle`` arguments from ``get_drf_settings`` and any custom ``REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]`` values to :setting:`API_RATELIMIT_ANON` and :setting:`API_RATELIMIT_USER`. Existing Docker rate-limit variables still work.
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+.. rubric:: Contributors
+
+.. include:: /changes/contributors/2026.10.rst
+
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/172?closed=1>`__.
+
+Weblate 2026.9.1
+----------------
+
+*Released on September 8th 2026.*
+
+.. rubric:: New features
+
+* Added per-user :ref:`notification diagnostics <notifications>` for users and administrators, with compact explanations of matching subscriptions for object paths.
+
+.. rubric:: Improvements
+
+* Added explicit :ref:`search result refresh <search-results-cache>` in the translation editors and improved recovery when saved search results expire.
+* :ref:`Docker development tests <dev-docker>` now automatically prepare an isolated test environment without requiring application startup or the Dev Container CLI.
+* Added a :ref:`development container <devcontainer>` for tests and lint, with an optional :ref:`application QA profile <dev-docker>`, isolated storage per Git worktree, dynamically allocated localhost application and mailbox ports, and Chromium diagnostics and mandatory browser test commands.
+* Improved :ref:`translation statistics <stats>` calculation performance and avoided redundant parent updates when loading check and label details.
+* Added posting and displaying scoped :doc:`announcements </admin/announcements>` on category-language pages.
+* Added a dismissible diagnostic for :ref:`glossaries <glossary-terminology>` with disabled string management when they use a local repository or contain terminology.
+* Clarified :doc:`incident reporting </security/incident-reporting>`, reporting deadlines, and security notifications for hosted and self-hosted users.
+* The :guilabel:`Manage reports` permission now consistently grants access to complete :doc:`translation reports </devel/reporting>` for the selected scope, including private projects and restricted components below it.
+* Docker deployments now use a combined :ref:`Celery <celery>` worker by default, reducing memory usage while increasing task throughput. Use :envvar:`CELERY_WORKER_MODE` to select the combined, split, or single worker setup.
+* Improved :ref:`Billing <billing>` detail page loading performance by batching related project, invoice, and audit log queries.
+* Further reduced :ref:`Celery <celery>` worker memory usage by sharing preloaded URL configuration between worker processes and loading bitmap widget rendering dependencies only when needed.
+* Docker startup configuration warnings are now available as :ref:`deployment checks <docker-startup-warnings>`, including in horizontally scaled deployments.
+* Reduced peak memory use and task duration for :ref:`notification digests <notifications>` by processing recipients in bounded batches and limiting each summary to 100 entries.
+
+.. rubric:: Security fixes
+
+* Prevented repeated :ref:`authenticator app registration <2fa>` from creating duplicate devices and allowing reuse of one-time codes. Existing equivalent duplicate devices are merged while preserving consumed codes.
+* Borg backup passphrases are now recursively scrubbed from Sentry error reports, including when a custom event scrubber is configured.
+* Font overrides are now restricted to fonts uploaded to the same project.
+* Engage pages and status widgets no longer disclose Private or Custom projects unless :ref:`project-public_sharing` is enabled.
+* Prevented excessive CPU consumption while checking malformed Markdown and MDX syntax.
+
+.. rubric:: Bug fixes
+
+* Fixed the approved-only :ref:`commit policy <project-commit_policy>` blocking commits for languages with reviews disabled by workflow settings.
+* Fixed the :ref:`uWSGI configuration example <uwsgi>` to use the virtual environment's Python when launching helpers for SSH repository operations.
+* Fixed language context and links in change history for scoped :doc:`announcements <admin/announcements>` and other language-specific events.
+* Restored :ref:`mt-deepl` API v1 translation support while retaining modern API language discovery and glossary improvements.
+* REST API unit updates now enforce the same translation text length limit as the web editor.
+* HTML void elements in :ref:`mdx` translations are now kept self-closing after sanitization, preventing invalid MDX output.
+* The :http:post:`autotranslate API endpoint </api/translations/(string:project)/(string:component)/(string:language)/autotranslate/>` now correctly describes its accepted request body fields (``q``, ``mode``, ``auto_source``, ``component``, ``engines``, ``threshold``) in the OpenAPI schema instead of incorrectly reflecting the Translation resource.
+* Links outside tab navigation now correctly activate their target tabs, fixing upload links for missing translations and new components.
+* Error reporting integrations now distinguish informational messages from exceptions and reliably report the explicitly handled exception.
+* The default Celery per-child memory limit now accommodates the application's baseline memory usage, avoiding unnecessary worker recycling.
+* Backup services now start only after settings and database backup files are fully updated, while backups to different Borg repositories can run in parallel.
+
+.. rubric:: Compatibility
+
+* Anonymous access to engage pages and status widgets is now disabled by default for Private and Custom projects. Enable :ref:`project-public_sharing` to preserve existing shared links after upgrading. Public and Protected projects are unchanged.
+
+.. rubric:: Upgrading
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+* Authenticator app registrations started before this upgrade must be restarted. Sessions referencing a removed duplicate device may require two-factor verification again.
+* Docker deployments now default to the combined Celery worker mode. If your deployment relies on separate workers for each queue or configures them using ``CELERY_MAIN_OPTIONS``, ``CELERY_NOTIFY_OPTIONS``, ``CELERY_MEMORY_OPTIONS``, ``CELERY_TRANSLATE_OPTIONS``, or ``CELERY_BACKUP_OPTIONS``, set ``CELERY_WORKER_MODE=split`` to preserve the previous behavior.
+* The Docker ``CELERY_SINGLE_PROCESS`` environment variable is deprecated. Use ``CELERY_WORKER_MODE=single`` instead; the compatibility alias logs a startup warning.
+
+.. rubric:: Contributors
+
+.. include:: /changes/contributors/2026.9.1.rst
+
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/173?closed=1>`__.
+
+Weblate 2026.9
 --------------
 
-*Released on June 20th 2025.*
+*Released on September 3rd 2026.*
+
+.. rubric:: New features
+
+* :ref:`Repository maintenance actions <repository-maintenance>` now run as background tasks, avoiding request and proxy timeouts. Project-wide maintenance remains available for authorized repositories and lists components skipped because of linked-component permissions. The :http:post:`repository API </api/projects/(string:project)/repository/>` supports the same behavior using ``background: true``.
+* :ref:`addon-weblate.discovery.discovery` can optionally create components from a monolingual base or new base file when no translation files exist yet.
+* Added :ref:`vcs_params` to configure repository behavior per component, including force pushing, opting out of pull requests, and GitHub pull request automerge.
+* Added :ref:`code-hosting-github-app-migrate` for migrating existing Git and GitHub components to the Weblate GitHub App integration.
+* Added a :guilabel:`Visible columns in lists` preference to choose which statistics columns are shown in project, component, and language lists. See :ref:`profile-preferences`.
 
 .. rubric:: Improvements
 
-* :ref:`mt-deepl` integration now supports using next-gen LLM model.
+* AWS SES can now be used as the outbound e-mail transport in Docker deployments by setting :envvar:`WEBLATE_EMAIL_BACKEND` to ``django_ses.SESBackend``. Region, endpoint, and SES v2 API opt-in are configurable via :envvar:`WEBLATE_AWS_SES_REGION_NAME`, :envvar:`WEBLATE_AWS_SES_REGION_ENDPOINT`, and :envvar:`WEBLATE_USE_SES_V2`.
+* Removing the final Weblate workspace connection for a GitHub account, or removing the workspace holding it, now also uninstalls the :ref:`Weblate GitHub App <code-hosting-github-app-register>` from GitHub.
+* :ref:`addon-weblate.gettext.xgettext` now accepts multiple custom keywords (newline-separated) passed to xgettext via ``--keyword``, enabling extraction from different function names.
+* :ref:`Screenshot images <screenshots>` are now cached in browsers to reduce repeated downloads.
+* Administrators can now find removed accounts by their former e-mail address in the audit log until :setting:`AUDITLOG_EXPIRY`. See :doc:`/security/privacy-compliance`.
+* Deployment diagnostics now detect slow filesystem metadata access in data and cache directories, and validate VCS command versions during configuration health checks instead of every process startup. See :ref:`manage-performance` and :setting:`VCS_BACKENDS`.
+* Clarified the instance-wide impact of roles containing site-wide permissions, including :ref:`site-wide user management <site-wide-user-management>`.
+* Improved translation file loading performance for metadata-only string changes.
+* Reduced :ref:`Celery <celery>` worker startup memory usage by avoiding duplicate Django system checks and loading font rendering only when needed.
+* :ref:`Billing <billing>` audit logs now identify users who change plans, initiate payments, or merge billings.
+* Assigning languages to a team now uses an :guilabel:`All languages` toggle which disables the language choice when turned on, and a manually chosen set of languages is kept when toggling it. See :ref:`manage-acl`.
+* Management notices now distinguish support package activation, status refresh, unlinking, and Discover Weblate registration.
+* Clarified generic :ref:`notification hook <hooks>` matching and privacy behavior.
+* Clarified that Weblate does not populate Git submodules. See :ref:`git-submodules`.
+* The initial :ref:`search-replace` action is now labeled :guilabel:`Review changes` to distinguish it from confirmation.
+* The :ref:`translation flags <additional-flags>` editor now supports reopening flags for editing, arrow-key navigation, and copying with :kbd:`Ctrl+C`. It also keeps commas inside quoted values intact, allowing flags such as ``regex:"^.{1,32}$"`` to be typed and pasted.
+* Repository failure alerts now provide guidance matching repository URL validation errors. See :ref:`vcs-repository-url-troubleshooting`.
+
+.. rubric:: Security fixes
+
+* Component discovery now limits repository paths and file-mask comparisons to prevent excessive resource consumption from specially crafted repositories.
+* Rejected :ref:`two-factor authentication <2fa>` attempts now apply :setting:`AUTH_LOCK_ATTEMPTS`, invalidate pending password sign-ins on lock or password change, and accept six-digit TOTP codes with leading zeroes.
+* :ref:`Project backup restores <projectbackup>` now preserve all project, category, and component settings. They also allowlist repository metadata for Git, git-svn, and Mercurial to prevent archives from supplying executable configuration or repository indirection.
+* Project administrators can no longer remove :ref:`API tokens <api-tokens>` belonging to other projects.
+* User listings and site-wide searches no longer expose project-scoped :ref:`API tokens <api-tokens>` to users without global user viewing or editing permission.
+* Project and workspace :ref:`translation memory <translation-memory>` now respects restricted component access, and restricted components no longer contribute to shared translation memory.
+* Webhook target matching no longer falls back to host/path suffix matching. Component repository URLs must match a repository URL from the webhook payload. See :ref:`hooks-target-matching`.
 
 .. rubric:: Bug fixes
 
-* Restoring :ref:`projectbackup` with votes.
-* Improved error handling in :ref:`mt-apertium-apy`.
+* LLM-based machine translation services now report invalid provider responses more clearly, custom :ref:`mt-openai` and :ref:`mt-mistral` models no longer require a model-listing endpoint, and OpenAI automatic selection supports API keys restricted to older GPT models.
+* Daily metric collection now uses independent tasks and more efficient database queries to reduce peak memory usage and avoid losing all scopes when one collection fails.
+* Database dump failures are now shown in the :ref:`backups management interface <automated-backup>`.
+* GitLab merge request forks now disable Git LFS to avoid missing-object push failures. See :ref:`git-lfs`.
+* Notification e-mails now wrap long strings instead of overflowing, keeping the :guilabel:`View` button reachable without horizontal scrolling.
+* Creating additional components for a repository imported through the :ref:`GitHub App <code-hosting-github-repositories>` no longer fails without showing any error, and component creation errors which previously could go unreported are now always displayed.
+
+.. rubric:: Compatibility
+
+* The ``json_sort_keys`` :ref:`file_format_params` is now a choice between ``none``, ``case_sensitive``, and ``case_insensitive`` instead of a boolean, including when reading or writing it through the component REST API; existing components are migrated automatically. See :http:get:`/api/components/(string:project)/(string:component)/`.
+* The :guilabel:`Git with force push` version control system has been replaced by the ``git_force_push`` :ref:`version control parameter <vcs_params>`; existing components are migrated automatically.
+* Component and category removal now preserves automatically generated translation memory by default. See :ref:`translation-memory` for the optional cleanup behavior.
+* Mercurial and Subversion repository hosts can now be trusted using :setting:`VCS_PRIVATE_ALLOWLIST` without restricting Git to the same hosts through :setting:`VCS_ALLOW_HOSTS`.
+* The :http:delete:`project deletion REST API endpoint </api/projects/(string:project)/>` now returns ``202 Accepted`` instead of ``204 No Content`` and contains a task URL in the response to track asynchronous deletion progress.
+
+.. rubric:: Upgrading
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+* Docker deployments need to configure trusted proxy addresses.
+  Set :envvar:`WEBLATE_TRUSTED_PROXY_ADDRESSES` to preserve client IP addresses
+  in nginx logs and Weblate when
+  ``WEBLATE_IP_PROXY_HEADER=HTTP_X_FORWARDED_FOR`` is used; otherwise, the
+  immediate TCP peer is used.
+
+.. rubric:: Contributors
+
+.. include:: /changes/contributors/2026.9.rst
+
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/168?closed=1>`__.
+
+Weblate 2026.8.1
+----------------
+
+*Released on August 7th 2026.*
+
+.. rubric:: New features
+
+* Project and component APIs now expose all user-configurable settings, including access control and translation-memory settings. See :doc:`api`.
+* Added the :wladmin:`metrics` command for retrieving server metrics locally in JSON, CSV, or OpenMetrics format.
+
+.. rubric:: Bug fixes
+
+* Task progress now requires authentication and works for aggregate automatic translation operations.
+* Docker Celery worker logging no longer emits duplicate records through both Celery and Weblate log handlers.
+* Component creation through the REST API now returns the background task URL in the response when creation work is queued.
+* Large language model machine translation services no longer fail when the optional persona and style settings are absent from the stored configuration, as happens when the service is installed through the REST API.
+* :wladmin:`import_json` now preserves the component source language for newly imported components from JSON exports.
+* Repository actions now require permission on every component sharing the affected repository, including linked components in other projects.
+* Legal document confirmation now explicitly covers the linked privacy policy. See :ref:`legal`.
+* Add-on change history now retains only explicitly public configuration values and marks changed credential fields as redacted.
+* Translator work reports with metrics can now be displayed and downloaded as HTML.
+* Repository credentials are now consistently hidden from web and API output.
 
 .. rubric:: Upgrading
 
@@ -115,105 +607,253 @@ Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.12.2.rst
+.. include:: /changes/contributors/2026.8.1.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/148?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/171?closed=1>`__.
 
-Weblate 5.12.1
+
+Weblate 2026.8
 --------------
 
-*Released on June 16th 2025.*
-
-.. rubric:: Bug fixes
-
-* :ref:`sbom` now includes serial number.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.12.1.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/147?closed=1>`__.
-
-Weblate 5.12
-------------
-
-*Released on June 16th 2025.*
-
-.. rubric:: Security
-
-* Exposure of personal IP address via e-mail (:cve:`2025-49134` / :ghsa:`4qqf-9m5c-w2c5`).
-* Lack of rate limiting when verifying second factor (:cve:`2025-47951` / :ghsa:`57jg-m997-cx3q`).
+*Released on August 3rd 2026.*
 
 .. rubric:: New features
 
-* Added :http:post:`/api/units/(int:id)/comments/` to create a new comment for the given translation unit.
-* :ref:`addon-weblate.json.customize` now has a configurable compact mode.
-* Added :ref:`check-kabyle-characters` quality check.
-* :ref:`sbom` is now being provided for Weblate.
-* :doc:`/security/index` documentation.
-* Added support for :doc:`/formats/compose-multiplatform-resources`.
-* Added :guilabel:`Translation Coordinator` role.
-* :ref:`addon-weblate.webhook.slack` is now available as an add-on.
-* Added :http:get:`/api/users/(str:username)/contributions/` to retrieve a list of all translations contributed by the user.
+* Added a :guilabel:`Show all columns in lists using horizontal scrolling` preference to keep all listing columns visible on narrow screens instead of hiding them.
+* :ref:`Workspaces <workspaces>` now provide aggregate translation statistics and historical metrics, a permission-filtered :guilabel:`My workspaces` list, archive downloads, search and replace, upload guidance, workspace translation memory management, and :ref:`removal of empty workspaces <workspace-removal>` not associated with billing.
+* Added :ref:`project-level translation metrics <monitoring-translation-progress>` in JSON, CSV, and OpenMetrics formats.
+* Added opt-in :ref:`running-granian-asgi` deployment support, including :envvar:`WEBLATE_ASGI` for Docker containers and asynchronous machine translation editor, GitHub App connection, and repository refresh requests.
+* Added grouped project and workspace :guilabel:`Diagnostics` views with state, severity, category, and actionable-by-user filters. Component diagnostics now track dismissal ownership, reopen after relevant changes, and notify only project maintainers who can act on warnings and errors.
+* Added API endpoints for listing, adding, accepting, rejecting, and voting on translation suggestions.
+* :doc:`Translation reports </devel/reporting>` are now generated in the background, stored for later download, available at workspace scope, and include translator work analysis.
+* Added :guilabel:`Use keywords exclusively` option to :ref:`addon-weblate.gettext.xgettext`, allowing projects to disable xgettext default keywords and rely only on a custom keyword.
+* Added API support for reading and updating :ref:`user-profile` preferences. See :ref:`api-users` endpoint.
+* Added :ref:`check-max-lines` and :ref:`check-asciidoc-markup` quality checks for limiting the number of translation lines and validating AsciiDoc strings.
+* Added :ref:`workflow-language-restrictions`, including per-language control for restricting direct translation editing to privileged users.
+* Added support for legacy Qt Linguist TS version 1 files. See :ref:`qtling`.
+* Weblate is now available in Lao language.
 
 .. rubric:: Improvements
 
-* :ref:`check-same` is now skipped for Toki Pona.
-* :ref:`search-strings` supports ``has:location`` lookup.
-* Unicode whitespaces are now considered as problematic characters for :ref:`glossary`, see :ref:`check-prohibited-initial-character`.
-* :ref:`addon-weblate.webhook.webhook` logs are now displayed nicely.
-* :ref:`addon-weblate.webhook.webhook` can be installed multiple times.
-* :ref:`user-profile` can now include contact URL.
-* :http:post:`/api/projects/` allows non-superusers to create projects when :ref:`billing` module is enabled.
-* :http:post:`/api/groups/` supports project-scoped team creation by non-superusers.
-* :http:get:`/api/users/` now includes ``languages``.
-* :ref:`addon-weblate.webhook.webhook` documentation improved.
-* Improved support for extended metadata in :ref:`tbx`.
-* :ref:`addon-weblate.webhook.webhook` now includes a category field when available.
-* Uploaded fonts can be updated and changes to them are tracked, see :ref:`fonts`.
-* Weblate is now available in Bashkir language.
+* Authenticated web-action rate-limit lockouts are now recorded in the :ref:`audit-log` with the affected scope and request path.
+* OpenMetrics API responses now include metric metadata and a versioned content type.
+* Add-on management now uses separate configuration, logs, and components tabs, while :ref:`activity logs <addon-activity-logging>` distinguish pending, successful, failed, and skipped executions and explain skipped executions.
+* Expanded :ref:`change-actions` documentation with detailed event semantics and improved OpenAPI schema accuracy.
+* Improved loading performance for multi-language matrix views, dashboard component lists, category histories, and shared component listings.
+* Translation memory management now loads origin summaries more efficiently, shows active and pending entry counts, and reports the number of entries processed during import.
+* Static assets now use content-hashed filenames, and CAPTCHA JavaScript is loaded only when needed.
+* :ref:`mt-aws` machine translation now supports configuring formality, brevity, and profanity masking.
+* Improved :ref:`screenshots` OCR reliability and error reporting when downloading recognition data.
+* Repository failure alerts now link directly to component version control settings for users who can edit them, keep technical errors in English, and localize actionable diagnoses for each viewer, including GitHub pull request restrictions.
+* Celery workers now prefetch fewer tasks by default to reduce memory usage and improve task distribution.
+* Improved the recommended :ref:`running-granian` configuration and Docker container worker resilience for Weblate's WSGI workload.
+* Deployment checks now detect corrupted PostgreSQL relation statistics.
+* :ref:`Community diagnostics <alerts>` now show source-string screenshot coverage, recommend key translation-instruction topics, and distinguish inbound from outbound repository automation.
+* User-provided links, such as those in comments, announcements, and profiles, are now underlined and use a higher contrast color.
 
 .. rubric:: Bug fixes
 
-* :ref:`dashboard` translations ordering when paginating.
-* Honor DeepL API Free glossary limits in :ref:`mt-deepl`.
-* :ref:`addon-weblate.webhook.webhook` delivery of project-wide events.
-* False reports of :ref:`check-translated` with flags or explanation changes.
-* Creating new translations in :doc:`/formats/appstore`.
-* :ref:`search-replace` correctly handles plurals.
+* :ref:`Disabling password authentication <site-wide-user-management>` from site-wide user management now regenerates the user's personal API key by default.
+* Category, project, and comment statistics now stay consistent after component topology and comment changes, and category metrics are collected correctly.
+* Mercurial repository filenames beginning with a dash are now handled safely.
+* URLs containing backslashes are now rejected as invalid.
+* Protected outbound HTTP and Git connections now bind to validated public addresses; protected Git operations fail closed when clients cannot enforce that binding (:ghsa:`45m9-pf98-8jmq`).
+* Permanent same-host Git HTTP redirects are now validated and stored as canonical component repository URLs.
+* Self-service REST API e-mail changes are now restricted to verified addresses (:ghsa:`x84p-6892-473c`).
+* REST API authorization now consistently protects internal accounts, restricted components, add-on configuration, component sharing, repository links, and review states.
+* :ref:`Project backup imports <projectbackup>` now validate restored data before creating project state, skip repository-linked components the importer cannot access, and no longer load archive-supplied Mercurial configuration or shared-repository indirection (:ghsa:`f66g-8pcg-jm8r`, :ghsa:`327h-qqgm-qv55`).
+* Rebuilding project translation memory no longer removes entries imported from files.
+* Suggestion submission and rejection now reject excessively long suggestion text and rejection reasons.
+* Restricted components are now available on Hosted Weblate when the billing plan permits private projects.
+* Machine translation and translation memory AJAX lookups no longer disclose whether inaccessible unit IDs exist.
+* :ref:`RSS feeds <rss>` no longer disclose change history from inaccessible projects or restricted components (:ghsa:`vvc6-wvqm-w5gc`).
+* Authenticated legacy GitHub App webhooks can again trigger repository updates through the :ref:`generic GitHub webhook endpoint <code-hosting-github-notifications>`.
 
 .. rubric:: Compatibility
 
-* The projects and categories default tab now shows translated languages.
-* If no ``secret`` is provided in the Webhook add-on configuration, the Webhook request will not be signed, see :ref:`addon-weblate.webhook.webhook`.
-* :ref:`saml-auth` support is no longer included in the default dependencies.
+* django-compressor is no longer used, and the ``COMPRESS_*`` settings have been removed.
+* Legal document styling is now provided through an overridable template instead of Weblate's global stylesheet. See :ref:`legal-customization`.
+* When :setting:`VCS_RESTRICT_PRIVATE` is enabled, Mercurial and Subversion repository hosts must be explicitly included in :setting:`VCS_ALLOW_HOSTS`; Git over HTTPS and SSH enforces connection address pinning without an allowlist entry.
+* Outbound HTTP proxy configuration is limited to the per-protocol environment variables documented in :ref:`http-proxy`.
+* Git SSH validates configured ``HostName`` and ``Port`` destinations before connecting; administrator SSH configuration remains trusted, and :setting:`SSH_EXTRA_ARGS` can override connection routing and address pinning.
+* Git LFS object transfers are unsupported and disabled for Weblate-managed repositories; LFS-tracked files remain pointer files.
+* The project and component ``credits`` REST API endpoints and their ``credits_url`` response fields have been replaced by scoped ``reports`` endpoints and ``reports_url``. Credits report generation is now asynchronous; clients need to submit a ``credits`` report, follow the returned task URL, and fetch the completed report. See :http:post:`/api/reports/`.
+* The top-level ``languages`` field on user REST API responses has been removed; use ``profile.languages`` instead. See :ref:`api-user-profile`.
 
 .. rubric:: Upgrading
 
 Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
+* There are changes in :file:`settings_example.py`, most notably the new ``STORAGES`` configuration and removal of the ``COMPRESS_*`` settings; please adjust your settings accordingly.
+* Running :program:`weblate compress` is no longer necessary; :program:`weblate collectstatic --noinput` now prepares versioned static assets without clearing the static storage.
+* NumPy is now a required dependency; review the updated :ref:`hardware requirements <hardware>` before upgrading.
+
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.12.rst
+.. include:: /changes/contributors/2026.8.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/141?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/167?closed=1>`__.
 
-Weblate 5.11.4
+Weblate 2026.7.1
+----------------
+
+*Released on July 10th 2026.*
+
+.. rubric:: New features
+
+* Added :setting:`INTERNAL_BOT_EMAIL_TEMPLATE` to customize internal bot e-mail addresses.
+
+.. rubric:: Improvements
+
+* Restricted components now show a status icon in component listings.
+* Permission checks now reuse materialized team membership data from lightweight relation lookups.
+* Documented that intermediate language files are hidden from language listings and can make target strings read-only.
+* Component diagnostics now warn when regular :ref:`gettext` PO files are configured as monolingual PO files.
+* Translation memory fuzzy lookups are now faster on large translation memories.
+* Permission denied messages when saving translations, editing glossaries, or voting on suggestions now show more specific reasons.
+* Comment notifications for strings you translated now also include strings you previously commented on or suggested translations for.
+* Comments and suggestions now auto-watch the project when :guilabel:`Automatically watch projects on contribution` is enabled.
+* Clarified Hosted Weblate repository access guidance in :doc:`/admin/code-hosting`.
+* :ref:`search-strings` now includes filters for comments by the current user and separate source string comment lookups.
+* Code-hosting account pages now consistently use :guilabel:`Code-hosting connections` and provider-neutral connected account wording.
+* :ref:`discover-weblate` registration can now be started from the management interface without manually copying the activation token.
+* :ref:`discover-weblate` can now be managed from a dedicated management panel, registration starts with discovery enabled, and protected projects are included in the listing.
+* Updated the :ref:`mt-openai`, :ref:`mt-mistral`, and :ref:`mt-anthropic` model lists for currently supported models.
+
+.. rubric:: Bug fixes
+
+* Filtered translation and zen navigation now reuse a stable session result list, keeping positions and counts stable after translated strings leave the filter.
+* Component priority icons are no longer shown on translation listings.
+* :ref:`check-punctuation-spacing` no longer flags Markdown image markers as French punctuation and now shows which punctuation marks triggered the check.
+* :ref:`addon-weblate.fedora_messaging.publish` received several reliability fixes.
+* The :guilabel:`Things to check` panel no longer uses error highlighting for suggestions and other non-error translation states.
+* Translation workflow customization now makes it clearer when per-language workflow settings are disabled until customization is enabled.
+* Anonymous user permission caches are now isolated between requests.
+* GitHub App setup now explains that a workspace is required instead of showing a permission error when no workspace exists.
+* LLM automatic suggestion settings no longer show ``null`` for empty language-specific instructions.
+* File format feature tables now better match actual format support, including descriptions, context, plural metadata, obsolete string removal, specialized file extensions, and merged variants.
+* Accepting a project invitation now automatically adds the project to the user's watched projects.
+* Dismissing a failing check no longer shows a JSON parsing error in the translation editor.
+* Screenshot searches without an explicit field now match screenshot names only, and the search box links to the full screenshot search documentation.
+* Anonymous and internal bot accounts can no longer be edited through generic user management.
+* LLM machine translation suggestions now recover from more malformed structured JSON replies.
+* Azure AI Translator settings now reject malformed region names before validating service connectivity.
+
+.. rubric:: Upgrading
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+* Weblate now requires the PostgreSQL ``btree_gist`` extension for translation memory lookups. The migration installs it automatically when the database user has sufficient privileges. Installations using a non-superuser database user should pre-create it before upgrading; see :ref:`dbsetup-postgres`.
+
+.. rubric:: Contributors
+
+.. include:: /changes/contributors/2026.7.1.rst
+
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/170?closed=1>`__.
+
+Weblate 2026.7
 --------------
 
-*Released on May 7th 2025.*
+*Released on July 1st 2026.*
+
+.. rubric:: New features
+
+* Added :ref:`check-safe-mdx`, :ref:`check-source-max-length`, and :ref:`check-accelerator` quality checks for :ref:`mdx` JSX expressions, source length limits, and accelerator key consistency.
+* Added :ref:`mt-mistral` machinery integration for Mistral LLM automatic suggestions.
+* Added :ref:`code-hosting-github-app-register` for connecting GitHub repositories through a Weblate GitHub App.
+* :ref:`projectbackup` backups can now be created and downloaded via the :ref:`api`.
+* Added file format parameters for translating individual YAML front matter values in :ref:`markdown` and :ref:`mdx` files and escaping formula-like values in :ref:`csv` files.
+* Added an option to capitalize the text in status badge widgets.
+* Added :ref:`workspace translation memory <memory-scopes>` with asynchronous scope backfill for existing translation memory entries.
+* Added :wladmin:`analyze_translator_work` to estimate realistic daily translator throughput from change history.
 
 .. rubric:: Improvements
 
-* :ref:`addon-weblate.webhook.webhook` logs requests and responses.
+* RTL editing and translation display now handle bidirectional text better, including Unicode isolate controls in the :ref:`visual-keyboard`.
+* Management interface access control is now more fine-grained with dedicated site-wide permissions.
+* Default commit and merge request message templates now use Conventional Commits, settings forms can restore installation defaults, and pull request messages use a compact language progress matrix.
+* Documented :ref:`legal` customizations and added options to hide legal pages or disable document numbering.
+* Expanded :doc:`security documentation </security/index>` for data residency, EU cloud sovereignty, release artifacts, supported versions, release verification, SBOMs, dependency handling, vulnerability reporting, hosted-service incident response, and self-hosted operator responsibilities.
+* :ref:`addon-weblate.gettext.linguas` better detects ``LINGUAS`` file presence.
+* :ref:`addon-weblate.gettext.xgettext` can now leave the xgettext language blank to let xgettext guess it from source file extensions.
+* :ref:`addon-weblate.gettext.xgettext`, :ref:`addon-weblate.gettext.meson`, :ref:`addon-weblate.gettext.django`, and :ref:`addon-weblate.gettext.sphinx` can now keep source locations in generated POT files even when translated PO files omit locations.
+* Add-ons installed at higher scopes are now shown on lower-scope add-on pages, and broad-scope add-ons can list affected components with compatibility details.
+* :envvar:`WEBLATE_ALLOWED_ASSET_SIZE` is now available in Docker container.
+* LLM automatic suggestions now use translated examples, language-specific instructions, richer glossary context, and structured placeholder context for more reliable output.
+* Meta descriptions now better match single-project and self-hosted installations.
+* Zen mode, filtered searches, nearby strings, translation form submissions, and add-on management pages now load more efficiently on large sites.
+* Added :ref:`distribution-packaging` guidance for distribution maintainers.
+* Large component imports now avoid duplicate translation-memory processing.
+* :ref:`gettext` files can now be configured to remove obsolete strings on save, including during repository maintenance.
+* :ref:`Bulk accepting suggestions <suggestions>` now confirms the number of affected suggestions, can approve them for reviewers, and processes the acceptance in the background.
+* Committing large numbers of pending translations now queues browser requests in the background and avoids duplicate repository commit tasks.
+* Change-event notification add-ons can now use presets for translation content events, all events, or selected individual events.
+* :ref:`addon-weblate.fedora_messaging.publish` now validates secure broker connections and exposes delivery timing and topic prefix settings.
+* Component diagnostics now sort entries by severity, color-code severity badges, and show the error count on the :guilabel:`Diagnostics` tab.
+* :ref:`manage-performance` now shows PostgreSQL database disk usage next to server disk usage and warns when the database usage cannot be collected.
+* :ref:`manage-performance` now shows PostgreSQL database disk usage next to server disk usage and warns when the database usage cannot be collected or there is not enough free space in the backup destination to store a database dump.
+* The :ref:`search-replace` preview now keeps the search parameters editable so the query can be refined before applying replacements.
 
 .. rubric:: Bug fixes
 
-* :ref:`addon-weblate.webhook.webhook` was not triggered in some situations.
+* :ref:`check-regex` and :ref:`check-placeholders` now enforce regular expression timeouts when evaluating source-string flags (:cve:`2026-62326`, :ghsa:`r52j-4vjp-q949`).
+* Restricted component changes are no longer exposed through nested project, component, or translation API change endpoints (:cve:`2026-62249`, :ghsa:`92m8-wv36-prmx`).
+* ZIP downloads, including :ref:`appstore` translation bundles, no longer follow child symbolic links outside the downloaded tree (:cve:`2026-61792`, :ghsa:`xwj4-fp82-r2rj`).
+* Teams enforcing two-factor authentication now also withhold site-wide permissions from human members without 2FA configured (:cve:`2026-61790`, :ghsa:`x86c-ff69-cr2m`).
+* Globally scoped HTML and AJAX object lookups no longer disclose object existence in private projects (:cve:`2026-55227`, :ghsa:`2p9g-x3cv-5hh4`).
+* Team API access checks now prevent project managers from reading private-project team data or expanding scoped team assignments outside their allowed projects (:cve:`2026-55228`, :ghsa:`2q2q-jr9g-v9rf`).
+* Malformed ``replacements`` flags no longer abort source length checks.
+* Empty component lists are no longer exposed to users without component list management permission.
+* Glossary handling no longer duplicates TBX terms or shows source-language terms in both translation columns.
+* Duplicate string alerts now offer a cleanup action to remove repeated strings from translation files.
+* :ref:`code-hosting-gerrit` review pushes can again include Gerrit push options in the target branch.
+* Webhook target fallback matching is now stricter and reported in component diagnostics.
+* Creating components linked with ``weblate://`` no longer waits on the shared repository lock during the request.
+* Project and workspace translation license defaults now follow component and project licenses more closely.
+* Component and category API ``PATCH`` requests no longer remove the category when the field is omitted.
+* Document and translation-memory uploads now enforce :setting:`TRANSLATION_UPLOAD_MAX_SIZE`, and API document uploads validate file extensions.
+* :ref:`check-rst-syntax` now detects inline roles wrapped in stray backticks.
+* :ref:`check-safe-html` now efficiently detects changed placeholder-only HTML attribute values in translations.
+* :ref:`check-max-size` no longer wraps text configured to fit on one line, checks source strings, and refreshes rendered previews after source edits.
+* Bitmap widgets and :ref:`check-max-size` previews now use Matplotlib and no longer require Pango, Cairo, librsvg, or GObject Introspection.
+* Repository reset and update history now keeps attribution, records remote update failures, and includes follow-up translation-file reconciliation.
+* Updating repository URLs now validates compatible Git history without requiring an immediate successful merge.
+* :ref:`auto-translation` no longer validates hidden component fields when using machine translation.
+* :guilabel:`Strings marked for edit` links now include all strings needing editing, checking, or rewriting.
+* Anonymous permission checks no longer fail when loading teams scoped to projects or workspaces.
+* API project creation can again use the user's only eligible workspace when no explicit workspace is supplied.
+* Git auto-maintenance is now disabled for Weblate-managed repositories to avoid concurrent detached maintenance jobs.
+* Interrupted Git repository operations are now either recovered and recorded or surfaced as a repository alert.
+* Watched translations on the dashboard now include category path segments.
+* Unsupported upload levels now show an upload placeholder pointing to individual translations.
+* Component API responses no longer expose repository export, push branch, or repository browser links to users without repository access.
+
+.. rubric:: Compatibility
+
+* :ref:`mt-deepl` now handles DeepL API versions internally, uses v3 for glossary management and language discovery, and no longer supports DeepL API v1.
+* :ref:`addon-weblate.fedora_messaging.publish` topics now include category path segments, and broker settings are stored as an AMQP URL with existing host and SSL settings migrated automatically.
+
+.. rubric:: Upgrading
+
+Please follow :ref:`generic-upgrade-instructions` in order to perform update.
+
+* There are changes in :file:`settings_example.py`, most notably in ``SOCIAL_AUTH_PIPELINE`` and ``SOCIAL_AUTH_DISCONNECT_PIPELINE``; please adjust your settings accordingly.
+* Existing translation-memory entries are moved to scoped storage by a periodic Celery background task. Keep Celery running after the upgrade; translation-memory suggestions can be incomplete until the backfill finishes.
+
+.. rubric:: Contributors
+
+.. include:: /changes/contributors/2026.7.rst
+
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/166?closed=1>`__.
+
+Weblate 2026.6.1
+----------------
+
+*Released on June 1st 2026.*
+
+.. rubric:: Bug fixes
+
+* Language-wide :doc:`/admin/announcements` no longer break language overview pages.
 
 .. rubric:: Upgrading
 
@@ -221,1321 +861,131 @@ Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.11.4.rst
+.. include:: /changes/contributors/2026.6.1.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/146?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/169?closed=1>`__.
 
-Weblate 5.11.3
+Weblate 2026.6
 --------------
 
-*Released on May 3rd 2025.*
+*Released on June 1st 2026.*
+
+.. rubric:: New features
+
+* :doc:`/admin/announcements` can now also be managed via the :ref:`api` for specific project languages.
+* Team memberships can now be limited to selected languages for per-user translation permissions.
+* Added :ref:`cost estimates <cost-estimate>` to translation reports.
+* Added optional :ref:`OpenTelemetry tracing <collecting-errors>` for backend requests and tasks, and :ref:`Google Cloud Error Reporting <collecting-errors>` for handled server errors.
+* Added :doc:`/admin/workspaces` to group related projects, with workspace project listings, workspace-scoped teams and project creation permissions, inherited workspace, project, and category defaults for selected component settings, and billing details when available.
+
+.. rubric:: Improvements
+
+* Docker containers can now configure :envvar:`WEBLATE_SAML_SECURITY_CONFIG` to customize SAML security settings, and adjust :setting:`WEBLATE_FORMATS` using :envvar:`WEBLATE_ADD_FORMATS` and :envvar:`WEBLATE_REMOVE_FORMATS`.
+* Improved performance of the :ref:`check-inconsistent` check on large projects.
+* Translation flag fields now use a tag-based editor with autocompletion and grouped suggestions for all known flags.
+* :ref:`Contributor stats <stats>` now de-duplicate repeated work on the same string by default, with an option to count all changes.
+* :doc:`/admin/code-hosting` now documents HTTPS access-token URLs and dedicated-user SSH URLs for accessing repositories, and :doc:`/admin/continuous` now explains why squash merging Weblate conflict-resolution pull requests can require a repository reset.
+* :ref:`alerts` now include dismissible component diagnostics for community localization.
+* :ref:`screenshots` now support bulk assignment from search or image text recognition results, make finding strings in uploaded images easier to discover, show source string coverage counts, and include advanced listing search.
+* :ref:`sbom` release artifacts now include CISA 2025 document-level metadata.
 
 .. rubric:: Bug fixes
 
-* Fixed release publishing.
+* Outbound URL validation now rejects additional non-public targets (:cve:`2026-50127`, :ghsa:`vmfc-9982-2m45`).
+* Project-language :doc:`/admin/announcements` no longer appear across the whole project.
+* Hardened :http:post:`/api/screenshots/` access checks against private project enumeration.
+* Registration-attempt account activity e-mails now link to password reset to help users finish account setup.
+* :ref:`invite-user` links now work for signed-in users whose account owns the invited e-mail address.
+* Searching for strings with content changes without a recorded author now supports ``changed_by:""``, and combined change filters now apply to the same change event.
+* Gitea and Forgejo pull requests no longer reconfigure existing fork remotes to point to the source repository.
+* Project and category language translation sessions now keep strings grouped by component priority and show component switch warnings reliably.
+* Engage page task links now stay centered and show the target translation language.
+* Gettext POT update add-ons now rescan translations after committing updated POT and PO files.
+* Git repositories now update branches correctly when the remote also has a tag with the same name.
+* Conflicting repository setup alerts now allow same-branch direct pushes.
+* Obsolete cleanup schedules are now removed from Celery beat during upgrade.
+* Translation pages for workspace projects no longer crash when workspace fields are deferred.
 
 .. rubric:: Upgrading
 
 Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
+* There is a change in :setting:`django:INSTALLED_APPS`; ``weblate.workspaces`` should be added.
+* The database migrations might take longer on larger instances.
+
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.11.3.rst
+.. include:: /changes/contributors/2026.6.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/145?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/165?closed=1>`__.
 
-Weblate 5.11.2
+Weblate 2026.5
 --------------
 
-*Released on May 3rd 2025.*
-
-.. rubric:: Improvements
-
-* Glossary performance in zen mode and automatic suggestions.
-* Extended supported formats for :ref:`addon-weblate.json.customize`.
-
-.. rubric:: Bug fixes
-
-* XML export no longer crashes on locations with special characters.
-* Improved error handling on ZIP upload.
-* Django 5.2 compatibility.
-* Avoid repeated glossary synchronizations.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.11.2.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/144?closed=1>`__.
-
-Weblate 5.11.1
---------------
-
-*Released on April 25th 2025.*
-
-.. rubric:: Improvements
-
-* :ref:`projectbackup` now include teams and categories.
-* Docker health check is now supported in non-web service containers.
-
-.. rubric:: Bug fixes
-
-* :ref:`vcs-gitlab` integration now detects merge‑request conflicts more robustly.
-* :ref:`addon-weblate.webhook.webhook` is now enabled in Docker.
-* Removing pending glossary terms.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.11.1.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/142?closed=1>`__.
-
-Weblate 5.11
-------------
-
-*Released on April 15th 2025.*
+*Released on May 15th 2026.*
 
 .. rubric:: New features
 
-* Added :http:get:`/api/units/(int:id)/translations/` to retrieve a list of all target translation units for the given source translation unit.
-* Added :http:delete:`/api/groups/(int:id)/roles/(int:role_id)` to delete a role from a group.
-* :ref:`addon-weblate.webhook.webhook` is now available as an add-on.
-* :ref:`check-automattic-components-format` check to validate placeholders in Automattic components.
-* Inherited flags can now be discarded, see :ref:`custom-checks`.
-* :ref:`secondary-languages` can now be specified in :ref:`project` and :ref:`component`.
-* :ref:`mt-sources` can now be customized.
+* Added :ref:`mdx` support for translating Markdown text while preserving JSX syntax, with :ref:`file_format_params` shared with :ref:`markdown` for line wrapping, code blocks, front matter, and placeholder handling.
+* Added extended :ref:`LLM translation context <llm-translation-context>` for automatic suggestions, covering string context, explanations, secondary-language translations, plurals, failing checks, and placeholders.
+* Added a digest-only translation activity summary notification, see :ref:`notifications`.
+* :ref:`CSV <csv>` and :ref:`XLSX <xlsx>` downloads in :ref:`download` now export plural strings as separate plural-form rows that can be imported back.
+* Added Gettext PO and POT :ref:`file_format_params` to control whether Weblate updates the ``Language-Team``, ``Last-Translator``, ``X-Generator``, and ``Report-Msgid-Bugs-To`` headers.
+* Added a :ref:`backup-management-command` to run configured backup services synchronously.
+* The translation memory lookup API can now skip fuzzy matching with the ``exact`` query parameter.
+* Added :ref:`addon-weblate.cdn.files` to publish translation files to the configured CDN.
 
 .. rubric:: Improvements
 
-* Weblate now uses OpenAPI Specification 3.1.1 to generate the schema for :ref:`api`.
-* :ref:`credits` and :ref:`stats` include translator's join date. Additionally, both reports can be sorted either by the join date or the number of strings translated.
-* Widgets show more precise stats.
-* :ref:`upload` is now tracked in history with details.
-* :ref:`check-c-sharp-format` now supports ``csharp-format`` flag for compatibility with GNU gettext.
-* Changes in string flags are now tracked in history.
-* :doc:`/admin/machine` documentation extended.
-* :ref:`addon-weblate.discovery.discovery` better handles hundreds of matches.
-* Dismissing :ref:`checks` automatically updates propagated strings.
-* :ref:`project-check_flags` can now also be configured on the project level.
-* Improved rendering of :ref:`additional-flags` and :ref:`additional-explanation` changes in history.
-* :ref:`mt-cyrtranslit` now automatically transliterates from a matching translation instead of the source strings.
-* Errors from creating a duplicate glossary and failure to delete a glossary are now handled gracefully.
+* Using DOS line endings can now be configured using the ``dos_eol`` :ref:`file_format_params`.
+* :ref:`mt-openai` and :ref:`mt-alibaba` no longer require their vendor Python SDKs.
+* Audited project and component setting changes are now recorded in history.
+* Gerrit review pushes now use :ref:`component-push_branch` as the target branch.
+* Weblate now checks whether :setting:`CACHE_DIR` allows executing generated helper files.
+* The :ref:`sbom` is now generated during release and published as a versioned release asset instead of being stored in the source repository.
+* The translating page now separates screenshots from string information, collapses rarely used string details, and groups glossary and screenshot actions more consistently.
+* Project access management now paginates users and better explains site-wide automatic team assignments.
+* Added provider-oriented code-hosting documentation and Gettext-style :ref:`plural-formula` guidance.
+* The Python wheel no longer ships source translation catalogs, test files, or deployment example files, reducing the installed package size.
+* The engage page now highlights actionable translation task buckets for newcomers.
+* :ref:`RSS feeds <rss>` can now use the same filters as the changes browsing page.
+* :ref:`addon-weblate.gettext.django` now supports gettext PO files used as templates when they are excluded by the language filter.
+* Reworked :doc:`/security/threat-model` into a contract-style document.
 
 .. rubric:: Bug fixes
 
-* **Security:** Cloning a component could leak component configuration into the URL (:cve:`2025-32021`).
-* Fixed captcha verification when some time zone was configured.
-* Improved translation propagation performance.
-* Leading and trailing whitespace are now correctly stripped in glossary strings that also contain a :ref:`check-prohibited-initial-character`.
-* Fixed background parsing of newly added translation files.
+* Hardened search previews and :ref:`machine-translation` suggestion origins against XSS, and stopped exposing database error details in upload failures (:cve:`2026-45106` / :ghsa:`6wxc-8mgq-w26m`).
+* Screenshot URL uploads, remote HTML extraction in :ref:`addon-weblate.cdn.cdnjs`, and URL health-check redirects now reject internal or non-public targets by default.
+* Gerrit review pushes now reject target branches containing push options, track the target branch before invoking ``git-review``, and suggest short branch names when full refs are supplied.
+* Category :doc:`/admin/announcements` no longer appear across the whole project, and translation announcement deletion now honors language-scoped permissions.
+* Merge request pushes now refresh stale fork remotes after changing repository hosting.
+* Plural counts parsed from translation file headers are now bounded, and plural formulas are rejected when they can evaluate outside the configured plural form range.
+* :ref:`project-api` expiring today now remain valid until the end of the day.
+* Malformed ALTCHA CAPTCHA submissions and repository URLs in webhook payloads no longer cause server errors.
+* :ref:`check-placeholders` now merges overlapping non-nested spans from multiple flags.
+* :ref:`backup` logs no longer include OpenSSH post-quantum key exchange warnings from remote Borg connections.
+* Category repository paths are now handled more safely during cleanup and moves.
+* Locked component pages now show an unsubscribe action after subscribing to unlock notifications.
+* :ref:`projectbackup` imports now restore in the background to avoid web worker memory limits.
 
 .. rubric:: Compatibility
 
-* Registration now disallows disposable e-mail domains.
+* The ``dos-eol`` flag is no longer supported. Use the ``dos_eol`` :ref:`file_format_params` instead.
+* The registration CAPTCHA now uses the ALTCHA widget v3 protocol with Argon2id proof-of-work.
+* The ``set_language_team`` project attribute has been replaced with the ``po_set_language_team`` file format parameter at the component level; see :ref:`file_format_params`.
+* Weblate now uses calendar versioning for releases, see :ref:`release-cycle`.
+* Weblate now uses stricter dependency version constraints to better control runtime environment.
 
 .. rubric:: Upgrading
 
 Please follow :ref:`generic-upgrade-instructions` in order to perform update.
 
-* The database migration updates indexes and this might take considerable time.
+* The ``ALTCHA_MAX_NUMBER`` setting has been replaced by :setting:`ALTCHA_COST`, :setting:`ALTCHA_MEMORY_COST`, and :setting:`ALTCHA_PARALLELISM`; please adjust your settings accordingly.
+* The upgrading policy was changed, and upgrades are only supported from the current or previous calendar year.
+* The ``COMMENT_CLEANUP_DAYS`` and ``SUGGESTION_CLEANUP_DAYS`` settings are migrated once to site-wide :ref:`addon-weblate.removal.comments` and :ref:`addon-weblate.removal.suggestions` add-ons; configure those add-ons instead.
 
 .. rubric:: Contributors
 
-.. include:: changes/contributors/5.11.rst
+.. include:: /changes/contributors/2026.5.rst
 
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/136?closed=1>`__.
-
-Weblate 5.10.4
---------------
-
-*Released on March 19th 2025.*
-
-.. rubric:: Bug fixes
-
-* Fixed dismissing of checks.
-* Reduced overhead of rendering other strings while translating.
-* Improved performance of some :ref:`api` endpoints.
-* Fixed :ref:`language-parsing-codes` in some corner cases.
-* :ref:`search-strings` now properly finds exact match on the component.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.10.4.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/140?closed=1>`__.
-
-Weblate 5.10.3
---------------
-
-*Released on March 13th 2025.*
-
-.. rubric:: Improvements
-
-* Captcha is not shown for registrations via :ref:`invite-user`.
-
-.. rubric:: Bug fixes
-
-* Improved performance of API download endpoints.
-* Optimized fetching other translations while translating.
-* Reduced notifications overhead.
-* Improved handling of components using :ref:`internal-urls`.
-* Fixed authenticating with some Git servers.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.10.3.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/139?closed=1>`__.
-
-Weblate 5.10.2
---------------
-
-*Released on February 28th 2025.*
-
-.. rubric:: Improvements
-
-* Improved :ref:`translation-memory` matching.
-* Visual diff now better highlights whitespace additions.
-* Improved performance on large projects.
-
-.. rubric:: Bug fixes
-
-* Consistency of :ref:`search-boolean` in :doc:`/user/search`.
-* Fixed some :ref:`addons` trigger upon installation.
-* Fixed restoring of Git repositories from :ref:`projectbackup`.
-
-.. rubric:: Compatibility
-
-* Weblate has switched to a different library for zxcvbn integration, as the old one is no longer maintained, see :ref:`password-authentication`.
-* Weblate uses proactive authentication with Git 2.46.0 and newer when HTTP credentials are supplied.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There are several changes in :file:`settings_example.py`, most notable are changed settings ``AUTH_PASSWORD_VALIDATORS`` and ``INSTALLED_APPS``; please adjust your settings accordingly.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.10.2.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/138?closed=1>`__.
-
-Weblate 5.10.1
---------------
-
-*Released on February 21st 2025.*
-
-.. rubric:: Improvements
-
-* :ref:`check-multiple-failures` better shows failing checks including links to the strings.
-* Detailed overview of locked components on project repository management.
-* :ref:`search-strings` supports searching by source string state.
-
-.. rubric:: Bug fixes
-
-* :ref:`download` performs faster on project and language scopes.
-* :ref:`zen-mode` does not display the source string twice when editing it.
-* Fixed :ref:`glossary` terms highlighting.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.10.1.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/137?closed=1>`__.
-
-Weblate 5.10
-------------
-
-*Released on February 14th 2025.*
-
-.. rubric:: New features
-
-* :ref:`check-rst-references` check to validate reStructuredText references.
-* :ref:`check-rst-syntax` check to validate reStructuredText syntax.
-* API can now produce CSV output.
-* New management command :wladmin:`import_projectbackup` to import :ref:`projectbackup`.
-
-.. rubric:: Improvements
-
-* Improved error handling in :ref:`machine-translation-setup`.
-* :envvar:`WEBLATE_REGISTRATION_CAPTCHA` is now available in Docker container.
-* :guilabel:`Synchronize` on shared repository now operates on all its components.
-* :ref:`check-punctuation-spacing` ignores markup such as Markdown or reStructuredText.
-* :ref:`autofix-punctuation-spacing` does not alter reStructuredText markup.
-* Improved validation errors in :doc:`/api`, see :ref:`api-errors`.
-* Any language changed into an alias in `Weblate language data <https://github.com/WeblateOrg/language-data/>`__ is now reflected in all existing installations.
-* Blank alias languages (not linked to any translation, profile, component, ...) are now automatically removed.
-* :ref:`check-duplicate` better works with markup such as Markdown or reStructuredText.
-* Automatically use DeepL API Free endpoint for the DeepL API Free authentication keys in :ref:`mt-deepl`.
-* Compatibility with third-party static files storage backends for Django.
-* Improved language compatibility in :ref:`mt-microsoft-translator`.
-* :ref:`check-reused` check gracefully handles languages which are not case sensitive.
-* :ref:`component-enforced_checks` are now applied on strings imported from the repository.
-* Reduced false positives in :ref:`check-end-colon` and :ref:`check-end-stop` for CJK languages.
-* OpenAPI schema for API includes more information.
-* :ref:`check-regex` supports advanced regular expressions.
-* :ref:`check-same` gracefully deals with case-insensitive languages.
-
-.. rubric:: Bug fixes
-
-* :ref:`check-reused` wrongly triggered after fixing the error.
-* Dark theme behavior in some situations.
-* Translation propagation sometimes did not work as expected.
-* :http:header:`Content-Security-Policy` is now automatically set for AWS.
-* :ref:`machine-translation-setup` sometimes cached results too aggressively.
-* Fixed translations caching in :ref:`machine-translation-setup`.
-* :ref:`autofix-html` automatic fixups honors the ``ignore-safe-html`` flag.
-* :ref:`check-punctuation-spacing` no longer applies to Breton.
-* Fixed :ref:`addon-weblate.git.squash` on linked repositories.
-* :ref:`check-multiple-failures` avoids false positives and better lists related checks.
-
-.. rubric:: Compatibility
-
-* Running tests using Django test executor is no longer supported, see :doc:`/contributing/tests`.
-* :ref:`check-bbcode` check is now disabled by default. The ``bbcode-text`` flag is required to activate this check, see :ref:`custom-checks`.
-* API error responses format has changed, see :ref:`api-errors`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There are several changes in :file:`settings_example.py`, most notable are the new settings for :ref:`api` in ``REST_FRAMEWORK``, ``SPECTACULAR_SETTINGS``, ``DRF_STANDARDIZED_ERRORS`` and ``INSTALLED_APPS``; please adjust your settings accordingly.
-* PostgreSQL 12 and MariaDB 10.4 are no longer supported.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.10.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/133?closed=1>`__.
-
-Weblate 5.9.2
--------------
-
-*Released on December 19th 2024.*
-
-.. rubric:: Improvements
-
-* Renamed :ref:`vcs-bitbucket-data-center` to match new product name.
-* :http:get:`/api/users/` supports searching by user ID.
-
-.. rubric:: Bug fixes
-
-* Avoid query parser crash in multi-threaded environments.
-* Avoid :ref:`autofix` crash on multi-value strings.
-* Make project tokens work when :ref:`2fa` or :ref:`component-agreement` are enforced.
-* Captcha solution were sometimes not accepted.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.9.2.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/135?closed=1>`__.
-
-Weblate 5.9.1
--------------
-
-*Released on December 16th 2024.*
-
-.. rubric:: Bug fixes
-
-* Fixed publishing package to PyPI.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.9.1.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/134?closed=1>`__.
-
-Weblate 5.9
------------
-
-*Released on December 16th 2024.*
-
-.. rubric:: New features
-
-* Per-project :ref:`machine-translation-setup` can now be configured via the Project :ref:`api`.
-
-  * Added :http:get:`/api/projects/{string:project}/machinery_settings/`.
-  * Added :http:post:`/api/projects/{string:project}/machinery_settings/`.
-
-* Translation memory import now supports files with XLIFF, PO and CSV formats, see :ref:`memory-user` and :wladmin:`import_memory` command in :ref:`manage`.
-* The registration CAPTCHA now includes proof-of-work mechanism ALTCHA.
-* Leading problematic characters in CSV are now checks for :ref:`glossary`, see :ref:`check-prohibited-initial-character`.
-* Logging to :ref:`graylog`.
-
-.. rubric:: Improvements
-
-* :ref:`mt-google-translate-api-v3` now supports :ref:`glossary-mt` (optional).
-* A shortcut to duplicate a component is now available directly in the menu (:guilabel:`Operations` → :guilabel:`Duplicate this component`).
-* Included username when generating :ref:`credits`.
-* :ref:`bulk-edit` shows a preview of matched strings.
-* :http:get:`/api/components/(string:project)/(string:component)/` exposes component lock state.
-* Editor in :ref:`zen-mode` is now stick to bottom of screen.
-* Added page navigation while :ref:`translating`.
-* :ref:`manage-appearance` now has distinct settings for dark mode.
-* Improved :ref:`translation-propagation` performance.
-* More detailed error messages for :http:post:`/api/translations/(string:project)/(string:component)/(string:language)/file/`.
-
-.. rubric:: Bug fixes
-
-* Using the ``has:variant`` field now correctly displays strings that have variants in the search language, see :ref:`search-strings`.
-* Saving newly added strings in some formats.
-* :ref:`check-java-printf-format` gracefully handles escaping.
-
-.. rubric:: Compatibility
-
-* :ref:`rollbar-errors` integration no longer includes client-side error collection.
-* Weblate now requires Git 2.28 or newer.
-* Any custom code that relied on ``Change`` models signals should be reviewed.
-* :ref:`fedora-messaging` integration needs to be updated to be compatible with this release.
-* :envvar:`WEB_WORKERS` now configures number of threads instead of processes.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.9.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/127?closed=1>`__.
-
-Weblate 5.8.4
--------------
-
-*Released on November 19th 2024.*
-
-.. rubric:: Improvements
-
-* :ref:`search-users` can search based on user changes.
-
-.. rubric:: Bug fixes
-
-* Fixed occasional crash in :ref:`rss`.
-* :ref:`check-icu-message-format` gracefully handles plural strings.
-* :ref:`vcs-bitbucket-cloud` correctly generates pull request description.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.8.4.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/132?closed=1>`__.
-
-Weblate 5.8.3
--------------
-
-*Released on November 6th 2024.*
-
-.. rubric:: Bug fixes
-
-* Formatting of some :ref:`audit-log` entries.
-* Fixed XML escaped output in some machine translation integrations.
-* Fixed duplicate listing of newly added glossary terms.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.8.3.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/131?closed=1>`__.
-
-Weblate 5.8.2
--------------
-
-*Released on November 1st 2024.*
-
-.. rubric:: Bug fixes
-
-* Update outdated plural definitions during the database migration.
-* Reduced number of database queries when updating multiple strings.
-* Leading problematic characters in :ref:`glossary` terms are now properly stripped in uploaded files.
-* Improved :ref:`workflow-customization` performance.
-* Fixed XML escaped output in some machine translation integrations.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.8.2.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/129?closed=1>`__.
-
-Weblate 5.8.1
--------------
-
-*Released on October 15th 2024.*
-
-.. rubric:: Bug fixes
-
-* Use lower case name for the Python package.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.8.1.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/128?closed=1>`__.
-
-Weblate 5.8
------------
-
-*Released on October 15th 2024.*
-
-.. rubric:: New features
-
-* Added :ref:`component-key_filter` in the component.
-* :doc:`/user/search` now supports filtering by object path and :ref:`date-search`.
-* Merge requests credentials can now be passed in the repository URL, see :ref:`settings-credentials`.
-* :ref:`mt-azure-openai` automatic suggestion service.
-* :ref:`vcs-bitbucket-cloud`.
-
-.. rubric:: Improvements
-
-* :ref:`mt-modernmt` supports :ref:`glossary-mt`.
-* :ref:`mt-deepl` now supports specifying translation context.
-* :ref:`mt-aws` now supports :ref:`glossary-mt`.
-* :ref:`autofix` for Devanagari danda now better handles latin script.
-* :ref:`autofix` for French and Breton now uses a non-breaking space before colons instead of a narrow one.
-* :ref:`api` now has a preview OpenAPI specification.
-* Stale, empty glossaries are now automatically removed.
-* :kbd:`?` now displays available :ref:`keyboard`.
-* Translation and language view in the project now include basic information about the language and plurals.
-* :ref:`search-replace` shows a preview of matched strings.
-* :ref:`aresource` now support translatable attribute in its strings.
-* Creating component via file upload (Translate document) now supports bilingual files.
-
-.. rubric:: Bug fixes
-
-* Displaying :ref:`workflow-customization` setting in some cases.
-* Users can add component in any language already existing in a project.
-* :ref:`check-unnamed-format` better handles some strings, such as :ref:`check-python-brace-format`.
-
-.. rubric:: Compatibility
-
-* Weblate now requires Python 3.11 or newer.
-* :ref:`mt-aws` now requires the ``TranslateFullAccess`` permission.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There are several changes in :file:`settings_example.py`, most notable are the new settings for :ref:`api` in ``SPECTACULAR_SETTINGS`` and changes in ``REST_FRAMEWORK`` and ``INSTALLED_APPS``; please adjust your settings accordingly.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.8.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/122?closed=1>`__.
-
-Weblate 5.7.2
--------------
-
-*Released on September 5th 2024.*
-
-.. rubric:: Improvements
-
-* :ref:`2fa` remembers last method used by user.
-* Instead of redirecting, the sign-out now displays a page.
-* Improved readability of exception logs.
-
-.. rubric:: Bug fixes
-
-* Updating of translations from the repository in linked components.
-* Improved rendering of digest notification e-mails.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.7.2.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/126?closed=1>`__.
-
-Weblate 5.7.1
--------------
-
-*Released on August 30th 2024.*
-
-.. rubric:: Improvements
-
-* Updated language names to better describe different scripts and Sinitic languages.
-* :ref:`addon-weblate.cleanup.generic` is now automatically installed for formats which need it to update non-translation content in the translated files.
-
-.. rubric:: Bug fixes
-
-* Support for using Docker network names in automatic suggestion settings.
-* Fixed authentication using some third-party providers such as Azure.
-* Support for formal and informal Portuguese in :ref:`mt-deepl`.
-* QR code for TOTP is now black/white even in dark mode.
-* Fixed TOTP authentication when WebAuthn is also configured for the user.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.7.1.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/125?closed=1>`__.
-
-Weblate 5.7
------------
-
-*Released on August 15th 2024.*
-
-.. rubric:: New features
-
-* :ref:`2fa` is now supported using Passkeys, WebAuthn, authentication apps (TOTP), and recovery codes.
-* :ref:`2fa` can be enforced at the team or project level.
-* :ref:`adding-new-strings` can now create plural strings in the user interface.
-* :ref:`labels` now include description to explain them.
-* New :ref:`subscriptions` for completed translation and component.
-* :ref:`mt-openai` now supports custom models and URLs and offers rephrasing of existing strings.
-* :ref:`mt-cyrtranslit` automatic suggestion service.
-
-.. rubric:: Improvements
-
-* :ref:`addon-weblate.properties.sort` can now do case-sensitive sorting.
-* The status widgets are now supported site-wide and language-wide, see :ref:`promotion`.
-* :ref:`reports` are now available for categories.
-* Highlight newlines in the editor.
-* :doc:`/formats/csv` better handle files with two fields only.
-* Browse mode can now be navigated using keyboard, see :ref:`keyboard`.
-* :http:get:`/api/components/(string:project)/(string:component)/credits/` and :http:get:`/api/projects/(string:project)/credits/` API endpoints for components and projects.
-* :ref:`glossary-terminology` entries in Glossary can now only be created by users with :guilabel:`Add glossary terminology` permission.
-* :ref:`check-python-brace-format` detects extra curly braces.
-* Screenshots now can be pasted from the clipboard in :ref:`screenshots`.
-
-.. rubric:: Bug fixes
-
-* Accessibility of keyboard navigation.
-* :ref:`git-exporter` now works with all Git based :ref:`vcs`.
-* :ref:`check-max-size` sometimes failed to render screenshot.
-
-.. rubric:: Compatibility
-
-* Weblate now uses mistletoe instead of misaka as a Markdown renderer.
-* :ref:`csp` is now stricter what might block third-party customizations.
-* Monolingual formats no longer copy comments from :ref:`component-template` when adding strings to translation.
-* Dropped support for Amagama in :ref:`machine-translation-setup` as the service is no longer maintained.
-* Default value for :setting:`SENTRY_SEND_PII` was changed.
-* Translation credit reports in the JSON format now follows a different format for entries.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There are several changes in :file:`settings_example.py`, most notable are the new settings for :ref:`2fa` and changes in ``INSTALLED_APPS``, ``SOCIAL_AUTH_PIPELINE`` and ``MIDDLEWARE``; please adjust your settings accordingly.
-* :setting:`ENABLE_HTTPS` is now required for WebAuthn support. If you cannot use HTTPS, please silence related check as described in :setting:`ENABLE_HTTPS` documentation.
-
-.. rubric:: Contributors
-
-.. include:: changes/contributors/5.7.rst
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/116?closed=1>`__.
-
-Weblate 5.6.2
--------------
-
-*Released on July 1st 2024.*
-
-.. rubric:: Bug fixes
-
-* Rendering of :ref:`labels` color selection widget.
-* Detection of pending outgoing commits.
-* :ref:`addons` button layout.
-* Crash when installing :ref:`addon-weblate.discovery.discovery` add-on.
-* Removal of source strings in :ref:`glossary`.
-* Validation of :ref:`projectbackup` ZIP file upon restoring (:cve:`2024-39303` / :ghsa:`jfgp-674x-6q4p`).
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/124?closed=1>`__.
-
-Weblate 5.6.1
--------------
-
-*Released on June 24th 2024.*
-
-.. rubric:: Improvements
-
-* Docker container accepts :envvar:`WEBLATE_REMOVE_ADDONS` and :envvar:`WEBLATE_ADD_MACHINERY` to customize automatic suggestion services and :envvar:`WEBLATE_CORS_ALLOW_ALL_ORIGINS` for CORS handling in API.
-* Added OpenMetrics compatibility for :http:get:`/api/metrics/`.
-
-.. rubric:: Bug fixes
-
-* Language aliases in :doc:`/admin/machine`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/123?closed=1>`__.
-
-Weblate 5.6
------------
-
-*Released on June 19th 2024.*
-
-.. rubric:: New features
-
-* :ref:`addons` activity log for tracking add-on activity.
-* Improved date range selection in :ref:`reports`.
-
-.. rubric:: Improvements
-
-* :ref:`subscriptions` now include strings which need updating.
-* Improved compatibility with password managers.
-* Improved tracking of uploaded changes.
-* Gracefully handle temporary machine translation errors in automatic suggestions.
-* :http:get:`/api/units/(int:id)/` now includes ``last_updated`` timestamp.
-* :http:get:`/api/changes/(int:id)/` now includes ``old`` and ``details``.
-* Reduced memory usage and increased performance of some views.
-
-.. rubric:: Bug fixes
-
-* Loading of strings with many glossary matches.
-* Fixed behavior of some site-wide :ref:`addons`.
-* Saving strings needing editing to :doc:`/formats/winrc`.
-* :ref:`check-xml-tags` better handle XML entities.
-* Automatic suggestions could mix up replacements between translated strings.
-
-.. rubric:: Compatibility
-
-* Compatibility with Django 5.1.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/114?closed=1>`__.
-
-Weblate 5.5.5
--------------
-
-*Released on May 13th 2024.*
-
-.. rubric:: Bug fixes
-
-* False-positive merge failure alert when using push branch.
-* Cleanup of stale repositories.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/121?closed=1>`__.
-
-Weblate 5.5.4
--------------
-
-*Released on May 10th 2024.*
-
-.. rubric:: Improvements
-
-* Visually highlight explanation in :ref:`glossary`.
-* Add :ref:`addons` history tab in management.
-* New :ref:`alerts` when :ref:`glossary` might not work as expected.
-* :doc:`/admin/announcements` can be posted on project/language scope.
-
-.. rubric:: Bug fixes
-
-* Improved handling placeables in :ref:`mt-openai`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/120?closed=1>`__.
-
-Weblate 5.5.3
--------------
-
-*Released on May 3rd 2024.*
-
-.. rubric:: Improvements
-
-* Improved performance of rendering large lists of objects.
-* Component management: added links to manage project/site-wide :ref:`addons`.
-
-.. rubric:: Bug fixes
-
-* Fixed crashes with librsvg older than 2.46.
-* Daily execution of some :ref:`addons`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/119?closed=1>`__.
-
-Weblate 5.5.2
--------------
-
-*Released on April 26th 2024.*
-
-.. rubric:: Bug fixes
-
-* Fixed publishing packages to PyPI.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/118?closed=1>`__.
-
-Weblate 5.5.1
--------------
-
-*Released on April 26th 2024.*
-
-.. rubric:: New features
-
-* :doc:`/user/search` supports ``source_changed:DATETIME``.
-* Added several new :ref:`component-language_code_style`.
-
-.. rubric:: Improvements
-
-* Display more details on source string change in history.
-* :ref:`mt-microsoft-translator` now supports using custom translators.
-* Improved error handling in :ref:`invite-user`.
-* Added PNG status badge.
-* Added list of managed projects to the dashboard view.
-* More detailed status of outgoing commits.
-* Reduced memory usage.
-
-.. rubric:: Bug fixes
-
-* Fixed skipped component update with some add-ons enabled.
-* Daily execution of project and site wide add-ons.
-* Allow editing strings when the source is marked for editing.
-* Updates of the last updated timestamp of a string.
-* Fixed project and site wide installation of :ref:`addon-weblate.git.squash` and :ref:`addon-weblate.discovery.discovery` add-ons.
-* Graceful handling of locking errors in the :ref:`api`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There is a change in ``REST_FRAMEWORK`` setting (newly added ``EXCEPTION_HANDLER``).
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/117?closed=1>`__.
-
-Weblate 5.5
------------
-
-*Released on April 20th 2024.*
-
-.. rubric:: New features
-
-* :ref:`addons` can be now installed project-wide and site-wide.
-
-* API improvements.
-
-  * Added :http:get:`/api/categories/(int:id)/statistics/`.
-  * Added :http:get:`/api/projects/(string:project)/file/`.
-  * Added :http:post:`/api/groups/(int:id)/admins/`.
-  * Added :http:delete:`/api/groups/(int:id)/admins/(int:user_id)`.
-  * Improved :http:post:`/api/translations/(string:project)/(string:component)/(string:language)/units/`.
-
-* Added :ref:`mt-systran` automatic translation support.
-
-.. rubric:: Improvements
-
-* Docker container now validates user password strength by default, see :envvar:`WEBLATE_MIN_PASSWORD_SCORE`.
-* Improved error reporting in :ref:`machine-translation-setup`.
-* :ref:`check-max-size` better displays rendered text.
-* Admins can now specify username and full name when :ref:`invite-user`.
-* Added :ref:`check-end-interrobang`.
-* :ref:`alerts` are now refreshed when needed, not just daily.
-* :doc:`/devel/reporting` uses specific word count for CJK languages.
-* Team membership changes are now tracked in :ref:`audit-log`.
-
-.. rubric:: Bug fixes
-
-* :ref:`check-check-glossary` works better for languages not using whitespace.
-* :ref:`alerts` better handle non-latin source languages.
-* :ref:`check-max-size` sometimes ignored ``font-spacing:SPACING`` flag.
-* Fixed per-language statistics on nested categories.
-* Fixed categories listing on per-language pages.
-* Fixed :guilabel:`Needs editing` state calculation.
-* Fixed changing :ref:`component-push` with :ref:`vcs-gerrit`.
-* Fixed using categorized components in :ref:`manage`, :ref:`memory` or :ref:`auto-translation`.
-
-.. rubric:: Compatibility
-
-* Several API calls might be affected by stricter validation of boolean fields by Django REST Framework. For example :http:post:`/api/projects/(string:project)/components/`.
-* Uniqueness of name and slug of a component is now enforced at the database level on PostgreSQL 15+.
-* Docker image now ships Python packages in :file:`/app/venv` and installs using :program:`uv`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There are several changes in :file:`settings_example.py`, most notable is changes in ``INSTALLED_APPS`` and ``LOGOUT_REDIRECT_URL``, please adjust your settings accordingly.
-* Weblate now requires Python 3.10 and Django 5.0.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/111?closed=1>`__.
-
-Weblate 5.4.3
--------------
-
-*Released on March 26th 2024.*
-
-.. rubric:: Bug fixes
-
-* Superuser access to components with :ref:`component-restricted`.
-* Adjusted default :setting:`LOGIN_REQUIRED_URLS_EXCEPTIONS` to not block :ref:`manage-appearance`.
-* Avoid crash on pushing changes to diverged repository.
-* Avoid crash when installing :ref:`addon-weblate.generate.pseudolocale`.
-* :ref:`azure-setup` gracefully handles repositories with spaces in URL.
-* :ref:`mt-deepl` gracefully handles glossaries for language variants.
-* :doc:`/formats/excel` better handles blank cells.
-* Fixed possible data loss when merging gettext PO file changes in Git.
-* Repository operations on project could have skipped some components.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/115?closed=1>`__.
-
-Weblate 5.4.2
--------------
-
-*Released on February 22nd 2024.*
-
-.. rubric:: Bug fixes
-
-* Displaying debugging page in case of database connection issues.
-* Gracefully handle migration with duplicate built-in teams.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/113?closed=1>`__.
-
-Weblate 5.4.1
--------------
-
-*Released on February 19th 2024.*
-
-.. rubric:: Bug fixes
-
-* Possible crash on Weblate upgrade check when cached from the previous versions.
-* Gracefully handle migration with duplicate built-in teams.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/112?closed=1>`__.
-
-Weblate 5.4
------------
-
-*Released on February 15th 2024.*
-
-.. rubric:: New features
-
-* :ref:`check-perl-brace-format` quality check.
-* :doc:`/formats/moko-resources`.
-* :doc:`/formats/formatjs`.
-* Search input is now syntax highlighted, see :doc:`/user/search`.
-* Weblate is now available in Tamil.
-
-.. rubric:: Improvements
-
-* Better logging in :wladmin:`createadmin`.
-* :ref:`addon-weblate.discovery.discovery` now reports skipped entries.
-* Adding string in a repository triggers :ref:`subscriptions`.
-* :ref:`mt-openai` better handles batch translations and glossaries.
-* :ref:`mt-libretranslate` better handles batch translations.
-* Text variant of notification e-mails now properly indicate changed strings.
-* File downloads now honor :http:header:`If-Modified-Since`.
-* :ref:`num-words` support for CJK languages.
-* :ref:`addon-weblate.discovery.discovery` now preserves :ref:`componentlists`.
-* Nicer formatting of :ref:`glossary` tooltips.
-* :http:get:`/api/components/(string:project)/(string:component)/` now includes information about linked component.
-* Improved :ref:`workflow-customization` configuration forms.
-
-.. rubric:: Bug fixes
-
-* Plural forms handling in :doc:`/formats/qt`.
-* Added missing documentation for :setting:`ADMINS_CONTACT`.
-* Automatic fixer for :ref:`autofix-punctuation-spacing` no longer adds new whitespace.
-* Pending changes committing could be omitted under some circumstances.
-* :ref:`addon-weblate.cleanup.blank` now correctly removes blank plurals.
-
-.. rubric:: Compatibility
-
-* Last changed timestamp now reflects changes outside Weblate as well. This affects both :ref:`api` and the user interface.
-* Releases are signed by Sigstore instead of PGP, see :ref:`verify`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/109?closed=1>`__.
-
-Weblate 5.3.1
--------------
-
-*Released on December 19th 2023.*
-
-.. rubric:: Bug fixes
-
-* Not updating statistics in some situations.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/110?closed=1>`__.
-
-Weblate 5.3
------------
-
-*Released on December 14th 2023.*
-
-.. rubric:: New features
-
-* :ref:`mt-openai` automatic suggestion service.
-* :ref:`mt-alibaba` automatic suggestion service.
-* Added labels API, see :http:get:`/api/projects/(string:project)/labels/`.
-* :ref:`glossary-mt`.
-* New automatic fixer for :ref:`autofix-punctuation-spacing`.
-* :ref:`mt-google-translate-api-v3` now better honors placeables or line breaks.
-
-.. rubric:: Improvements
-
-* Reduced memory usage for statistics.
-* :ref:`mt-deepl` performs better in :ref:`auto-translation` and supports :ref:`glossary-mt`.
-* :ref:`mt-microsoft-translator` supports :ref:`glossary-mt`.
-* Improved region selection in :ref:`mt-google-translate-api-v3`.
-* Added nested JSON exporter in :ref:`download`.
-* Improved :ref:`git-exporter` performance on huge repositories.
-
-.. rubric:: Bug fixes
-
-* Removing stale VCS directories.
-
-.. rubric:: Compatibility
-
-* Dropped Microsoft Terminology service for automatic suggestions, as it is no longer provided by Microsoft.
-* ``labels`` in units API now expose full label info, see :http:get:`/api/units/(int:id)/`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/107?closed=1>`__.
-
-Weblate 5.2.1
--------------
-
-*Released on November 22nd 2023.*
-
-.. rubric:: Improvements
-
-* Show search field after no strings found while translating.
-* Added soft hyphen to special-characters toolbar.
-
-.. rubric:: Bug fixes
-
-* Database backups compatibility with Alibaba Cloud Database PolarDB.
-* Crash on loading statistics calculated by previous versions.
-* Sort icons in dark mode.
-* Project level statistics no longer count categorized components twice.
-* Possible discarding pending translations after editing source strings.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/108?closed=1>`__.
-
-Weblate 5.2
------------
-
-*Released on November 16th 2023.*
-
-.. rubric:: New features
-
-* :ref:`vcs-azure-devops`.
-
-.. rubric:: Improvements
-
-* Faster statistics updates.
-* Better e-mail selection in user profile.
-* :ref:`autofix` are now applied to suggestions as well.
-* :ref:`mt-deepl` can now configure default formality for translations.
-* Use neutral colors for progress bars and translation unit states.
-* :ref:`addon-weblate.gettext.mo` can optionally include strings needing editing.
-* Use :http:header:`Accept-Language` to order translations for unauthenticated users.
-* Add option to directly approve suggestions with :ref:`reviews` workflow.
-* One-click removal of project or component :ref:`subscriptions`.
-* :ref:`api-statistics` now includes character and word counts for more string states.
-
-.. rubric:: Bug fixes
-
-* Fixed creating component within a category by upload.
-* Error handling in organizing components and categories.
-* Fixed moving categories between projects.
-* Fixed formatting of translation memory search results.
-* Allow non-breaking space character in :ref:`autofix-html`.
-
-.. rubric:: Compatibility
-
-* :doc:`/formats/apple` exporter now produces UTF-8 encoded files.
-* Python 3.12 is now supported, though not recommended, see :ref:`python-deps`.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/104?closed=1>`__.
-
-Weblate 5.1.1
--------------
-
-*Released on October 25th 2023.*
-
-.. rubric:: Improvements
-
-* :ref:`addon-weblate.consistency.languages` now uses a dedicated user for changes.
-* Added button for sharing on Fediverse.
-* Added validation for VCS integration credentials.
-* Reduced overhead of statistics collection.
-
-.. rubric:: Bug fixes
-
-* Added plurals validation when editing string using the API.
-* Replacing a file using upload when existing is corrupted.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/106?closed=1>`__.
-
-Weblate 5.1
------------
-
-*Released on October 16th 2023.*
-
-.. rubric:: New features
-
-* :ref:`mt-yandex-v2` machine translation service.
-* :ref:`addon-weblate.autotranslate.autotranslate` and :ref:`auto-translation` are now stored with a dedicated user as an author.
-* :ref:`addons` changes to strings are now stored with a dedicated user as an author.
-* :ref:`download-multi` can now convert file formats.
-* :ref:`workflow-customization` allows to fine-tune localization workflow per language.
-
-.. rubric:: Improvements
-
-* :ref:`project-translation_review` also shows the approval percentage in object listings.
-* Project is added to watched upon accepting an invitation.
-* Configure VCS API credentials as a Python dict from environment variables.
-* Improved accuracy of checks on plural messages.
-* Engage page better shows stats.
-* Strings which can not be saved to a file no longer block other strings to be written.
-* Fixed some API URLs for categorized components.
-* Show plural form examples more prominently.
-* Highlight whitespace in :ref:`machine-translation`.
-* Faster comment and component removal.
-* Show disabled save button reason more prominently.
-* New string notification can now be triggered for each string.
-
-.. rubric:: Bug fixes
-
-* Improved OCR error handling in :ref:`screenshots`.
-* :ref:`autofix` gracefully handle strings from :ref:`multivalue-csv`.
-* Occasional crash in :ref:`machine-translation` caching.
-* Fixed history listing for entries within a :ref:`category`.
-* Fixed editing :guilabel:`Administration` team.
-* :ref:`addon-weblate.consistency.languages` add-on could miss some languages.
-
-.. rubric:: Compatibility
-
-* Categories are now included ``weblate://`` repository URLs.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* Upgrades from older version than 5.0.2 are not supported, please upgrade to 5.0.2 first and then continue in upgrading.
-* Dropped support for deprecated insecure configuration of VCS service API keys via _TOKEN/_USERNAME in :file:`settings.py`.
-* Weblate now defaults to persistent database connections in :file:`settings_example.py` and Docker.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/100?closed=1>`__.
-
-Weblate 5.0.2
--------------
-
-*Released on September 14th 2023.*
-
-.. rubric:: Improvements
-
-* Translate page performance.
-* Search now looks for categories as well.
-
-.. rubric:: Bug fixes
-
-* Rendering of release notes on GitHub.
-* Listing of categorized projects.
-* Translating a language inside a category.
-* Categories sorting.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* The database upgrade can take considerable time on larger sites due to indexing changes.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/105?closed=1>`__.
-
-Weblate 5.0.1
--------------
-
-*Released on September 10th 2023.*
-
-.. rubric:: New features
-
-* Added :http:get:`/api/component-lists/(str:slug)/components/`.
-
-.. rubric:: Improvements
-
-* Related glossary terms lookup is now faster.
-* Logging of failures when creating pull requests.
-* History is now loaded faster.
-* Added object ``id`` to all :ref:`api` endpoints.
-* Better performance of projects with a lot of components.
-* Added compatibility redirects for some old URLs.
-
-.. rubric:: Bug fixes
-
-* Creating component within a category.
-* Source strings and state display for converted formats.
-* Block :ref:`component-edit_template` on formats which do not support it.
-* :ref:`check-reused` is no longer triggered for blank strings.
-* Performance issues while browsing some categories.
-* Fixed GitHub Team and Organization authentication in Docker container.
-* GitLab merge requests when using a customized SSH port.
-
-.. rubric:: Compatibility
-
-* `pyahocorasick` dependency has been replaced by `ahocorasick_rs`.
-* The default value of :setting:`IP_PROXY_OFFSET` has been changed from 1 to -1.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* The database upgrade can take considerable time on larger sites due to indexing changes.
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/103?closed=1>`__.
-
-Weblate 5.0
------------
-
-*Released on August 24th 2023.*
-
-.. rubric:: New features
-
-* :doc:`/formats/markdown` support, thanks to Anders Kaplan.
-* :ref:`category` can now organize components within a project.
-* :doc:`/formats/fluent` now has better syntax checks thanks to Henry Wilkes.
-* Inviting users now works with all authentication methods.
-* Docker container supports file backed secrets, see :ref:`docker-secrets`.
-
-.. rubric:: Improvements
-
-* Plurals handling in machine translation.
-* :ref:`check-same` check now honors placeholders even in the strict mode.
-* :ref:`check-reused` is no longer triggered for languages with a single plural form.
-* WebP is now supported for :ref:`screenshots`.
-* Avoid duplicate notification when a user is subscribed to overlapping scopes.
-* OCR support for non-English languages in :ref:`screenshots`.
-* :ref:`xliff` now supports displaying source string location.
-* Rendering strings with plurals, placeholders or alternative translations.
-* User API now includes last sign in date.
-* User API token is now hidden for privacy reasons by default.
-* Faster adding terms to glossary.
-* Better preserve translation on source file change in :doc:`/formats/html` and :doc:`/formats/txt`.
-* Added indication of automatic assignment to team listing.
-* Users now have to confirm invitations to become team members.
-* :ref:`check-formats` can now check all plural forms with the ``strict-format`` flag.
-* :doc:`/user/checks` browsing experience.
-* Highlight differences in the source string in automatic suggestions.
-* Visual diff now better understands compositing characters.
-
-.. rubric:: Bug fixes
-
-* User names handling while committing to Git.
-* :ref:`addon-weblate.cleanup.blank` and :ref:`addon-weblate.cleanup.generic` now remove all strings at once.
-* Language filtering in :doc:`/devel/reporting`.
-* Reduced false positives of :ref:`check-reused` when fixing the translation.
-* Fixed caching issues after updating screenshots from the repository.
-
-.. rubric:: Compatibility
-
-* Python 3.9 or newer is now required.
-* Several UI URLs have been changed to be able to handle categories.
-
-.. rubric:: Upgrading
-
-Please follow :ref:`generic-upgrade-instructions` in order to perform update.
-
-* There are several changes in :file:`settings_example.py`, most notable is changes in ``CACHES`` and ``SOCIAL_AUTH_PIPELINE``, please adjust your settings accordingly.
-* Several previously optional dependencies are now required.
-* The database upgrade can take considerable time on larger sites due to structure changes.
-
-
-`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/99?closed=1>`__.
+`All changes in detail <https://github.com/WeblateOrg/weblate/milestone/162?closed=1>`__.

@@ -14,37 +14,50 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
+from __future__ import annotations
+
 import os
 import sys
+from importlib import resources
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import sphinx.builders.gettext
+import weblate_fonts
 from matplotlib import font_manager
 from sphinx.util.tags import Tags
+
+if TYPE_CHECKING:
+    from sphinx.application import Sphinx
 
 # -- Path setup --------------------------------------------------------------
 
 file_dir = Path(__file__).parent.resolve()
 font_locations = (
-    "weblate/static/js/vendor/fonts/font-source/",
-    "weblate/static/vendor/font-kurinto/",
+    "static/weblate_fonts/source-sans/ttf",
+    "static/weblate_fonts/source-code/ttf",
+    "static/weblate_fonts/kurinto/ttf",
 )
 
 weblate_dir = file_dir.parent
 # Our extension
 sys.path.append(str(file_dir / "_ext"))
+
+# The documentation extension directory must be on sys.path before importing.
+from intersphinx_cache import cached_mapping, normalize_language  # ruff: ignore[module-import-not-at-top-of-file]
+
 # Weblate code
 sys.path.append(str(weblate_dir))
 
 
 class WeblateTags(Tags):
-    def eval_condition(self, condition):
+    def eval_condition(self, condition: str) -> bool:
         # Exclude blocks marked as not gettext
         return condition != "not gettext"
 
 
-def setup(app) -> None:
-    # Monkey path gettext build tags handling, this is workaround until
+def setup(app: Sphinx) -> None:
+    # Monkey patch gettext build tags handling, this is workaround until
     # https://github.com/sphinx-doc/sphinx/issues/13307 is addressed.
     sphinx.builders.gettext.I18nTags = WeblateTags
     # Used in Sphinx docs, needed for intersphinx links to it
@@ -57,8 +70,10 @@ def setup(app) -> None:
 
     font_dirs: list[str] = []
 
+    package_dir = resources.files(weblate_fonts)
+
     for font_location in font_locations:
-        font_dir = weblate_dir / font_location
+        font_dir = package_dir / font_location
         if not font_dir.is_dir():
             msg = f"Font directory not found: {font_dir}"
             raise NotADirectoryError(msg)
@@ -77,7 +92,7 @@ project_copyright = "Michal Čihař"
 author = "Michal Čihař"
 
 # The full version, including alpha/beta/rc tags
-release = "5.13.1"
+release = "2026.11.2"
 
 # -- General configuration ---------------------------------------------------
 
@@ -86,14 +101,17 @@ release = "5.13.1"
 # ones.
 extensions = [
     "djangodocs",
+    "rubric_permalinks",
     "sphinxcontrib.httpdomain",
     "sphinx.ext.autodoc",
+    "autodoc_signature_filter",
     "sphinx.ext.graphviz",
     "sphinx.ext.intersphinx",
     "sphinx-jsonschema",
     "sphinx_copybutton",
     "sphinxext.opengraph",
     "sphinx_reredirects",
+    "sphinx_llm.txt",
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -107,6 +125,11 @@ exclude_patterns = [
     "Thumbs.db",
     ".DS_Store",
     "devel/reporting-example.rst",
+    # exclude snippets from being treated as standalone documents
+    # as they are already included in the real pages
+    # this prevents some labels defined in snippets from being marked as duplicate
+    "snippets/*",
+    "snippets/**/*",
 ]
 
 ogp_social_cards = {
@@ -138,6 +161,14 @@ html_theme = "furo"
 
 # Define the canonical URL if you are using a custom domain on Read the Docs
 html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")
+markdown_http_base = html_baseurl.rstrip("/")
+llms_txt_suffix_mode = "replace"
+llms_txt_suppress_unknown_node_warnings = [
+    "graphviz",
+    "admonition",
+    "caption",
+    "abbreviation",
+]
 
 # Tell Jinja2 templates the build is running on Read the Docs
 if os.environ.get("READTHEDOCS", "") == "True":
@@ -148,7 +179,7 @@ if os.environ.get("READTHEDOCS", "") == "True":
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ["../weblate/static/"]
+html_static_path = ["../weblate/static/", "_ext/static"]
 
 html_logo = "images/logo-text.svg"
 
@@ -161,20 +192,20 @@ html_theme_options = {
     "dark_css_variables": {
         "font-stack": '"Source Sans 3", sans-serif',
         "font-stack--monospace": '"Source Code Pro", monospace',
-        "color-brand-primary": "#1fa385",
-        "color-brand-content": "#1fa385",
+        "color-brand-primary": "#107a62",
+        "color-brand-content": "#107a62",
     },
     "light_css_variables": {
         "font-stack": '"Source Sans 3", sans-serif',
         "font-stack--monospace": '"Source Code Pro", monospace',
-        "color-brand-primary": "#1fa385",
-        "color-brand-content": "#1fa385",
+        "color-brand-primary": "#107a62",
+        "color-brand-content": "#107a62",
     },
 }
 
 html_css_files = [
-    "https://weblate.org/static/vendor/font-source/source-sans-3.css",
-    "https://weblate.org/static/vendor/font-source/source-code-pro.css",
+    "https://weblate.org/static/weblate_fonts/source-sans-3.css",
+    "https://weblate.org/static/weblate_fonts/source-code-pro.css",
 ]
 
 # -- Options for HTMLHelp output ---------------------------------------------
@@ -266,82 +297,15 @@ graphviz_output_format = "svg"
 
 # Use localized Python docs on Read the Docs build
 language = os.environ.get("READTHEDOCS_LANGUAGE", "en")
-# RTD uses no but the correct code is nb
-if language == "no":
-    language = "nb"
-if "-" in language:
-    # RTD normalized their language codes to ll-cc (e.g. zh-cn),
-    # but Sphinx did not and still uses ll_CC (e.g. zh_CN).
-    # `language` is the Sphinx configuration so it needs to be converted back.
-    (lang_name, lang_country) = language.split("-")
-    language = lang_name + "_" + lang_country.upper()
-
-python_doc_url = "https://docs.python.org/3/"
-if language == "pt_BR":
-    python_doc_url = "https://docs.python.org/pt-br/3/"
-elif language in {"es", "fr", "ja", "ko", "tr"}:
-    python_doc_url = f"https://docs.python.org/{language}/3/"
-elif language == "zh_CN":
-    python_doc_url = "https://docs.python.org/zh-cn/3/"
-elif language == "zh_TW":
-    python_doc_url = "https://docs.python.org/zh-tw/3/"
-
-django_doc_url = "https://docs.djangoproject.com/en/stable/"
-if language in {"el", "es", "fr", "id", "ja", "ko", "pl"}:
-    django_doc_url = f"https://docs.djangoproject.com/{language}/stable/"
-elif language == "pt_BR":
-    django_doc_url = "https://docs.djangoproject.com/pt-br/stable/"
-elif language == "zh_CN":
-    django_doc_url = "https://docs.djangoproject.com/zh-hans/stable/"
-
-sphinx_doc_url = "https://www.sphinx-doc.org/en/master/"
-if language in {
-    "ar",
-    "ca",
-    "de",
-    "ru",
-    "es",
-    "fr",
-    "it",
-    "ja",
-    "ko",
-    "pl",
-    "pt_BR",
-    "sr",
-    "zh_CN",
-}:
-    sphinx_doc_url = f"https://www.sphinx-doc.org/{language}/master/"
-elif language in {"zh_TW", "ta"}:
-    sphinx_doc_url = f"https://www.sphinx-doc.org/{language}/latest/"
+language = normalize_language(language)
 
 if language != "en":
-    tags.add("i18n")  # noqa: F821
+    # ruff: ignore[undefined-name]
+    tags.add("i18n")
 
 
 # Configuration for intersphinx
-intersphinx_mapping = {
-    "python": (python_doc_url, None),
-    "django": (django_doc_url, f"{django_doc_url}_objects/"),
-    "psa": ("https://python-social-auth.readthedocs.io/en/latest/", None),
-    "tt": (
-        "https://docs.translatehouse.org/projects/translate-toolkit/en/latest/",
-        None,
-    ),
-    "amagama": ("https://docs.translatehouse.org/projects/amagama/en/latest/", None),
-    "virtaal": ("https://docs.translatehouse.org/projects/virtaal/en/latest/", None),
-    "ldap": ("https://django-auth-ldap.readthedocs.io/en/latest/", None),
-    "celery": ("https://docs.celeryq.dev/en/stable/", None),
-    "sphinx": (sphinx_doc_url, None),
-    "rtd": ("https://docs.readthedocs.io/en/latest/", None),
-    "venv": ("https://virtualenv.pypa.io/en/stable/", None),
-    "borg": ("https://borgbackup.readthedocs.io/en/stable/", None),
-    "pip": ("https://pip.pypa.io/en/stable/", None),
-    "compressor": ("https://django-compressor.readthedocs.io/en/stable/", None),
-    "drf-standardized-error": (
-        "https://drf-standardized-errors.readthedocs.io/en/latest/",
-        None,
-    ),
-}
+intersphinx_mapping = cached_mapping(language)
 intersphinx_disabled_reftypes = ["*"]
 
 # Ignore missing targets for the http:obj <type>, it's how we declare the types
@@ -355,15 +319,36 @@ nitpick_ignore = [
     ("http:obj", "string"),
     ("http:obj", "timestamp"),
     ("http:obj", "file"),
+    # Django forms are mocked when documenting add-on hooks.
+    ("py:class", "Form"),
+    # Autodoc renders these type annotations from wlc signatures, but their
+    # reference targets are not available in the configured inventories.
+    ("py:class", "HttpRequest"),
+    ("py:class", "Path"),
+    ("py:class", "JSONValue"),
+    ("py:class", "RequestParams"),
+    ("py:class", "QueryValue"),
+    ("py:class", "pathlib.Path"),
+    ("py:class", "builtins.list"),
+    ("py:class", "collections.abc.Iterable"),
+    ("py:class", "collections.abc.Iterator"),
+    ("py:class", "collections.abc.Mapping"),
+    ("py:class", "requests.models.Response"),
+    ("py:class", "wlc.base.LazyObject"),
 ]
 
 # Number of retries and timeout for linkcheck
 linkcheck_retries = 10
 linkcheck_timeout = 10
+linkcheck_anchors_ignore_for_url = [
+    # JavaScript robot checks prevent verifying article anchors
+    r"https://eur-lex\.europa\.eu/",
+]
 linkcheck_ignore = [
     # Local URL to Weblate
     "http://127.0.0.1:8080/",
     "http://127.0.0.1:1080/",
+    "http://localhost:11434",
     # Requires a valid token
     "https://api.deepl.com/v2/translate",
     # Requires authentication
@@ -376,23 +361,40 @@ linkcheck_ignore = [
     "https://my-instance.openai.azure.com",
     # These are PDF and fails with Unicode decode error
     "http://ftp.pwg.org/",
-    # Access to our service has been temporarily blocked
-    "https://yandex.com/dev/translate/",
+    # Times out in CI
+    "https://ai.youdao.com/product-fanyi-text.s",
+    "https://help.gitee.com/webhook",
     # 403
     "https://openai.com/",
     "https://platform.openai.com/api-keys",
     "https://platform.openai.com/docs/models",
     "https://translate.systran.net/en/account",
+    "https://api.sap.com/api/translationhub/overview",
+    r"https://www\.enisa\.europa\.eu/topics/product-security/single-reporting-platform-srp/cra-srp-glossary$",
+    # Anchor is not there for linkcheck
+    "https://hub.docker.com/_/postgres#pgdata",
+    "https://github.com/SAML-Toolkits/python3-saml#settings",
+    # Protected by Anubis
+    "https://anubis.techaro.lol/",
     # Seems unstable
     "https://pagure.io/",
+    "https://cgit.git.savannah.gnu.org/cgit/gettext.git/",
     "https://azure.microsoft.com/en-us/products/ai-services/ai-translator",
     "https://wiki.gnupg.org/",
-    "https://www.bis.doc.gov/",
+    "https://www.bis.gov/",
+    "https://www.libravatar.org/",
+    "https://glosbe.com/",
+    "https://www.gwtproject.org/",
     # These seems to block bots/GitHub
     "https://docs.github.com/",
     "https://translate.yandex.com/",
     "https://www.gnu.org/",
-    "https://dev.mysql.com/",
+    "https://www.contributor-covenant.org/",
+    "https://mymemory.translated.net/",
+    "https://docs.oasis-open.org/",
+    "https://digital-strategy.ec.europa.eu/",
+    # Responds with HTTP 418 I'm a teapot
+    "https://www.freedesktop.org/",
 ]
 
 # HTTP docs
@@ -404,7 +406,7 @@ autodoc_mock_imports = [
     "django",
     "unidecode",
     "nh3",
-    "html2text",
+    "turbohtml",
     "weblate_language_data",
     "celery",
     "sentry_sdk",
@@ -441,12 +443,14 @@ autodoc_mock_imports = [
     "rest_framework",
 ]
 
-# Create single gettext PO file for while documentation,
+# Create single gettext PO file for whole documentation,
 # instead of having one file per chapter.
 gettext_compact = "docs"
 
 redirects = {
-    "devel/thirdparty": "third-party.html",  # codespell:ignore thirdparty
+    "devel/third-party": "libraries.html",
+    "devel/thirdparty": "libraries.html",  # codespell:ignore thirdparty
     "contributing/security": "security/index.html",
     "formats/moko": "formats/moko-resources.html",
+    "legal": "security/index.html",
 }

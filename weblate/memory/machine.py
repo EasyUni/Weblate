@@ -1,11 +1,26 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from django.urls import reverse
 
-from weblate.machinery.base import DownloadTranslations, InternalMachineTranslation
-from weblate.memory.models import Memory
+from weblate.machinery.base import (
+    MACHINERY_DEFAULT_THRESHOLD,
+    InternalMachineTranslation,
+)
+from weblate.memory.models import (
+    MEMORY_LOOKUP_LIMIT,
+    Memory,
+)
+
+if TYPE_CHECKING:
+    from django.db.models import Q
+
+    from weblate.machinery.base import DownloadTranslations
+    from weblate.machinery.types import SettingsDict, TranslationResultDict
 
 PENDING_MEMORY_PENALTY_FACTOR = 0.7
 DIFFERENT_CONTEXT_PENALTY_FACTOR = 0.95
@@ -18,6 +33,43 @@ class WeblateMemory(InternalMachineTranslation):
     rank_boost = 2
     same_languages = True
 
+    def __init__(
+        self,
+        configuration: SettingsDict,
+        *,
+        additional_component_access: Q | None = None,
+    ) -> None:
+        super().__init__(configuration)
+        self.additional_component_access = additional_component_access
+
+    def get_quality(self, text: str, result: Memory, unit) -> int:
+        quality = self.comparer.similarity(text, result.source)
+        if result.status == Memory.STATUS_PENDING:
+            quality = round(quality * PENDING_MEMORY_PENALTY_FACTOR)
+        # Compare context when translation memory has one
+        if result.context and unit.context != result.context:
+            quality = round(quality * DIFFERENT_CONTEXT_PENALTY_FACTOR)
+        return quality
+
+    def format_result(
+        self, result: Memory, quality: int, project, user
+    ) -> TranslationResultDict:
+        scopes = result.get_scope_list()
+        return {
+            "text": result.target,
+            "quality": quality,
+            "service": self.name,
+            "context": result.context
+            if result.is_context_visible(scopes, project=project, user=user)
+            else "",
+            "origin": result.get_origin_display(project=project, user=user),
+            "source": result.source,
+            "show_quality": True,
+            "delete_url": reverse("api:memory-detail", kwargs={"pk": result.id})
+            if user is not None and user.has_perm("memory.delete", result)
+            else None,
+        }
+
     def download_translations(
         self,
         source_language,
@@ -25,35 +77,30 @@ class WeblateMemory(InternalMachineTranslation):
         text: str,
         unit,
         user,
-        threshold: int = 75,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
-        for result in Memory.objects.lookup(
+        project = unit.translation.component.project
+        queryset = Memory.objects.get_lookup_queryset(
             source_language,
             target_language,
-            text,
             user,
-            unit.translation.component.project,
-            unit.translation.component.project.use_shared_tm,
-            threshold=threshold,
-        ):
-            quality = self.comparer.similarity(text, result.source)
-            if result.status == Memory.STATUS_PENDING:
-                quality = round(quality * PENDING_MEMORY_PENALTY_FACTOR)
+            project,
+            project.use_shared_tm,
+            additional_component_access=self.additional_component_access,
+        )
+        if threshold >= self.max_score:
+            scored_results = []
+            for result in queryset.filter(source=text)[:MEMORY_LOOKUP_LIMIT]:
+                quality = self.get_quality(text, result, unit)
+                if quality >= threshold:
+                    scored_results.append((quality, result))
+        else:
+            scored_results = queryset.get_scored_fuzzy_candidates(
+                text,
+                lambda result: self.get_quality(text, result, unit),
+                threshold=threshold,
+            )
 
-            if unit.context != result.context:
-                quality = round(quality * DIFFERENT_CONTEXT_PENALTY_FACTOR)
-
-            if quality < threshold:
-                continue
-            yield {
-                "text": result.target,
-                "quality": quality,
-                "service": self.name,
-                "origin": result.get_origin_display(),
-                "source": result.source,
-                "show_quality": True,
-                "delete_url": reverse("api:memory-detail", kwargs={"pk": result.id})
-                if user is not None and user.has_perm("memory.delete", result)
-                else None,
-            }
+        for quality, result in scored_results:
+            yield self.format_result(result, quality, project, user)

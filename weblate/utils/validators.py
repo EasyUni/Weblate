@@ -9,23 +9,57 @@ import binascii
 import os
 import re
 import sys
+from dataclasses import dataclass
 from email.errors import HeaderDefect
 from email.headerregistry import Address
 from gettext import c2py  # type: ignore[attr-defined]
 from io import BytesIO
+from itertools import chain
 from pathlib import Path
-from typing import cast
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import ParseResult, unquote, urlparse
 
+import regex
+from confusable_homoglyphs import confusables
 from disposable_email_domains import blocklist
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import EmailValidator as EmailValidatorDjango
-from django.core.validators import URLValidator, validate_ipv46_address
+from django.core.validators import (
+    URLValidator,
+    validate_domain_name,
+    validate_ipv46_address,
+)
+from django.db.models.fields.files import FieldFile
+from django.http.request import validate_host
+from django.utils.deconstruct import deconstructible
 from django.utils.translation import gettext, gettext_lazy
+from PIL import Image
 
 from weblate.trans.util import cleanup_path
+from weblate.utils.const import WEBHOOKS_SECRET_PREFIX
 from weblate.utils.data import data_dir
+from weblate.utils.errors import report_error
+from weblate.utils.files import (
+    is_managed_vcs_metadata_path,
+    is_unsafe_path,
+    read_file_bytes,
+)
+from weblate.utils.outbound import (
+    get_environment_proxy,
+    is_allowlisted_hostname,
+    resolve_runtime_hostname,
+    validate_outbound_hostname,
+    validate_outbound_url,
+    validate_runtime_url,
+)
+from weblate.utils.regex import REGEX_TIMEOUT, compile_regex
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from django.core.files.base import File
+    from django.core.files.base import File as DjangoFile
 
 USERNAME_MATCHER = re.compile(r"^[\w@+-][\w.@+-]*$")
 
@@ -34,8 +68,18 @@ EMAIL_BLACKLIST = re.compile(r"^([./|]|.*([@%!`#&?]|/\.\./))")
 
 # Matches Git condition on "name consists only of disallowed characters"
 CRUD_RE = re.compile(r"^[.,;:<>\"'\\]+$")
+# Block certain characters from full name
+FULL_NAME_RESTRICT = re.compile(r'[<>"]')
+PLURAL_FORMULA_NUMBER_RE = re.compile(r"\d+")
+
+# Repository URLs are persisted in configuration files by VCS backends. Keep
+# this in sync with the unsafe characters rejected by GitPython's config
+# writer. In particular, urllib silently removes CR and LF while parsing,
+# which would otherwise validate a different value than the one persisted.
+UNSAFE_REPOSITORY_URL_CHARS_RE = re.compile(r"[\r\n\x00]")
 
 ALLOWED_IMAGES = {"image/jpeg", "image/png", "image/apng", "image/gif", "image/webp"}
+PIL_FORMATS = ["png", "jpeg", "webp", "gif"]
 
 # File formats we do not accept on translation/glossary upload
 FORBIDDEN_EXTENSIONS = {
@@ -55,14 +99,53 @@ FORBIDDEN_EXTENSIONS = {
 }
 
 
-def validate_re(value, groups=None, allow_empty=True) -> None:
+def iter_plural_formula_examples() -> Iterator[int]:
+    return chain(range(10000), range(10000, 2000001, 1000))
+
+
+def iter_plural_formula_validation_numbers(value: str | None) -> Iterator[int]:
+    seen: set[int] = set()
+
+    for number in iter_plural_formula_examples():
+        seen.add(number)
+        yield number
+
+    if value is None:
+        return
+
+    for match in PLURAL_FORMULA_NUMBER_RE.finditer(value):
+        try:
+            number = int(match[0])
+        except ValueError:
+            continue
+        for candidate in (number - 1, number, number + 1):
+            if candidate >= 0 and candidate not in seen:
+                seen.add(candidate)
+                yield candidate
+
+
+def validate_re(
+    value: str,
+    groups: list[str] | tuple[str, ...] | None = None,
+    *,
+    allow_empty: bool = True,
+) -> None:
     try:
-        compiled = re.compile(value)
-    except re.error as error:
+        compiled = compile_regex(value)
+    except regex.error as error:
         raise ValidationError(
             gettext("Compilation failed: {0}").format(error)
         ) from error
-    if not allow_empty and compiled.match(""):
+    try:
+        matches_empty = compiled.match("", timeout=REGEX_TIMEOUT)
+    except TimeoutError as error:
+        report_error("Regular expression validation timed out")
+        raise ValidationError(
+            gettext(
+                "The regular expression is too complex and took too long to evaluate."
+            )
+        ) from error
+    if not allow_empty and matches_empty:
         raise ValidationError(
             gettext("The regular expression can not match an empty string.")
         )
@@ -78,53 +161,67 @@ def validate_re(value, groups=None, allow_empty=True) -> None:
             )
 
 
-def validate_re_nonempty(value):
-    return validate_re(value, allow_empty=False)
+def validate_re_nonempty(value: str) -> None:
+    validate_re(value, allow_empty=False)
 
 
-def validate_bitmap(value) -> None:
+def validate_upload_size(value: DjangoFile) -> None:
+    if value.size > settings.ALLOWED_ASSET_SIZE:
+        raise ValidationError(gettext("Uploaded file is too big."))
+
+
+def validate_translation_upload_size(value: DjangoFile) -> None:
+    if value.size > settings.TRANSLATION_UPLOAD_MAX_SIZE:
+        raise ValidationError(gettext("Uploaded translation file is too big."))
+
+
+def validate_component_zip_upload_size(value: DjangoFile) -> None:
+    if value.size > settings.COMPONENT_ZIP_UPLOAD_MAX_SIZE:
+        raise ValidationError(gettext("Uploaded ZIP file is too big."))
+
+
+def validate_project_backup_upload_size(value: DjangoFile) -> None:
+    if value.size > settings.PROJECT_BACKUP_UPLOAD_MAX_SIZE:
+        raise ValidationError(gettext("Uploaded ZIP file is too big."))
+
+
+def validate_bitmap(
+    value: FieldFile | File | None,
+) -> None:
     """Validate bitmap, based on django.forms.fields.ImageField."""
-    from PIL import Image
-
     if value is None:
         return
+    if not (isinstance(value, FieldFile) and getattr(value, "_committed", True)):
+        validate_upload_size(value)
 
     # Ensure we have image object and content type
     # Pretty much copy from django.forms.fields.ImageField:
 
-    # We need to get a file object for Pillow. We might have a path or we
-    # might have to read the data into memory.
-    if hasattr(value, "temporary_file_path"):
-        content = value.temporary_file_path()
-    elif hasattr(value, "read"):
-        content = BytesIO(value.read())
-    else:
-        content = BytesIO(value["content"])
+    content_target: Any = value
+    content = BytesIO(read_file_bytes(value))
 
     try:
         # load() could spot a truncated JPEG, but it loads the entire
         # image in memory, which is a DoS vector. See #3848 and #18520.
-        image = Image.open(content)
+        image = Image.open(content, formats=PIL_FORMATS)
         # verify() must be called immediately after the constructor.
         image.verify()
 
         # Pillow doesn't detect the MIME type of all formats. In those
         # cases, content_type will be None.
-        value.file.content_type = Image.MIME.get(cast("str", image.format))
+        content_type = Image.MIME.get(cast("str", image.format))
+        if content_target is not None:
+            content_target.content_type = content_type
     except Exception as exc:
         # Pillow doesn't recognize it as an image.
         raise ValidationError(
             gettext("The uploaded image was invalid."), code="invalid_image"
         ).with_traceback(sys.exc_info()[2]) from exc
-    if hasattr(value.file, "seek") and callable(value.file.seek):
-        value.file.seek(0)
 
     # Check image type
-    if value.file.content_type not in ALLOWED_IMAGES:
+    if content_type not in ALLOWED_IMAGES:
         image.close()
-        raise ValidationError(
-            gettext("Unsupported image type: %s") % value.file.content_type
-        )
+        raise ValidationError(gettext("Unsupported image type: %s") % content_type)
 
     # Check dimensions
     width, height = image.size
@@ -152,9 +249,18 @@ def validate_fullname(val):
         raise ValidationError(
             gettext("Please avoid using special characters in the full name.")
         )
+
+    if confusables.is_dangerous(val):
+        raise ValidationError(
+            gettext("This name cannot be registered. Please choose a different one.")
+        )
+
     # Validates full name that would be rejected by Git
     if CRUD_RE.match(val):
         raise ValidationError(gettext("Name consists only of disallowed characters."))
+
+    if FULL_NAME_RESTRICT.search(val):
+        raise ValidationError(gettext("Name contains disallowed characters."))
 
     return val
 
@@ -175,6 +281,12 @@ def validate_username(value) -> None:
             gettext(
                 "Username may only contain letters, "
                 "numbers or the following characters: @ . + - _"
+            )
+        )
+    if confusables.is_dangerous(value):
+        raise ValidationError(
+            gettext(
+                "This username cannot be registered. Please choose a different one."
             )
         )
 
@@ -198,23 +310,60 @@ class EmailValidator(EmailValidatorDjango):
                 gettext("Invalid e-mail address: {}").format(error)
             ) from error
 
-        if address.domain in blocklist:
+        if (
+            address.domain.lower().strip() in blocklist
+            and not settings.REGISTRATION_ALLOW_DISPOSABLE_EMAILS
+        ):
             raise ValidationError(gettext("Disposable e-mail domains are disallowed."))
 
 
 validate_email = EmailValidator()
 
 
-def validate_plural_formula(value) -> None:
+def _compile_plural_formula(value: str | None) -> Callable[[int], int]:
     try:
-        c2py(value or "0")
+        return c2py(value or "0")
     except ValueError as error:
         raise ValidationError(
             gettext("Could not evaluate plural formula: {}").format(error)
         ) from error
 
 
-def validate_filename(value) -> None:
+def validate_plural_formula(value: str | None) -> None:
+    _compile_plural_formula(value)
+
+
+def validate_plural_formula_range(
+    number: int | None, value: str | None, *, validate_formula: bool = True
+) -> None:
+    if number is None or number < 1:
+        return
+
+    try:
+        plural = _compile_plural_formula(value)
+    except ValidationError:
+        if validate_formula:
+            raise
+        return
+    for count in iter_plural_formula_validation_numbers(value):
+        try:
+            result = plural(count)
+        except Exception as error:
+            raise ValidationError(
+                gettext(
+                    "Could not evaluate plural formula for count {count}: {error}"
+                ).format(count=count, error=error)
+            ) from error
+        if result < 0 or result >= number:
+            raise ValidationError(
+                gettext(
+                    "Plural formula result {result} for count {count} is outside "
+                    "the allowed range 0..{max}."
+                ).format(result=result, count=count, max=number - 1)
+            )
+
+
+def validate_filename(value: str, *, check_prohibited: bool = True) -> None:
     if "../" in value or "..\\" in value:
         raise ValidationError(
             gettext("The filename can not contain reference to a parent directory.")
@@ -230,10 +379,15 @@ def validate_filename(value) -> None:
                 "Maybe you want to use: {}"
             ).format(cleaned)
         )
+    if check_prohibited and (
+        is_unsafe_path(cleaned) or is_managed_vcs_metadata_path(cleaned)
+    ):
+        raise ValidationError(gettext("The filename contains a prohibited folder."))
 
 
 def validate_backup_path(value: str) -> None:
     # Lazily import borg as it pulls quite a lot of memory usage
+    # ruff: ignore[import-outside-top-level]
     from borg.helpers import Location
 
     try:
@@ -242,22 +396,29 @@ def validate_backup_path(value: str) -> None:
         raise ValidationError(str(err)) from err
 
     if loc.archive:
-        msg = "No archive can be specified in backup location."
+        msg = gettext("No archive can be specified in backup location.")
         raise ValidationError(msg)
 
     if loc.proto == "file":
+        # Missing path
+        if not loc.path:
+            msg = gettext("Backup location has to be an absolute path.")
+            raise ValidationError(msg)
+
         # The path is already normalized here
         path = Path(loc.path)
 
         # Restrict relative paths as the cwd might change
         if not path.is_absolute():
-            msg = "Backup location has to be an absolute path."
+            msg = gettext("Backup location has to be an absolute path.")
             raise ValidationError(msg)
 
         # Restrict placing under Weblate backups as that will produce mess
         data_backups = Path(data_dir("backups"))
         if data_backups == path or data_backups in path.parents:
-            msg = "Backup location should be outside Weblate backups in DATA_DIR."
+            msg = gettext(
+                "Backup location should be outside Weblate backups in DATA_DIR."
+            )
             raise ValidationError(msg)
 
 
@@ -269,12 +430,22 @@ def validate_slug(value) -> None:
 
 
 def validate_language_aliases(value) -> None:
-    """Validate language aliases - comma separated semi colon values."""
+    """Validate language aliases - comma separated code mappings."""
     if not value:
         return
+    # Imported here because language models also import validators from this module.
+    from weblate.lang.models import (  # ruff: ignore[import-outside-top-level]
+        Language,
+    )
+
+    code_field = Language._meta.get_field("code")  # ruff: ignore[private-member-access]
     for part in value.split(","):
         if part.count(":") != 1:
             raise ValidationError(gettext("Syntax error in language aliases."))
+        _source, target = part.split(":")
+        language = Language.objects.fuzzy_get(target)
+        code = language.code if isinstance(language, Language) else language
+        code_field.clean(code, None)
 
 
 def validate_project_name(value) -> None:
@@ -285,48 +456,414 @@ def validate_project_name(value) -> None:
         raise ValidationError(gettext("This name is prohibited"))
 
 
-def validate_project_web(value) -> None:
+def _validate_runtime_public_url(
+    value: str,
+    *,
+    allow_private_targets: bool,
+    allow_unresolved_hostname: bool = True,
+    private_allowlist: list[str] | tuple[str, ...] = (),
+) -> None:
+    hostname = urlparse(value).hostname or ""
+    if allow_private_targets or is_allowlisted_hostname(hostname, private_allowlist):
+        return
+
+    try:
+        validate_runtime_url(value, allow_private_targets=False)
+    except ValidationError as error:
+        if not allow_unresolved_hostname or not isinstance(error.__cause__, OSError):
+            raise
+
+
+def is_project_web_allowlisted(project_slug: str | None) -> bool:
+    if project_slug is None:
+        return False
+
+    normalized_slug = project_slug.lower()
+    return normalized_slug in {
+        slug.lower() for slug in settings.PROJECT_WEB_RESTRICT_ALLOWLIST
+    }
+
+
+def validate_project_web(value: str, *, project_slug: str | None = None) -> None:
+    allowlisted = is_project_web_allowlisted(project_slug)
+
     # Regular expression filtering
-    if settings.PROJECT_WEB_RESTRICT_RE is not None and re.match(
-        settings.PROJECT_WEB_RESTRICT_RE, value
+    if (
+        not allowlisted
+        and settings.PROJECT_WEB_RESTRICT_RE is not None
+        and re.match(settings.PROJECT_WEB_RESTRICT_RE, value)
     ):
-        raise ValidationError(gettext("This URL is prohibited"))
+        raise ValidationError(
+            gettext("This URL is prohibited because it matches a restricted pattern.")
+        )
     parsed = urlparse(value)
     hostname = parsed.hostname or ""
     hostname = hostname.lower()
 
     # Hostname filtering
-    if any(
+    if not allowlisted and any(
         hostname.endswith(blocked) for blocked in settings.PROJECT_WEB_RESTRICT_HOST
     ):
-        raise ValidationError(gettext("This URL is prohibited"))
+        raise ValidationError(
+            gettext("This URL is prohibited because it uses a restricted host.")
+        )
 
     # Numeric address filtering
-    if settings.PROJECT_WEB_RESTRICT_NUMERIC:
+    if not allowlisted and settings.PROJECT_WEB_RESTRICT_NUMERIC:
         try:
             validate_ipv46_address(hostname)
         except ValidationError:
             pass
         else:
-            raise ValidationError(gettext("This URL is prohibited"))
+            raise ValidationError(
+                gettext("This URL is prohibited because it uses a numeric IP address.")
+            )
+
+    _validate_runtime_public_url(
+        value,
+        allow_private_targets=allowlisted or not settings.PROJECT_WEB_RESTRICT_PRIVATE,
+    )
 
 
-def validate_base64_encoded_string(value: str) -> None:
+def validate_webhook_secret_string(value: str) -> None:
     """Validate that the given string is a valid base64 encoded string."""
+    if not value:
+        return
+    value = value.removeprefix(WEBHOOKS_SECRET_PREFIX)
     try:
-        base64.b64decode(value)
+        decoded = base64.b64decode(value)
     except binascii.Error as error:
         raise ValidationError(gettext("Invalid base64 encoded string")) from error
+
+    if len(decoded) < 24:
+        raise ValidationError(gettext("The provided secret is too short."))
+    if len(decoded) > 64:
+        raise ValidationError(gettext("The provided secret is too long."))
 
 
 class WeblateURLValidator(URLValidator):
     """Validator for http and https URLs only."""
 
-    schemes = ["http", "https"]
+    unsafe_chars = URLValidator.unsafe_chars | frozenset({"\\"})
+
+    # ruff: ignore[mutable-class-default]
+    schemes: list[str] = [
+        "http",
+        "https",
+    ]
+
+    def __call__(self, value: str | None):
+        super().__call__(value)
+        if value and confusables.is_dangerous(value):
+            raise ValidationError(
+                gettext("This website cannot be used. Please provide a different one.")
+            )
 
 
-class WeblateEditorURLValidator(URLValidator):
-    schemes = ["editor", "netbeans", "txmt", "pycharm", "phpstorm", "idea", "jetbrains"]
+PROFILE_URL_BLOCKED_EXTENSIONS = (
+    ".7z",
+    ".apk",
+    ".appimage",
+    ".bat",
+    ".bin",
+    ".bz2",
+    ".cmd",
+    ".deb",
+    ".dmg",
+    ".exe",
+    ".gz",
+    ".hta",
+    ".iso",
+    ".jar",
+    ".js",
+    ".lnk",
+    ".msi",
+    ".pkg",
+    ".ps1",
+    ".rar",
+    ".reg",
+    ".rpm",
+    ".scr",
+    ".sh",
+    ".tar",
+    ".vbs",
+    ".wsf",
+    ".xz",
+    ".zip",
+)
+
+CODE_SITE_PROFILE_SEGMENT = re.compile(r"^~?[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
+CODE_SITE_REJECTED_TOP_LEVEL_SEGMENTS = {
+    "-",
+    "about",
+    "admin",
+    "api",
+    "explore",
+    "help",
+    "login",
+    "oauth",
+    "org",
+    "organizations",
+    "projects",
+    "session",
+    "settings",
+    "signup",
+    "users",
+}
+FEDIVERSE_PROFILE_PREFIXES = {"accounts", "channel", "profile", "u", "users"}
+FEDIVERSE_REJECTED_TOP_LEVEL_SEGMENTS = {
+    "about",
+    "admin",
+    "api",
+    "auth",
+    "directory",
+    "explore",
+    "featured",
+    "groups",
+    "home",
+    "interact",
+    "login",
+    "media",
+    "notifications",
+    "oauth",
+    "objects",
+    "posts",
+    "public",
+    "search",
+    "settings",
+    "share",
+    "tags",
+    "users",
+    "webfinger",
+}
+FEDIVERSE_PROFILE_SEGMENT = re.compile(r"^@?[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
+FEDIVERSE_HANDLE_SEGMENT = re.compile(
+    r"^@[A-Za-z0-9][A-Za-z0-9_.-]{0,254}(?:@[A-Za-z0-9.-]+)?$"
+)
+FEDIVERSE_PROFILE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_public_profile_url(
+    value: str | None,
+    *,
+    credentials_message: str,
+) -> None:
+    """Reject unsafe public profile URLs before path-shape checks."""
+    if not value:
+        return
+
+    parsed = urlparse(value)
+    if parsed.username or parsed.password:
+        raise ValidationError(credentials_message)
+
+    validate_outbound_url(value, allow_private_targets=False)
+
+
+def _has_blocked_profile_url_extension(value: str) -> bool:
+    path = unquote(urlparse(value).path).lower().rstrip("/")
+    return path.endswith(PROFILE_URL_BLOCKED_EXTENSIONS)
+
+
+def _validate_profile_like_url(
+    value: str | None,
+    *,
+    credentials_message: str,
+    blocked_extension_message: str,
+) -> None:
+    """Validate common profile/contact URL safety checks."""
+    _validate_public_profile_url(value, credentials_message=credentials_message)
+    if value and _has_blocked_profile_url_extension(value):
+        raise ValidationError(blocked_extension_message)
+
+
+def _get_profile_path_segments(value: str) -> list[str]:
+    parsed = urlparse(value)
+    if parsed.query or parsed.fragment:
+        return []
+    return [
+        segment for segment in unquote(parsed.path).strip("/").split("/") if segment
+    ]
+
+
+def validate_profile_url(value: str | None) -> None:
+    """Reject unsafe public profile URLs."""
+    _validate_profile_like_url(
+        value,
+        credentials_message=gettext(
+            "Profile URL cannot include username or password credentials."
+        ),
+        blocked_extension_message=gettext(
+            "Profile URL should link to a profile page, "
+            "not directly to a file download."
+        ),
+    )
+
+
+def validate_code_site_url(value: str | None) -> None:
+    """Reject URLs not matching common code-hosting profile shapes."""
+    _validate_profile_like_url(
+        value,
+        credentials_message=gettext(
+            "Profile URL cannot include username or password credentials."
+        ),
+        blocked_extension_message=gettext(
+            "Profile URL should link to a profile page, "
+            "not directly to a file download."
+        ),
+    )
+    if not value:
+        return
+
+    segments = _get_profile_path_segments(value)
+    is_profile_like = (
+        len(segments) == 1
+        and segments[0] not in CODE_SITE_REJECTED_TOP_LEVEL_SEGMENTS
+        and CODE_SITE_PROFILE_SEGMENT.match(segments[0])
+    )
+    is_repository_like = (
+        len(segments) >= 2
+        and segments[0] not in CODE_SITE_REJECTED_TOP_LEVEL_SEGMENTS
+        and all(segment != "-" for segment in segments)
+        and all(CODE_SITE_PROFILE_SEGMENT.match(segment) for segment in segments)
+    )
+    if is_profile_like:
+        return
+    if is_repository_like:
+        return
+    if len(segments) == 3 and segments[:2] == ["-", "u"] and segments[2].isdigit():
+        return
+
+    raise ValidationError(
+        gettext(
+            "Code site URL should link to a user profile or repository page on a "
+            "code-hosting site."
+        )
+    )
+
+
+def validate_contact_url(value: str | None) -> None:
+    """Reject unsafe public contact URLs."""
+    _validate_profile_like_url(
+        value,
+        credentials_message=gettext(
+            "Contact URL cannot include username or password credentials."
+        ),
+        blocked_extension_message=gettext(
+            "Contact URL should link to a contact or profile page, "
+            "not directly to a file download."
+        ),
+    )
+
+
+def validate_fediverse_url(value: str | None) -> None:
+    """Reject URLs not matching common Fediverse profile shapes."""
+    validate_profile_url(value)
+    if not value:
+        return
+
+    segments = _get_profile_path_segments(value)
+    if len(segments) == 1 and FEDIVERSE_HANDLE_SEGMENT.match(segments[0]):
+        return
+    if (
+        len(segments) == 1
+        and segments[0] not in FEDIVERSE_REJECTED_TOP_LEVEL_SEGMENTS
+        and "." not in segments[0]
+        and FEDIVERSE_PROFILE_SEGMENT.match(segments[0])
+    ):
+        return
+    if (
+        len(segments) == 2
+        and segments[0] in FEDIVERSE_PROFILE_PREFIXES
+        and (segments[0] != "profile" or "." not in segments[1])
+        and FEDIVERSE_PROFILE_SEGMENT.match(segments[1])
+    ):
+        return
+    if (
+        len(segments) == 2
+        and segments[0] == "web"
+        and FEDIVERSE_HANDLE_SEGMENT.match(segments[1])
+    ):
+        return
+    if (
+        len(segments) == 2
+        and segments[0] == "people"
+        and FEDIVERSE_PROFILE_ID.match(segments[1])
+    ):
+        return
+
+    raise ValidationError(
+        gettext("Fediverse URL should link to a Fediverse user profile.")
+    )
+
+
+def validate_asset_url(value: str) -> None:
+    WeblateURLValidator()(value)
+    if not validate_host(
+        urlparse(value).hostname or "", settings.ALLOWED_ASSET_DOMAINS
+    ):
+        raise ValidationError(gettext("URL domain is not allowed."))
+
+
+def validate_restricted_asset_url(value: str) -> None:
+    validate_asset_url(value)
+    validate_outbound_url(
+        value,
+        allow_private_targets=not settings.ASSET_RESTRICT_PRIVATE,
+        private_allowlist=settings.ASSET_PRIVATE_ALLOWLIST,
+    )
+    _validate_runtime_public_url(
+        value,
+        allow_private_targets=not settings.ASSET_RESTRICT_PRIVATE,
+        allow_unresolved_hostname=False,
+        private_allowlist=settings.ASSET_PRIVATE_ALLOWLIST,
+    )
+
+
+def validate_machinery_url(value: str, *, allow_private_targets: bool = True) -> None:
+    WeblateServiceURLValidator()(value)
+    validate_outbound_url(
+        value,
+        allow_private_targets=allow_private_targets,
+        private_allowlist=settings.ALLOWED_MACHINERY_DOMAINS,
+    )
+
+
+def validate_machinery_hostname(
+    value: str, *, allow_private_targets: bool = True
+) -> None:
+    validate_outbound_hostname(
+        value,
+        allow_private_targets=allow_private_targets,
+        private_allowlist=settings.ALLOWED_MACHINERY_DOMAINS,
+    )
+
+
+def validate_webhook_url(value: str) -> None:
+    WeblateServiceURLValidator()(value)
+    validate_outbound_url(
+        value,
+        allow_private_targets=not settings.WEBHOOK_RESTRICT_PRIVATE,
+        private_allowlist=settings.WEBHOOK_PRIVATE_ALLOWLIST,
+    )
+    _validate_runtime_public_url(
+        value,
+        allow_private_targets=not settings.WEBHOOK_RESTRICT_PRIVATE,
+        allow_unresolved_hostname=False,
+        private_allowlist=settings.WEBHOOK_PRIVATE_ALLOWLIST,
+    )
+
+
+class WeblateEditorURLValidator(WeblateURLValidator):
+    # ruff: ignore[mutable-class-default]
+    schemes: list[str] = [
+        "editor",
+        "netbeans",
+        "txmt",
+        "pycharm",
+        "phpstorm",
+        "idea",
+        "jetbrains",
+    ]
 
     regex = re.compile(
         r"^(?:[a-z0-9.+-]*)://"  # scheme is validated separately
@@ -344,15 +881,7 @@ class WeblateServiceURLValidator(WeblateURLValidator):
     This is useful for using dockerized services.
     """
 
-    host_re = (
-        "("
-        + WeblateURLValidator.hostname_re
-        + WeblateURLValidator.domain_re
-        + WeblateURLValidator.tld_re
-        + "|"
-        + WeblateURLValidator.hostname_re
-        + ")"
-    )
+    host_re = f"({WeblateURLValidator.hostname_re}{WeblateURLValidator.domain_re}{WeblateURLValidator.tld_re}|{WeblateURLValidator.hostname_re})"
     regex = re.compile(
         r"^(?:[a-z0-9.+-]*)://"  # scheme is validated separately
         r"(?:[^\s:@/]+(?::[^\s:@/]*)?@)?"  # user:pass authentication
@@ -368,3 +897,258 @@ class WeblateServiceURLValidator(WeblateURLValidator):
         r"\Z",
         re.IGNORECASE,
     )
+
+
+class FedoraMessagingURLValidator(WeblateServiceURLValidator):
+    """Validator for Fedora Messaging AMQP URLs."""
+
+    # ruff: ignore[mutable-class-default]
+    schemes: list[str] = [
+        "amqp",
+        "amqps",
+    ]
+
+
+def validate_fedora_messaging_url(value: str, *, resolve: bool = True) -> None:
+    """Validate the broker URL, optionally deferring DNS checks to connection setup."""
+    FedoraMessagingURLValidator()(value)
+    if "?" in value or "#" in value:
+        raise ValidationError(
+            gettext("AMQP broker URLs must not contain query strings or fragments.")
+        )
+    validate_outbound_url(
+        value,
+        allow_private_targets=not settings.WEBHOOK_RESTRICT_PRIVATE,
+        private_allowlist=settings.WEBHOOK_PRIVATE_ALLOWLIST,
+    )
+    if resolve:
+        _validate_runtime_public_url(
+            value,
+            allow_private_targets=not settings.WEBHOOK_RESTRICT_PRIVATE,
+            allow_unresolved_hostname=False,
+            private_allowlist=settings.WEBHOOK_PRIVATE_ALLOWLIST,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRepositoryURL:
+    """Validated repository URL and approved outbound route."""
+
+    scheme: str
+    hostname: str
+    port: int | None
+    addresses: tuple[str, ...]
+    requires_pinning: bool
+    proxy_url: str | None
+
+
+def validate_repo_url_characters(url: str) -> None:
+    """Reject characters unsafe for VCS configuration files."""
+    if UNSAFE_REPOSITORY_URL_CHARS_RE.search(url):
+        raise ValidationError(
+            gettext("Repository URL contains unsafe characters."),
+            code="repository_url_unsafe",
+        )
+
+
+def _is_local_repository_path(url: str) -> bool:
+    """Return whether a scheme-less repository value is a filesystem path."""
+    colon_position = url.find(":")
+    separator_positions = [
+        position for separator in ("/", "\\") if (position := url.find(separator)) >= 0
+    ]
+    return (
+        os.path.isabs(url)
+        or url.startswith(("./", "../"))
+        or colon_position < 0
+        or any(position < colon_position for position in separator_positions)
+    )
+
+
+def _parse_repository_url(
+    url: str, *, allow_scp_style: bool
+) -> tuple[str, ParseResult, bool] | None:
+    """Parse a repository URL and classify implicit SSH and local paths."""
+    parsed = urlparse(url)
+    if parsed.scheme:
+        return url, parsed, False
+    if _is_local_repository_path(url):
+        if "file" not in settings.VCS_ALLOW_SCHEMES:
+            raise ValidationError(
+                gettext("Fetching VCS repository using %s is not allowed.") % "file",
+                code="repository_scheme_not_allowed",
+                params={"scheme": "file"},
+            )
+        return None
+    if not allow_scp_style:
+        raise ValidationError(gettext("Could not parse URL."), code="url_parse_invalid")
+
+    normalized_url = f"ssh://{url}"
+    try:
+        return normalized_url, urlparse(normalized_url), True
+    except ValueError as error:
+        raise ValidationError(
+            gettext("Could not parse URL: {}").format(error),
+            code="url_parse_failed",
+            params={"error": str(error)},
+        ) from error
+
+
+def resolve_repo_hostname(
+    hostname: str, *, policy_hostname: str | None = None
+) -> tuple[str, ...]:
+    """Resolve a VCS hostname to addresses approved by the VCS policy."""
+    policy_hostname = policy_hostname or hostname
+    if settings.VCS_ALLOW_HOSTS and policy_hostname not in settings.VCS_ALLOW_HOSTS:
+        raise ValidationError(
+            gettext("Fetching VCS repository from %s is not allowed.")
+            % policy_hostname,
+            code="repository_host_not_allowed",
+            params={"hostname": policy_hostname},
+        )
+    allow_private_targets = (
+        policy_hostname in settings.VCS_ALLOW_HOSTS
+        or is_allowlisted_hostname(
+            policy_hostname,
+            settings.VCS_PRIVATE_ALLOWLIST,
+        )
+        or not settings.VCS_RESTRICT_PRIVATE
+    )
+    validate_outbound_hostname(
+        hostname,
+        allow_private_targets=allow_private_targets,
+    )
+    return resolve_runtime_hostname(
+        hostname,
+        allow_private_targets=allow_private_targets,
+    )
+
+
+def resolve_repo_url(
+    url: str,
+    *,
+    allow_scp_style: bool = True,
+    ssh_destination_resolver: Callable[[str, str | None, int | None], tuple[str, int]]
+    | None = None,
+    proxy_url: str | None = None,
+) -> ResolvedRepositoryURL | None:
+    """Validate a repository URL and retain its approved outbound route."""
+    validate_repo_url_characters(url)
+    parsed_result = _parse_repository_url(url, allow_scp_style=allow_scp_style)
+    if parsed_result is None:
+        return None
+    normalized_url, parsed, implicit_ssh = parsed_result
+
+    # Allow Weblate internal URLs
+    if parsed.scheme in {"weblate", "local"}:
+        return None
+
+    # Filter out schemes early
+    if parsed.scheme not in settings.VCS_ALLOW_SCHEMES:
+        raise ValidationError(
+            gettext("Fetching VCS repository using %s is not allowed.") % parsed.scheme,
+            code="repository_scheme_not_allowed",
+            params={"scheme": parsed.scheme},
+        )
+
+    # URL validation using for http (the URL validator is too strict to handle others)
+    if parsed.scheme in {"http", "https"}:
+        validator = URLValidator(schemes=list(settings.VCS_ALLOW_SCHEMES))
+        validator(normalized_url)
+
+    hostname = parsed.hostname
+
+    if parsed.scheme == "file":
+        if hostname is None:
+            return None
+        raise ValidationError(gettext("Could not parse URL."), code="url_parse_invalid")
+
+    if hostname is None:
+        raise ValidationError(gettext("Could not parse URL."), code="url_parse_invalid")
+
+    if settings.VCS_ALLOW_HOSTS and hostname not in settings.VCS_ALLOW_HOSTS:
+        raise ValidationError(
+            gettext("Fetching VCS repository from %s is not allowed.") % hostname,
+            code="repository_host_not_allowed",
+            params={"hostname": hostname},
+        )
+
+    allow_private_targets = (
+        hostname in settings.VCS_ALLOW_HOSTS
+        or is_allowlisted_hostname(hostname, settings.VCS_PRIVATE_ALLOWLIST)
+        or not settings.VCS_RESTRICT_PRIVATE
+    )
+
+    try:
+        explicit_port = None if implicit_ssh else parsed.port
+    except ValueError as error:
+        raise ValidationError(
+            gettext("Could not parse URL: {}").format(error),
+            code="url_parse_failed",
+            params={"error": str(error)},
+        ) from error
+    port = explicit_port
+    if port is None:
+        port = {"http": 80, "https": 443, "ssh": 22}.get(parsed.scheme)
+
+    connection_hostname = hostname
+    if (
+        parsed.scheme == "ssh"
+        and not allow_private_targets
+        and ssh_destination_resolver is not None
+    ):
+        connection_hostname, port = ssh_destination_resolver(
+            hostname, parsed.username, explicit_port
+        )
+
+    if proxy_url is None:
+        addresses = resolve_repo_hostname(
+            connection_hostname,
+            policy_hostname=hostname,
+        )
+    else:
+        validate_outbound_hostname(
+            hostname,
+            allow_private_targets=allow_private_targets,
+        )
+        addresses = ()
+
+    return ResolvedRepositoryURL(
+        scheme=parsed.scheme,
+        hostname=hostname,
+        port=port,
+        addresses=addresses,
+        requires_pinning=not allow_private_targets,
+        proxy_url=proxy_url,
+    )
+
+
+def validate_repo_url(url: str) -> None:
+    # ruff: ignore[import-outside-top-level]
+    from weblate.vcs.ssh import (
+        resolve_ssh_destination,
+    )
+
+    resolve_repo_url(
+        url,
+        ssh_destination_resolver=resolve_ssh_destination,
+        proxy_url=get_environment_proxy(url),
+    )
+
+
+@deconstructible
+class DomainOrIPValidator:
+    def __call__(self, value: str) -> None:
+        try:
+            validate_ipv46_address(value)
+        except ValidationError:
+            try:
+                # Note: Django's DomainNameValidator (or validate_domain_name function)
+                # does not accept IP addresses as valid domain names, which is what we want.
+                validate_domain_name(value)
+            except ValidationError:
+                # If both fail, raise a final ValidationError
+                raise ValidationError(
+                    gettext("Enter a valid domain name or IP address."),
+                    code="invalid_domain_or_ip",
+                ) from None

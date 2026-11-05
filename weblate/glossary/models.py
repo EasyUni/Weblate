@@ -5,52 +5,108 @@
 from __future__ import annotations
 
 import re
-import sys
-import unicodedata
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from copy import copy
 from itertools import chain
+from threading import Lock
 from typing import TYPE_CHECKING, cast
 
 import ahocorasick_rs
-import sentry_sdk
 from django.core.cache import cache
-from django.db.models import Prefetch, Q, Value
-from django.db.models.functions import MD5, Lower
+from django.db.models import Prefetch, Q
 
+from weblate.checks.flags import Flags
 from weblate.trans.models.unit import Unit
+from weblate.trans.util import split_plural
 from weblate.utils.csv import PROHIBITED_INITIAL_CHARS
 from weblate.utils.state import STATE_TRANSLATED
+from weblate.utils.terminology import term_forbidden, term_records
+from weblate.utils.tracing import start_span
+from weblate.utils.unicodechars import CONTROLCHARS
 
 if TYPE_CHECKING:
-    from weblate.trans.models.translation import Translation
+    from collections.abc import Generator, Iterable
+
+    from weblate.lang.models import Language
+    from weblate.trans.models import Project, Translation
+    from weblate.utils.terminology import TermRecord
 
 SPLIT_RE = re.compile(r"[\s,.:!?]+")
 NON_WORD_RE = re.compile(r"\W")
-# All control chars including tab and newline, this is different from
-# weblate.formats.helpers.CONTROLCHARS which contains only chars
-# problematic in XML or SQL scopes.
-CONTROLCHARS = [
-    char
-    for char in map(chr, range(sys.maxunicode + 1))
-    if unicodedata.category(char) in {"Zl", "Cc"}
-]
+PROHIBITED_INITIAL_CHARS_RE = re.compile(
+    f"^({'|'.join(re.escape(char) for char in PROHIBITED_INITIAL_CHARS)})*"
+)
 CONTROLCHARS_TRANS = str.maketrans(dict.fromkeys(CONTROLCHARS))
+GLOSSARY_AUTOMATON_CACHE_SIZE = 16
+GLOSSARY_AUTOMATON_CACHE: OrderedDict[tuple[int, int], ahocorasick_rs.AhoCorasick] = (
+    OrderedDict()
+)
+GLOSSARY_AUTOMATON_CACHE_LOCK = Lock()
+
+
+def cleanup_glossary_term(text: str) -> str:
+    """
+    Clean up the provided glossary term by removing unwanted characters.
+
+    - Translates and removes control characters.
+    - Strips leading and trailing whitespace.
+    - Removes prohibited leading characters.
+    """
+    text = text.translate(CONTROLCHARS_TRANS)
+    return PROHIBITED_INITIAL_CHARS_RE.sub("", text).strip()
+
+
+def get_glossary_source_index(component):
+    result = defaultdict(list)
+    sources = list(
+        component.source_translation.unit_set.filter(
+            state__gte=STATE_TRANSLATED
+        ).values_list("pk", "source")
+    )
+    if component.project.translation_parent_language_ids:
+        sources.extend(
+            Unit.objects.filter(
+                translation__component=component, translation_parent__isnull=False
+            )
+            .exclude_blocked(custom_sources=True)
+            .with_effective_source(custom_sources=True)
+            .values_list("pk", "check_source")
+        )
+    for pk, source in sources:
+        for alias in dict.fromkeys(split_plural(source.lower())):
+            if alias:
+                result[alias].append(pk)
+    return dict(result)
 
 
 def get_glossary_sources(component):
-    # Fetch list of terms defined in a translation
-    return list(
-        component.source_translation.unit_set.filter(state__gte=STATE_TRANSLATED)
-        .values_list(Lower("source"), flat=True)
-        .distinct()
+    return list(component.glossary_source_index)
+
+
+def clear_glossary_automaton_cache(project_id: int | None = None) -> None:
+    """Clear process-local glossary automatons."""
+    with GLOSSARY_AUTOMATON_CACHE_LOCK:
+        if project_id is None:
+            GLOSSARY_AUTOMATON_CACHE.clear()
+        else:
+            for cache_key in list(GLOSSARY_AUTOMATON_CACHE):
+                if cache_key[0] == project_id:
+                    del GLOSSARY_AUTOMATON_CACHE[cache_key]
+
+
+def get_glossary_automaton(project: Project) -> ahocorasick_rs.AhoCorasick:
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.models.component import (
+        prefetch_glossary_terms,
     )
 
+    with start_span(op="glossary.automaton", name=project.slug):
+        cache_key = (project.pk, project.glossary_automaton_cache_version)
+        with GLOSSARY_AUTOMATON_CACHE_LOCK:
+            if cache_key in GLOSSARY_AUTOMATON_CACHE:
+                GLOSSARY_AUTOMATON_CACHE.move_to_end(cache_key)
+                return GLOSSARY_AUTOMATON_CACHE[cache_key]
 
-def get_glossary_automaton(project):
-    from weblate.trans.models.component import prefetch_glossary_terms
-
-    with sentry_sdk.start_span(op="glossary.automaton", name=project.slug):
         # Chain terms
         prefetch_glossary_terms(project.glossaries)
         terms = set(
@@ -61,18 +117,35 @@ def get_glossary_automaton(project):
         # Remove blank string as that is not really reasonable to match
         terms.discard("")
         # Build automaton for efficient Aho-Corasick search
-        return ahocorasick_rs.AhoCorasick(
+        result = ahocorasick_rs.AhoCorasick(
             terms,
             implementation=ahocorasick_rs.Implementation.ContiguousNFA,
             store_patterns=False,
         )
+        with GLOSSARY_AUTOMATON_CACHE_LOCK:
+            GLOSSARY_AUTOMATON_CACHE[cache_key] = result
+            GLOSSARY_AUTOMATON_CACHE.move_to_end(cache_key)
+            while len(GLOSSARY_AUTOMATON_CACHE) > GLOSSARY_AUTOMATON_CACHE_SIZE:
+                GLOSSARY_AUTOMATON_CACHE.popitem(last=False)
+        return result
 
 
 def get_glossary_units(project, source_language, target_language):
-    return Unit.objects.filter(
+    units = Unit.objects.filter(
         translation__component__in=project.glossaries,
-        translation__component__source_language=source_language,
         translation__language=target_language,
+    )
+    custom_sources = any(
+        glossary.project.translation_parent_language_ids
+        for glossary in project.glossaries
+    )
+    if not custom_sources:
+        return units.filter(translation__component__source_language=source_language)
+    return (
+        units.exclude_blocked(custom_sources=True)
+        .with_effective_source(custom_sources=True, select=False)
+        .filter(check_source_language=source_language.pk)
+        .prefetch_translation_parent()
     )
 
 
@@ -85,36 +158,46 @@ def get_glossary_terms(
     return cast("list[Unit]", unit.glossary_terms)
 
 
-def fetch_glossary_terms(  # noqa: C901
+def fetch_glossary_terms(  # ruff: ignore[complex-structure]
     units: list[Unit], *, full: bool = False, include_variants: bool = True
 ) -> None:
     """Fetch glossary terms for list of units."""
-    from weblate.trans.models import Component, Project
+    from weblate.trans.models import (  # ruff: ignore[import-outside-top-level]
+        Component,
+        Project,
+    )
+
+    # ruff: ignore[import-outside-top-level]
+    from weblate.workspaces.models import (
+        Workspace,
+    )
 
     if len(units) == 0:
         return
 
-    translations: dict[int, Translation] = {}
-    translation_units: dict[int, list[Unit]] = defaultdict(list)
+    translations: dict[tuple[int, int], Translation] = {}
+    translation_units: dict[tuple[int, int], list[Unit]] = defaultdict(list)
 
     for unit in units:
-        translations[unit.translation.id] = unit.translation
-        translation_units[unit.translation.id].append(unit)
+        key = (unit.translation.id, unit.effective_source_language.pk)
+        translations[key] = unit.translation
+        translation_units[key].append(unit)
         # Initialize glossary terms
         unit.glossary_terms = []
 
     for translation_id, translation in translations.items():
         language = translation.language
         component = translation.component
-        project = component.project
-        source_language = component.source_language
-
-        # Short circuit source language
-        if language == source_language:
+        # Do not get glossary matches when display is disabled
+        if component.hide_glossary_matches:
             continue
+        project = component.project
+        source_language = translation_units[translation_id][0].effective_source_language
 
         # Extract all source strings
-        sources = [unit.source.lower() for unit in translation_units[translation_id]]
+        sources = [
+            unit.effective_source.lower() for unit in translation_units[translation_id]
+        ]
 
         # Match word boundaries if needed
         uses_whitespace = source_language.uses_whitespace()
@@ -134,7 +217,7 @@ def fetch_glossary_terms(  # noqa: C901
         ]
         terms: set[str] = set()
         # Extract terms present in the source
-        with sentry_sdk.start_span(op="glossary.match", name=project.slug):
+        with start_span(op="glossary.match", name=project.slug):
             for i, source in enumerate(sources):
                 for _termno, start, end in automaton.find_matches_as_indexes(
                     source, overlapping=True
@@ -153,6 +236,11 @@ def fetch_glossary_terms(  # noqa: C901
             base_units = get_glossary_units(project, source_language, language)
             # Variant is used for variant grouping below, source unit for flags
             base_units = base_units.select_related("source_unit", "variant")
+
+            # Exclude currently edited unit items to prevent self-referencing glossary items
+            current_unit_ids = [u.pk for u in translation_units[translation_id] if u.pk]
+            if current_unit_ids:
+                base_units = base_units.exclude(pk__in=current_unit_ids)
 
             if full:
                 # Include full details needed for rendering
@@ -175,11 +263,21 @@ def fetch_glossary_terms(  # noqa: C901
                             "check_flags",
                         ),
                     ),
+                    Prefetch(
+                        "translation__component__project__workspace",
+                        queryset=Workspace.objects.defer_huge(),
+                    ),
                 )
 
+            source_ids = {
+                pk
+                for glossary in project.glossaries
+                for term in terms
+                for pk in glossary.glossary_source_index.get(term, ())
+            }
             glossary_units = list(
                 base_units.filter(
-                    Q(source__lower__md5__in=[MD5(Value(term)) for term in terms]),
+                    Q(source_unit_id__in=source_ids) | Q(pk__in=source_ids)
                 )
             )
 
@@ -202,7 +300,10 @@ def fetch_glossary_terms(  # noqa: C901
             # Prepare term lookup
             glossary_lookup: dict[str, list[Unit]] = defaultdict(list)
             for match in glossary_units:
-                glossary_lookup[match.source.lower()].append(match)
+                for alias in dict.fromkeys(
+                    record["text"].lower() for record in glossary_source_records(match)
+                ):
+                    glossary_lookup[alias].append(match)
 
             # Inject matches back to the units
             for i, unit in enumerate(translation_units[translation_id]):
@@ -214,23 +315,183 @@ def fetch_glossary_terms(  # noqa: C901
                         continue
 
                     for match in matches:
-                        item = copy(match)
-                        item.glossary_positions = tuple(glossary_positions)
-                        result[item.pk] = item
+                        item = result.setdefault(match.pk, copy(match))
+                        item.glossary_positions = tuple(
+                            sorted(
+                                set(
+                                    getattr(item, "glossary_positions", ())
+                                    + tuple(glossary_positions)
+                                )
+                            )
+                        )
+                        item.matched_sources = tuple(
+                            dict.fromkeys((*(item.matched_sources or ()), term))
+                        )
                         for variant in glossary_variants[match.pk].values():
                             item = copy(variant)
                             item.glossary_positions = tuple(glossary_positions)
                             result[item.pk] = item
 
+                for item in result.values():
+                    prepare_glossary_alternatives(item)
                 # Store sorted results in a unit cache
                 unit.glossary_terms = sorted(
                     result.values(), key=lambda x: x.glossary_sort_key
                 )
 
 
-def render_glossary_units_tsv(units) -> str:
+def glossary_source_records(
+    unit: Unit, *, effective_source: bool = True
+) -> list[TermRecord]:
+    """Use shared TBX source alternatives even before sibling files are reparsed."""
+    if effective_source:
+        if unit.missing_source_snapshot is not None:
+            return []
+        if unit.translation_parent is not None:
+            return term_records(unit.translation_parent)
+    if unit.details.get("tbx_terms") and unit.source_unit_id:
+        return term_records(unit.source_unit, source=True)
+    return term_records(unit, source=True)
+
+
+def prepare_glossary_alternatives(unit):
+    """Prepare a single concept row with independently selectable alternatives."""
+    sources = glossary_source_records(unit)
+    matched = getattr(unit, "matched_sources", None)
+    if matched is not None:
+        sources = [record for record in sources if record["text"].lower() in matched]
+    # Shared notes occur on every term record; render them once at their scope.
+    unit.glossary_notes = {"concept": [], "source": [], "target": []}
+    term_note_lines = {
+        line
+        for record in sources
+        for note in record.get("notes", [])
+        if note.get("scope", "term") == "term"
+        for line in note["text"].splitlines()
+    }
+    unit.glossary_note = "\n".join(
+        line for line in unit.note.splitlines() if line not in term_note_lines
+    )
+    common_notes = {unit.glossary_note, unit.explanation, unit.source_unit.explanation}
+    for side in ("source", "target"):
+        records = (
+            glossary_source_records(unit) if side == "source" else term_records(unit)
+        )
+        for record in records:
+            for note in record.get("notes", []):
+                scope = note.get("scope", "term")
+                if scope == "term":
+                    continue
+                notes = unit.glossary_notes["concept" if scope == "concept" else side]
+                already_rendered = any(
+                    f"\n{note['text']}\n" in f"\n{text}\n" for text in common_notes
+                )
+                if note["text"] not in notes and not already_rendered:
+                    notes.append(note["text"])
+    unit.glossary_sources = sources
+    untranslatable = unit.untranslatable
+    unit.glossary_target_language = (
+        unit.effective_source_language if untranslatable else unit.translation.language
+    )
+    targets = sources if untranslatable else term_records(unit)
+    forbidden = "forbidden" in unit.all_flags or all(
+        term_forbidden(record) for record in sources
+    )
+    unit.glossary_targets = [
+        dict(record, forbidden=forbidden or term_forbidden(record))
+        for record in targets
+        if record["text"]
+    ]
+
+
+def iter_glossary_alternatives(
+    units, *, allow_readonly_aliases: bool = False, effective_source: bool = False
+):
+    """
+    Expand concepts into source/target pairs, preserving DNT text.
+
+    With effective_source, read text and rules from the workflow parent together.
+    Yielded units represent individual pairs: consumers must use source and target,
+    rather than resolving their effective source again.
+    """
+    for unit in units:
+        parent = unit.translation_parent if effective_source else None
+        if not unit.details.get("tbx_terms") and not unit.is_multivalue:
+            from weblate.lang.models import PluralMapper  # ruff: ignore[import-outside-top-level]
+
+            sources = (
+                parent.get_target_plurals() if parent else unit.get_source_plurals()
+            )
+            targets = unit.get_target_plurals()
+            if unit.untranslatable:
+                pairs = [(source, source) for source in sources]
+            elif len(sources) == 1 and len(targets) == 1:
+                pairs = [(sources[0], targets[0])]
+            else:
+                source_plural = (
+                    parent.translation.plural
+                    if parent
+                    else unit.translation.component.source_language.plural
+                )
+                target_plural = unit.translation.plural
+                if (
+                    len(sources) == source_plural.number
+                    and len(targets) == target_plural.number
+                ):
+                    pairs = PluralMapper(source_plural, target_plural).zip(
+                        sources, targets, unit
+                    )
+                else:
+                    pairs = [(sources[-1], target) for target in targets]
+            for source, target in pairs:
+                if (
+                    unit.matched_sources is not None
+                    and source.lower() not in unit.matched_sources
+                ):
+                    continue
+                item = copy(unit)
+                item.source, item.target = source, target
+                yield item
+            continue
+        source_records = (
+            term_records(parent)
+            if parent
+            else glossary_source_records(unit, effective_source=False)
+        )
+        sources = source_records
+        matched = getattr(unit, "matched_sources", None)
+        if matched is not None:
+            sources = [
+                record for record in sources if record["text"].lower() in matched
+            ]
+        untranslatable = unit.untranslatable
+        targets = source_records if untranslatable else term_records(unit)
+        for source in sources:
+            for target in (
+                [source] if untranslatable and not allow_readonly_aliases else targets
+            ):
+                item = copy(unit)
+                item.source = source["text"]
+                item.target = target["text"]
+                item.all_flags = Flags(unit.all_flags)
+                if term_forbidden(source) or term_forbidden(target):
+                    item.all_flags.merge("forbidden")
+                records = [source] if untranslatable else [source, target]
+                notes = [
+                    note["text"]
+                    for record in records
+                    for note in record.get("notes", [])
+                    if note.get("text")
+                ]
+                item.note = "\n".join(dict.fromkeys(filter(None, [unit.note, *notes])))
+                yield item
+
+
+def get_glossary_tuples(
+    units: Iterable[Unit], *, effective_source: bool = False
+) -> Generator[tuple[str, str]]:
     r"""
-    Build a tab separated glossary.
+    Build a glossary content as word tuples.
 
     Based on the DeepL specification:
 
@@ -241,44 +502,49 @@ def render_glossary_units_tsv(units) -> str:
     - source/target entry pairs are separated by a newline
     - source entries and target entries are separated by a tab
     """
-    from weblate.trans.models.component import Component
+    from weblate.trans.models import (  # ruff: ignore[import-outside-top-level]
+        Component,
+        Project,
+    )
 
-    def cleanup(text):
-        """
-        Clean up the provided text by removing unwanted characters.
-
-        - Translates and removes control characters using CONTROLCHARS_TRANS.
-        - Strips leading and trailing whitespace.
-        - Removes leading characters from PROHIBITED_INITIAL_CHARS if present.
-        """
-        text = text.translate(CONTROLCHARS_TRANS)
-        prohibited_initial_chars_pattern = (
-            "^(" + "|".join(re.escape(char) for char in PROHIBITED_INITIAL_CHARS) + ")*"
-        )
-
-        return re.sub(prohibited_initial_chars_pattern, "", text).strip()
+    # ruff: ignore[import-outside-top-level]
+    from weblate.workspaces.models import (
+        Workspace,
+    )
 
     # We can get list or iterator as well
     if hasattr(units, "prefetch_related"):
+        if effective_source:
+            units = units.prefetch_related(
+                "translation_parent__translation__language",
+                "translation_parent__translation__plural",
+            )
         units = units.prefetch_related(
             "source_unit",
             "translation",
             Prefetch("translation__component", queryset=Component.objects.defer_huge()),
+            Prefetch(
+                "translation__component__project",
+                queryset=Project.objects.defer_huge(),
+            ),
+            Prefetch(
+                "translation__component__project__workspace",
+                queryset=Workspace.objects.defer_huge(),
+            ),
         )
 
     included = set()
-    output = []
-    for unit in units:
+    for unit in iter_glossary_alternatives(units, effective_source=effective_source):
         # Skip forbidden term
         if "forbidden" in unit.all_flags:
             continue
 
-        if not unit.translated and "read-only" not in unit.all_flags:
+        if not unit.translated and not unit.untranslatable:
             continue
 
         # Cleanup strings
-        source = cleanup(unit.source)
-        target = source if "read-only" in unit.all_flags else cleanup(unit.target)
+        source = cleanup_glossary_term(unit.source)
+        target = source if unit.untranslatable else cleanup_glossary_term(unit.target)
 
         # Skip blanks and duplicates
         if not source or not target or source in included:
@@ -288,14 +554,27 @@ def render_glossary_units_tsv(units) -> str:
         included.add(source)
 
         # Render TSV
-        output.append(f"{source}\t{target}")
-
-    return "\n".join(output)
+        yield source, target
 
 
-def get_glossary_tsv(translation) -> str:
+def render_glossary_units_tsv(
+    units: Iterable[Unit], *, effective_source: bool = False
+) -> str:
+    """Build a tab separated glossary."""
+    return "\n".join(
+        f"{source}\t{target}"
+        for source, target in get_glossary_tuples(
+            units, effective_source=effective_source
+        )
+    )
+
+
+def get_glossary_tsv(
+    translation: Translation, *, source_language: Language | None = None
+) -> str:
     project = translation.component.project
-    source_language = translation.component.source_language
+    if source_language is None:
+        source_language = translation.component.source_language
     language = translation.language
 
     cache_key = project.get_glossary_tsv_cache_key(source_language, language)
@@ -308,7 +587,9 @@ def get_glossary_tsv(translation) -> str:
     units = get_glossary_units(project, source_language, language)
 
     # Render as tsv
-    result = render_glossary_units_tsv(units.filter(state__gte=STATE_TRANSLATED))
+    result = render_glossary_units_tsv(
+        units.filter(state__gte=STATE_TRANSLATED), effective_source=True
+    )
 
     cache.set(cache_key, result, 24 * 3600)
 

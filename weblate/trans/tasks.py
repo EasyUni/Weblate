@@ -6,93 +6,248 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from glob import glob
+from itertools import batched
 from operator import itemgetter
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+from celery import current_task
+from celery.exceptions import Retry
 from celery.schedules import crontab
+from celery.utils.time import get_exponential_backoff_interval
 from django.conf import settings
-from django.contrib.staticfiles.storage import staticfiles_storage
+from django.contrib.messages import get_messages
+from django.contrib.messages.storage.cookie import CookieStorage
 from django.core.cache import cache
+from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Count, F
-from django.http import Http404
-from django.http.request import HttpRequest
+from django.db.models import Exists, F, OuterRef, Prefetch, Q
 from django.utils import timezone
 from django.utils.timezone import make_aware
-from django.utils.translation import override
+from django.utils.translation import gettext, ngettext, override
+from translate.storage.base import ParseError as TranslateParseError
 
-from weblate.addons.models import Addon
-from weblate.auth.models import User, get_anonymous
+from weblate.accounts.utils import remove_user
+from weblate.addons.events import AddonActivityLogReason, AddonActivityLogStatus
+from weblate.auth.models import AuthenticatedHttpRequest, User, get_anonymous
+from weblate.checks.models import Check
 from weblate.lang.models import Language
 from weblate.logger import LOGGER
 from weblate.trans.actions import ActionEvents
-from weblate.trans.autotranslate import AutoTranslate
+from weblate.trans.autotranslate import BatchAutoTranslate
+from weblate.trans.component_copy import copy_component_addons
+from weblate.trans.coordination import translation_task
 from weblate.trans.exceptions import FileParseError
+from weblate.trans.inherited_settings import apply_create_inheritance_defaults
 from weblate.trans.models import (
     Category,
     Change,
     Comment,
     Component,
     ComponentList,
+    PendingUnitChange,
     Project,
+    Report,
     Suggestion,
     Translation,
+    Unit,
 )
-from weblate.utils.celery import app
+from weblate.trans.removal import RemovalBatch, logged_removal, removal_batch_context
+from weblate.trans.repository import (
+    RepositoryOperation,
+    RepositoryOperationConflictError,
+    acquire_repository_operation,
+    get_operation_call,
+    get_repository_components,
+    get_repository_operation_permission,
+    keep_repository_operation_reservation,
+    refresh_repository_operation,
+    release_repository_operation,
+    reserve_repository_operation,
+    store_repository_operation_tracking,
+)
+from weblate.trans.repository_context import (
+    RepositoryFollowupLockError,
+    RepositoryOperationFollowup,
+    defer_repository_auto_push,
+    defer_repository_background_tasks,
+    inline_repository_followups,
+    repository_component_progress,
+    suppress_repository_auto_push,
+)
+from weblate.utils.celery import app, store_task_metadata
+from weblate.utils.change_origin import (
+    acting_user_context,
+    change_origin_context,
+    get_acting_user,
+    get_change_origin,
+)
 from weblate.utils.data import data_dir
 from weblate.utils.errors import report_error
-from weblate.utils.files import remove_tree
+from weblate.utils.files import MANAGED_VCS_METADATA_DIRS, remove_tree
 from weblate.utils.lock import WeblateLockTimeoutError
-from weblate.utils.stats import prefetch_stats
-from weblate.utils.views import parse_path
+from weblate.utils.state import STATE_APPROVED, STATE_TRANSLATED
+from weblate.utils.stats import ProjectLanguage, prefetch_stats
+from weblate.utils.task_log import (
+    get_task_components,
+    record_repository_failure,
+    record_repository_progress,
+    record_task_failure,
+    store_task_failure_dependencies,
+)
 from weblate.vcs.base import RepositoryError
 
+COMPONENT_MEMORY_CLEANUP_BATCH_SIZE = 1000
+LEGACY_REPOSITORY_LOCK_MAX_RETRIES = 3
+
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
+
+    from celery import Celery, Task
+
+    from weblate.trans.models.change import RevertUserEditsResult
+    from weblate.workspaces.models import Workspace
 
 
-@app.task(
-    trail=False,
-    autoretry_for=(WeblateLockTimeoutError,),
-    retry_backoff=600,
-    retry_backoff_max=3600,
-)
+def commit_retries_exhausted() -> bool:
+    """Check whether a commit failure will no longer be retried."""
+    if not current_task:
+        return True
+
+    if current_task.max_retries is None:
+        return False
+    return current_task.request.retries >= current_task.max_retries
+
+
+def schedule_deferred_commit(component: Component) -> None:
+    followup = component.finish_commit_task()
+    if followup:
+        actor_id = followup.get("acting_user_id")
+        actor = User.objects.get(pk=actor_id) if actor_id is not None else None
+        with (
+            change_origin_context(followup.get("origin", get_change_origin())),
+            acting_user_context(actor),
+        ):
+            component.queue_commit_pending(
+                followup["reason"],
+                user_id=followup["user_id"],
+                force_scan=followup["force_scan"],
+                previous_head=followup["previous_head"],
+            )
+
+
+def retry_legacy_repository_operation(
+    task: Task,
+    error: RepositoryOperationConflictError | WeblateLockTimeoutError,
+    repository_lock_retries: int,
+) -> None:
+    """Retry reservation conflicts without extending repository lock retries."""
+    retry_kwargs = dict(task.request.kwargs or {})
+    if isinstance(error, WeblateLockTimeoutError):
+        if repository_lock_retries >= LEGACY_REPOSITORY_LOCK_MAX_RETRIES:
+            raise error
+        retry_kwargs["_repository_lock_retries"] = repository_lock_retries + 1
+        retries = repository_lock_retries
+    else:
+        retries = task.request.retries
+    countdown = get_exponential_backoff_interval(
+        factor=600,
+        retries=retries,
+        maximum=3600,
+        full_jitter=True,
+    )
+    raise task.retry(exc=error, countdown=countdown, kwargs=retry_kwargs)
+
+
+def execute_legacy_update(
+    obj: Project | Component,
+    repositories: list[Component],
+    request: AuthenticatedHttpRequest | None,
+    auto: bool,
+) -> tuple[list[Callable[[], None]], dict[int, Callable[[], None]]]:
+    """Run a legacy update and return follow-ups after releasing its reservation."""
+    with (
+        reserve_repository_operation(
+            [component.pk for component in repositories], "pull"
+        ),
+        defer_repository_auto_push() as deferred_pushes,
+        defer_repository_background_tasks() as deferred_tasks,
+        # This is stored as alert, so we can silently ignore some exceptions here.
+        suppress(FileParseError, RepositoryError, FileNotFoundError),
+    ):
+        obj.log_info("Updating remote repository")
+        if (
+            isinstance(obj, Project)
+            or settings.AUTO_UPDATE in {"full", True}
+            or not auto
+        ):
+            obj.do_update(request)
+        else:
+            obj.update_remote_branch(user=obj.get_update_user(request))
+    return deferred_tasks, deferred_pushes
+
+
+def perform_component_commit(
+    component: Component,
+    reason: str,
+    user: User | None,
+    *,
+    force_scan: bool = False,
+    previous_head: str | None = None,
+) -> None:
+    with component.repository.lock:
+        component.commit_pending(reason, user=user)
+        if force_scan:
+            component.trigger_post_update(
+                previous_head=previous_head,
+                skip_push=False,
+                user=user,
+                parse_after_update=True,
+            )
+            component.create_translations(force=True)
+
+
+@app.task(bind=True, trail=False, max_retries=None)
 def perform_update(
+    task: Task,
     cls: Literal["Project", "Component"],
     pk: int,
     auto: bool = False,
     obj=None,
     user_id: int = 0,
+    *,
+    _repository_lock_retries: int = 0,
 ) -> None:
-    request: HttpRequest | None = None
+    request: AuthenticatedHttpRequest | None = None
     if user_id:
-        request = HttpRequest()
+        request = AuthenticatedHttpRequest()
         request.user = User.objects.get(pk=user_id)
-    try:
-        if obj is None:
-            if cls == "Project":
-                obj = Project.objects.get(pk=pk)
-            else:
-                obj = Component.objects.get(pk=pk)
-        if settings.AUTO_UPDATE in {"full", True} or not auto:
-            obj.do_update(request)
+    if obj is None:
+        if cls == "Project":
+            obj = Project.objects.get(pk=pk)
         else:
-            obj.update_remote_branch()
-    except (FileParseError, RepositoryError, FileNotFoundError):
-        # This is stored as alert, so we can silently ignore here
+            obj = Component.objects.get(pk=pk)
+    repositories, _display_components = get_repository_components(obj)
+    try:
+        deferred_tasks, deferred_pushes = execute_legacy_update(
+            obj, repositories, request, auto
+        )
+    except (RepositoryOperationConflictError, WeblateLockTimeoutError) as error:
+        retry_legacy_repository_operation(task, error, _repository_lock_retries)
         return
+    for publish in deferred_tasks:
+        publish()
+    for push in deferred_pushes.values():
+        push()
 
 
-@app.task(
-    trail=False,
-    autoretry_for=(WeblateLockTimeoutError,),
-    retry_backoff=600,
-    retry_backoff_max=3600,
-)
+@app.task(bind=True, trail=False, max_retries=None)
 def perform_load(
+    task: Task,
     pk: int,
     *,
     force: bool = False,
@@ -101,45 +256,410 @@ def perform_load(
     changed_template: bool = False,
     from_link: bool = False,
     change: int | None = None,
+    preserve_pending_units: bool = False,
     user_id: int | None = None,
+    _repository_lock_retries: int = 0,
 ) -> None:
-    request: HttpRequest | None = None
+    request: AuthenticatedHttpRequest | None = None
+    user: User | None = None
     if user_id:
-        request = HttpRequest()
-        request.user = User.objects.get(pk=user_id)
-    component = Component.objects.get(pk=pk)
-    component.create_translations_immediate(
-        force=force,
-        force_scan=force_scan,
-        langs=langs,
-        changed_template=changed_template,
-        from_link=from_link,
-        change=change,
-        request=request,
-    )
+        user = User.objects.get(pk=user_id)
+        request = AuthenticatedHttpRequest()
+        request.user = user
+    try:
+        component = Component.objects.get(pk=pk)
+    except Component.DoesNotExist:
+        # Component was removed
+        return
+    try:
+        with reserve_repository_operation(
+            [component.effective_repo_component.pk], "file-scan"
+        ):
+            component.create_translations_immediate(
+                force=force,
+                force_scan=force_scan,
+                langs=langs,
+                changed_template=changed_template,
+                from_link=from_link,
+                change=change,
+                preserve_pending_units=preserve_pending_units,
+                request=request,
+                user=user,
+            )
+    except (RepositoryOperationConflictError, WeblateLockTimeoutError) as error:
+        retry_legacy_repository_operation(task, error, _repository_lock_retries)
 
 
 @app.task(
     trail=False,
-    autoretry_for=(WeblateLockTimeoutError,),
+    autoretry_for=(WeblateLockTimeoutError, RepositoryOperationConflictError),
     retry_backoff=600,
     retry_backoff_max=3600,
 )
-def perform_commit(pk, reason: str, *, user_id: int | None = None) -> None:
-    user = User.objects.get(pk=user_id) if user_id else None
+def perform_commit(
+    pk,
+    reason: str,
+    *,
+    user_id: int | None = None,
+    force_scan: bool = False,
+    previous_head: str | None = None,
+) -> None:
     component = Component.objects.get(pk=pk)
-    component.commit_pending(reason, user=user)
+    try:
+        user = User.objects.get(pk=user_id) if user_id else None
+        with (
+            reserve_repository_operation(
+                [component.effective_repo_component.pk], "commit"
+            ),
+            suppress_repository_auto_push(),
+        ):
+            perform_component_commit(
+                component,
+                reason,
+                user,
+                force_scan=force_scan,
+                previous_head=previous_head,
+            )
+        component.push_if_needed()
+    except (RepositoryOperationConflictError, WeblateLockTimeoutError):
+        if commit_retries_exhausted():
+            schedule_deferred_commit(component)
+        raise
+    except Exception:
+        component.delete_commit_task(require_match=True)
+        raise
+    schedule_deferred_commit(component)
 
 
-@app.task(
-    trail=False,
-    autoretry_for=(WeblateLockTimeoutError,),
-    retry_backoff=600,
-    retry_backoff_max=3600,
-)
-def perform_push(pk, *args, **kwargs) -> None:
+@app.task(bind=True, trail=False, max_retries=None)
+def perform_push(
+    task: Task,
+    pk,
+    *args,
+    _repository_lock_retries: int = 0,
+    **kwargs,
+) -> None:
     component = Component.objects.get(pk=pk)
-    component.do_push(*args, **kwargs)
+    try:
+        with reserve_repository_operation(
+            [component.effective_repo_component.pk], "push"
+        ):
+            component.do_push(*args, **kwargs)
+    except (RepositoryOperationConflictError, WeblateLockTimeoutError) as error:
+        retry_legacy_repository_operation(task, error, _repository_lock_retries)
+
+
+@app.task(bind=True, trail=False, max_retries=3)
+def perform_repository_operation(
+    task: Task,
+    *,
+    operation: RepositoryOperation,
+    component_ids: list[int],
+    user_id: int,
+    tracking_component_ids: list[int] | None = None,
+    start_index: int = 0,
+    successful: bool = True,
+    failure_messages: list[str] | None = None,
+    resume_followup: RepositoryOperationFollowup | None = None,
+    followup_previous_head: str | None = None,
+) -> dict[str, dict[str, str] | bool]:
+    """Celery wrapper for a user-requested repository operation."""
+    task_id = str(task.request.id)
+    tracking_component_ids = tracking_component_ids or component_ids
+    reservation_acquired = False
+    release_reservation = True
+    try:
+        acquire_repository_operation(component_ids, operation, task_id)
+        reservation_acquired = True
+        store_repository_operation_tracking(
+            task_id,
+            tracking_component_ids,
+            user_id,
+            authorization_component_ids=tracking_component_ids,
+        )
+        with keep_repository_operation_reservation(
+            component_ids, task_id, tracking_component_ids
+        ):
+            result = execute_repository_operation(
+                task,
+                operation,
+                component_ids,
+                user_id,
+                task_id,
+                start_index=start_index,
+                successful=successful,
+                failure_messages=failure_messages,
+                resume_followup=resume_followup,
+                followup_previous_head=followup_previous_head,
+            )
+    except RepositoryOperationRetryError as retry:
+        if task.max_retries is None or task.request.retries < task.max_retries:
+            refresh_repository_operation(component_ids, task_id, tracking_component_ids)
+            countdown = get_exponential_backoff_interval(
+                factor=600,
+                retries=task.request.retries,
+                maximum=3600,
+                full_jitter=False,
+            )
+            try:
+                task.retry(
+                    exc=retry.error,
+                    countdown=countdown,
+                    kwargs={
+                        "operation": operation,
+                        "component_ids": component_ids,
+                        "tracking_component_ids": tracking_component_ids,
+                        "user_id": user_id,
+                        "start_index": retry.start_index,
+                        "successful": retry.successful,
+                        "failure_messages": retry.failure_messages,
+                        "resume_followup": retry.resume_followup,
+                        "followup_previous_head": retry.followup_previous_head,
+                    },
+                )
+            except Retry:
+                release_reservation = False
+                raise
+        record_task_failure(task_id, retry.error)
+        with override(User.objects.get(pk=user_id).profile.language):
+            message = gettext(
+                "Repository operation could not be completed because it remained locked."
+            )
+        return {
+            "result": False,
+            "completion_message": {"level": "error", "text": message},
+        }
+    except (
+        FileParseError,
+        RepositoryError,
+        FileNotFoundError,
+        TranslateParseError,
+        ValueError,
+    ) as error:
+        record_task_failure(task_id, error)
+        with override(User.objects.get(pk=user_id).profile.language):
+            message = gettext("Repository operation could not be completed.")
+        return {
+            "result": False,
+            "completion_message": {"level": "error", "text": message},
+        }
+    except PermissionDenied:
+        record_task_failure(task_id, "Repository access is no longer permitted.")
+        with override(User.objects.get(pk=user_id).profile.language):
+            message = gettext(
+                "Repository operation could not be completed because access is no longer permitted."
+            )
+        return {
+            "result": False,
+            "completion_message": {"level": "error", "text": message},
+        }
+    else:
+        return result
+    finally:
+        if reservation_acquired and release_reservation:
+            release_repository_operation(component_ids, task_id)
+
+
+class RepositoryOperationRequest(AuthenticatedHttpRequest):
+    """Request carrying the context expected by repository operations."""
+
+    def __init__(self, user: User) -> None:
+        super().__init__()
+        self.user = user
+        self._messages = CookieStorage(self)
+
+
+def execute_repository_operation(
+    task: Task,
+    operation: RepositoryOperation,
+    component_ids: list[int],
+    user_id: int,
+    task_id: str,
+    *,
+    start_index: int = 0,
+    successful: bool = True,
+    failure_messages: list[str] | None = None,
+    resume_followup: RepositoryOperationFollowup | None = None,
+    followup_previous_head: str | None = None,
+) -> dict[str, dict[str, str] | bool]:
+    """Execute the components covered by one repository operation task."""
+    user = User.objects.get(pk=user_id)
+    total = len(component_ids)
+    permission = get_repository_operation_permission(operation)
+    failure_messages = list(failure_messages or ())
+    display_components: dict[int, list[Component]] = {}
+    for source in get_task_components(task_id):
+        display_components.setdefault(source.effective_repo_component.pk, []).append(
+            source
+        )
+
+    with (
+        acting_user_context(user),
+        override(user.profile.language),
+        inline_repository_followups(),
+    ):
+        for index in range(start_index, total):
+            component_id = component_ids[index]
+            completed = index + 1
+            try:
+                component = Component.objects.get(pk=component_id)
+            except Component.DoesNotExist:
+                successful = False
+                resume_followup = None
+                followup_previous_head = None
+            else:
+                if component.effective_repo_component.pk != component_id:
+                    component.log_info(
+                        "skipping repository operation: repository link changed"
+                    )
+                    successful = False
+                    record_repository_failure(task_id, component, operation)
+                    resume_followup = None
+                    followup_previous_head = None
+                else:
+                    if not user.has_perm(permission, component):
+                        raise PermissionDenied
+                    sources = display_components.get(component.pk, [])
+                    record_repository_progress(
+                        task_id, component, operation, "started", sources=sources
+                    )
+                    # Repository methods use request messages for actionable VCS
+                    # failures. Give each operation fresh in-memory storage.
+                    request = RepositoryOperationRequest(user)
+                    method_name, args, kwargs = get_operation_call(operation)
+                    method = getattr(component, method_name)
+                    try:
+                        with repository_component_progress(completed - 1, total):
+                            result = execute_repository_operation_method(
+                                operation,
+                                component,
+                                method,
+                                request,
+                                user,
+                                args,
+                                kwargs,
+                                resume_followup=resume_followup,
+                                followup_previous_head=followup_previous_head,
+                            )
+                            resume_followup = None
+                            followup_previous_head = None
+                    except RepositoryFollowupLockError as error:
+                        raise RepositoryOperationRetryError(
+                            error.error,
+                            start_index=index,
+                            successful=successful,
+                            failure_messages=failure_messages,
+                            resume_followup=error.followup,
+                            followup_previous_head=error.previous_head,
+                        ) from error
+                    except WeblateLockTimeoutError as error:
+                        raise RepositoryOperationRetryError(
+                            error,
+                            start_index=index,
+                            successful=successful,
+                            failure_messages=failure_messages,
+                            resume_followup=resume_followup,
+                            followup_previous_head=followup_previous_head,
+                        ) from error
+                    method_messages = [
+                        str(message) for message in get_messages(request)
+                    ]
+                    for method_message in method_messages:
+                        component.log_info(
+                            "repository operation: %s", method_message, sensitive=True
+                        )
+                    if result is False:
+                        successful = False
+                        record_repository_failure(
+                            task_id,
+                            component,
+                            operation,
+                            sources=sources,
+                        )
+                        failure_messages.append("Repository operation failed.")
+                    else:
+                        record_repository_progress(
+                            task_id, component, operation, "completed", sources=sources
+                        )
+            task.update_state(
+                state="PROGRESS",
+                meta={"progress": 100 * completed // total if total else 100},
+            )
+
+        if successful:
+            message = gettext("Repository operation completed.")
+            level = "success"
+        else:
+            message = gettext("Repository operation completed with errors.")
+            level = "error"
+    return {
+        "result": successful,
+        "completion_message": {"level": level, "text": message},
+    }
+
+
+def execute_repository_operation_method(
+    operation: RepositoryOperation,
+    component: Component,
+    method,
+    request: AuthenticatedHttpRequest,
+    user: User,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    resume_followup: RepositoryOperationFollowup | None,
+    followup_previous_head: str | None,
+) -> bool | None:
+    """Execute one repository method or its already-committed follow-up."""
+    if resume_followup == "file-sync":
+        if operation != resume_followup:
+            raise ValueError(operation)
+        perform_component_commit(component, "file-sync", user)
+        return True
+    if resume_followup in {"pull", "pull-skip-push"}:
+        component.finish_update(request, user, push=resume_followup == "pull")
+        if operation == "push":
+            return component.do_push(request, force_commit=False, do_update=False)
+        return True
+    if resume_followup == "reset-keep":
+        if operation != resume_followup or followup_previous_head is None:
+            raise ValueError(operation)
+        perform_component_commit(
+            component,
+            "reset-sync",
+            user,
+            force_scan=True,
+            previous_head=followup_previous_head,
+        )
+        return True
+    if resume_followup is not None:
+        raise ValueError(resume_followup)
+    if operation == "commit":
+        perform_component_commit(component, "commit", user)
+        return True
+    return cast("bool | None", method(request, *args, **kwargs))
+
+
+class RepositoryOperationRetryError(Exception):
+    """Carry the resume position across a repository task retry."""
+
+    def __init__(
+        self,
+        error: WeblateLockTimeoutError,
+        *,
+        start_index: int,
+        successful: bool,
+        failure_messages: list[str] | None = None,
+        resume_followup: RepositoryOperationFollowup | None = None,
+        followup_previous_head: str | None = None,
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.start_index = start_index
+        self.successful = successful
+        self.failure_messages = list(failure_messages or ())
+        self.resume_followup = resume_followup
+        self.followup_previous_head = followup_previous_head
 
 
 @app.task(trail=False)
@@ -148,35 +668,314 @@ def commit_pending(
     pks: set[int] | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> None:
-    if pks is None:
-        components = Component.objects.all()
-    else:
-        components = Component.objects.filter(translation__pk__in=pks)
+    components = PendingUnitChange.objects.find_committable_components(
+        pks=list(pks) if pks else None, hours=hours
+    )
 
-    # All components with pending units
-    components = components.filter(
-        translation__unit__pending_changes__isnull=False
-    ).distinct()
+    if not components:
+        return
 
-    for component in prefetch_stats(components.prefetch()):
-        age = timezone.now() - timedelta(
-            hours=component.commit_pending_age if hours is None else hours
-        )
+    components = prefetch_stats(components)
 
-        units = component.pending_units.older_than(age)
-
-        # No pending units
-        if not units.exists():
-            continue
-
+    for component in components:
         if logger:
             logger(f"Committing {component}")
 
-        perform_commit.delay(component.pk, "commit_pending")
+        component.queue_commit_pending("commit_pending")
 
 
 @app.task(trail=False)
-def cleanup_component(pk) -> None:
+def revert_user_edits(
+    target_user_id: int,
+    acting_user_id: int,
+    *,
+    project_id: int | None = None,
+    sitewide: bool = False,
+) -> RevertUserEditsResult:
+    if project_id is None and not sitewide:
+        msg = "Either project_id or sitewide must be provided"
+        raise ValueError(msg)
+
+    target_user = User.objects.get(pk=target_user_id)
+    acting_user = User.objects.get(pk=acting_user_id)
+    project = Project.objects.get(pk=project_id) if project_id is not None else None
+    return Change.objects.revert_user_edits(
+        target_user,
+        acting_user,
+        project=project,
+    )
+
+
+@app.task(trail=False)
+@transaction.atomic
+def cleanup_user_contributions(
+    target_user_id: int,
+    acting_user_id: int,
+    *,
+    project_id: int | None = None,
+    sitewide: bool = False,
+    reject_suggestions: bool = False,
+    delete_comments: bool = False,
+) -> dict[str, int]:
+    if project_id is None and not sitewide:
+        msg = "Either project_id or sitewide must be provided"
+        raise ValueError(msg)
+
+    target_user = User.objects.get(pk=target_user_id)
+    acting_user = User.objects.get(pk=acting_user_id)
+
+    rejected_suggestions = 0
+    deleted_comments = 0
+
+    if reject_suggestions:
+        suggestions = Suggestion.objects.filter(user=target_user).select_related("unit")
+        if project_id is not None:
+            suggestions = suggestions.filter(
+                unit__translation__component__project_id=project_id
+            )
+        for suggestion in suggestions.iterator(chunk_size=100):
+            suggestion.delete_log(acting_user, old=suggestion.unit.target)
+            rejected_suggestions += 1
+
+    if delete_comments:
+        comments = Comment.objects.filter(user=target_user).select_related("unit")
+        if project_id is not None:
+            comments = comments.filter(
+                unit__translation__component__project_id=project_id
+            )
+        for comment in comments.iterator(chunk_size=100):
+            comment.delete(user=acting_user)
+            deleted_comments += 1
+
+    return {
+        "comments": deleted_comments,
+        "suggestions": rejected_suggestions,
+    }
+
+
+def get_bulk_accept_user_suggestions_message(
+    *, accepted: int, failed: int, total: int, username: str
+) -> str:
+    """Build the completion message for accepting suggestions from a user."""
+    if total == 0:
+        return gettext("No suggestions found.")
+
+    if failed == 0:
+        return ngettext(
+            "Accepted %(count)d suggestion from %(user)s.",
+            "Accepted %(count)d suggestions from %(user)s.",
+            accepted,
+        ) % {
+            "count": accepted,
+            "user": username,
+        }
+
+    return ngettext(
+        "Accepted %(accepted)d of %(total)d suggestion from %(user)s. %(failed)d failed due to permissions or checks.",
+        "Accepted %(accepted)d of %(total)d suggestions from %(user)s. %(failed)d failed due to permissions or checks.",
+        total,
+    ) % {
+        "accepted": accepted,
+        "total": total,
+        "failed": failed,
+        "user": username,
+    }
+
+
+def get_bulk_accept_user_suggestions_message_level(
+    *, accepted: int, failed: int
+) -> str:
+    """Return the message level for a bulk accept result."""
+    if accepted > 0:
+        if failed == 0:
+            return "success"
+        return "warning"
+    if failed > 0:
+        return "error"
+    return "info"
+
+
+def report_bulk_accept_user_suggestions_progress(processed: int, total: int) -> None:
+    """Report bulk suggestion acceptance progress to Celery."""
+    if current_task and current_task.request.id:
+        current_task.update_state(
+            state="PROGRESS",
+            meta={"progress": 100 * processed // total if total else 100},
+        )
+
+
+@app.task(trail=False)
+def bulk_edit_task(
+    *,
+    user_id: int,
+    path: list[str],
+    data: dict[str, list[str]],
+    selected_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Apply a browser bulk edit with fresh scope and permission checks."""
+    from django.http import Http404, QueryDict  # ruff: ignore[import-outside-top-level]
+
+    from weblate.trans.bulk import bulk_perform  # ruff: ignore[import-outside-top-level]
+    from weblate.trans.forms import BulkEditForm  # ruff: ignore[import-outside-top-level]
+    from weblate.trans.views.search import (  # ruff: ignore[import-outside-top-level]
+        get_bulk_edit_options,
+        get_bulk_edit_scope,
+    )
+
+    user = User.objects.get(pk=user_id)
+    request = AuthenticatedHttpRequest()
+    request.user = user
+    payload = QueryDict(mutable=True)
+    for key, values in data.items():
+        payload.setlist(key, values)
+    processed = 0
+    updated_so_far = 0
+
+    def report_progress(done: int, total: int, updated: int) -> None:
+        nonlocal processed, updated_so_far
+        processed = done
+        updated_so_far = updated
+        if current_task and current_task.request.id:
+            current_task.update_state(
+                state="PROGRESS",
+                meta={"progress": 100 * done // total if total else 100},
+            )
+
+    with override(user.profile.language):
+        # ruff: ignore[too-many-statements-in-try-clause]
+        try:
+            obj, unit_set, context = get_bulk_edit_scope(request, path)
+            form = BulkEditForm(
+                user, obj, payload, project=context.get("project"), selection=True
+            )
+            if not form.is_valid():
+                # ruff: ignore[raise-within-try]
+                raise ValidationError(
+                    gettext("Bulk edit parameters are no longer valid.")
+                )
+            if selected_ids is not None:
+                unit_set = unit_set.filter(pk__in=selected_ids)
+            updated = bulk_perform(
+                user,
+                unit_set,
+                progress=report_progress,
+                **get_bulk_edit_options(form, context),
+            )
+        except (ValidationError, PermissionDenied, Http404) as error:
+            message = gettext(
+                "Bulk edit failed after processing %(count)d strings: %(error)s"
+            ) % {
+                "count": processed,
+                "error": "; ".join(error.messages)
+                if isinstance(error, ValidationError)
+                else gettext("The target or permissions changed."),
+            }
+            return {
+                "message": message,
+                "updated": updated_so_far,
+                "errors": [message],
+                "completion_message": {"text": message, "level": "error"},
+            }
+        except Exception:
+            LOGGER.exception(
+                "Bulk edit task failed after processing %d units", processed
+            )
+            message = gettext(
+                "Bulk edit failed after processing %(count)d strings. Earlier batches may have been applied."
+            ) % {"count": processed}
+            return {
+                "message": message,
+                "updated": updated_so_far,
+                "errors": [message],
+                "completion_message": {"text": message, "level": "error"},
+            }
+        message = (
+            ngettext(
+                "Bulk edit completed, %d string was updated.",
+                "Bulk edit completed, %d strings were updated.",
+                updated,
+            )
+            % updated
+        )
+        return {
+            "message": message,
+            "updated": updated,
+            "completion_message": {"text": message, "level": "success"},
+        }
+
+
+@app.task(trail=False)
+def bulk_accept_user_suggestions(
+    *,
+    translation_id: int,
+    target_user_id: int,
+    user_id: int,
+    approve: bool = False,
+    return_url: str = "",
+) -> dict[str, dict[str, str] | int | str]:
+    """Accept all suggestions from a specific user for a translation."""
+    translation = Translation.objects.get(pk=translation_id)
+    target_user = User.objects.get(pk=target_user_id)
+    user = User.objects.get(pk=user_id)
+
+    request = AuthenticatedHttpRequest()
+    request.user = user
+
+    suggestions = Suggestion.objects.filter(
+        unit__translation=translation, user=target_user
+    ).select_related("unit")
+    total = suggestions.count()
+    accepted = 0
+    failed = 0
+    processed = 0
+
+    report_bulk_accept_user_suggestions_progress(processed, total)
+
+    for suggestion in suggestions.iterator(chunk_size=100):
+        processed += 1
+
+        if (
+            not user.has_perm("suggestion.accept", suggestion.unit)
+            or (approve and not user.has_perm("unit.review", suggestion.unit))
+            or list(suggestion.get_checks())
+        ):
+            failed += 1
+        else:
+            suggestion.accept(
+                request,
+                state=STATE_APPROVED if approve else STATE_TRANSLATED,
+            )
+            accepted += 1
+
+        report_bulk_accept_user_suggestions_progress(processed, total)
+
+    with override(user.profile.language if user else "en"):
+        message_level = get_bulk_accept_user_suggestions_message_level(
+            accepted=accepted, failed=failed
+        )
+        message = get_bulk_accept_user_suggestions_message(
+            accepted=accepted,
+            failed=failed,
+            total=total,
+            username=target_user.username,
+        )
+    result: dict[str, dict[str, str] | int | str] = {
+        "accepted": accepted,
+        "failed": failed,
+        "total": total,
+        "message": message,
+        "completion_message": {
+            "level": message_level,
+            "text": message,
+        },
+    }
+    if return_url:
+        result["url"] = return_url
+    return result
+
+
+@app.task(trail=False)
+def cleanup_component(pk: int) -> None:
     """
     Perform cleanup of component models.
 
@@ -203,9 +1002,12 @@ def cleanup_component(pk) -> None:
 
     # Remove all units where there is just one referenced unit (self)
     with transaction.atomic():
+        referenced_units = Unit.objects.filter(source_unit=OuterRef("pk")).exclude(
+            pk=OuterRef("pk")
+        )
         deleted, details = (
-            translation.unit_set.annotate(Count("unit"))
-            .filter(unit__count__lte=1)
+            translation.unit_set.alias(has_references=Exists(referenced_units))
+            .filter(has_references=False)
             .delete()
         )
         if deleted:
@@ -217,7 +1019,7 @@ def cleanup_suggestions() -> None:
     # Process suggestions
     anonymous_user = get_anonymous()
     suggestions = Suggestion.objects.prefetch_related("unit")
-    for suggestion in suggestions:
+    for suggestion in suggestions.iterator(chunk_size=100):
         with transaction.atomic():
             # Remove suggestions with same text as real translation
             if (
@@ -230,21 +1032,21 @@ def cleanup_suggestions() -> None:
                 continue
 
             # Remove duplicate suggestions
-            sugs = Suggestion.objects.filter(
-                unit=suggestion.unit, target=suggestion.target
-            ).exclude(id=suggestion.id)
-            # Do not rely on the SQL as MySQL compares strings case insensitive
-            for other in sugs:
-                if other.target == suggestion.target:
-                    suggestion.delete_log(
-                        anonymous_user, change=ActionEvents.SUGGESTION_CLEANUP
-                    )
-                    break
+            if (
+                Suggestion.objects.filter(
+                    unit=suggestion.unit, target=suggestion.target
+                )
+                .exclude(id=suggestion.id)
+                .exists()
+            ):
+                suggestion.delete_log(
+                    anonymous_user, change=ActionEvents.SUGGESTION_CLEANUP
+                )
 
 
 @app.task(trail=False)
 def update_remotes() -> None:
-    """Update all remote branches (without attempt to merge)."""
+    """Queue updates of all remote branches (without attempt to merge)."""
     if settings.AUTO_UPDATE not in {"full", "remote", True, False}:
         return
 
@@ -254,17 +1056,146 @@ def update_remotes() -> None:
         .annotate(hourmod=F("id") % 24)
         .filter(hourmod=now.hour)
     )
-    for component in components.prefetch().iterator(chunk_size=100):
-        perform_update("Component", -1, auto=True, obj=component)
+    component_ids = components.values_list("pk", flat=True)
+    for component_id in component_ids.iterator(chunk_size=100):
+        perform_update.delay("Component", component_id, auto=True)
 
 
 @app.task(trail=False)
-def cleanup_stale_repos(root: Path | None = None) -> bool:
-    vcs_root = Path(data_dir("vcs"))
-    if root is None:
-        root = vcs_root
+def cleanup_repos() -> None:
+    """Cleanup of all internal repositories."""
+    now = timezone.now()
 
-    yesterday = time.time() - 86400
+    components = (
+        Component.objects.with_repo()
+        .annotate(id_mod=F("id") % (30 * 24))
+        .filter(id_mod=(now.day - 1) * 24 + now.hour)
+    )
+    for component in components.prefetch().iterator(chunk_size=100):
+        try:
+            with component.repository.lock:
+                component.log_info("Performing repository maintenance")
+                component.repository.maintenance()
+        except (RepositoryError, WeblateLockTimeoutError):
+            report_error("Repository maintenance failed", project=component.project)
+
+
+def _is_project_or_category_path(parts: tuple[str, ...]) -> bool:
+    if len(parts) == 1:
+        return Project.objects.filter(slug__iexact=parts[0]).exists()
+
+    if len(parts) < 2:
+        return False
+
+    project, *categories = parts
+    category = categories[-1]
+    kwargs: dict[str, str | None] = {}
+    prefix = ""
+    for parent in reversed(categories[:-1]):
+        kwargs[f"{prefix}category__slug"] = parent
+        prefix = f"category__{prefix}"
+    if not kwargs:
+        kwargs["category"] = None
+
+    return Category.objects.filter(
+        slug__iexact=category, project__slug__iexact=project, **kwargs
+    ).exists()
+
+
+def _get_component_by_vcs_path(parts: tuple[str, ...]) -> Component | None:
+    if len(parts) < 2:
+        return None
+    with suppress(Component.DoesNotExist):
+        return Component.objects.get_by_path("/".join(parts))
+    return None
+
+
+@dataclass
+class _StaleRepositoryLookup:
+    containers: set[tuple[str, ...]]
+    components: dict[tuple[str, ...], list[bool]]
+
+    @classmethod
+    def load(cls, project_slug: str) -> _StaleRepositoryLookup:
+        project_ids = list(
+            Project.objects.filter(slug__iexact=project_slug).values_list(
+                "pk", flat=True
+            )
+        )
+        if not project_ids:
+            return cls(set(), {})
+
+        categories = {
+            pk: (slug, parent_id)
+            for pk, slug, parent_id in Category.objects.filter(
+                project_id__in=project_ids
+            ).values_list("pk", "slug", "category_id")
+        }
+
+        def category_path(category_id: int | None) -> tuple[str, ...]:
+            slugs = []
+            while category_id is not None:
+                slug, category_id = categories[category_id]
+                slugs.append(slug)
+            return tuple(reversed(slugs))
+
+        containers: set[tuple[str, ...]] = {()}
+        for pk in categories:
+            containers.update(cls.matching_paths(category_path(pk)))
+
+        components: dict[tuple[str, ...], list[bool]] = {}
+        for slug, category_id, is_link in (
+            Component.objects.filter(project_id__in=project_ids)
+            .annotate(is_link=Q(repo__startswith="weblate://"))
+            .values_list("slug", "category_id", "is_link")
+        ):
+            for path in cls.matching_paths((*category_path(category_id), slug)):
+                components.setdefault(path, []).append(is_link)
+        return cls(containers, components)
+
+    @staticmethod
+    def matching_paths(parts: tuple[str, ...]) -> list[tuple[str, ...]]:
+        # Match the existing path filters: the leaf is case insensitive, parents
+        # are exact, and only paths without parents require a top-level object.
+        normalized = (*parts[:-1], parts[-1].upper())
+        return [normalized[index:] for index in range(max(1, len(parts) - 1))]
+
+    @staticmethod
+    def path_key(parts: tuple[str, ...]) -> tuple[str, ...]:
+        if len(parts) == 1:
+            return ()
+        return (*parts[1:-1], parts[-1].upper())
+
+    def is_container(self, parts: tuple[str, ...]) -> bool:
+        return self.path_key(parts) in self.containers
+
+    def component_is_link(self, parts: tuple[str, ...]) -> bool | None:
+        matches = self.components.get(self.path_key(parts), [])
+        if len(matches) > 1:
+            raise Component.MultipleObjectsReturned
+        return matches[0] if matches else None
+
+
+def _remove_empty_stale_repo(root: Path, parts: tuple[str, ...]) -> bool:
+    if _is_project_or_category_path(parts):
+        return False
+    component = _get_component_by_vcs_path(parts)
+    if component is not None and not component.is_repo_link:
+        return False
+    LOGGER.info("removing stale VCS path (not found): %s", root)
+    root.rmdir()
+    return True
+
+
+def _cleanup_stale_repos(
+    root: Path,
+    vcs_root: Path,
+    yesterday: float,
+    lookup: _StaleRepositoryLookup | None,
+) -> bool:
+    root_is_known_container = lookup is None or lookup.is_container(
+        root.relative_to(vcs_root).parts
+    )
 
     empty_dir = True
     for path in root.glob("*"):
@@ -272,11 +1203,34 @@ def cleanup_stale_repos(root: Path | None = None) -> bool:
             empty_dir = False
             # Possibly a lock file
             continue
+        if (
+            root_is_known_container
+            and path.name.casefold() in MANAGED_VCS_METADATA_DIRS
+        ):
+            empty_dir = False
+            continue
+
         git_dir = path / ".git"
         mercurial_dir = path / ".hg"
+        relative_parts = path.relative_to(vcs_root).parts
+        path_lookup = lookup
+        if path_lookup is None:
+            path_lookup = _StaleRepositoryLookup.load(relative_parts[0])
+
+        if path_lookup.is_container(relative_parts):
+            # Project/category dir, regardless of stale VCS metadata.
+            if not _cleanup_stale_repos(path, vcs_root, yesterday, path_lookup):
+                empty_dir = False
+            continue
+
+        is_link = path_lookup.component_is_link(relative_parts)
+        if is_link is False:
+            empty_dir = False
+            continue
+
         if not git_dir.exists() and not mercurial_dir.exists():
-            # Category dir
-            if not cleanup_stale_repos(path):
+            # Possible project/category dir not present in the database.
+            if not _cleanup_stale_repos(path, vcs_root, yesterday, path_lookup):
                 empty_dir = False
             continue
 
@@ -285,66 +1239,61 @@ def cleanup_stale_repos(root: Path | None = None) -> bool:
             empty_dir = False
             continue
 
-        try:
-            # Find matching components
-            component: Component = parse_path(
-                None, path.relative_to(vcs_root).parts, (Component,)
-            )
-        except Http404:
-            # Remove stale dir
+        # The lookup is a snapshot. Recheck deletion candidates in case a project,
+        # category, or component was created or changed while traversing the tree.
+        if _is_project_or_category_path(relative_parts):
+            empty_dir = False
+            continue
+        component = _get_component_by_vcs_path(relative_parts)
+        if component is None:
             LOGGER.info("removing stale VCS path (not found): %s", path)
             remove_tree(path)
-        else:
-            if component.is_repo_link:
-                LOGGER.info("removing stale VCS path (uses link): %s", root)
-                remove_tree(path)
-            else:
-                empty_dir = False
-
-    if empty_dir and root != vcs_root:
-        try:
-            # Find matching components
-            parse_path(None, root.relative_to(vcs_root).parts, (Category, Project))
-        except Http404:
-            LOGGER.info("removing stale VCS path (not found): %s", root)
-            root.rmdir()
+        elif component.is_repo_link:
+            LOGGER.info("removing stale VCS path (uses link): %s", path)
+            remove_tree(path)
         else:
             empty_dir = False
+
+    if empty_dir and root != vcs_root:
+        if root_is_known_container:
+            return False
+        return _remove_empty_stale_repo(root, root.relative_to(vcs_root).parts)
     return empty_dir
 
 
 @app.task(trail=False)
-def cleanup_old_suggestions() -> None:
-    if not settings.SUGGESTION_CLEANUP_DAYS:
-        return
-    cutoff = timezone.now() - timedelta(days=settings.SUGGESTION_CLEANUP_DAYS)
-    Suggestion.objects.filter(timestamp__lt=cutoff).delete()
+def cleanup_stale_repos(root: Path | None = None) -> bool:
+    vcs_root = Path(data_dir("vcs"))
+    lookup = None
+    if root is None:
+        root = vcs_root
+    elif root != vcs_root:
+        lookup = _StaleRepositoryLookup.load(root.relative_to(vcs_root).parts[0])
+    return _cleanup_stale_repos(root, vcs_root, time.time() - 86400, lookup)
 
 
 @app.task(trail=False)
-def cleanup_old_comments() -> None:
-    if not settings.COMMENT_CLEANUP_DAYS:
-        return
-    cutoff = timezone.now() - timedelta(days=settings.COMMENT_CLEANUP_DAYS)
-    Comment.objects.filter(timestamp__lt=cutoff).delete()
-
-
-@app.task(trail=False)
-def repository_alerts(threshold=settings.REPOSITORY_ALERT_THRESHOLD) -> None:
+def repository_alerts(threshold: int = settings.REPOSITORY_ALERT_THRESHOLD) -> None:
     non_linked = Component.objects.with_repo()
     for component in non_linked.iterator():
         try:
-            if component.repository.count_missing() > threshold:
-                component.add_alert("RepositoryOutdated")
-            else:
-                component.delete_alert("RepositoryOutdated")
-            if component.repository.count_outgoing() > threshold:
-                component.add_alert("RepositoryChanges")
-            else:
-                component.delete_alert("RepositoryChanges")
+            update_repository_alerts(component, threshold)
         except RepositoryError as error:
             report_error("Could not check repository status", project=component.project)
-            component.add_alert("MergeFailure", error=component.error_text(error))
+            component.add_alert(
+                "MergeFailure", **component.get_repository_alert_details(error)
+            )
+
+
+def update_repository_alerts(component: Component, threshold: int) -> None:
+    if component.repository.count_missing() > threshold:
+        component.add_alert("RepositoryOutdated")
+    else:
+        component.delete_alert("RepositoryOutdated")
+    if component.repository.count_outgoing() > threshold:
+        component.add_alert("RepositoryChanges")
+    else:
+        component.delete_alert("RepositoryChanges")
 
 
 @app.task(trail=False)
@@ -356,7 +1305,7 @@ def component_alerts(component_ids=None) -> None:
         components = Component.objects.annotate(hourmod=F("id") % 24).filter(
             hourmod=now.hour
         )
-    for component in components.prefetch().iterator(chunk_size=100):
+    for component in components.order_by("id").prefetch().iterator(chunk_size=100):
         with transaction.atomic():
             component.update_alerts()
 
@@ -369,6 +1318,7 @@ def component_alerts(component_ids=None) -> None:
 @transaction.atomic
 def component_after_save(
     pk: int,
+    *,
     changed_git: bool,
     changed_setup: bool,
     changed_template: bool,
@@ -376,7 +1326,18 @@ def component_after_save(
     changed_enforced_checks: bool,
     skip_push: bool,
     create: bool,
+    seed_source_component_id: int | None = None,
+    copy_seed_addons: bool = False,
+    seed_author: str | None = None,
 ) -> dict[Literal["component"], int]:
+    if (
+        seed_source_component_id is not None
+        and current_task
+        and current_task.request.id
+    ):
+        task_id = str(current_task.request.id)
+        store_task_metadata(task_id, component_id=pk)
+        store_task_failure_dependencies(task_id, [seed_source_component_id])
     component = Component.objects.get(pk=pk)
     component.after_save(
         changed_git=changed_git,
@@ -386,6 +1347,9 @@ def component_after_save(
         changed_enforced_checks=changed_enforced_checks,
         skip_push=skip_push,
         create=create,
+        seed_source_component_id=seed_source_component_id,
+        copy_seed_addons=copy_seed_addons,
+        seed_author=seed_author,
     )
     return {"component": pk}
 
@@ -403,41 +1367,160 @@ def update_enforced_checks(component: int | Component) -> None:
 
 
 @app.task(trail=False)
-@transaction.atomic
-def component_removal(pk: int, uid: int) -> None:
+@logged_removal(Component)
+def component_removal(pk: int, uid: int, delete_memory: bool = False) -> None:
     user = User.objects.get(pk=uid)
     try:
         component = Component.objects.get(pk=pk)
     except Component.DoesNotExist:
         return
-    component.acting_user = user
-    component.project.change_set.create(
-        action=ActionEvents.REMOVE_COMPONENT,
-        target=component.slug,
-        user=user,
-        author=user,
+
+    batch = RemovalBatch()
+    _collect_linked_removal_targets([component.pk], batch)
+    with removal_batch_context(batch):
+        _component_removal(component, user, batch, delete_memory=delete_memory)
+    transaction.on_commit(batch.flush)
+
+
+def _component_removal(
+    component: Component,
+    user: User,
+    batch: RemovalBatch | None = None,
+    *,
+    delete_memory: bool = False,
+) -> None:
+    with acting_user_context(user):
+        memory_cleanup = None
+        if delete_memory:
+            cleanup_batch = batch
+            if cleanup_batch is None:
+                cleanup_batch = RemovalBatch()
+                _collect_linked_removal_targets([component.pk], cleanup_batch)
+            memory_cleanup = collect_component_memory_cleanup(cleanup_batch)
+            # Remove attributed scopes while their component foreign keys exist.
+            delete_collected_component_memory(memory_cleanup)
+        if batch is not None:
+            component.removal_batch = batch
+        with component.repository.lock:
+            component.project.change_set.create(
+                action=ActionEvents.REMOVE_COMPONENT,
+                target=component.slug,
+                user=user,
+                author=user,
+            )
+            component.delete()
+            if component.allow_translation_propagation:
+                components = component.project.component_set.filter(
+                    allow_translation_propagation=True
+                ).exclude(pk=component.pk)
+                if batch is not None:
+                    components = components.exclude(pk__in=batch.removed_component_ids)
+                for current in components.iterator():
+                    current.schedule_update_checks()
+        if memory_cleanup is not None:
+            # Catch memory writes which raced with the initial cleanup. Current
+            # writers normalize origins to the component's current full slug.
+            delete_collected_component_memory(memory_cleanup)
+
+
+@dataclass(frozen=True)
+class ComponentMemoryCleanup:
+    """Component identifiers retained across component deletion."""
+
+    component_ids: frozenset[int]
+    origins: frozenset[str]
+
+
+def delete_component_memory(component: Component) -> None:
+    """Delete non-personal automatic memory for a component and linked children."""
+    batch = RemovalBatch()
+    _collect_linked_removal_targets([component.pk], batch)
+    delete_collected_component_memory(collect_component_memory_cleanup(batch))
+
+
+def collect_component_memory_cleanup(batch: RemovalBatch) -> ComponentMemoryCleanup:
+    """Collect component identifiers needed after removing components."""
+    components = list(
+        Component.objects.filter(pk__in=batch.removed_component_ids).prefetch()
     )
-    component.delete()
-    if component.allow_translation_propagation:
-        components = component.project.component_set.filter(
-            allow_translation_propagation=True
-        ).exclude(pk=component.pk)
-        for component in components.iterator():
-            component.schedule_update_checks()
+    return ComponentMemoryCleanup(
+        component_ids=frozenset(component.id for component in components),
+        origins=frozenset(component.full_slug for component in components),
+    )
 
 
-@app.task(trail=False)
-@transaction.atomic
-def category_removal(pk: int, uid: int) -> None:
-    user = User.objects.get(pk=uid)
-    try:
-        category = Category.objects.get(pk=pk)
-    except Category.DoesNotExist:
-        return
+def delete_collected_component_memory(cleanup: ComponentMemoryCleanup) -> None:
+    """Delete automatic memory collected for removed components."""
+    # ruff: ignore[import-outside-top-level]
+    from weblate.memory.models import Memory, MemoryScope
+
+    automatic_scopes = Q(
+        scope__in=(
+            MemoryScope.SCOPE_PROJECT,
+            MemoryScope.SCOPE_SHARED,
+            MemoryScope.SCOPE_WORKSPACE,
+        ),
+    )
+    for component_ids in batched(
+        cleanup.component_ids, COMPONENT_MEMORY_CLEANUP_BATCH_SIZE
+    ):
+        Memory.objects.delete_scope(
+            automatic_scopes & Q(source_component_id__in=component_ids),
+            delete_legacy=False,
+        )
+    for origins in batched(cleanup.origins, COMPONENT_MEMORY_CLEANUP_BATCH_SIZE):
+        Memory.objects.delete_scope(
+            automatic_scopes & Q(memory__origin__in=origins),
+            delete_legacy=False,
+        )
+        # TODO(2028.1): Remove legacy unscoped cleanup once Weblate no longer
+        # supports direct upgrades from 2026 releases.
+        Memory.objects.filter(
+            scopes__isnull=True,
+            origin__in=origins,
+            legacy_user__isnull=True,
+            legacy_from_file=False,
+        ).delete()
+
+
+def _collect_removal_targets(category: Category, batch: RemovalBatch) -> None:
+    _collect_linked_removal_targets(
+        category.component_set.values_list("id", flat=True).iterator(chunk_size=1000),
+        batch,
+    )
+
     for child in category.category_set.all():
-        category_removal(child.pk, uid)
-    for component_id in category.component_set.values_list("id", flat=True):
-        component_removal(component_id, uid)
+        _collect_removal_targets(child, batch)
+
+
+def _collect_linked_removal_targets(
+    component_ids: Iterable[int], batch: RemovalBatch
+) -> None:
+    linked_frontier: set[int] = set()
+    for component_id in component_ids:
+        batch.mark_component(component_id)
+        linked_frontier.add(component_id)
+
+    while linked_frontier:
+        children = Component.objects.filter(
+            linked_component_id__in=linked_frontier
+        ).values_list("id", flat=True)
+        next_frontier = set()
+        for component_id in children.iterator(chunk_size=1000):
+            if component_id in batch.removed_component_ids:
+                continue
+            batch.mark_component(component_id)
+            next_frontier.add(component_id)
+        linked_frontier = next_frontier
+
+
+def _category_removal(
+    category: Category, user: User, batch: RemovalBatch | None = None
+) -> None:
+    for child in category.category_set.all():
+        _category_removal(child, user, batch)
+    for component in category.component_set.iterator():
+        _component_removal(component, user, batch)
     category.project.change_set.create(
         action=ActionEvents.REMOVE_CATEGORY,
         target=category.slug,
@@ -447,155 +1530,407 @@ def category_removal(pk: int, uid: int) -> None:
     category.delete()
 
 
-@app.task(
-    trail=False,
-    autoretry_for=(IntegrityError,),
-    retry_backoff=600,
-    retry_backoff_max=3600,
-)
-def actual_project_removal(pk: int, uid: int | None) -> None:
-    """
-    Remove project.
+@app.task(trail=False)
+@logged_removal(Category)
+def category_removal(pk: int, uid: int, delete_memory: bool = False) -> None:
+    user = User.objects.get(pk=uid)
+    try:
+        category = Category.objects.get(pk=pk)
+    except Category.DoesNotExist:
+        return
+    batch = RemovalBatch()
+    _collect_removal_targets(category, batch)
+    memory_cleanup = collect_component_memory_cleanup(batch) if delete_memory else None
+    with removal_batch_context(batch):
+        if memory_cleanup is not None:
+            # Remove attributed scopes while their component foreign keys exist.
+            delete_collected_component_memory(memory_cleanup)
+        _category_removal(category, user, batch)
+        if memory_cleanup is not None:
+            # Catch memory writes which raced with the initial cleanup. Current
+            # writers normalize origins to the component's current full slug.
+            delete_collected_component_memory(memory_cleanup)
+    transaction.on_commit(batch.flush)
 
-    This is separated from project_removal to allow retry on integrity errors.
-    """
-    with transaction.atomic():
-        user = get_anonymous() if uid is None else User.objects.get(pk=uid)
-        try:
-            project = Project.objects.get(pk=pk)
-        except Project.DoesNotExist:
-            return
+
+def cleanup_project_tokens(project: Project, user: User | None) -> None:
+    """Remove project-scoped tokens before project groups are deleted."""
+    other_project_groups = User.groups.through.objects.filter(
+        user_id=OuterRef("pk"),
+        group__defining_project__isnull=False,
+    ).exclude(group__defining_project=project)
+    project_tokens = (
+        User.objects.filter(
+            groups__defining_project=project,
+            is_bot=True,
+            username__startswith="bot-",
+            email__endswith="@bots.noreply.weblate.org",
+        )
+        .exclude(username__contains=":")
+        .exclude(full_name="Deleted User")
+        .annotate(has_other_project_groups=Exists(other_project_groups))
+        .filter(has_other_project_groups=False)
+        .distinct()
+        .order_by("pk")
+    )
+    username = user.username if user is not None else None
+    for token_user in project_tokens.iterator():
+        remove_user(
+            token_user,
+            None,
+            activity="token-removed",
+            project=project.name,
+            username=username,
+        )
+
+
+@logged_removal(Project)
+def _remove_project(pk: int, uid: int | None) -> None:
+    user = get_anonymous() if uid is None else User.objects.get(pk=uid)
+    try:
+        project = Project.objects.get(pk=pk)
+    except Project.DoesNotExist:
+        return
+    batch = RemovalBatch()
+    _collect_linked_removal_targets(
+        project.component_set.values_list("id", flat=True).iterator(chunk_size=1000),
+        batch,
+    )
+    with removal_batch_context(batch):
         Change.objects.create(
             action=ActionEvents.REMOVE_PROJECT,
             target=project.slug,
             user=user,
             author=user,
         )
+        cleanup_project_tokens(project, user)
         project.delete()
-        transaction.on_commit(project.stats.update_parents)
+    transaction.on_commit(batch.flush)
 
 
-@app.task(trail=False)
-def project_removal(pk: int, uid: int | None) -> None:
-    """Backup project and schedule actual removal."""
-    create_project_backup(pk)
-    actual_project_removal.delay(pk, uid)
+@app.task(bind=True, trail=False)
+def project_removal(
+    task: Task, pk: int, uid: int | None, *, backup: bool = True
+) -> None:
+    """Backup and remove project."""
+    if backup:
+        create_project_backup(pk, uid)
+
+    try:
+        _remove_project(pk, uid)
+    except IntegrityError as error:
+        countdown = get_exponential_backoff_interval(
+            factor=600,
+            retries=task.request.retries,
+            maximum=3600,
+            full_jitter=True,
+        )
+        retry_args = tuple(task.request.args) if task.request.args is not None else None
+        retry_kwargs = {**(task.request.kwargs or {}), "backup": False}
+        raise task.retry(
+            args=retry_args,
+            kwargs=retry_kwargs,
+            exc=error,
+            countdown=countdown,
+        ) from error
 
 
-@app.task(
-    trail=False,
-    autoretry_for=(WeblateLockTimeoutError,),
-    retry_backoff=600,
-    retry_backoff_max=3600,
-)
+def store_auto_translate_activity_log(
+    activity_log_id: int | None,
+    result: dict[str, Any],
+    *,
+    status: AddonActivityLogStatus | None = None,
+    reason: AddonActivityLogReason | None = None,
+    task_count: int | None = None,
+    log_message: str | None = None,
+) -> dict[str, Any]:
+    if activity_log_id is None:
+        return result
+
+    # ruff: ignore[import-outside-top-level]
+    from weblate.addons.tasks import update_addon_activity_log
+
+    if status is None:
+        status = (
+            AddonActivityLogStatus.ERROR
+            if result.get("_automatic_translation_failed")
+            else AddonActivityLogStatus.SUCCESS
+        )
+    update_addon_activity_log(
+        activity_log_id,
+        {**result, "message": log_message} if log_message is not None else result,
+        status=status,
+        reason=reason,
+        task_count=task_count,
+    )
+    return result
+
+
+def get_auto_translate_target(
+    *,
+    translation_id: int | None,
+    component_id: int | None,
+    category_id: int | None,
+    project_id: int | None,
+    language_id: int | None,
+    workspace_id: str | None = None,
+) -> tuple[
+    Translation | Component | Category | ProjectLanguage | Workspace,
+    dict[str, int | str],
+]:
+    if translation_id is not None:
+        translation = Translation.objects.get(pk=translation_id)
+        return translation, {"translation": translation.id}
+    if component_id is not None:
+        component = Component.objects.get(pk=component_id)
+        return component, {"component": component.id}
+    if category_id is not None:
+        category = Category.objects.get(pk=category_id)
+        return category, {"category": category.id}
+    if project_id is not None:
+        if language_id is None:
+            msg = "language_id must be provided when project_id is given"
+            raise ValueError(msg)
+        project_language = ProjectLanguage(
+            project=Project.objects.get(pk=project_id),
+            language=Language.objects.get(pk=language_id),
+        )
+        return project_language, {
+            "project": project_language.project.id,
+            "language": project_language.language.id,
+        }
+    if workspace_id is not None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.workspaces.models import Workspace
+
+        workspace = Workspace.objects.get(pk=workspace_id)
+        return workspace, {"workspace": str(workspace.pk)}
+    msg = (
+        "One of translation_id, component_id, category_id, project_id, "
+        "or workspace_id must be provided"
+    )
+    raise ValueError(msg)
+
+
+@app.task(trail=False, max_retries=None)
+@translation_task
+# ruff: ignore[too-many-arguments]
 def auto_translate(
     *,
     user_id: int | None,
-    translation_id: int,
     mode: str,
     q: str,
     auto_source: Literal["mt", "others"],
-    component: int | None,
+    source_component_id: int | None,
     engines: list[str],
     threshold: int,
     component_wide: bool = False,
-):
-    translation = Translation.objects.get(pk=translation_id)
-    user = User.objects.get(pk=user_id) if user_id else None
-    with override(user.profile.language if user else "en"):
-        auto = AutoTranslate(
+    unit_ids: list[int] | None = None,
+    translation_id: int | None = None,
+    component_id: int | None = None,
+    category_id: int | None = None,
+    project_id: int | None = None,
+    language_id: int | None = None,
+    workspace_id: str | None = None,
+    activity_log_id: int | None = None,
+    activity_log_task_count: int | None = None,
+    enforce_permissions: bool = True,
+) -> dict[str, Any]:
+    if current_task and current_task.request.id:
+        store_task_metadata(
+            str(current_task.request.id),
+            user_id=user_id,
+            component_id=component_id,
+            translation_id=translation_id,
+            task_kind="automatic-translation",
+        )
+    result: dict[str, Any] = {"warnings": [], "errors": []}
+    if user_id is None:
+        # Older queued add-on jobs did not carry an actor for MT operations.
+        from weblate.addons.autotranslate import AutoTranslateAddon  # ruff: ignore[import-outside-top-level]
+
+        user = User.objects.get_or_create_bot(
+            scope="addon",
+            name=AutoTranslateAddon.user_name,
+            verbose=AutoTranslateAddon.user_verbose,
+        )
+        enforce_permissions = False
+    else:
+        user = User.objects.get(pk=user_id)
+    with override(user.profile.language):
+        try:
+            obj, target_result = get_auto_translate_target(
+                translation_id=translation_id,
+                component_id=component_id,
+                category_id=category_id,
+                project_id=project_id,
+                language_id=language_id,
+                workspace_id=workspace_id,
+            )
+        except ObjectDoesNotExist:
+            result["message"] = gettext(
+                "Automatic translation skipped because the target no longer exists."
+            )
+            return store_auto_translate_activity_log(
+                activity_log_id,
+                result,
+                status=AddonActivityLogStatus.SKIPPED,
+                reason=AddonActivityLogReason.TARGET_MISSING,
+                task_count=activity_log_task_count,
+            )
+        result.update(target_result)
+        auto = BatchAutoTranslate(
+            obj,
             user=user,
-            translation=translation,
             q=q,
             mode=mode,
             component_wide=component_wide,
+            unit_ids=unit_ids,
+            enforce_permissions=enforce_permissions,
         )
-        message = auto.perform(
-            auto_source=auto_source,
-            engines=engines,
-            threshold=threshold,
-            source=component,
+        try:
+            message = auto.perform(
+                auto_source=auto_source,
+                engines=engines,
+                threshold=threshold,
+                source_component_ids=(
+                    [source_component_id] if source_component_id is not None else None
+                ),
+            )
+        except PermissionDenied as error:
+            result.update(
+                {
+                    "message": auto.get_message() if auto.errors else str(error),
+                    "_automatic_translation_failed": True,
+                    "warnings": auto.get_warnings(),
+                    "_warning_details": auto.get_warning_details(),
+                    "errors": auto.get_errors(),
+                    "_error_details": auto.get_error_details(),
+                }
+            )
+            return store_auto_translate_activity_log(
+                activity_log_id,
+                result,
+                status=AddonActivityLogStatus.ERROR,
+                task_count=activity_log_task_count,
+                log_message="Automatic translation failed.",
+            )
+        result.update(
+            {
+                "message": message,
+                "_automatic_translation_failed": bool(
+                    auto.failure_message or auto.errors
+                ),
+                "warnings": auto.get_warnings(),
+                "_warning_details": auto.get_warning_details(),
+                "errors": auto.get_errors(),
+                "_error_details": auto.get_error_details(),
+            }
         )
-        return {"translation": translation_id, "message": message}
+        # Task results follow the user's language; persisted activity messages
+        # must remain independent of the language active during execution.
+        with override(None):
+            log_message = auto.get_message()
+        return store_auto_translate_activity_log(
+            activity_log_id,
+            result,
+            task_count=activity_log_task_count,
+            log_message=log_message,
+        )
 
 
-@app.task(
-    trail=False,
-    autoretry_for=(WeblateLockTimeoutError,),
-    retry_backoff=600,
-    retry_backoff_max=3600,
-)
+@app.task(trail=False, max_retries=None)
+@translation_task
 def auto_translate_component(
     component_id: int,
+    *,
     mode: str,
     q: str,
     auto_source: Literal["mt", "others"],
     engines: list[str],
     threshold: int,
-    component: int | None = None,
-):
+    source_component_id: int | None = None,
+    user_id: int | None = None,
+    activity_log_id: int | None = None,
+    enforce_permissions: bool = True,
+) -> dict[str, Any]:
     component_obj = Component.objects.get(pk=component_id)
+    user = User.objects.get(pk=user_id) if user_id else None
+    from weblate.trans.automation import automatic_translation  # ruff: ignore[import-outside-top-level]
 
-    for translation in component_obj.translation_set.iterator():
-        if translation.is_source:
-            continue
-
-        auto = AutoTranslate(
-            user=None,
-            translation=translation,
-            q=q,
-            mode=mode,
-            component_wide=True,
-        )
-        auto.perform(
-            auto_source=auto_source,
-            engines=engines,
-            threshold=threshold,
-            source=component,
-        )
-    component_obj.update_source_checks()
-    component_obj.run_batched_checks()
-    return {"component": component_obj.id}
+    result = automatic_translation(
+        component_obj,
+        {
+            "mode": mode,
+            "q": q,
+            "auto_source": auto_source,
+            "engines": engines,
+            "threshold": threshold,
+            "component": source_component_id,
+        },
+        user,
+        enforce_permissions=enforce_permissions,
+    )
+    return store_auto_translate_activity_log(activity_log_id, result)
 
 
 @app.task(trail=False)
-def create_component(copy_from=None, copy_addons=False, in_task=False, **kwargs):
-    kwargs["project"] = Project.objects.get(pk=kwargs["project"])
-    kwargs["source_language"] = Language.objects.get(pk=kwargs["source_language"])
-    component = Component(**kwargs)
-    # Perform validation to avoid creating duplicate components via background
-    # tasks in discovery
-    component.full_clean()
-    component.save(force_insert=True)
-    component.change_set.create(action=ActionEvents.CREATE_COMPONENT)
-    if copy_from:
-        # Copy non-automatic component lists
-        for clist in ComponentList.objects.filter(
-            components__id=copy_from, autocomponentlist__isnull=True
-        ):
-            clist.components.add(component)
-        # Copy add-ons
-        if copy_addons:
-            addons = Addon.objects.filter(component__pk=copy_from, repo_scope=False)
-            for addon in addons:
-                # Avoid installing duplicate addons
-                if component.addon_set.filter(name=addon.name).exists():
-                    continue
-                if not addon.addon.can_install(component, None):
-                    continue
-                addon.addon.create(
-                    component=component, configuration=addon.configuration
+def create_component(
+    copy_from=None,
+    copy_addons=False,
+    in_task=False,
+    *,
+    user_id: int | None = None,
+    **kwargs,
+):
+    user = User.objects.get(pk=user_id) if user_id is not None else get_acting_user()
+    if user is None:
+        msg = "Component creation requires an acting user"
+        raise ValueError(msg)
+    with acting_user_context(user):
+        explicit_fields = set(kwargs)
+        kwargs["project"] = Project.objects.get(pk=kwargs["project"])
+        kwargs["source_language"] = Language.objects.get(pk=kwargs["source_language"])
+        if "secondary_language" in kwargs and kwargs["secondary_language"] is not None:
+            kwargs["secondary_language"] = Language.objects.get(
+                pk=kwargs["secondary_language"]
+            )
+        apply_create_inheritance_defaults(kwargs, explicit_fields)
+        component = Component(**kwargs)
+        # Perform validation to avoid creating duplicate components via background
+        # tasks in discovery
+        component.full_clean()
+        component.save(force_insert=True)
+        component.change_set.create(
+            action=ActionEvents.CREATE_COMPONENT,
+            user=get_acting_user(),
+            author=get_acting_user(),
+        )
+        if copy_from:
+            source_component = Component.objects.filter(pk=copy_from).first()
+            # Copy non-automatic component lists
+            for clist in ComponentList.objects.filter(
+                components__id=copy_from, autocomponentlist__isnull=True
+            ):
+                clist.components.add(component)
+            # Copy add-ons
+            if copy_addons and source_component is not None:
+                copy_component_addons(
+                    component,
+                    source_component,
+                    same_project_only=False,
+                    acting_user=user,
                 )
-    if in_task:
-        return {"component": component.id}
-    return component
+        if in_task:
+            return {"component": component.id}
+        return component
 
 
 @app.task(trail=False)
 @transaction.atomic
 def update_checks(pk: int, update_token: str, update_state: bool = False) -> None:
     try:
-        component = Component.objects.get(pk=pk)
+        component = Component.objects.select_related("source_language").get(pk=pk)
     except Component.DoesNotExist:
         return
 
@@ -604,19 +1939,35 @@ def update_checks(pk: int, update_token: str, update_state: bool = False) -> Non
     if latest_token and update_token != latest_token:
         return
 
-    component.batch_checks = True
+    component.start_batched_checks()
+    source_translation = component.source_translation
+    # Share source data across target translations. Fetch sources again for the
+    # final check pass so it sees changes made while processing targets.
+    source_units = {unit.pk: unit for unit in source_translation.unit_set.all()}
     # Source translation as last
     translations = (
-        *component.translation_set.exclude(
-            pk=component.source_translation.pk
-        ).prefetch(),
-        component.source_translation,
+        *component.translation_set.exclude(pk=source_translation.pk).select_related(
+            "language", "plural"
+        ),
+        source_translation,
     )
     for translation in translations:
-        units = translation.unit_set.prefetch()
+        units = translation.unit_set.prefetch_related(
+            Prefetch("check_set", queryset=Check.objects.order(), to_attr="all_checks")
+        )
         if update_state:
             units = units.select_for_update()
-        for unit in units.prefetch_all_checks():
+        for unit in units:
+            if not unit.is_source:
+                try:
+                    unit.source_unit = source_units[unit.source_unit_id]
+                except KeyError:
+                    # A source can be added after the initial snapshot. Let the
+                    # relation fetch it, then share it with later translations.
+                    unit.source_unit.translation = source_translation
+                    source_units[unit.source_unit_id] = unit.source_unit
+            # Mark this as a batch update to avoid stats update on each unit
+            unit.is_batch_update = True
             if update_state:
                 unit.update_state()
             unit.run_checks()
@@ -644,6 +1995,7 @@ def daily_update_checks() -> None:
 
 @app.task(trail=False)
 def cleanup_project_backups() -> None:
+    # ruff: ignore[import-outside-top-level]
     from weblate.trans.backups import PROJECTBACKUP_PREFIX
 
     # This intentionally does not use Project objects to remove stale backups
@@ -665,7 +2017,8 @@ def cleanup_project_backups() -> None:
                 (
                     path,
                     make_aware(
-                        datetime.fromtimestamp(int(path.split(".")[0]))  # noqa: DTZ006
+                        # ruff: ignore[call-datetime-fromtimestamp]
+                        datetime.fromtimestamp(int(path.split(".")[0]))
                     ),
                 )
                 for path in os.listdir(projectdir)
@@ -684,36 +2037,179 @@ def cleanup_project_backups() -> None:
 
 
 @app.task(trail=False)
-def create_project_backup(pk) -> None:
+def create_project_backup(pk: int, uid: int | None = None) -> None:
+    # ruff: ignore[import-outside-top-level]
     from weblate.trans.backups import ProjectBackup
 
     project = Project.objects.get(pk=pk)
-    ProjectBackup().backup_project(project)
+    user = User.objects.get(pk=uid) if uid else None
+    backup = ProjectBackup()
+    backup.backup_project(project, user)
+
+
+def report_task_progress(progress: int) -> None:
+    if current_task and current_task.request.id:
+        current_task.update_state(state="PROGRESS", meta={"progress": progress})
+
+
+@app.task(trail=False)
+def generate_report(
+    *,
+    kind: str,
+    parameters: dict[str, Any],
+    user_id: int,
+    scope_type: str = "",
+    scope_id: str = "",
+    target: str = "api",
+) -> dict[str, str]:
+    # Importing here avoids loading report views in every Celery process at startup.
+    # ruff: ignore[import-outside-top-level]
+    from django.urls import reverse
+
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.views.reports import collect_report_data, load_report_scope
+
+    user = User.objects.get(pk=user_id)
+    scope = load_report_scope(scope_type, scope_id)
+    report_task_progress(10)
+    with override(user.profile.language or "en"):
+        data = collect_report_data(kind, parameters, user, scope)
+        message = gettext("Report generated.")
+    report_task_progress(90)
+    scope_values = {scope_type: scope} if scope_type else {}
+    report = Report.objects.create(
+        creator=user,
+        kind=kind,
+        parameters=parameters,
+        data=data,
+        **scope_values,
+    )
+    if target == "web":
+        url = reverse("report", kwargs={"pk": report.pk})
+    else:
+        url = reverse("api:report-detail", kwargs={"pk": report.pk})
+    return {"message": message, "url": url}
+
+
+@app.task(trail=False)
+def cleanup_reports() -> None:
+    cutoff = timezone.now() - timedelta(days=settings.REPORT_EXPIRY)
+    Report.objects.filter(created__lt=cutoff).delete()
+
+
+def report_restore_component_progress(completed: int, total: int) -> None:
+    if total:
+        report_task_progress(30 + (60 * completed // total))
+
+
+def restore_project_backup(
+    project_name: str,
+    project_slug: str,
+    user_id: int,
+    filename: str,
+    billing_id: int | None,
+    workspace_id: str | None = None,
+) -> tuple[Project, list[str]]:
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.backups import ProjectBackup
+
+    report_task_progress(5)
+    user = User.objects.get(pk=user_id)
+    billing = None
+    if billing_id is not None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.billing.models import Billing
+
+        billing = Billing.objects.get(pk=billing_id)
+    workspace = None
+    if workspace_id is not None:
+        # ruff: ignore[import-outside-top-level]
+        from weblate.workspaces.models import Workspace
+
+        workspace = Workspace.objects.get(pk=workspace_id)
+    restore = ProjectBackup(filename)
+    report_task_progress(10)
+    restore.validate()
+    report_task_progress(30)
+    project = restore.restore(
+        project_name=project_name,
+        project_slug=project_slug,
+        user=user,
+        billing=billing,
+        workspace=workspace,
+        progress_callback=report_restore_component_progress,
+    )
+    report_task_progress(95)
+    return project, restore.get_restore_warnings()
+
+
+@app.task(trail=False)
+def import_project_backup(
+    project_name: str,
+    project_slug: str,
+    user_id: int,
+    filename: str,
+    billing_id: int | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        project, restore_warnings = restore_project_backup(
+            project_name,
+            project_slug,
+            user_id,
+            filename,
+            billing_id,
+            workspace_id,
+        )
+    finally:
+        with suppress(OSError):
+            os.unlink(filename)
+
+    if restore_warnings:
+        return {
+            "message": gettext("Project backup import completed with warnings."),
+            "warnings": restore_warnings,
+        }
+
+    return {
+        "message": gettext("Project backup import completed."),
+        "url": project.get_absolute_url(),
+    }
 
 
 @app.task(trail=False)
 def remove_project_backup_download(name: str) -> None:
-    if staticfiles_storage.exists(name):
-        staticfiles_storage.delete(name)
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.backups import get_project_backup_download_storage
+
+    storage = get_project_backup_download_storage()
+    if storage.exists(name):
+        storage.delete(name)
 
 
 @app.task(trail=False)
 def cleanup_project_backup_download() -> None:
-    from weblate.trans.backups import PROJECTBACKUP_PREFIX
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.backups import (
+        PROJECTBACKUP_PREFIX,
+        get_project_backup_download_storage,
+    )
 
-    if not staticfiles_storage.exists(PROJECTBACKUP_PREFIX):
+    storage = get_project_backup_download_storage()
+    if not storage.exists(PROJECTBACKUP_PREFIX):
         return
     cutoff = timezone.now() - timedelta(hours=2)
-    for name in staticfiles_storage.listdir(PROJECTBACKUP_PREFIX)[1]:
+    for name in storage.listdir(PROJECTBACKUP_PREFIX)[1]:
         full_name = os.path.join(PROJECTBACKUP_PREFIX, name)
-        if staticfiles_storage.get_created_time(full_name) < cutoff:
-            staticfiles_storage.delete(full_name)
+        if storage.get_created_time(full_name) < cutoff:
+            storage.delete(full_name)
 
 
 @app.on_after_finalize.connect
-def setup_periodic_tasks(sender, **kwargs) -> None:
+def setup_periodic_tasks(sender: Celery, **kwargs: object) -> None:
     sender.add_periodic_task(3600, commit_pending.s(), name="commit-pending")
     sender.add_periodic_task(3600, update_remotes.s(), name="update-remotes")
+    sender.add_periodic_task(3600, cleanup_repos.s(), name="cleanup-repos")
     sender.add_periodic_task(
         crontab(minute=30), daily_update_checks.s(), name="daily-update-checks"
     )
@@ -728,16 +2224,6 @@ def setup_periodic_tasks(sender, **kwargs) -> None:
         crontab(hour=0, minute=40), cleanup_stale_repos.s(), name="cleanup-stale-repos"
     )
     sender.add_periodic_task(
-        crontab(hour=0, minute=45),
-        cleanup_old_suggestions.s(),
-        name="cleanup-old-suggestions",
-    )
-    sender.add_periodic_task(
-        crontab(hour=0, minute=50),
-        cleanup_old_comments.s(),
-        name="cleanup-old-comments",
-    )
-    sender.add_periodic_task(
         crontab(hour=2, minute=30),
         cleanup_project_backups.s(),
         name="cleanup-project-backups",
@@ -746,4 +2232,7 @@ def setup_periodic_tasks(sender, **kwargs) -> None:
         3600,
         cleanup_project_backup_download.s(),
         name="cleanup-project-backup-download",
+    )
+    sender.add_periodic_task(
+        crontab(hour=0, minute=50), cleanup_reports.s(), name="reports-cleanup"
     )

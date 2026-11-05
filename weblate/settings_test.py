@@ -8,48 +8,41 @@
 
 import os
 import warnings
+from importlib.util import find_spec
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from weblate.settings_example import *  # noqa: F403
+# ruff: ignore[undefined-local-with-import-star]
+from weblate.settings_example import *
 
-CI_DATABASE = os.environ.get("CI_DATABASE", "")
-
-default_user = "weblate"
+default_user = "postgres"
 default_name = "weblate"
-if CI_DATABASE in {"mysql", "mariadb"}:
-    DATABASES["default"]["ENGINE"] = "django.db.backends.mysql"
-    default_user = "root"
-    DATABASES["default"]["OPTIONS"] = {
-        "init_command": (
-            "SET NAMES utf8mb4, "
-            "wait_timeout=28800, "
-            "default_storage_engine=INNODB, "
-            'sql_mode="STRICT_TRANS_TABLES"'
-        ),
-        "charset": "utf8",
-        "isolation_level": "read committed",
-    }
-elif CI_DATABASE == "postgresql":
-    DATABASES["default"]["ENGINE"] = "django.db.backends.postgresql"
-    default_user = "postgres"
-else:
-    if not CI_DATABASE:
-        msg = "Missing CI_DATABASE configuration in the environment"
-        raise ValueError(msg)
-    msg = f"Not supported database: {CI_DATABASE}"
-    raise ValueError(msg)
 
+DATABASES["default"]["ENGINE"] = "django.db.backends.postgresql"
 DATABASES["default"]["HOST"] = os.environ.get("CI_DB_HOST", "")
 DATABASES["default"]["NAME"] = os.environ.get("CI_DB_NAME", default_name)
 DATABASES["default"]["USER"] = os.environ.get("CI_DB_USER", default_user)
 DATABASES["default"]["PASSWORD"] = os.environ.get("CI_DB_PASSWORD", "")
 DATABASES["default"]["PORT"] = os.environ.get("CI_DB_PORT", "")
+# Disable connection recycling in tests
+DATABASES["default"]["CONN_MAX_AGE"] = 0
 
 # Configure admins
-ADMINS = (("Weblate test", "noreply@weblate.org"),)
+ADMINS = ("Weblate test <noreply@weblate.org>",)
 
 # The secret key is needed for tests
-SECRET_KEY = "secret key used for tests only"  # noqa: S105
+# ruff: ignore[hardcoded-password-string]
+SECRET_KEY = "secret key used for tests only"
+
+# Exercise the opt-in provider when its extra is installed in the test environment.
+if find_spec("oauth2_provider") is not None:
+    OIDC_PROVIDER_ENABLED = True
+    INSTALLED_APPS += ["weblate.oidc", "oauth2_provider"]
+    OAUTH2_PROVIDER = {
+        "OIDC_RSA_PRIVATE_KEY": (
+            Path(__file__).resolve().parent / "trans/tests/data/saml.key"
+        ).read_text(encoding="utf-8")
+    }
 
 SITE_DOMAIN = "example.com"
 OTP_WEBAUTHN_RP_NAME = SITE_DOMAIN
@@ -63,6 +56,8 @@ else:
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR = os.path.join(BASE_DIR, "data-test")
+# Share cached external assets between xdist workers and CI runs.
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
 
 # Use random data directory when running in parallel
 if "PYTEST_XDIST_TESTRUNUID" in os.environ:
@@ -71,7 +66,6 @@ if "PYTEST_XDIST_TESTRUNUID" in os.environ:
     DATA_DIR_TMP = TemporaryDirectory(dir=DATA_DIR, prefix="xdist-")
     DATA_DIR = DATA_DIR_TMP.name
 
-CACHE_DIR = os.path.join(DATA_DIR, "cache")
 MEDIA_ROOT = os.path.join(DATA_DIR, "media")
 STATIC_ROOT = os.path.join(DATA_DIR, "static")
 CELERY_TASK_ALWAYS_EAGER = True
@@ -79,11 +73,15 @@ CELERY_BROKER_URL = "memory://"
 CELERY_TASK_EAGER_PROPAGATES = True
 CELERY_RESULT_BACKEND = None
 
+# Fail tests when crispy layouts reference missing or duplicate form fields.
+CRISPY_FAIL_SILENTLY = False
+
 # Enable lazy stats for testing
 STATS_LAZY = True
 
 VCS_API_DELAY = 0
-VCS_FILE_PROTOCOL = True
+VCS_ALLOW_SCHEMES = {"https", "ssh"}
+VCS_PRIVATE_ALLOWLIST = ["vcs-fixture.invalid"]
 
 # Localize CDN addon
 LOCALIZE_CDN_URL = "https://cdn.example.com/"
@@ -128,9 +126,7 @@ CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"
 if "CI_REDIS_HOST" in os.environ:
     CACHES["avatar"] = {
         "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": "redis://{}:{}/0".format(
-            os.environ["CI_REDIS_HOST"], os.environ.get("CI_REDIS_PORT", "6379")
-        ),
+        "LOCATION": f"redis://{os.environ['CI_REDIS_HOST']}:{os.environ.get('CI_REDIS_PORT', '6379')}/0",
     }
 
 # Selenium can not clear HttpOnly cookies in MSIE
@@ -151,6 +147,7 @@ AUTHENTICATION_BACKENDS = (
 
 # Disable random admin checks trigger
 BACKGROUND_ADMIN_CHECKS = False
+
 
 # Use weak password hasher for testing
 PASSWORD_HASHERS = [

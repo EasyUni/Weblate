@@ -7,24 +7,751 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
+from unittest import TestCase
+from unittest.mock import patch
 
+from django.contrib.messages import get_messages
+from django.core.exceptions import ValidationError
+from django.db import connection
+from django.test import Client
+from django.test.utils import CaptureQueriesContext, override_settings
 from django.urls import reverse
+from lxml import html
 
 from weblate.addons.resx import ResxUpdateAddon
+from weblate.auth.data import SELECTION_ALL
+from weblate.auth.models import Group, Permission, Role, UserBlock, setup_project_groups
 from weblate.checks.models import Check
+from weblate.screenshots.models import Screenshot
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Change, Component, Translation, Unit
-from weblate.trans.tests.test_views import ViewTestCase
+from weblate.trans.exceptions import FileParseError
+from weblate.trans.formatting import unit_state_title
+from weblate.trans.forms import get_new_unit_form
+from weblate.trans.models import (
+    Change,
+    Comment,
+    Component,
+    Project,
+    Suggestion,
+    Translation,
+    Unit,
+    WorkflowSetting,
+)
+from weblate.trans.models.project import CommitPolicyChoices
+from weblate.trans.tests.test_views import ReusableViewTestCase, ViewTestCase
+from weblate.trans.tests.utils import TEST_VCS_ALLOW_SCHEMES, get_test_actor
 from weblate.trans.util import join_plural
-from weblate.utils.hash import hash_to_checksum
-from weblate.utils.state import STATE_FUZZY, STATE_TRANSLATED
+from weblate.trans.views.edit import (
+    cleanup_session,
+    format_newly_failing_checks_message,
+    perform_translation,
+)
+from weblate.utils.change_origin import acting_user_context
+from weblate.utils.docs import get_doc_url
+from weblate.utils.hash import calculate_hash, hash_to_checksum
+from weblate.utils.lock import WeblateLockTimeoutError
+from weblate.utils.ratelimit import reset_rate_limit
+from weblate.utils.state import (
+    STATE_APPROVED,
+    STATE_EMPTY,
+    STATE_FUZZY,
+    STATE_NEEDS_CHECKING,
+    STATE_NEEDS_REWRITING,
+    STATE_TRANSLATED,
+)
+from weblate.utils.stats import CategoryLanguage, ProjectLanguage
+from weblate.utils.views import get_sort_name
 
 if TYPE_CHECKING:
     from weblate.checks.base import BaseCheck
 
 
-class EditTest(ViewTestCase):
+class SearchSessionTest(TestCase):
+    def test_cleanup_session_removes_malformed_entries(self) -> None:
+        session = {
+            "search_valid": {"ttl": int(time.time()) + 60},
+            "search_expired": {"ttl": int(time.time()) - 60},
+            "search_missing_ttl": {},
+            "search_invalid_ttl": {"ttl": "invalid"},
+            "unrelated": {"ttl": "invalid"},
+        }
+
+        cleanup_session(session)
+
+        self.assertIn("search_valid", session)
+        self.assertIn("unrelated", session)
+        self.assertNotIn("search_expired", session)
+        self.assertNotIn("search_missing_ttl", session)
+        self.assertNotIn("search_invalid_ttl", session)
+
+
+class SearchRecoveryTest(ReusableViewTestCase):
+    query = "state:<translated"
+    recovery_message = "Your previous search results are no longer available."
+
+    def prepare_search(self) -> tuple[Unit, list[int], str]:
+        self.url = self.translation.get_translate_url()
+        self.client.get(self.url, {"q": self.query})
+        session = self.client.session
+        session_keys = session.keys()
+        key = next(key for key in session_keys if key.startswith("search_"))
+        ids = session[key]["ids"]
+        unit = self.get_unit("Thank you for using Weblate.")
+        offset = ids.index(unit.pk) + 1
+        self.client.get(self.url, {"q": self.query, "offset": str(offset)})
+        return unit, ids, f"{self.url}?q=state:%3Ctranslated&offset={offset}"
+
+    def expire_search(self, *, missing: bool = False) -> None:
+        session = self.client.session
+        for key in list(session.keys()):
+            if key.startswith("search_"):
+                if missing:
+                    del session[key]
+                else:
+                    session[key] = {**session[key], "ttl": 0}
+        session.save()
+
+    def prepare_project_search(self) -> tuple[Unit, str]:
+        self.component.allow_translation_propagation = False
+        self.component.save(update_fields=["allow_translation_propagation"])
+        linked = self.create_link_existing(allow_translation_propagation=False)
+        unit = linked.translation_set.get(language_code="cs").unit_set.get(
+            source="Hello, world!\n"
+        )
+        self.url = reverse("translate", kwargs={"path": [self.project.slug, "-", "cs"]})
+        self.client.get(self.url, {"q": self.query})
+        ids = next(
+            value["ids"]
+            for key, value in self.client.session.items()
+            if key.startswith("search_")
+        )
+        url = f"{self.url}?q=state:%3Ctranslated&offset={ids.index(unit.pk) + 1}"
+        response = self.client.get(url)
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertContains(response, f'name="unit_id" value="{unit.pk}"')
+        return unit, url
+
+    @staticmethod
+    def translation_data(unit: Unit) -> dict[str, str]:
+        return {
+            "unit_id": str(unit.pk),
+            "checksum": unit.checksum,
+            "contentsum": hash_to_checksum(unit.content_hash),
+            "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
+            "target_0": "Díky za použití Weblate.",
+            "review": "20",
+        }
+
+    def test_expired_search_saves_submitted_unit_at_new_position(self) -> None:
+        unit, ids, url = self.prepare_search()
+        previous_ids = ids[: ids.index(unit.pk)]
+        self.assertTrue(previous_ids)
+        previous_targets = dict(
+            Unit.objects.filter(pk__in=previous_ids).values_list("pk", "target")
+        )
+        Unit.objects.filter(pk__in=previous_ids).update(state=STATE_TRANSLATED)
+        self.expire_search()
+
+        response = self.client.post(url, self.translation_data(unit), follow=True)
+
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Díky za použití Weblate.")
+        self.assertContains(response, self.recovery_message)
+        self.assertNotContains(response, "The source string has changed meanwhile.")
+        self.assertIn("offset=2", response.redirect_chain[0][0])
+        self.assertContains(response, "The translation has come to an end.")
+        self.assertEqual(
+            dict(Unit.objects.filter(pk__in=previous_ids).values_list("pk", "target")),
+            previous_targets,
+        )
+
+    def test_expired_project_search_uses_exact_submitted_unit(self) -> None:
+        unit, url = self.prepare_project_search()
+        self.expire_search(missing=True)
+        data = {
+            **self.translation_data(unit),
+            "target_0": "Nazdar svete!\n",
+            "save-stay": "1",
+        }
+        response = self.client.post(url, data, follow=True)
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, data["target_0"])
+        self.assertEqual(self.get_unit().target, "")
+
+    def test_legacy_project_form_uses_cached_position(self) -> None:
+        unit, url = self.prepare_project_search()
+        data = {
+            **self.translation_data(unit),
+            "target_0": "Nazdar svete!\n",
+            "save-stay": "1",
+        }
+        del data["unit_id"]
+        response = self.client.post(url, data, follow=True)
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, data["target_0"])
+        self.assertEqual(self.get_unit().target, "")
+
+    def test_legacy_project_form_uses_lightweight_position(
+        self, *, expired: bool = False
+    ) -> None:
+        self.prepare_project_search()
+        self.expire_search(missing=True)
+        url = f"{self.url}?offset=1"
+        response = self.client.get(url)
+        unit = response.context["unit"]
+        duplicates = Unit.objects.filter(
+            translation__component__project=self.project,
+            translation__language=self.translation.language,
+            id_hash=unit.id_hash,
+        ).exclude(pk=unit.pk)
+        targets = dict(duplicates.values_list("pk", "target"))
+        self.assertTrue(targets)
+        snapshot = next(
+            value
+            for key, value in self.client.session.items()
+            if key.startswith("search_")
+        )
+        self.assertNotIn("ids", snapshot)
+        if expired:
+            self.expire_search()
+        data = {
+            **self.translation_data(unit),
+            "target_0": "Nazdar svete!\n",
+            "save-stay": "1",
+        }
+        del data["unit_id"]
+        original_target = unit.target
+
+        response = self.client.post(url, data, follow=True)
+
+        unit.refresh_from_db()
+        if expired:
+            self.assertContains(
+                response, "The string you wanted to translate could not be identified."
+            )
+            self.assertEqual(unit.target, original_target)
+        else:
+            self.assertEqual(response.context["unit"].pk, unit.pk)
+            self.assertEqual(unit.target, data["target_0"])
+        self.assertEqual(dict(duplicates.values_list("pk", "target")), targets)
+
+    def test_expired_legacy_project_form_rejects_lightweight_position(self) -> None:
+        self.test_legacy_project_form_uses_lightweight_position(expired=True)
+
+    def test_expired_legacy_project_form_rejects_ambiguous_checksum(self) -> None:
+        unit, url = self.prepare_project_search()
+        data = self.translation_data(unit)
+        del data["unit_id"]
+        self.expire_search()
+        response = self.client.post(url, data, follow=True)
+        self.assertContains(
+            response, "The string you wanted to translate could not be identified."
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "")
+        self.assertEqual(self.get_unit().target, "")
+
+    def test_submitted_unit_id_is_scoped_to_translation(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        response = self.client.post(
+            url,
+            {**self.translation_data(unit), "unit_id": str(unit.source_unit_id)},
+            follow=True,
+        )
+        self.assertContains(
+            response, "The string you wanted to translate is no longer available."
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "")
+
+    def test_missing_search_keeps_nonmatching_submitted_unit(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_TRANSLATED)
+        unit.refresh_from_db()
+        self.expire_search(missing=True)
+        data = {**self.translation_data(unit), "save-stay": "1"}
+
+        response = self.client.post(url, data, follow=True)
+
+        self.assertContains(response, self.recovery_message)
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertEqual(response.context["filter_pos"], 1)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, data["target_0"])
+        response = self.client.get(self.url, {"q": self.query, "offset": "2"})
+        self.assertNotEqual(response.context["unit"].pk, unit.pk)
+        response = self.client.get(self.url, {"q": self.query, "offset": "1"})
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+
+    def test_expired_search_saves_when_no_strings_match(self) -> None:
+        unit, ids, url = self.prepare_search()
+        Unit.objects.filter(pk__in=ids).update(state=STATE_TRANSLATED)
+        unit.refresh_from_db()
+        self.expire_search()
+        response = self.client.post(
+            url, {**self.translation_data(unit), "save-stay": "1"}, follow=True
+        )
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertEqual(response.context["filter_count"], 1)
+        self.assertContains(response, self.recovery_message)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Díky za použití Weblate.")
+
+    def test_expired_search_preserves_text_on_conflict(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        data = {**self.translation_data(unit), "contentsum": "aaa"}
+        self.expire_search()
+
+        response = self.client.post(url, data)
+
+        self.assertContains(response, "The source string has changed meanwhile.")
+        self.assertContains(response, data["target_0"])
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertTrue(response.context["form"].is_bound)
+        self.assertContains(response, 'data-unsaved="true"')
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "")
+
+        response = self.client.post(
+            url, {**self.translation_data(unit), "save-stay": "1"}, follow=True
+        )
+        self.assertContains(response, 'data-unsaved="false"')
+
+    def test_translation_conflict_retry_preserves_other_users_translation(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        data = {**self.translation_data(unit), "save-stay": "1"}
+        competing_target = "Překlad jiného uživatele."
+        unit.translate(
+            self.anotheruser, competing_target, STATE_TRANSLATED, propagate=False
+        )
+
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                if expired:
+                    self.expire_search()
+                for _attempt in range(2):
+                    response = self.client.post(url, data)
+                    self.assertContains(
+                        response,
+                        "The translation of the string has changed meanwhile.",
+                    )
+                    self.assertContains(response, data["target_0"])
+                    self.assertContains(response, 'data-unsaved="true"')
+                    unit.refresh_from_db()
+                    self.assertEqual(unit.target, competing_target)
+                    # Retry using the hidden values actually rendered to the user.
+                    document = html.fromstring(response.content)
+                    fields = document.xpath(
+                        '//form[@data-unsaved="true"]//input[@type="hidden"]'
+                    )
+                    self.assertTrue(fields)
+                    for field in fields:
+                        data[field.get("name")] = field.get("value", "")
+                    self.assertNotEqual(
+                        data["translationsum"], hash_to_checksum(unit.get_target_hash())
+                    )
+
+    def test_expired_search_preserves_all_plural_values(self) -> None:
+        _unit, ids, _url = self.prepare_search()
+        unit = self.translation.unit_set.get(source__contains="Orangutan")
+        data = {
+            **self.translation_data(unit),
+            "contentsum": "aaa",
+            "target_0": "První návrh",
+            "target_1": "Druhý návrh",
+            "target_2": "Třetí návrh",
+        }
+        self.expire_search()
+        response = self.client.post(
+            f"{self.url}?q=state:%3Ctranslated&offset={ids.index(unit.pk) + 1}", data
+        )
+        for idx in range(3):
+            self.assertContains(response, data[f"target_{idx}"])
+        self.assertContains(response, 'data-unsaved="true"')
+
+    def test_expired_search_rejects_unavailable_checksum(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        other = self.component.source_translation.unit_set.get(id_hash=unit.id_hash)
+        # Use a checksum that is valid but outside the translation's unit set.
+        other.id_hash = calculate_hash("unavailable string", "")
+        other.save(update_fields=["id_hash"], run_checks=False)
+        self.expire_search()
+        response = self.client.post(
+            url,
+            {**self.translation_data(unit), "checksum": other.checksum},
+            follow=True,
+        )
+        self.assertContains(
+            response, "The string you wanted to translate is no longer available."
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "")
+
+    def test_expired_search_get_recovers_out_of_range_offset(self) -> None:
+        _unit, ids, _url = self.prepare_search()
+        Unit.objects.filter(pk__in=ids[1:]).update(state=STATE_TRANSLATED)
+        self.expire_search()
+        response = self.client.get(self.url, {"q": self.query, "offset": str(len(ids))})
+        self.assertContains(response, self.recovery_message)
+        self.assertEqual(response.context["unit"].pk, ids[0])
+        self.assertEqual(response.context["filter_pos"], 1)
+
+    def test_expired_search_rejects_deleted_unit(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        data = self.translation_data(unit)
+        unit.delete()
+        targets = dict(self.translation.unit_set.values_list("pk", "target"))
+        self.expire_search()
+        response = self.client.post(url, data, follow=True)
+        self.assertContains(
+            response, "The string you wanted to translate is no longer available."
+        )
+        self.assertEqual(
+            dict(self.translation.unit_set.values_list("pk", "target")), targets
+        )
+
+    def test_expired_search_rejects_malformed_checksum(self) -> None:
+        unit, _ids, url = self.prepare_search()
+        self.expire_search()
+        response = self.client.post(
+            url,
+            {**self.translation_data(unit), "checksum": "invalid"},
+            follow=True,
+        )
+        self.assertContains(response, "Invalid checksum specified!")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "")
+
+    def test_expired_search_get_empty_results(self) -> None:
+        _unit, ids, _url = self.prepare_search()
+        Unit.objects.filter(pk__in=ids).update(state=STATE_TRANSLATED)
+        self.expire_search()
+        response = self.client.get(
+            self.url, {"q": self.query, "offset": "2"}, follow=True
+        )
+        self.assertContains(response, self.recovery_message)
+        self.assertContains(response, "No strings found!")
+        self.assertNotContains(response, "The translation has come to an end.")
+
+    def test_refresh_replaces_all_sort_variants(self) -> None:
+        unit, ids, url = self.prepare_search()
+        self.client.get(self.url, {"q": self.query, "sort_by": "source", "offset": "1"})
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_TRANSLATED)
+        response = self.client.get(url)
+        self.assertEqual(response.context["filter_count"], len(ids))
+        self.assertContains(response, "Refresh results")
+
+        response = self.client.get(
+            self.url, {"q": self.query, "offset": "2", "refresh": "1"}, follow=True
+        )
+        self.assertEqual(response.context["filter_pos"], 1)
+        self.assertEqual(response.context["filter_count"], len(ids) - 1)
+        self.assertNotContains(response, self.recovery_message)
+        self.assertTrue(response.redirect_chain[-1][0].startswith("?"))
+        self.assertNotIn("refresh=", response.redirect_chain[-1][0])
+        response = self.client.get(
+            self.url, {"q": self.query, "sort_by": "source", "offset": "1"}
+        )
+        self.assertEqual(response.context["filter_count"], len(ids) - 1)
+        for key, value in self.client.session.items():
+            if key.startswith("search_"):
+                self.assertNotIn(unit.pk, value["ids"])
+
+    def test_zen_refresh_replaces_results(self) -> None:
+        unit, ids, _url = self.prepare_search()
+        url = reverse("zen", kwargs=self.kw_translation)
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_TRANSLATED)
+        response = self.client.get(url, {"q": self.query, "offset": "1"})
+        self.assertEqual(response.context["filter_count"], len(ids))
+        self.assertContains(response, "Refresh results")
+        response = self.client.get(url, {"q": self.query, "refresh": "1"}, follow=True)
+        self.assertEqual(response.context["filter_count"], len(ids) - 1)
+        self.assertNotIn(
+            unit.pk, [item["unit"].pk for item in response.context["unitdata"]]
+        )
+
+    def test_refresh_preserves_invalid_query(self) -> None:
+        query = 'source:r"^(hello"'
+        for view in ("translate", "zen"):
+            with self.subTest(view=view):
+                url = reverse(view, kwargs={"path": self.translation.get_url_path()})
+                response = self.client.get(url, {"q": query, "refresh": "1"})
+                self.assertEqual(response.status_code, 200)
+                form = response.context["search_form"]
+                self.assertIn("q", form.errors)
+                document = html.fromstring(response.content)
+                self.assertEqual(
+                    document.xpath('//textarea[@name="q"]/text()'), [f"\n{query}"]
+                )
+
+    def test_refresh_empty_results(self) -> None:
+        _unit, ids, _url = self.prepare_search()
+        Unit.objects.filter(pk__in=ids).update(state=STATE_TRANSLATED)
+        response = self.client.get(
+            self.url,
+            {"q": self.query, "offset": "2", "refresh": "1"},
+            follow=True,
+        )
+        self.assertContains(response, "No strings found!")
+        self.assertNotContains(response, "The translation has come to an end.")
+        self.assertNotContains(response, self.recovery_message)
+
+    def test_expired_zen_scroll_requires_refresh(self) -> None:
+        self.prepare_search()
+        self.expire_search()
+        response = self.client.get(
+            reverse("load_zen", kwargs=self.kw_translation),
+            {"q": self.query, "offset": "21"},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.content, b"")
+
+
+class EditScreenshotContextTest(ViewTestCase):
+    def test_screenshot_context_has_documentation_link(self) -> None:
+        self.make_manager()
+        response = self.client.get(self.translation.get_translate_url())
+        self.assertContains(
+            response, get_doc_url("admin/translating", "screenshots", user=self.user)
+        )
+
+    def test_screenshot_upload_has_paste_button(self) -> None:
+        self.make_manager()
+        response = self.client.get(self.translation.get_translate_url())
+        self.assertContains(response, 'id="paste-screenshot-btn"')
+        modal = html.fromstring(response.content).get_element_by_id(
+            "add-screenshot-form"
+        )
+        form = modal.xpath("ancestor::form[1]")[0]
+        self.assertEqual(
+            len(form.xpath('.//input[@name="csrfmiddlewaretoken"]')),
+            1,
+        )
+
+    def test_screenshot_context_deduplicates_source_and_unit_links(self) -> None:
+        self.make_manager()
+        unit = self.get_unit()
+        screenshot = Screenshot.objects.create(
+            name="Shared screenshot",
+            image="screenshots/test.png",
+            translation=unit.source_unit.translation,
+            user=self.user,
+        )
+        screenshot.units.add(unit.source_unit, unit)
+
+        response = self.client.get(unit.get_absolute_url())
+
+        self.assertEqual(list(response.context["screenshots"]), [screenshot])
+
+
+class ReviewStateTest(ReusableViewTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.make_manager()
+        self.unit = self.change_unit("Nazdar svete!\n", state=STATE_NEEDS_REWRITING)
+        self.url = self.unit.translation.get_translate_url()
+        self.data = {
+            "unit_id": str(self.unit.pk),
+            "checksum": self.unit.checksum,
+            "contentsum": hash_to_checksum(self.unit.edit_content_hash),
+            "translationsum": hash_to_checksum(self.unit.get_target_hash()),
+            "initial_state": str(self.unit.state),
+            "target_0": "Ahoj svete!\n",
+            "review": str(self.unit.state),
+            "save-stay": "1",
+        }
+
+    def test_state_conflict_preserves_draft(self) -> None:
+        for actor in (self.user, self.anotheruser):
+            with self.subTest(actor=actor.username):
+                self.change_unit("Nazdar svete!\n", state=STATE_NEEDS_REWRITING)
+                self.change_unit("Nazdar svete!\n", state=STATE_TRANSLATED, user=actor)
+                change_count = Change.objects.filter(unit=self.unit).count()
+                for _attempt in range(2):
+                    response = self.client.post(self.url, self.data)
+                    self.assertContains(
+                        response,
+                        "The review state of this string has changed from "
+                        "Needs editing (Needs rewriting) to Translated",
+                    )
+                    self.assertNotContains(
+                        response, "This review state is not available"
+                    )
+                    self.assertNotContains(response, "Select a valid choice")
+                    self.assertContains(response, self.data["target_0"])
+                    self.assertContains(response, 'name="initial_state" value="11"')
+                    self.assertContains(response, 'data-unsaved="true"')
+                self.unit.refresh_from_db()
+                self.assertEqual(self.unit.target, "Nazdar svete!\n")
+                self.assertEqual(self.unit.state, STATE_TRANSLATED)
+                self.assertEqual(
+                    Change.objects.filter(unit=self.unit).count(), change_count
+                )
+
+    def test_conflict_with_still_available_choice(self) -> None:
+        self.change_unit("Nazdar svete!\n", state=STATE_NEEDS_CHECKING)
+        response = self.client.post(self.url, {**self.data, "review": "20"})
+        self.assertContains(response, "The review state of this string has changed")
+        self.unit.refresh_from_db()
+        self.assertEqual(self.unit.state, STATE_NEEDS_CHECKING)
+
+    def test_source_conflict_takes_precedence(self) -> None:
+        self.change_unit("Nazdar svete!\n", state=STATE_TRANSLATED)
+        response = self.client.post(self.url, {**self.data, "contentsum": "aaa"})
+        self.assertContains(response, "The source string has changed meanwhile.")
+        self.assertNotContains(response, "The review state of this string has changed")
+        self.assertNotContains(response, "This review state is not available")
+
+    def test_translation_conflict_takes_precedence(self) -> None:
+        self.change_unit("Jiný překlad\n", user=self.anotheruser)
+        response = self.client.post(self.url, self.data)
+        self.assertContains(
+            response, "The translation of the string has changed meanwhile."
+        )
+        self.assertNotContains(response, "The review state of this string has changed")
+
+    def test_unchanged_state_and_intentional_state_change(self) -> None:
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        response = self.client.get(self.unit.get_absolute_url())
+        self.assertContains(response, 'name="initial_state" value="11"')
+        for review in ("11", "20"):
+            with self.subTest(review=review):
+                response = self.client.post(self.url, {**self.data, "review": review})
+                self.assertEqual(response.status_code, 302)
+                self.unit.refresh_from_db()
+                self.assertEqual(self.unit.state, int(review))
+                self.assertEqual(self.unit.target, self.data["target_0"])
+                self.data["translationsum"] = hash_to_checksum(
+                    self.unit.get_target_hash()
+                )
+
+    def test_invalid_review_is_readable(self) -> None:
+        for review in ("12", "999", "invalid"):
+            with self.subTest(review=review):
+                response = self.client.post(self.url, {**self.data, "review": review})
+                self.assertContains(response, "Error in parameter Review state:")
+                self.assertContains(
+                    response, "This review state is not available for this string."
+                )
+                self.assertNotContains(response, "Select a valid choice")
+                self.assertNotContains(response, "Error in parameter review:")
+
+    def test_missing_or_invalid_initial_state(self) -> None:
+        for initial_state in (None, "", "invalid", "999"):
+            with self.subTest(initial_state=initial_state):
+                data = self.data.copy()
+                if initial_state is None:
+                    del data["initial_state"]
+                else:
+                    data["initial_state"] = initial_state
+                response = self.client.post(self.url, data)
+                self.assertContains(response, "The original review state is")
+                self.assertContains(response, "Reload the editor and try again.")
+                self.unit.refresh_from_db()
+                self.assertEqual(self.unit.target, "Nazdar svete!\n")
+
+    def test_zen_state_conflict(self) -> None:
+        self.change_unit("Nazdar svete!\n", state=STATE_TRANSLATED)
+        response = self.client.post(
+            reverse("save_zen", kwargs=self.kw_translation), self.data
+        )
+        data = response.json()
+        self.assertEqual(data["state"], "danger")
+        self.assertEqual(data["translationsum"], "")
+        self.assertIsNone(data["initial_state"])
+        self.assertEqual(len(data["messages"]), 1)
+        self.assertIn(
+            "The review state of this string has changed", data["messages"][0]["text"]
+        )
+        self.unit.refresh_from_db()
+        self.assertEqual(self.unit.target, "Nazdar svete!\n")
+
+    def test_zen_repeated_saves(self) -> None:
+        for target in ("Ahoj svete!\n", "Zdravím svete!\n"):
+            with self.subTest(target=target):
+                self.data.update(target_0=target, review="20")
+                response = self.client.post(
+                    reverse("save_zen", kwargs=self.kw_translation), self.data
+                )
+                data = response.json()
+                self.assertEqual(data["initial_state"], STATE_TRANSLATED)
+                self.assertNotEqual(data["translationsum"], "")
+                self.data.update(
+                    initial_state=data["initial_state"],
+                    translationsum=data["translationsum"],
+                )
+                self.unit.refresh_from_db()
+                self.assertEqual(self.unit.target, target)
+
+    def test_suggestion_ignores_state_conflict(self) -> None:
+        self.change_unit("Nazdar svete!\n", state=STATE_TRANSLATED)
+        self.anotheruser.groups.set([Group.objects.get(name="Guests")])
+        for actor in (self.user, self.anotheruser):
+            with self.subTest(actor=actor.username):
+                self.assertEqual(
+                    bool(actor.has_perm("unit.edit", self.unit)), actor == self.user
+                )
+                self.client.force_login(actor)
+                target = f"Suggestion by {actor.username}\n"
+                response = self.client.post(
+                    self.url,
+                    {**self.data, "target_0": target, "suggest": "1"},
+                    follow=True,
+                )
+                self.assertNotContains(
+                    response, "The review state of this string has changed"
+                )
+                suggestion = self.unit.suggestion_set.get(target=target)
+                self.assertEqual(suggestion.user, actor)
+                self.unit.refresh_from_db()
+                self.assertEqual(self.unit.target, "Nazdar svete!\n")
+                self.assertEqual(self.unit.state, STATE_TRANSLATED)
+
+    def test_state_change_after_validation(self) -> None:
+        def change_state(unit, form, request):
+            competing_unit = Unit.objects.get(pk=unit.pk)
+            competing_unit.translate(
+                self.anotheruser,
+                competing_unit.target,
+                STATE_TRANSLATED,
+                propagate=False,
+            )
+            return perform_translation(unit, form, request)
+
+        for zen in (False, True):
+            with self.subTest(zen=zen):
+                self.change_unit("Nazdar svete!\n", state=STATE_NEEDS_REWRITING)
+                url = (
+                    reverse("save_zen", kwargs=self.kw_translation) if zen else self.url
+                )
+                with patch(
+                    "weblate.trans.views.edit.perform_translation",
+                    side_effect=change_state,
+                ):
+                    response = self.client.post(url, self.data)
+                self.assertContains(
+                    response, "The review state of this string has changed"
+                )
+                if zen:
+                    data = response.json()
+                    self.assertEqual(data["translationsum"], "")
+                    self.assertIsNone(data["initial_state"])
+                else:
+                    self.assertContains(response, self.data["target_0"])
+                    self.assertContains(response, 'name="initial_state" value="11"')
+                self.unit.refresh_from_db()
+                self.assertEqual(self.unit.target, "Nazdar svete!\n")
+                self.assertEqual(self.unit.state, STATE_TRANSLATED)
+
+
+class EditTest(ReusableViewTestCase):
     """Test for manipulating translation."""
 
     has_plurals = True
@@ -68,6 +795,16 @@ class EditTest(ViewTestCase):
         self.assertEqual(len(unit.all_checks), 0)
         self.assertEqual(unit.state, STATE_TRANSLATED)
         self.assert_backend(self.already_translated + 1)
+
+    def test_editor_cache_control(self) -> None:
+        for url in (
+            self.translate_url,
+            reverse("zen", kwargs=self.kw_translation),
+        ):
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("no-store", response.headers["Cache-Control"])
 
     def test_plurals(self) -> None:
         """Test plural editing."""
@@ -117,6 +854,49 @@ class EditTest(ViewTestCase):
         self.edit_unit(self.source, "")
         unit = self.get_unit(source=self.source)
         self.assertFalse(unit.has_failing_check)
+
+        self.change_unit(self.target, source=self.source, state=STATE_NEEDS_CHECKING)
+        self.edit_unit(self.source, self.target, fuzzy="yes")
+        unit = self.get_unit(source=self.source)
+        self.assertEqual(unit.state, STATE_NEEDS_CHECKING)
+
+        self.change_unit(self.target, source=self.source, state=STATE_NEEDS_REWRITING)
+        self.edit_unit(self.source, self.target, fuzzy="yes")
+        unit = self.get_unit(source=self.source)
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
+
+    def test_fuzzy_with_review(self) -> None:
+        self.project.translation_review = True
+        self.project.save()
+        self.make_manager()
+
+        unit = self.get_unit(source=self.source)
+        self.assertNotEqual(unit.state, STATE_FUZZY)
+        self.change_unit(self.target, source=self.source, state=STATE_NEEDS_CHECKING)
+
+        self.edit_unit(self.source, self.target, review=str(STATE_NEEDS_CHECKING))
+        unit = self.get_unit(source=self.source)
+        self.assertEqual(unit.state, STATE_NEEDS_CHECKING)
+
+    def test_approved_state_visible_without_edit_permission(self) -> None:
+        self.project.translation_review = True
+        self.project.save()
+        unit = self.change_unit(self.target, source=self.source, state=STATE_APPROVED)
+
+        self.assertFalse(self.user.has_perm("unit.edit", unit))
+
+        response = self.client.get(unit.get_absolute_url())
+
+        form = response.context["form"]
+        self.assertTrue(form.fields["fuzzy"].widget.is_hidden)
+        self.assertFalse(form.fields["review"].widget.is_hidden)
+        self.assertTrue(form.fields["review"].disabled)
+        self.assertEqual(
+            [choice[0] for choice in form.fields["review"].choices],
+            [STATE_APPROVED],
+        )
+        self.assertContains(response, "Approved")
+        self.assertNotContains(response, "fuzzy_checkbox")
 
     def add_unit(self, key, force_source: bool = False):
         if force_source or self.component.has_template():
@@ -256,7 +1036,7 @@ class EditTest(ViewTestCase):
         if not self.component.file_format_cls.can_add_unit:
             self.assertEqual(response.status_code, 403)
             return
-        if not self.component.file_format_cls.supports_plural:
+        if not self.component.file_format_cls.supports_adding_plural_units():
             self.assertContains(
                 response, "Plurals are not supported by the file format"
             )
@@ -288,8 +1068,207 @@ class EditTest(ViewTestCase):
         else:
             self.skipTest("Not supported")
 
+    def test_dismiss_automatically_translated(self) -> None:
+        """Test dismissing automatically translated flag."""
+        unit = self.get_unit(self.source)
+        unit.automatically_translated = True
+        unit.save(update_fields=["automatically_translated"])
+
+        response = self.client.post(
+            reverse("js-dismiss-automatically-translated", kwargs={"unit_id": unit.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Content-Type"], "application/json")
+
+        unit = self.get_unit(self.source)
+        self.assertFalse(unit.automatically_translated)
+
+    def test_dismiss_automatically_translated_no_permission(self) -> None:
+        """Test dismissing automatically translated without permission."""
+        unit = self.get_unit(self.source)
+        unit.automatically_translated = True
+        unit.save(update_fields=["automatically_translated"])
+
+        # Remove edit permission
+        self.user.groups.clear()
+
+        response = self.client.post(
+            reverse("js-dismiss-automatically-translated", kwargs={"unit_id": unit.id})
+        )
+        self.assertEqual(response.status_code, 403)
+
+        unit = self.get_unit(self.source)
+        self.assertTrue(unit.automatically_translated)
+
+    def test_dismiss_automatically_translated_not_authenticated(self) -> None:
+        """Test dismissing automatically translated without authentication."""
+        unit = self.get_unit(self.source)
+        unit.automatically_translated = True
+        unit.save(update_fields=["automatically_translated"])
+
+        self.client.logout()
+
+        response = self.client.post(
+            reverse("js-dismiss-automatically-translated", kwargs={"unit_id": unit.id})
+        )
+        self.assertEqual(response.status_code, 302)
+
+        unit = self.get_unit(self.source)
+        self.assertTrue(unit.automatically_translated)
+
+
+class EditAccessTest(ViewTestCase):
+    def test_private_editor_access_after_logout(self) -> None:
+        self.make_manager()
+        self.project.access_control = Project.ACCESS_PRIVATE
+        self.project.save(update_fields=["access_control"])
+        url = reverse("translate", kwargs=self.kw_translation)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        self.client.logout()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+
+    def create_restricted_matching_unit(self) -> tuple[Component, Unit, Unit]:
+        restricted = self.create_link_existing(
+            name="Restricted", slug="restricted", allow_translation_propagation=False
+        )
+        restricted.restricted = True
+        restricted.save(update_fields=["restricted"])
+        target_unit = self.get_unit("Hello, world!\n")
+        restricted_unit = self.get_unit(
+            "Hello, world!\n",
+            translation=restricted.translation_set.get(language_code="cs"),
+        )
+        Unit.objects.filter(pk=restricted_unit.pk).update(
+            target="Restricted translation\n", state=STATE_TRANSLATED
+        )
+        restricted_unit.refresh_from_db()
+        self.user.clear_permissions_cache()
+        return restricted, target_unit, restricted_unit
+
+    def test_other_units_and_merge_skip_restricted_component(self) -> None:
+        restricted, target_unit, restricted_unit = (
+            self.create_restricted_matching_unit()
+        )
+        url = (
+            f"{target_unit.translation.get_translate_url()}"
+            f"?checksum={target_unit.checksum}"
+        )
+
+        response = self.client.get(url)
+
+        self.assertNotContains(response, restricted_unit.target)
+        self.assertNotContains(response, f'value="{restricted_unit.pk}"')
+
+        response = self.client.post(url, {"merge": restricted_unit.pk})
+
+        self.assertContains(response, "Could not find the merged string.")
+        target_unit.refresh_from_db()
+        self.assertEqual(target_unit.target, "")
+
+        group = Group.objects.create(
+            name="Restricted component translators",
+            language_selection=SELECTION_ALL,
+        )
+        group.components.add(restricted)
+        group.roles.add(Role.objects.get(name="Translate"))
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        response = self.client.get(url)
+
+        self.assertContains(response, "Restricted translation")
+        self.assertContains(response, f'value="{restricted_unit.pk}"')
+
+        response = self.client.post(url, {"merge": restricted_unit.pk})
+
+        self.assertEqual(response.status_code, 302)
+        target_unit.refresh_from_db()
+        self.assertEqual(target_unit.target, restricted_unit.target)
+
+    def assert_unit_action_urls_not_found(self, unit: Unit) -> None:
+        check = Check.objects.create(unit=unit, name="same")
+
+        urls = (
+            reverse("js-dismiss-automatically-translated", kwargs={"unit_id": unit.pk}),
+            reverse("delete-unit", kwargs={"unit_id": unit.source_unit.pk}),
+            reverse("js-ignore-check", kwargs={"check_id": check.pk}),
+            reverse("js-ignore-check-source", kwargs={"check_id": check.pk}),
+        )
+        for url in urls:
+            response = self.client.post(url)
+            self.assertEqual(response.status_code, 404)
+
+    def test_private_unit_actions_return_not_found(self) -> None:
+        private_project = self.create_project(
+            name="Private edit",
+            slug="private-edit",
+            access_control=Project.ACCESS_PRIVATE,
+        )
+        private_component = self.create_po(project=private_project, name="private-edit")
+        private_translation = private_component.translation_set.get(language_code="cs")
+        unit = self.get_unit("Hello, world!\n", translation=private_translation)
+
+        self.assert_unit_action_urls_not_found(unit)
+
+    def test_blocked_project_unit_actions_return_not_found(self) -> None:
+        group = Group.objects.create(
+            name="All projects edit", project_selection=SELECTION_ALL
+        )
+        self.user.groups.add(group)
+        private_project = self.create_project(
+            name="Blocked edit",
+            slug="blocked-edit",
+            access_control=Project.ACCESS_PRIVATE,
+        )
+        private_component = self.create_po(project=private_project, name="blocked-edit")
+        private_translation = private_component.translation_set.get(language_code="cs")
+        unit = self.get_unit("Hello, world!\n", translation=private_translation)
+        UserBlock.objects.create(user=self.user, project=private_project)
+        self.user.clear_permissions_cache()
+
+        self.assert_unit_action_urls_not_found(unit)
+
 
 class EditValidationTest(ViewTestCase):
+    def test_failed_edit_does_not_claim_translation_was_saved(self) -> None:
+        self.project.translation_review = True
+        self.project.save()
+        unit = self.get_unit()
+        unit.state = STATE_FUZZY
+        unit.save(update_fields=["state"])
+        original_target = unit.target
+        for policy in (
+            CommitPolicyChoices.APPROVED_ONLY,
+            CommitPolicyChoices.WITHOUT_NEEDS_EDITING,
+        ):
+            with self.subTest(policy=policy):
+                self.project.commit_policy = policy
+                self.project.save()
+                response = self.client.post(
+                    unit.translation.get_translate_url(),
+                    {
+                        "unit_id": unit.pk,
+                        "checksum": unit.checksum,
+                        "contentsum": hash_to_checksum(unit.content_hash),
+                        "translationsum": "invalid",
+                        "target_0": "Unsaved review regression draft",
+                        "review": STATE_TRANSLATED,
+                    },
+                    follow=True,
+                )
+                self.assertContains(response, "Unsaved review regression draft")
+                self.assertTrue(response.context["form"].errors)
+                self.assertContains(response, "Translation quality filter")
+                self.assertNotContains(
+                    response, "This translation is saved in Weblate."
+                )
+                unit.refresh_from_db()
+                self.assertEqual(unit.target, original_target)
+
     def edit(self, **kwargs):
         """Editing with no specific params."""
         unit = self.get_unit()
@@ -297,6 +1276,30 @@ class EditValidationTest(ViewTestCase):
         params.update(kwargs)
         return self.client.post(
             unit.translation.get_translate_url(), params, follow=True
+        )
+
+    def test_new_plural_unit_rejected_for_conditional_plural_format(self) -> None:
+        self.component.file_format = "csv"
+        self.component.save(update_fields=["file_format"])
+        self.component.drop_file_format_cache()
+
+        self.assertTrue(self.component.file_format_cls.supports_plural)
+        self.assertFalse(self.component.file_format_cls.supports_adding_plural_units())
+
+        form = get_new_unit_form(
+            self.component.source_translation,
+            self.user,
+            data={
+                "context": "test-plural",
+                "source_0": "%(count)s test",
+                "source_1": "%(count)s tests",
+            },
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            "Plurals are not supported by the file format.",
+            form.errors["__all__"],
         )
 
     def test_edit_invalid(self) -> None:
@@ -313,7 +1316,7 @@ class EditValidationTest(ViewTestCase):
         """Merging with invalid parameter."""
         unit = self.get_unit()
         response = self.client.post(
-            unit.translation.get_translate_url() + "?checksum=" + unit.checksum,
+            f"{unit.translation.get_translate_url()}?checksum={unit.checksum}",
             {"merge": "invalid"},
             follow=True,
         )
@@ -325,7 +1328,7 @@ class EditValidationTest(ViewTestCase):
         trans = self.component.translation_set.exclude(language_code="cs")[0]
         other = trans.unit_set.get(source=unit.source, context=unit.context)
         response = self.client.post(
-            unit.translation.get_translate_url() + "?checksum=" + unit.checksum,
+            f"{unit.translation.get_translate_url()}?checksum={unit.checksum}",
             {"merge": other.pk},
             follow=True,
         )
@@ -333,15 +1336,13 @@ class EditValidationTest(ViewTestCase):
 
     def test_revert(self) -> None:
         unit = self.get_unit()
-        # Try the merge
-        response = self.client.get(
+        response = self.client.post(
             unit.translation.get_translate_url(),
             {"checksum": unit.checksum, "revert": "invalid"},
             follow=True,
         )
         self.assertContains(response, "Enter a whole number.")
-        # Try the merge
-        response = self.client.get(
+        response = self.client.post(
             unit.translation.get_translate_url(),
             {"checksum": unit.checksum, "revert": -1},
             follow=True,
@@ -398,7 +1399,7 @@ class EditResxTest(EditTest):
 
     def create_component(self):
         component = self.create_resx()
-        ResxUpdateAddon.create(component=component)
+        ResxUpdateAddon.create(acting_user=get_test_actor(self), component=component)
         return component
 
 
@@ -412,6 +1413,7 @@ class EditLanguageTest(EditTest):
             kwargs={"path": [self.project.slug, "-", "cs"]},
         )
 
+    # pylint: disable=arguments-differ
     def edit_unit(self, source, target, language="cs", **kwargs):
         """Do edit single unit using web interface."""
         unit = self.get_unit(source, language)
@@ -419,6 +1421,7 @@ class EditLanguageTest(EditTest):
             "checksum": unit.checksum,
             "contentsum": hash_to_checksum(unit.content_hash),
             "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
             "target_0": target,
             "review": "20",
         }
@@ -446,6 +1449,104 @@ class EditResourceSourceTest(ViewTestCase):
         self.assertEqual(unit.state, STATE_TRANSLATED)
         self.assert_backend(4, "en")
 
+    def test_edit_without_source_string_permission(self) -> None:
+        Role.objects.get(name="Power user").permissions.remove(
+            Permission.objects.get(codename="unit.template")
+        )
+        self.user.clear_permissions_cache()
+        response = self.edit_unit(
+            "Hello, world!\n", "Nazdar svete!\n", "en", follow=True
+        )
+
+        self.assertContains(
+            response, "You do not have permission to edit source strings."
+        )
+
+    def test_edit_does_not_rebuild_component_language_stats(self) -> None:
+        self.assertGreater(self.get_translation().stats.all, 0)
+        with patch(
+            "weblate.trans.models.component.Component.invalidate_cache",
+            autospec=True,
+        ) as invalidate_cache:
+            self.edit_unit("Hello, world!\n", "Nazdar svete!\n", "en")
+        invalidate_cache.assert_not_called()
+
+    def test_suppress_cache_invalidation_is_reentrant(self) -> None:
+        translation = self.get_translation()
+        with patch(
+            "weblate.trans.models.translation.transaction.on_commit"
+        ) as on_commit:
+            with translation.suppress_cache_invalidation():
+                translation.invalidate_cache()
+                with translation.suppress_cache_invalidation():
+                    translation.invalidate_cache()
+                translation.invalidate_cache()
+                on_commit.assert_not_called()
+
+            translation.invalidate_cache()
+            translation.invalidate_cache()
+
+        on_commit.assert_called_once()
+
+    def test_source_edit_updates_translation_and_component_stats(self) -> None:
+        translation = self.get_translation()
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n", "cs")
+        translation = Translation.objects.get(pk=translation.pk)
+        component = Component.objects.get(pk=self.component.pk)
+        unit_before = translation.unit_set.get(context="hello")
+        all_chars_before = translation.stats.all_chars
+        all_words_before = translation.stats.all_words
+        translated_before = translation.stats.translated
+        component_all_chars_before = component.stats.all_chars
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.edit_unit("Hello, world!\n", "Hello, universe!\n", "en")
+
+        translation = Translation.objects.get(pk=translation.pk)
+        component = Component.objects.get(pk=self.component.pk)
+        unit_after = translation.unit_set.get(context="hello")
+        all_chars_delta = len(unit_after.source) - len(unit_before.source)
+        all_words_delta = unit_after.num_words - unit_before.num_words
+
+        self.assertEqual(
+            translation.stats.all_chars,
+            all_chars_before + all_chars_delta,
+        )
+        self.assertEqual(
+            translation.stats.all_words,
+            all_words_before + all_words_delta,
+        )
+        self.assertEqual(translation.stats.translated, translated_before - 1)
+        self.assertNotEqual(component.stats.all_chars, component_all_chars_before)
+        self.assertEqual(
+            component.stats.all_chars,
+            sum(
+                child.stats.all_chars
+                for child in Component.objects.get(
+                    pk=self.component.pk
+                ).translation_set.all()
+            ),
+        )
+
+    def test_source_edit_falls_back_to_full_recompute_on_nonlocal_checks(self) -> None:
+        def fake_run_checks(unit, *args, **kwargs) -> None:
+            unit.translation.require_full_stats_rebuild()
+
+        with (
+            patch(
+                "weblate.trans.models.unit.Unit.run_checks",
+                autospec=True,
+                side_effect=fake_run_checks,
+            ),
+            patch(
+                "weblate.trans.models.component.Component.invalidate_cache",
+                autospec=True,
+            ) as invalidate_cache,
+        ):
+            self.edit_unit("Hello, world!\n", "Nazdar svete!\n", "en")
+
+        invalidate_cache.assert_called()
+
     def test_edit_revert(self) -> None:
         translation = self.get_translation()
         # Edit translation
@@ -458,7 +1559,7 @@ class EditResourceSourceTest(ViewTestCase):
         self.edit_unit("Hello, world!\n", "Hello, universe!\n", "en")
 
         unit = translation.unit_set.get(context="hello")
-        self.assertEqual(unit.state, STATE_FUZZY)
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
 
         # Revert source
         self.edit_unit("Hello, universe!\n", "Hello, world!\n", "en")
@@ -480,12 +1581,12 @@ class EditResourceSourceTest(ViewTestCase):
         # Change state and source
         self.edit_unit("Hello, world!\n", "Hello, universe!\n", "en", fuzzy="yes")
         unit = translation.unit_set.get(context="hello")
-        self.assertEqual(unit.state, STATE_FUZZY)
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
 
         # Change state and source
         self.edit_unit("Hello, universe!\n", "Hello, universe!\n", "en")
         unit = translation.unit_set.get(context="hello")
-        self.assertEqual(unit.state, STATE_FUZZY)
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
 
         # Revert source
         self.edit_unit("Hello, universe!\n", "Hello, world!\n", "en")
@@ -501,9 +1602,30 @@ class EditBranchTest(EditTest):
         return self.create_po_branch()
 
 
+@override_settings(VCS_ALLOW_SCHEMES=TEST_VCS_ALLOW_SCHEMES)
 class EditMercurialTest(EditTest):
     def create_component(self):
         return self.create_po_mercurial()
+
+    def test_option_shaped_commit_message(self) -> None:
+        message = "--config=alias.commit=version"
+        self.component.commit_message = message
+        self.component.inherit_commit_message = False
+        self.component.save(update_fields=["commit_message", "inherit_commit_message"])
+        old_revision = self.component.repository.last_revision
+
+        self.edit_unit(self.source, self.target)
+        self.translation.commit_pending("test", self.user)
+
+        self.assertNotEqual(self.component.repository.last_revision, old_revision)
+        self.assertEqual(
+            self.component.repository.execute(
+                ["log", "--rev=.", "--template={desc}"],
+                remote_op="none",
+                needs_lock=False,
+            ),
+            message,
+        )
 
 
 class EditPoMonoTest(EditTest):
@@ -529,15 +1651,39 @@ class EditPoMonoTest(EditTest):
         response = self.client.post(reverse("delete-unit", kwargs={"unit_id": unit.pk}))
         self.assertEqual(response.status_code, 403)
         # Actual removal
-        response = self.client.post(
-            reverse("delete-unit", kwargs={"unit_id": unit.source_unit.pk}),
-            data={"next": self.translate_url + "?offset=3"},
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                reverse("delete-unit", kwargs={"unit_id": unit.source_unit.pk}),
+                data={"next": f"{self.translate_url}?offset=3"},
+            )
         self.assertEqual(response.status_code, 302)
         self.assert_redirects_offset(response, self.translate_url, 3)
         component = Component.objects.get(pk=self.component.pk)
         self.assertEqual(component.stats.all, 12)
         self.assertEqual(unit_count - 4, Unit.objects.count())
+
+    def test_remove_unit_locked(self) -> None:
+        self.user.is_superuser = True
+        self.user.save()
+        unit = self.get_unit().source_unit
+
+        with patch(
+            "weblate.trans.models.translation.Translation.delete_unit",
+            side_effect=WeblateLockTimeoutError(
+                "repository locked",
+                lock=SimpleNamespace(scope="repository", origin="test/component"),
+            ),
+        ):
+            response = self.client.post(
+                reverse("delete-unit", kwargs={"unit_id": unit.pk}),
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            "Could not remove the string because another background operation is in progress. Please try again later.",
+        )
 
 
 class EditIphoneTest(EditTest):
@@ -562,10 +1708,23 @@ class EditJoomlaTest(EditTest):
 
 
 class EditRubyYAMLTest(EditTest):
-    has_plurals = False
-
     def create_component(self):
         return self.create_ruby_yaml()
+
+    def test_new_unit_hierarchical_context_validation(self) -> None:
+        self.make_manager()
+        self.component.manage_units = True
+        self.component.save()
+
+        response = self.add_unit("weblate")
+        self.assertContains(
+            response, "This key conflicts with an existing hierarchical key."
+        )
+
+        response = self.add_unit("weblate->hello->title")
+        self.assertContains(
+            response, "This key conflicts with an existing hierarchical key."
+        )
 
 
 class EditDTDTest(EditTest):
@@ -577,17 +1736,107 @@ class EditDTDTest(EditTest):
 
 class EditJSONMonoTest(EditTest):
     has_plurals = False
+    new_source_string = "Source string"
 
     def create_component(self):
         return self.create_json_mono()
 
-    def test_new_unit_validation(self) -> None:
-        self.make_manager()
+    def enable_nested_unit_management(self) -> None:
         self.component.manage_units = True
         self.component.file_format = "json-nested"
-        self.component.save()
+        self.component.drop_file_format_cache()
+        # These tests only need the changed settings to be visible to the view.
+        # Avoid Component.save(), which rescans the repository as a side effect.
+        Component.objects.filter(pk=self.component.pk).update(
+            file_format=self.component.file_format,
+            manage_units=self.component.manage_units,
+        )
+
+    def test_new_unit_validation(self) -> None:
+        self.make_manager()
+        self.enable_nested_unit_management()
         response = self.add_unit("key")
         self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "New string has been added")
+
+    def test_new_unit_validation_flat_format_does_not_load_store(self) -> None:
+        self.translation.__dict__.pop("store", None)
+
+        with patch.object(
+            self.translation,
+            "load_store",
+            side_effect=AssertionError("store should not be loaded"),
+        ):
+            self.translation.validate_new_unit_data(
+                "flat.key",
+                ["Added source string"],
+                ["Added target string"],
+            )
+
+    def test_new_unit_validation_parse_error(self) -> None:
+        self.make_manager()
+        self.enable_nested_unit_management()
+
+        with patch.object(
+            Translation,
+            "load_store",
+            side_effect=FileParseError("Broken JSON"),
+        ):
+            response = self.add_unit("test.key")
+
+        self.assertContains(response, "Could not parse translation file: Broken JSON")
+
+    def test_new_unit_validation_materializes_pending_contexts(self) -> None:
+        self.enable_nested_unit_management()
+        store = self.translation.store
+
+        with patch.object(store, "validate_new_context") as validate_new_context:
+            self.translation.validate_new_unit_data(
+                "test.key",
+                ["Added source string"],
+                ["Added target string"],
+            )
+
+        self.assertIsInstance(
+            validate_new_context.call_args.kwargs["pending_contexts"], list
+        )
+
+    def test_add_unit_revalidates_hierarchical_context(self) -> None:
+        self.enable_nested_unit_management()
+        translation = self.component.source_translation
+
+        translation.add_unit(
+            None,
+            "test.key",
+            ["Added source string"],
+            "",
+            author=self.user,
+        )
+
+        with self.assertRaisesMessage(
+            ValidationError, "This key conflicts with an existing hierarchical key."
+        ):
+            translation.add_unit(
+                None,
+                "test.key.title",
+                ["Other source string"],
+                "",
+                author=self.user,
+            )
+
+    def test_new_unit_hierarchical_context_validation(self) -> None:
+        self.make_manager()
+        self.enable_nested_unit_management()
+
+        response = self.add_unit("test.key")
+        self.assertContains(response, "New string has been added")
+
+        response = self.add_unit("test.key.title")
+        self.assertContains(
+            response, "This key conflicts with an existing hierarchical key."
+        )
+
+        response = self.add_unit("other.key.title")
         self.assertContains(response, "New string has been added")
 
 
@@ -672,6 +1921,49 @@ class EditPropagateTest(EditTest):
         )
         return result
 
+    def test_edit_restricted_component(self) -> None:
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+
+        response = self.edit_unit(self.source, self.target)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.get_unit(source=self.source).target, "")
+
+    def test_edit_skips_restricted_propagated_component(self) -> None:
+        second_translation = Translation.objects.get(
+            component__slug="second", language_code="cs"
+        )
+        second_component = second_translation.component
+        self.component.allow_translation_propagation = True
+        self.component.save(update_fields=["allow_translation_propagation"])
+        second_component.allow_translation_propagation = True
+        second_component.restricted = True
+        self.enterContext(acting_user_context(self.user))
+        second_component.save(
+            update_fields=["allow_translation_propagation", "restricted"]
+        )
+
+        self.assertFalse(self.user.has_perm("unit.edit", second_translation))
+
+        response = self.edit_unit(self.source, self.target)
+
+        self.assertEqual(self.get_unit(source=self.source).target, self.target)
+        self.assertEqual(
+            self.get_unit(source=self.source, translation=second_translation).target, ""
+        )
+        self.assertFalse(
+            Change.objects.filter(
+                component=second_component, action=ActionEvents.PROPAGATED_EDIT
+            ).exists()
+        )
+        self.assertFalse(
+            any(
+                second_component.name in str(message)
+                for message in get_messages(response.wsgi_request)
+            )
+        )
+
     def test_edit(self) -> None:
         def get_targets() -> list[str]:
             return list(
@@ -733,7 +2025,7 @@ class EditPropagateTest(EditTest):
         unit = self.get_unit()
         test_edit = "Test edit\n"
         unit.translate(
-            None,
+            get_test_actor(self),
             test_edit,
             STATE_TRANSLATED,
             change_action=ActionEvents.AUTO,
@@ -746,7 +2038,7 @@ class EditPropagateTest(EditTest):
 
         # Resync them
         unit.translate(
-            None,
+            get_test_actor(self),
             self.second_target,
             STATE_TRANSLATED,
             change_action=ActionEvents.AUTO,
@@ -768,7 +2060,89 @@ class EditTSMonoTest(EditTest):
         return self.create_ts_mono()
 
 
-class ZenViewTest(ViewTestCase):
+class ZenViewTest(ReusableViewTestCase):
+    def test_project_language_zen_hides_restricted_component_state(self) -> None:
+        self.create_po(name="Visible locked peer", locked=True, project=self.project)
+        hidden = self.create_po(
+            name="Hidden locked peer", locked=True, project=self.project
+        )
+        Component.objects.filter(pk=hidden.pk).update(restricted=True)
+        hidden.refresh_from_db()
+        url = reverse(
+            "zen",
+            kwargs={"path": [self.project.slug, "-", self.translation.language.code]},
+        )
+        lock_message = (
+            "The translation is temporarily closed for contributions due to maintenance"
+        )
+
+        for viewer in ("member", "anonymous"):
+            if viewer == "anonymous":
+                self.client.logout()
+            with self.subTest(viewer=viewer):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content.decode().count(lock_message), 1)
+                self.assertEqual(
+                    self.client.get(hidden.get_absolute_url()).status_code, 404
+                )
+
+    def test_category_language_zen_hides_restricted_component_state(self) -> None:
+        category = self.create_category(self.project)
+        self.create_po(
+            name="Visible locked category peer",
+            locked=True,
+            project=self.project,
+            category=category,
+        )
+        hidden = self.create_po(
+            name="Hidden locked category peer",
+            locked=True,
+            project=self.project,
+            category=category,
+        )
+        Component.objects.filter(pk=hidden.pk).update(restricted=True)
+        category_language = CategoryLanguage(category, self.translation.language)
+
+        response = self.client.get(
+            reverse("zen", kwargs={"path": category_language.get_url_path()})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.content.decode().count(
+                "The translation is temporarily closed for contributions due to maintenance"
+            ),
+            1,
+        )
+        self.assertEqual(self.client.get(hidden.get_absolute_url()).status_code, 404)
+
+    def create_zen_unit(self, position: int) -> Unit:
+        source = f"Zen source {position}\n"
+        id_hash = calculate_hash(source, "")
+        source_unit = Unit(
+            translation=self.component.source_translation,
+            id_hash=id_hash,
+            source=source,
+            target=source,
+            state=STATE_TRANSLATED,
+            original_state=STATE_TRANSLATED,
+            position=position,
+        )
+        source_unit.save(run_checks=False)
+        unit = Unit(
+            translation=self.translation,
+            id_hash=id_hash,
+            source=source,
+            target=f"Zen target {position}\n",
+            state=STATE_TRANSLATED,
+            original_state=STATE_TRANSLATED,
+            position=position,
+            source_unit=source_unit,
+        )
+        unit.save(run_checks=False)
+        return unit
+
     def test_zen(self) -> None:
         response = self.client.get(reverse("zen", kwargs=self.kw_translation))
         self.assertContains(response, "Thank you for using Weblate.")
@@ -781,7 +2155,7 @@ class ZenViewTest(ViewTestCase):
             {"q": "has:nonexisting"},
             follow=True,
         )
-        self.assertContains(response, "Unsupported has lookup")
+        self.assertContains(response, "Unsupported lookup for has: nonexisting")
 
     def test_load_zen(self) -> None:
         response = self.client.get(reverse("load_zen", kwargs=self.kw_translation))
@@ -802,12 +2176,68 @@ class ZenViewTest(ViewTestCase):
         )
         self.assertContains(response, "Hello, world")
 
+    def test_load_zen_deep_offset(self) -> None:
+        for position in range(5, 27):
+            self.create_zen_unit(position)
+
+        response = self.client.get(
+            reverse("load_zen", kwargs=self.kw_translation),
+            {"offset": "21"},
+        )
+
+        self.assertNotContains(response, "Hello, world")
+        self.assertContains(response, "Zen source 21")
+        self.assertContains(response, "Zen source 26")
+        self.assertContains(response, "The translation has come to an end.")
+
+    def test_load_zen_offset_survives_cached_translate_sort(self) -> None:
+        for position in range(5, 27):
+            self.create_zen_unit(position)
+        first = self.get_unit()
+        self.translation.unit_set.update(target="zzz\n")
+        Unit.objects.filter(pk=first.pk).update(target="aaa\n")
+
+        response = self.client.get(
+            reverse("translate", kwargs=self.kw_translation),
+            {"sort_by": "target", "offset": "1"},
+        )
+        self.assertEqual(response.context["unit"].pk, first.pk)
+
+        response = self.client.get(
+            reverse("load_zen", kwargs=self.kw_translation),
+            {"offset": "21"},
+        )
+
+        self.assertNotContains(response, "Hello, world")
+        self.assertContains(response, "Zen source 21")
+        self.assertContains(response, "Zen source 26")
+        self.assertContains(response, "The translation has come to an end.")
+
+    def test_zen_stores_full_search_ids(self) -> None:
+        for position in range(5, 27):
+            self.create_zen_unit(position)
+
+        response = self.client.get(reverse("zen", kwargs=self.kw_translation))
+
+        session = self.client.session
+        session_keys = list(session.keys())
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertEqual(response.context["filter_count"], 26)
+        self.assertEqual(len(session[search_key]["ids"]), 26)
+
+    def test_zen_skips_glossary_fetch_without_glossaries(self) -> None:
+        with patch("weblate.trans.views.edit.fetch_glossary_terms") as fetch_terms:
+            self.client.get(reverse("zen", kwargs=self.kw_translation))
+
+        fetch_terms.assert_not_called()
+
     def test_save_zen(self) -> None:
         unit = self.get_unit()
         params = {
             "checksum": unit.checksum,
             "contentsum": hash_to_checksum(unit.content_hash),
             "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
             "target_0": "Zen translation",
             "review": "20",
         }
@@ -817,9 +2247,116 @@ class ZenViewTest(ViewTestCase):
         )
         self.assertContains(
             response,
-            "Following fixups were applied to translation: "
-            "Trailing and leading whitespace",
+            "The following fix-up was applied to the translation: Trailing and leading whitespace",
         )
+
+    @override_settings(RATELIMIT_TRANSLATE_ATTEMPTS=1)
+    def test_save_zen_respects_classic_translate_limit(self) -> None:
+        unit = self.get_unit()
+        self.assertFalse(self.user.is_superuser)
+        self.assertTrue(self.user.has_perm("unit.edit", unit))
+        self.assertEqual(
+            self.edit_unit(unit.source, "First translation\n").status_code, 302
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First translation\n")
+
+        response = self.client.post(
+            reverse("save_zen", kwargs=self.kw_translation),
+            {
+                "checksum": unit.checksum,
+                "contentsum": hash_to_checksum(unit.content_hash),
+                "translationsum": hash_to_checksum(unit.get_target_hash()),
+                "initial_state": str(unit.state),
+                "target_0": "Second translation\n",
+                "review": "20",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["state"], "danger")
+        self.assertEqual(response.json()["translationsum"], "")
+        self.assertIn(
+            {
+                "tags": "error",
+                "kind": "danger",
+                "text": (
+                    "Your request was rejected because you have performed too many "
+                    "operations recently. Please try again later."
+                ),
+            },
+            response.json()["messages"],
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First translation\n")
+
+    @override_settings(RATELIMIT_TRANSLATE_ATTEMPTS=1)
+    def test_classic_translate_respects_zen_limit(self) -> None:
+        unit = self.get_unit()
+        response = self.client.post(
+            reverse("save_zen", kwargs=self.kw_translation),
+            {
+                "checksum": unit.checksum,
+                "contentsum": hash_to_checksum(unit.content_hash),
+                "translationsum": hash_to_checksum(unit.get_target_hash()),
+                "initial_state": str(unit.state),
+                "target_0": "First Zen translation\n",
+                "review": "20",
+            },
+        )
+        self.assertNotEqual(response.json()["translationsum"], "")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First Zen translation\n")
+
+        response = self.edit_unit(unit.source, "Second translation\n")
+        self.assertEqual(response.status_code, 302)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First Zen translation\n")
+
+    @override_settings(RATELIMIT_TRANSLATE_ATTEMPTS=1)
+    def test_save_zen_csrf_token_survives_rate_limit(self) -> None:
+        unit = self.get_unit()
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        response = client.get(reverse("zen", kwargs=self.kw_translation))
+        self.assertEqual(response.status_code, 200)
+        document = html.fromstring(response.content)
+        form = document.xpath(
+            f'//form[.//input[@name="checksum"][@value="{unit.checksum}"]]'
+        )[0]
+        params = {
+            "csrfmiddlewaretoken": form.xpath(
+                './/input[@name="csrfmiddlewaretoken"]/@value'
+            )[0],
+            "checksum": unit.checksum,
+            "contentsum": hash_to_checksum(unit.content_hash),
+            "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
+            "target_0": "First Zen translation\n",
+            "review": "20",
+        }
+        url = form.get("action")
+        response = client.post(url, params)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.json()["translationsum"], "")
+        params.update(
+            translationsum=response.json()["translationsum"],
+            initial_state=response.json()["initial_state"],
+            target_0="Pending Zen translation\n",
+        )
+
+        response = client.post(url, params)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["state"], "danger")
+        self.assertEqual(response.json()["translationsum"], "")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "First Zen translation\n")
+
+        reset_rate_limit("translate", user=self.user)
+        response = client.post(url, params)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.json()["translationsum"], "")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Pending Zen translation\n")
 
     def test_save_zen_lock(self) -> None:
         self.component.locked = True
@@ -829,6 +2366,7 @@ class ZenViewTest(ViewTestCase):
             "checksum": unit.checksum,
             "contentsum": hash_to_checksum(unit.content_hash),
             "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
             "target_0": "Zen translation",
             "review": "20",
         }
@@ -836,12 +2374,345 @@ class ZenViewTest(ViewTestCase):
             reverse("save_zen", kwargs=self.kw_translation),
             params,
         )
+        self.assertContains(response, "This translation is currently locked.")
+
+    def test_save_zen_suggestions(self) -> None:
+        self.add_zen_suggestion()
+        unit = self.get_unit()
+        response = self.client.post(
+            reverse("save_zen", kwargs=self.kw_translation),
+            {
+                "checksum": unit.checksum,
+                "contentsum": hash_to_checksum(unit.content_hash),
+                "translationsum": hash_to_checksum(unit.get_target_hash()),
+                "initial_state": str(unit.state),
+                "target_0": "Nazdar!\n",
+                "review": "20",
+            },
+        )
+        data = response.json()
+        self.assertTrue(data["has_suggestions"])
+        # The suggestion diff is rendered against the saved target
+        self.assertIn("Suggested change:", data["suggestions_html"])
+        self.assertIn("<ins>", data["suggestions_html"])
+
+    def test_save_zen_no_suggestions(self) -> None:
+        unit = self.get_unit()
+        response = self.client.post(
+            reverse("save_zen", kwargs=self.kw_translation),
+            {
+                "checksum": unit.checksum,
+                "contentsum": hash_to_checksum(unit.content_hash),
+                "translationsum": hash_to_checksum(unit.get_target_hash()),
+                "initial_state": str(unit.state),
+                "target_0": "Nazdar!\n",
+                "review": "20",
+            },
+        )
+        self.assertNotIn("has_suggestions", response.json())
+
+    def add_zen_suggestion(self, target: str = "Nazdar svete!\n") -> Suggestion:
+        self.edit_unit("Hello, world!\n", target, suggest="yes")
+        return self.get_unit().suggestion_set.get(target=target)
+
+    def assert_accept_button(self, content: str, pk: int, *, present: bool) -> None:
+        pattern = rf'name="accept"\s+value="{pk}"'
+        if present:
+            self.assertRegex(content, pattern)
+        else:
+            self.assertNotRegex(content, pattern)
+
+    def post_zen_suggestion(self, unit: Unit, **params):
+        response = self.client.post(
+            reverse("zen_suggestion", kwargs=self.kw_translation),
+            {"checksum": unit.checksum, "unit_id": unit.pk, **params},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_zen_suggestions_shown(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        response = self.client.get(reverse("zen", kwargs=self.kw_translation))
+        self.assertContains(response, f"row-suggestions-{unit.checksum}")
+        self.assertContains(response, "Nazdar svete!")
+        self.assert_accept_button(
+            response.content.decode(), suggestion.pk, present=True
+        )
         self.assertContains(
-            response, "Insufficient privileges for saving translations."
+            response, reverse("zen_suggestion", kwargs=self.kw_translation)
         )
 
+    def test_zen_suggestions_indicator(self) -> None:
+        response = self.client.get(reverse("zen", kwargs=self.kw_translation))
+        self.assertNotContains(response, "zen-suggestions-indicator")
+        self.add_zen_suggestion()
+        self.add_zen_suggestion("Ahoj svete!\n")
+        response = self.client.get(reverse("zen", kwargs=self.kw_translation))
+        self.assertContains(response, "zen-suggestions-indicator", count=1)
+        self.assertContains(response, 'title="2 suggestions"')
+
+    def test_zen_suggestions_toggle(self) -> None:
+        # The visibility is remembered client side, the toggle is always there
+        # and suggestions are hidden until shown
+        response = self.client.get(reverse("zen", kwargs=self.kw_translation))
+        self.assertContains(response, 'id="zen-toggle-suggestions"')
+        self.assertContains(response, "zen-hide-suggestions")
+
+    def test_zen_suggestions_anonymous(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        self.client.logout()
+        response = self.client.get(reverse("zen", kwargs=self.kw_translation))
+        self.assertContains(response, "Hello, world")
+        # Suggestions are listed, but cannot be acted upon
+        self.assertContains(response, f"row-suggestions-{unit.checksum}")
+        self.assertContains(response, "Nazdar svete!")
+        self.assert_accept_button(
+            response.content.decode(), suggestion.pk, present=False
+        )
+
+    def test_load_zen_suggestions(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        response = self.client.get(reverse("load_zen", kwargs=self.kw_translation))
+        self.assertContains(response, f"row-suggestions-{unit.checksum}")
+        self.assertContains(response, "Nazdar svete!")
+        self.assert_accept_button(
+            response.content.decode(), suggestion.pk, present=True
+        )
+
+    def test_zen_suggestion_accept(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        data = self.post_zen_suggestion(unit, accept=suggestion.pk)
+        self.assertEqual(data["state"], "success")
+        self.assertEqual(data["mode"], "accept")
+        self.assertEqual(data["checksum"], unit.checksum)
+        self.assertFalse(data["has_suggestions"])
+        self.assertEqual(data["suggestions_html"], "")
+        self.assertEqual(data["target"], ["Nazdar svete!\n"])
+        self.assertEqual(data["review"], str(STATE_TRANSLATED))
+        self.assertEqual(data["initial_state"], STATE_TRANSLATED)
+        self.assertFalse(data["fuzzy"])
+        self.assertEqual(data["unit_state_class"], "unit-state-translated")
+        unit = self.get_unit()
+        self.assertEqual(unit.target, "Nazdar svete!\n")
+        self.assertEqual(
+            data["translationsum"], hash_to_checksum(unit.get_target_hash())
+        )
+        self.assertNotEqual(data["translationsum"], "")
+        self.assertEqual(Suggestion.objects.count(), 0)
+
+    def test_zen_suggestion_accept_approve(self) -> None:
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        self.make_manager()
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        data = self.post_zen_suggestion(unit, accept_approve=suggestion.pk)
+        self.assertEqual(data["state"], "success")
+        self.assertEqual(data["mode"], "accept_approve")
+        self.assertEqual(data["review"], str(STATE_APPROVED))
+        self.assertEqual(data["unit_state_class"], "unit-state-approved")
+        self.assertEqual(self.get_unit().state, STATE_APPROVED)
+
+    def test_zen_suggestion_accept_edit(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        data = self.post_zen_suggestion(unit, accept_edit=suggestion.pk)
+        self.assertEqual(data["state"], "success")
+        self.assertEqual(data["mode"], "accept_edit")
+        self.assertEqual(data["target"], ["Nazdar svete!\n"])
+        self.assertEqual(self.get_unit().target, "Nazdar svete!\n")
+
+    def test_zen_suggestion_accept_keeps_others(self) -> None:
+        first = self.add_zen_suggestion("Nazdar svete!\n")
+        second = self.add_zen_suggestion("Ahoj svete!\n")
+        unit = self.get_unit()
+        data = self.post_zen_suggestion(unit, accept=first.pk)
+        self.assertTrue(data["has_suggestions"])
+        self.assertIn("Ahoj svete!", data["suggestions_html"])
+        self.assert_accept_button(data["suggestions_html"], second.pk, present=True)
+        self.assert_accept_button(data["suggestions_html"], first.pk, present=False)
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_suggestion_delete(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        original_target = unit.target
+        data = self.post_zen_suggestion(
+            unit, delete=suggestion.pk, rejection="not good"
+        )
+        self.assertEqual(data["state"], "success")
+        self.assertEqual(data["mode"], "delete")
+        self.assertFalse(data["has_suggestions"])
+        self.assertIsNone(data["target"])
+        self.assertIsNone(data["review"])
+        self.assertIsNone(data["initial_state"])
+        self.assertEqual(self.get_unit().target, original_target)
+        self.assertEqual(Suggestion.objects.count(), 0)
+        change = Change.objects.filter(action=ActionEvents.SUGGESTION_DELETE).get()
+        self.assertEqual(change.details["rejection_reason"], "not good")
+
+    def test_zen_suggestion_delete_long_rejection(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        data = self.post_zen_suggestion(unit, delete=suggestion.pk, rejection="x" * 201)
+        self.assertEqual(data["state"], "danger")
+        self.assertIsNone(data["mode"])
+        self.assertIn("Rejection reason is too long!", data["messages"][0]["text"])
+        self.assertTrue(data["has_suggestions"])
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_suggestion_vote(self) -> None:
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=self.translation.language,
+            enable_suggestions=True,
+            suggestion_voting=True,
+            suggestion_autoaccept=0,
+        )
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        data = self.post_zen_suggestion(unit, upvote=suggestion.pk)
+        self.assertEqual(data["state"], "success")
+        self.assertEqual(data["mode"], "upvote")
+        self.assertTrue(data["has_suggestions"])
+        self.assertIsNone(data["target"])
+        self.assertIn("1 vote", data["suggestions_html"])
+        self.assertEqual(suggestion.get_num_votes(), 1)
+
+    def test_zen_suggestion_vote_autoaccept(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        WorkflowSetting.objects.create(
+            project=self.project,
+            language=self.translation.language,
+            enable_suggestions=True,
+            suggestion_voting=True,
+            suggestion_autoaccept=1,
+        )
+        unit = self.get_unit()
+        with self.captureOnCommitCallbacks(execute=True):
+            data = self.post_zen_suggestion(unit, upvote=suggestion.pk)
+        self.assertEqual(data["mode"], "upvote")
+        self.assertFalse(data["has_suggestions"])
+        # The vote accepted the suggestion, so the editor has to be synced
+        self.assertEqual(data["target"], ["Nazdar svete!\n"])
+        self.assertEqual(data["review"], str(STATE_TRANSLATED))
+        self.assertEqual(self.get_unit().target, "Nazdar svete!\n")
+
+    def test_zen_suggestion_invalid_checksum(self) -> None:
+        self.add_zen_suggestion()
+        response = self.client.post(
+            reverse("zen_suggestion", kwargs=self.kw_translation),
+            {"checksum": "invalid", "accept": "1"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_zen_suggestion_invalid_id(self) -> None:
+        self.add_zen_suggestion()
+        data = self.post_zen_suggestion(self.get_unit(), accept="0")
+        self.assertEqual(data["state"], "danger")
+        self.assertIsNone(data["mode"])
+        self.assertEqual(data["messages"][0]["text"], "Invalid suggestion!")
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_suggestion_no_action(self) -> None:
+        self.add_zen_suggestion()
+        data = self.post_zen_suggestion(self.get_unit())
+        self.assertEqual(data["state"], "danger")
+        self.assertEqual(data["messages"][0]["text"], "Invalid suggestion!")
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_suggestion_denied(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        # Guests can only add suggestions
+        self.user.groups.set([Group.objects.get(name="Guests")])
+        data = self.post_zen_suggestion(unit, accept=suggestion.pk)
+        self.assertEqual(data["state"], "danger")
+        self.assertIsNone(data["mode"])
+        self.assertIn("permission", data["messages"][0]["text"])
+        self.assertTrue(data["has_suggestions"])
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_suggestion_get_not_allowed(self) -> None:
+        response = self.client.get(
+            reverse("zen_suggestion", kwargs=self.kw_translation)
+        )
+        self.assertEqual(response.status_code, 405)
+
+    def test_zen_suggestion_anonymous(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        self.client.logout()
+        response = self.client.post(
+            reverse("zen_suggestion", kwargs=self.kw_translation),
+            {"checksum": unit.checksum, "unit_id": unit.pk, "accept": suggestion.pk},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response["Location"])
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_unit(self) -> None:
+        suggestion = self.add_zen_suggestion()
+        unit = self.get_unit()
+        response = self.client.get(
+            reverse("zen_unit", kwargs=self.kw_translation),
+            {"checksum": unit.checksum, "unit_id": unit.pk},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIsNone(data["mode"])
+        self.assertTrue(data["has_suggestions"])
+        self.assert_accept_button(data["suggestions_html"], suggestion.pk, present=True)
+        self.assertEqual(data["target"], [unit.target])
+        self.assertEqual(data["review"], str(unit.state))
+        self.assertEqual(
+            data["translationsum"], hash_to_checksum(unit.get_target_hash())
+        )
+        # Reading never changes anything
+        self.assertEqual(Suggestion.objects.count(), 1)
+
+    def test_zen_unit_invalid_checksum(self) -> None:
+        response = self.client.get(
+            reverse("zen_unit", kwargs=self.kw_translation),
+            {"checksum": "invalid"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_zen_suggestions_query_count(self) -> None:
+        def add_suggested_units(positions: range) -> None:
+            for position in positions:
+                unit = self.create_zen_unit(position)
+                Suggestion.objects.add(
+                    unit, [f"Suggested {position}\n"], None, user=self.anotheruser
+                )
+                Suggestion.objects.add(
+                    unit, [f"Other suggestion {position}\n"], None, user=self.user
+                )
+
+        url = reverse("zen", kwargs=self.kw_translation)
+        params = {"q": "has:suggestion"}
+
+        add_suggested_units(range(5, 8))
+        # Warm up caches so that only per-unit queries are compared
+        self.client.get(url, params)
+        with CaptureQueriesContext(connection) as small:
+            response = self.client.get(url, params)
+        self.assertContains(response, "Suggested 7")
+
+        add_suggested_units(range(8, 17))
+        self.client.get(url, params)
+        with CaptureQueriesContext(connection) as large:
+            response = self.client.get(url, params)
+        self.assertContains(response, "Suggested 16")
+
+        self.assertEqual(len(small), len(large))
+
     def test_browse(self) -> None:
-        response = self.client.get(reverse("browse", kwargs=self.kw_translation))
+        response = self.client.get(reverse("search", kwargs=self.kw_translation))
         self.assertContains(response, "Thank you for using Weblate.")
         self.assertContains(
             response,
@@ -849,7 +2720,7 @@ class ZenViewTest(ViewTestCase):
         )
 
 
-class EditComplexTest(ViewTestCase):
+class EditComplexTest(ReusableViewTestCase):
     """Test for complex manipulating translation."""
 
     def setUp(self) -> None:
@@ -857,13 +2728,43 @@ class EditComplexTest(ViewTestCase):
         self.translation = self.get_translation()
         self.translate_url = reverse("translate", kwargs=self.kw_translation)
 
+    def test_add_duplicate_plural(self) -> None:
+        self.component.manage_units = True
+        self.component.save()
+        self.user.is_superuser = True
+        self.user.save()
+        response = self.client.post(
+            reverse("new-unit", kwargs=self.kw_translation),
+            {
+                "source_0": "Hello, world!\n",
+                "source_1": "Hello, worlds!\n",
+                "target_0": "Ahoj světe!\n",
+                "target_1": "Ahoj světy!\n",
+                "target_2": "Ahoj světy!\n",
+            },
+            follow=True,
+        )
+        self.assertContains(response, "This string seems to already exist.")
+        response = self.client.post(
+            reverse("new-unit", kwargs=self.kw_translation),
+            {
+                "source_0": "Hello, %d world!\n",
+                "source_1": "Hello, %d worlds!\n",
+                "target_0": "Ahoj %d světe!\n",
+                "target_1": "Ahoj %d světy!\n",
+                "target_2": "Ahoj %d světy!\n",
+            },
+            follow=True,
+        )
+        self.assertNotContains(response, "This string seems to already exist.")
+
     def test_merge(self) -> None:
         # Translate unit to have something to start with
         response = self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
         unit = self.get_unit()
         # Try the merge
         response = self.client.post(
-            self.translate_url + "?checksum=" + unit.checksum, {"merge": unit.id}
+            f"{self.translate_url}?checksum={unit.checksum}", {"merge": unit.id}
         )
         self.assert_backend(1)
         # We should stay on same message
@@ -872,9 +2773,40 @@ class EditComplexTest(ViewTestCase):
         # Test error handling
         unit2 = self.translation.unit_set.get(source="Thank you for using Weblate.")
         response = self.client.post(
-            self.translate_url + "?checksum=" + unit.checksum, {"merge": unit2.id}
+            f"{self.translate_url}?checksum={unit.checksum}", {"merge": unit2.id}
         )
         self.assertContains(response, "Could not find the merged string.")
+
+    def test_merge_approved_requires_review_permission(self) -> None:
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        self.component.allow_translation_propagation = False
+        self.component.save(update_fields=["allow_translation_propagation"])
+        linked = self.create_link_existing(allow_translation_propagation=False)
+        source = linked.translation_set.get(language_code="cs").unit_set.get(
+            source="Hello, world!\n"
+        )
+        source.translate(self.user, "Approved merge target\n", STATE_APPROVED)
+        destination = self.get_unit()
+        self.assertNotEqual(destination.state, STATE_APPROVED)
+        self.assertTrue(self.user.has_perm("unit.edit", destination))
+        self.assertFalse(self.user.has_perm("unit.review", destination))
+
+        url = f"{self.translate_url}?checksum={destination.checksum}"
+        response = self.client.post(url, {"merge": source.pk})
+        self.assertEqual(response.status_code, 302)
+        destination.refresh_from_db()
+        self.assertEqual(destination.target, source.target)
+        self.assertEqual(destination.state, STATE_TRANSLATED)
+
+        self.make_manager()
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.review", destination))
+        response = self.client.post(url, {"merge": source.pk})
+        self.assertEqual(response.status_code, 302)
+        destination.refresh_from_db()
+        self.assertEqual(destination.target, source.target)
+        self.assertEqual(destination.state, STATE_APPROVED)
 
     def test_merge_inconsistent(self) -> None:
         # Translate unit to have something to start with
@@ -885,14 +2817,15 @@ class EditComplexTest(ViewTestCase):
         self.assertEqual(
             set(units.values_list("target", flat=True)), {"Nazdar svete!\n"}
         )
-        self.create_link_existing()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.create_link_existing()
         self.assertEqual(
             set(units.values_list("target", flat=True)), {"Nazdar svete!\n", ""}
         )
         unit = self.get_unit()
         self.assertEqual(unit.all_checks_names, {"inconsistent"})
         self.client.post(
-            self.translate_url + "?checksum=" + unit.checksum, {"merge": unit.id}
+            f"{self.translate_url}?checksum={unit.checksum}", {"merge": unit.id}
         )
         self.assertEqual(
             set(units.values_list("target", flat=True)), {"Nazdar svete!\n"}
@@ -906,18 +2839,33 @@ class EditComplexTest(ViewTestCase):
         )
         self.create_link_existing()
         self.assertEqual(set(units.values_list("target", flat=True)), {""})
-        self.edit_unit("Thank you for using Weblate.", "Díky za použití Weblate")
-        self.assertEqual(
-            set(units.values_list("target", flat=True)), {"Díky za použití Weblate"}
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.edit_unit("Thank you for using Weblate.", "Díky za použití Weblate")
+            self.assertEqual(
+                set(units.values_list("target", flat=True)), {"Díky za použití Weblate"}
+            )
+            edited_unit = self.get_unit("Thank you for using Weblate.")
+            self.assertEqual(edited_unit.all_checks_names, {"end_stop"})
+            self.assertEqual(
+                [unit.all_checks_names for unit in units.exclude(pk=edited_unit.pk)],
+                [set()],
+            )
         self.assertEqual(
             [unit.all_checks_names for unit in units.iterator()],
             [{"end_stop"}, {"end_stop"}],
         )
-        self.edit_unit("Thank you for using Weblate.", "Díky za použití Weblate.")
-        self.assertEqual(
-            set(units.values_list("target", flat=True)), {"Díky za použití Weblate."}
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self.edit_unit("Thank you for using Weblate.", "Díky za použití Weblate.")
+            self.assertEqual(
+                set(units.values_list("target", flat=True)),
+                {"Díky za použití Weblate."},
+            )
+            edited_unit = self.get_unit("Thank you for using Weblate.")
+            self.assertEqual(edited_unit.all_checks_names, set())
+            self.assertEqual(
+                [unit.all_checks_names for unit in units.exclude(pk=edited_unit.pk)],
+                [{"end_stop"}],
+            )
         self.assertEqual(
             [unit.all_checks_names for unit in units.iterator()], [set(), set()]
         )
@@ -936,20 +2884,702 @@ class EditComplexTest(ViewTestCase):
         self.assertEqual(changes[0].target, target_2)
         self.assert_backend(1)
         # revert it
-        self.client.get(
+        self.client.post(
             self.translate_url, {"checksum": unit.checksum, "revert": changes[1].id}
         )
         unit = self.get_unit()
-        self.assertEqual(unit.target, target_2)
+        self.assertEqual(unit.target, "")
+        self.assertEqual(unit.state, STATE_EMPTY)
         # check that we cannot revert to string from another translation
         self.edit_unit("Thank you for using Weblate.", "Kiitoksia Weblaten kaytosta.")
         unit2 = self.get_unit(source="Thank you for using Weblate.")
         change = unit2.change_set.order()[0]
-        response = self.client.get(
+        response = self.client.post(
             self.translate_url, {"checksum": unit.checksum, "revert": change.id}
         )
         self.assertContains(response, "Could not find the reverted change.")
-        self.assert_backend(2)
+        self.assert_backend(1)
+
+    def test_revert_get_does_not_modify_unit(self) -> None:
+        target = "Nazdar svete!\n"
+        self.edit_unit("Hello, world!\n", target)
+        unit = self.get_unit()
+        change = Change.objects.content().filter(unit=unit).order()[0]
+        revert_count = unit.change_set.filter(action=ActionEvents.REVERT).count()
+
+        response = self.client.get(
+            self.translate_url,
+            {"checksum": unit.checksum, "revert": change.id},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, target)
+        self.assertEqual(
+            unit.change_set.filter(action=ActionEvents.REVERT).count(), revert_count
+        )
+
+    def test_revert_csrf_protection(self) -> None:
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+        unit = self.get_unit()
+        change = Change.objects.content().filter(unit=unit).order()[0]
+        csrf_client = Client(enforce_csrf_checks=True)
+        csrf_client.force_login(self.user)
+        payload = {"checksum": unit.checksum, "revert": change.id}
+
+        response = csrf_client.post(self.translate_url, payload)
+
+        self.assertEqual(response.status_code, 403)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Nazdar svete!\n")
+
+        response = csrf_client.get(self.translate_url, {"checksum": unit.checksum})
+        document = html.fromstring(response.content)
+        form = document.xpath(
+            f'//form[.//button[@name="revert"][@value="{change.id}"]]'
+        )[0]
+        payload["csrfmiddlewaretoken"] = form.xpath(
+            './input[@name="csrfmiddlewaretoken"]/@value'
+        )[0]
+
+        response = csrf_client.post(form.get("action"), payload)
+
+        self.assertEqual(response.status_code, 302)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "")
+
+    def test_revert_history_after_component_move_uses_current_translate_url(
+        self,
+    ) -> None:
+        second_project = Project.objects.create(
+            name="Second project",
+            slug="second-project",
+            web="https://weblate.org/",
+        )
+        setup_project_groups(Project, second_project, created=False)
+        second_project.add_user(self.user, "Administration")
+
+        self.component.project = second_project
+        self.component.save()
+        self.component.refresh_from_db()
+        self.translation.refresh_from_db()
+
+        self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
+        unit = self.get_unit(translation=self.translation)
+        change = Change.objects.content().filter(unit=unit).order()[0]
+        translate_url = ProjectLanguage(
+            second_project,
+            self.translation.language,
+        ).get_translate_url()
+
+        response = self.client.get(translate_url, {"checksum": unit.checksum})
+
+        document = html.fromstring(response.content)
+        forms = document.xpath(
+            f'//form[.//button[@name="revert"][@value="{change.id}"]]'
+        )
+        self.assertEqual(len(forms), 1)
+        self.assertEqual(
+            forms[0].get("action"), f"{translate_url}?checksum={unit.checksum}"
+        )
+        self.assertEqual(forms[0].get("method"), "post")
+        self.assertEqual(
+            forms[0].xpath('./input[@name="checksum"]/@value'), [unit.checksum]
+        )
+        self.assertEqual(len(forms[0].xpath('./input[@name="csrfmiddlewaretoken"]')), 1)
+
+    def test_translate_get_search_stores_full_ids(self) -> None:
+        Check.objects.all().delete()
+        unit = self.get_unit(source="Thank you for using Weblate.")
+        Check.objects.get_or_create(unit=unit, name="end_stop")
+
+        response = self.client.get(self.translate_url, {"q": "has:check"})
+
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertEqual(response.context["filter_count"], 1)
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertEqual(session[search_key]["ids"], [unit.pk])
+        self.assertEqual(session[search_key]["last_viewed_unit_id"], unit.pk)
+
+    def test_translate_checksum_search_stores_full_ids(self) -> None:
+        unit = self.get_unit(source="Thank you for using Weblate.")
+
+        self.client.get(self.translate_url, {"checksum": unit.checksum, "offset": 1})
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertIn("ids", session[search_key])
+        self.assertIn(unit.pk, session[search_key]["ids"])
+
+    def test_translate_post_uses_lightweight_search_session(self) -> None:
+        unit = self.get_unit()
+
+        self.client.get(self.translate_url, {"checksum": unit.checksum, "offset": 1})
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertIn("ids", session[search_key])
+
+        params = {
+            "checksum": unit.checksum,
+            "contentsum": hash_to_checksum(unit.content_hash),
+            "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
+            "target_0": "Translated first string",
+            "review": "20",
+        }
+        response = self.client.post(f"{self.translate_url}?offset=1", params)
+
+        self.assert_redirects_offset(response, self.translate_url, 2)
+        session = self.client.session
+        session_data = session[search_key]
+        self.assertNotIn("ids", session_data)
+        self.assertNotIn("partial_ids", session_data)
+        self.assertEqual(session_data["last_viewed_unit_id"], unit.pk)
+
+    def test_translate_filtered_search_keeps_stable_navigation(self) -> None:
+        first = self.get_unit()
+
+        response = self.client.get(self.translate_url, {"q": "state:<translated"})
+        self.assertEqual(response.context["unit"].pk, first.pk)
+        initial_count = response.context["filter_count"]
+
+        params = {
+            "checksum": first.checksum,
+            "contentsum": hash_to_checksum(first.content_hash),
+            "translationsum": hash_to_checksum(first.get_target_hash()),
+            "initial_state": str(first.state),
+            "target_0": "Translated first string",
+            "review": "20",
+        }
+        response = self.client.post(
+            f"{self.translate_url}?q=state:%3Ctranslated&offset=1",
+            params,
+        )
+        self.assert_redirects_offset(response, self.translate_url, 2)
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        expected_unit_id = session[search_key]["ids"][1]
+        self.assertNotIn("partial_ids", session[search_key])
+
+        response = self.client.get(
+            self.translate_url, {"q": "state:<translated", "offset": "2"}
+        )
+        self.assertEqual(response.context["unit"].pk, expected_unit_id)
+        self.assertEqual(response.context["filter_pos"], 2)
+        self.assertEqual(response.context["filter_count"], initial_count)
+
+        response = self.client.get(
+            self.translate_url, {"q": "state:<translated", "offset": "1"}
+        )
+        self.assertEqual(response.context["unit"].pk, first.pk)
+        self.assertEqual(response.context["filter_pos"], 1)
+        self.assertEqual(response.context["filter_count"], initial_count)
+
+    def test_translate_post_offset_uses_bounded_search_lookup(self) -> None:
+        response = self.client.get(self.translate_url, {"offset": 1})
+        unit = response.context["unit"]
+        self.assertContains(
+            response, f'name="checksum" value="{unit.checksum}"', html=False
+        )
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertNotIn("ids", session[search_key])
+
+        params = {
+            "checksum": unit.checksum,
+            "contentsum": hash_to_checksum(unit.content_hash),
+            "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
+            "target_0": "Translated first string",
+            "review": "20",
+        }
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.post(f"{self.translate_url}?offset=1", params)
+
+        self.assert_redirects_offset(response, self.translate_url, 2)
+        unit_id_searches = [
+            query["sql"]
+            for query in queries
+            if '"trans_unit"."id" AS "id"' in query["sql"]
+            and 'FROM "trans_unit"' in query["sql"]
+            and "ORDER BY" in query["sql"]
+        ]
+        self.assertTrue(
+            any("LIMIT 2" in sql for sql in unit_id_searches),
+            "\n".join(query["sql"] for query in queries),
+        )
+        self.assertFalse(
+            any("LIMIT" not in sql for sql in unit_id_searches),
+            "\n".join(query["sql"] for query in queries),
+        )
+
+    def test_translate_mutable_sort_uses_cached_search_ids(self) -> None:
+        # Empty targets tie; use file order to select the same singular unit.
+        sort_by = "target,position"
+        response = self.client.get(
+            self.translate_url, {"sort_by": sort_by, "offset": "1"}
+        )
+        unit = response.context["unit"]
+        self.assertEqual(unit.pk, self.get_unit("Hello, world!\n").pk)
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertIn("ids", session[search_key])
+
+        params = {
+            "checksum": unit.checksum,
+            "contentsum": hash_to_checksum(unit.content_hash),
+            "translationsum": hash_to_checksum(unit.get_target_hash()),
+            "initial_state": str(unit.state),
+            "target_0": "Translated first string",
+            "review": "20",
+        }
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.post(
+                f"{self.translate_url}?sort_by={sort_by}&offset=1", params
+            )
+
+        self.assert_redirects_offset(response, self.translate_url, 2)
+        unit_id_searches = [
+            query["sql"]
+            for query in queries
+            if '"trans_unit"."id" AS "id"' in query["sql"]
+            and 'FROM "trans_unit"' in query["sql"]
+            and "ORDER BY" in query["sql"]
+        ]
+        self.assertFalse(
+            unit_id_searches,
+            "\n".join(query["sql"] for query in queries),
+        )
+
+        response = self.client.get(
+            self.translate_url, {"sort_by": sort_by, "offset": "2"}
+        )
+        self.assertEqual(response.context["unit"].pk, session[search_key]["ids"][1])
+
+    def test_translate_sort_change_reorders_cached_ids_and_keeps_current_unit(
+        self,
+    ) -> None:
+        query = "state:<translated"
+        self.client.get(self.translate_url, {"q": query, "offset": "1"})
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        original_ids = list(session[search_key]["ids"])
+        expected_ids = list(
+            self.translation.unit_set.filter(pk__in=original_ids)
+            .order_by("source")
+            .values_list("pk", flat=True)
+        )
+        self.assertGreaterEqual(len(expected_ids), 2)
+
+        current_id = expected_ids[1]
+        self.client.get(
+            self.translate_url,
+            {"q": query, "offset": str(original_ids.index(current_id) + 1)},
+        )
+
+        response = self.client.get(
+            self.translate_url,
+            {"q": query, "sort_by": "source", "offset": "1"},
+        )
+
+        self.assertEqual(response.context["unit"].pk, current_id)
+        self.assertEqual(response.context["filter_pos"], 2)
+
+        session = self.client.session
+        session_keys = session.keys()
+        sorted_key = next(
+            key
+            for key in session_keys
+            if key.startswith("search_")
+            and session[key].get("url", "").endswith("sort_by=source")
+        )
+        self.assertEqual(session[sorted_key]["ids"], expected_ids)
+
+    def test_translate_sort_change_refreshes_cached_sort_from_newer_ids(
+        self,
+    ) -> None:
+        query = "state:<translated"
+        self.client.get(
+            self.translate_url,
+            {"q": query, "sort_by": "source", "offset": "1"},
+        )
+
+        session = self.client.session
+        session_keys = session.keys()
+        source_key = next(
+            key
+            for key in session_keys
+            if key.startswith("search_")
+            and session[key].get("url", "").endswith("sort_by=source")
+        )
+        source_ids = list(session[source_key]["ids"])
+        self.assertGreaterEqual(len(source_ids), 2)
+
+        current_id = source_ids[1]
+        self.client.get(self.translate_url, {"q": query, "offset": "1"})
+        session = self.client.session
+        session_keys = session.keys()
+        default_key = next(
+            key
+            for key in session_keys
+            if key.startswith("search_")
+            and session[key].get("query") == query
+            and "sort_by" not in session[key].get("url", "")
+        )
+        default_ids = list(session[default_key]["ids"])
+
+        response = self.client.get(
+            self.translate_url,
+            {"q": query, "offset": str(default_ids.index(current_id) + 1)},
+        )
+        self.assertEqual(response.context["unit"].pk, current_id)
+
+        session = self.client.session
+        self.assertEqual(session[default_key]["last_viewed_unit_id"], current_id)
+        source_data = session[source_key]
+        source_data["ttl"] = session[default_key]["ttl"] - 10
+        session[source_key] = source_data
+        session.save()
+
+        response = self.client.get(
+            self.translate_url,
+            {"q": query, "sort_by": "source", "offset": "1"},
+        )
+
+        self.assertEqual(response.context["unit"].pk, current_id)
+        self.assertEqual(response.context["filter_pos"], 2)
+
+        session = self.client.session
+        self.assertEqual(session[source_key]["ids"], source_ids)
+        self.assertEqual(session[source_key]["last_viewed_unit_id"], current_id)
+
+    def test_translate_consecutive_filtered_post_uses_cached_search_ids(
+        self,
+    ) -> None:
+        def get_targets(unit: Unit) -> dict[str, str]:
+            replacements = {
+                "Hello": "Hi",
+                "Orangutan": "Monkey",
+                "Weblate": "Software",
+            }
+            targets = {}
+            sources = unit.get_source_plurals()
+            plural_count = unit.translation.plural.number if unit.is_plural else 1
+            for position in range(plural_count):
+                source = sources[min(position, len(sources) - 1)]
+                target = source
+                for old, new in replacements.items():
+                    target = target.replace(old, new)
+                if target == source:
+                    target = f"Translated {source}"
+                targets[f"target_{position}"] = target
+            return targets
+
+        response = self.client.get(
+            self.translate_url, {"q": "state:<translated", "offset": "2"}
+        )
+        first = response.context["unit"]
+
+        params = {
+            "checksum": first.checksum,
+            "contentsum": hash_to_checksum(first.content_hash),
+            "translationsum": hash_to_checksum(first.get_target_hash()),
+            "initial_state": str(first.state),
+            "review": "20",
+        }
+        params.update(get_targets(first))
+        response = self.client.post(
+            f"{self.translate_url}?q=state:%3Ctranslated&offset=2", params
+        )
+        self.assert_redirects_offset(response, self.translate_url, 3)
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        second = Unit.objects.get(pk=session[search_key]["ids"][2])
+        params = {
+            "checksum": second.checksum,
+            "contentsum": hash_to_checksum(second.content_hash),
+            "translationsum": hash_to_checksum(second.get_target_hash()),
+            "initial_state": str(second.state),
+            "review": "20",
+        }
+        params.update(get_targets(second))
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.post(
+                f"{self.translate_url}?q=state:%3Ctranslated&offset=3", params
+            )
+
+        self.assert_redirects_offset(response, self.translate_url, 4)
+        unit_id_searches = [
+            query["sql"]
+            for query in queries
+            if '"trans_unit"."id" AS "id"' in query["sql"]
+            and 'FROM "trans_unit"' in query["sql"]
+            and "ORDER BY" in query["sql"]
+        ]
+        self.assertFalse(
+            unit_id_searches,
+            "\n".join(query["sql"] for query in queries),
+        )
+        session = self.client.session
+        self.assertNotIn("partial_ids", session[search_key])
+        self.assertGreaterEqual(len(session[search_key]["ids"]), 3)
+
+    def test_translate_cached_total_keeps_unit_after_filter_removal(
+        self,
+    ) -> None:
+        unit = self.get_unit()
+        suggestion = Suggestion.objects.create(
+            unit=unit,
+            user=self.user,
+            target="Suggested",
+        )
+
+        response = self.client.get(self.translate_url, {"q": "has:suggestion"})
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertEqual(response.context["filter_count"], 1)
+
+        response = self.client.post(
+            f"{self.translate_url}?q=has:suggestion&offset=1",
+            {"checksum": unit.checksum, "delete": suggestion.pk},
+        )
+
+        self.assert_redirects_offset(response, self.translate_url, 1)
+        response = self.client.get(
+            self.translate_url, {"q": "has:suggestion", "offset": "1"}
+        )
+        self.assertEqual(response.context["unit"].pk, unit.pk)
+        self.assertEqual(response.context["filter_count"], 1)
+
+    def test_nearby_embed_prefetches_state_relations(self) -> None:
+        unit = self.get_unit(source="Thank you for using Weblate.")
+        Check.objects.get_or_create(unit=unit, name="end_stop")
+        Comment.objects.create(unit=unit, user=self.user, comment="Needs work")
+        Suggestion.objects.create(unit=unit, user=self.user, target="Suggested")
+
+        nearby = unit.nearby(1)
+        nearby_unit = next(item for item in nearby if item.pk == unit.pk)
+
+        with self.assertNumQueries(0):
+            self.assertTrue(nearby_unit.active_checks)
+            self.assertTrue(nearby_unit.has_comment)
+            self.assertTrue(nearby_unit.has_suggestion)
+            self.assertIn("Failing checks:", unit_state_title(nearby_unit))
+
+    def test_translate_keeps_addterm_form_behind_project_permission(self) -> None:
+        self.create_po(
+            name="Glossary",
+            project=self.project,
+            is_glossary=True,
+            manage_units=True,
+        )
+        user_class = type(self.user)
+        has_perm = user_class.has_perm
+
+        def has_project_glossary_permission(user, permission, obj=None):
+            if permission == "glossary.add":
+                return False
+            return has_perm(user, permission, obj)
+
+        with (
+            patch.object(
+                user_class,
+                "has_perm",
+                autospec=True,
+                side_effect=has_project_glossary_permission,
+            ),
+            patch("weblate.trans.views.edit.TermForm") as term_form,
+        ):
+            response = self.client.get(self.translate_url)
+
+        term_form.assert_not_called()
+        self.assertIsNone(response.context["addterm_form"])
+        self.assertNotContains(response, "Add term to glossary")
+
+    def test_translate_addterm_form_uses_addable_glossary(self) -> None:
+        self.make_manager()
+        self.create_po(
+            name="Glossary",
+            project=self.project,
+            is_glossary=True,
+            manage_units=True,
+        )
+
+        response = self.client.get(self.translate_url)
+
+        self.assertIsNotNone(response.context["addterm_form"])
+        self.assertContains(response, "Add term to glossary")
+
+    def test_translate_source_language_renders_glossary_term_once(self) -> None:
+        glossary = self.create_po(
+            name="Glossary",
+            project=self.project,
+            is_glossary=True,
+            manage_units=True,
+        )
+        glossary.source_translation.unit_set.create(
+            source="Hello",
+            target="Hello",
+            context="",
+            id_hash=calculate_hash("Hello", ""),
+            position=glossary.source_translation.unit_set.count() + 1,
+            state=STATE_TRANSLATED,
+        )
+        glossary.invalidate_glossary_cache()
+
+        response = self.client.get(
+            self.component.source_translation.get_translate_url()
+        )
+
+        self.assertEqual(response.context["glossary"][0].source, "Hello")
+        self.assertTrue(response.context["glossary"][0].is_source)
+        content = response.content.decode()
+        glossary_start = content.index('<tbody id="glossary-terms">')
+        glossary_end = content.index("</tbody>", glossary_start)
+        glossary_body = content[glossary_start:glossary_end]
+        self.assertIn('class="source target" colspan="2"', glossary_body)
+        self.assertIn("Hello", glossary_body)
+        self.assertNotIn('class="source">', glossary_body)
+        self.assertNotIn('class="target">', glossary_body)
+
+    def test_translate_skips_glossary_fetch_without_glossaries(self) -> None:
+        with patch("weblate.trans.views.edit.fetch_glossary_terms") as fetch_terms:
+            response = self.client.get(self.translate_url)
+
+        fetch_terms.assert_not_called()
+        self.assertEqual(response.context["glossary"], [])
+
+    def test_project_language_warns_when_switching_component(self) -> None:
+        Component.objects.filter(pk=self.component.pk).update(priority=120)
+        high_component = self.create_po(name="High", priority=80, project=self.project)
+        high_translation = high_component.translation_set.get(
+            language=self.translation.language
+        )
+        translate_url = ProjectLanguage(
+            self.project, self.translation.language
+        ).get_translate_url()
+        high_component_offset = high_translation.unit_set.count()
+
+        response = self.client.get(translate_url, {"offset": high_component_offset})
+        self.assertNotContains(response, "You have shifted from")
+        self.assertContains(response, 'value="component,-priority"')
+
+        response = self.client.get(translate_url, {"offset": high_component_offset + 1})
+        self.assertContains(response, "You have shifted from")
+
+    def test_language_scope_sort_defaults_to_component_priority(self) -> None:
+        request = SimpleNamespace(GET={})
+        category = self.create_category(self.project)
+
+        self.assertEqual(
+            get_sort_name(
+                request, ProjectLanguage(self.project, self.translation.language)
+            )["query"],
+            "component,-priority",
+        )
+        self.assertEqual(
+            get_sort_name(
+                request, CategoryLanguage(category, self.translation.language)
+            )["query"],
+            "component,-priority",
+        )
+
+    def test_project_language_get_search_uses_lightweight_state(self) -> None:
+        Component.objects.filter(pk=self.component.pk).update(priority=120)
+        self.create_po(name="High", locked=True, priority=80, project=self.project)
+        translate_url = ProjectLanguage(
+            self.project, self.translation.language
+        ).get_translate_url()
+
+        self.client.get(
+            translate_url, {"sort_by": "component,-priority", "offset": "1"}
+        )
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        self.assertNotIn("ids", session[search_key])
+        self.assertIn("last_viewed_unit_id", session[search_key])
+
+    def test_project_language_checksum_search_keeps_component_order(self) -> None:
+        Component.objects.filter(pk=self.component.pk).update(priority=120)
+        high_component = self.create_po(
+            name="High", locked=True, priority=80, project=self.project
+        )
+        high_translation = high_component.translation_set.get(
+            language=self.translation.language
+        )
+        translate_url = ProjectLanguage(
+            self.project, self.translation.language
+        ).get_translate_url()
+        unit = high_translation.unit_set.order_by("position")[0]
+
+        self.client.get(
+            translate_url,
+            {
+                "sort_by": "component,-priority",
+                "checksum": unit.checksum,
+            },
+        )
+
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        expected_ids = [
+            *self.translation.unit_set.order_by("position").values_list(
+                "pk", flat=True
+            ),
+            *high_translation.unit_set.order_by("position").values_list(
+                "pk", flat=True
+            ),
+        ]
+        self.assertEqual(session[search_key]["ids"], expected_ids)
+
+    def test_project_language_ignores_stale_component_shift_unit(self) -> None:
+        Component.objects.filter(pk=self.component.pk).update(priority=120)
+        high_component = self.create_po(name="High", priority=80, project=self.project)
+        high_translation = high_component.translation_set.get(
+            language=self.translation.language
+        )
+        translate_url = ProjectLanguage(
+            self.project, self.translation.language
+        ).get_translate_url()
+        high_component_offset = high_translation.unit_set.count()
+
+        response = self.client.get(translate_url, {"offset": high_component_offset})
+        self.assertEqual(response.status_code, 200)
+
+        last_unit_id = Unit.objects.order_by("-pk").values_list("pk", flat=True)[0]
+        stale_unit_id = last_unit_id + 1
+        session = self.client.session
+        session_keys = session.keys()
+        search_key = next(key for key in session_keys if key.startswith("search_"))
+        session_result = session[search_key]
+        session_result["last_viewed_unit_id"] = stale_unit_id
+        session[search_key] = session_result
+        session.save()
+
+        response = self.client.get(translate_url, {"offset": high_component_offset + 1})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "You have shifted from")
+        self.assertNotEqual(
+            self.client.session[search_key]["last_viewed_unit_id"], stale_unit_id
+        )
 
     def test_revert_plural(self) -> None:
         source = "Orangutan has %d banana.\n"
@@ -973,11 +3603,126 @@ class EditComplexTest(ViewTestCase):
         self.assertEqual(changes[0].target, join_plural(target_2))
         self.assert_backend(1)
         # revert it
-        self.client.get(
+        self.client.post(
             self.translate_url, {"checksum": unit.checksum, "revert": changes[0].id}
         )
         unit = self.get_unit(source)
         self.assertEqual(unit.get_target_plurals(), target)
+
+    def test_revert_empty(self) -> None:
+        source = "Hello, world!\n"
+        target = "Nazdar svete!\n"
+        self.edit_unit(source, target)
+        unit = self.get_unit(source)
+        change = Change.objects.content().filter(unit=unit).order()[0]
+
+        self.client.post(
+            self.translate_url, {"checksum": unit.checksum, "revert": change.id}
+        )
+
+        unit = self.get_unit(source)
+        self.assertEqual(unit.target, "")
+        self.assertEqual(unit.state, STATE_EMPTY)
+
+    def test_revert_invalid_old_state(self) -> None:
+        source = "Hello, world!\n"
+        target = "Nazdar svete!\n"
+        self.edit_unit(source, target)
+        unit = self.get_unit(source)
+        change = Change.objects.content().filter(unit=unit).order()[0]
+        change.details["old_state"] = -1
+        change.save(update_fields=["details"])
+
+        self.assertFalse(change.can_revert())
+        self.assertIsNone(change.get_revert_state())
+        self.assertFalse(change.revert(self.user))
+
+        response = self.client.post(
+            self.translate_url,
+            {"checksum": unit.checksum, "revert": change.id},
+            follow=True,
+        )
+
+        self.assertContains(response, "Could not find the reverted change.")
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, target)
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+
+    def test_revert_restores_old_state(self) -> None:
+        source = "Hello, world!\n"
+        original = "Nazdar svete!\n"
+        updated = "Hei maailma!\n"
+        self.change_unit(original, source=source, state=STATE_NEEDS_REWRITING)
+        self.edit_unit(source, updated)
+        unit = self.get_unit(source)
+        change = Change.objects.content().filter(unit=unit).order()[0]
+
+        self.client.post(
+            self.translate_url, {"checksum": unit.checksum, "revert": change.id}
+        )
+
+        unit = self.get_unit(source)
+        self.assertEqual(unit.target, original)
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
+
+    def test_revert_approved_requires_review_permission(self) -> None:
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        self.project.add_user(self.anotheruser, "Administration")
+        unit = self.get_unit()
+        original = "Reviewed translation\n"
+        updated = "Revised translation\n"
+        unit.translate(self.anotheruser, original, STATE_APPROVED)
+        unit.translate(self.anotheruser, updated, STATE_TRANSLATED)
+        change = (
+            Change.objects.content()
+            .filter(unit=unit, user=self.anotheruser)
+            .order_by("-timestamp", "-pk")[0]
+        )
+        self.assertEqual(change.get_revert_state(), STATE_APPROVED)
+        self.assertTrue(self.user.has_perm("unit.edit", unit))
+        self.assertFalse(self.user.has_perm("unit.review", unit))
+
+        response = self.client.post(
+            self.translate_url, {"checksum": unit.checksum, "revert": change.pk}
+        )
+        self.assertEqual(response.status_code, 302)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, original)
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+        self.assertEqual(
+            Change.objects.filter(unit=unit, action=ActionEvents.REVERT)
+            .latest("pk")
+            .user,
+            self.user,
+        )
+
+        self.client.force_login(self.anotheruser)
+        self.assertTrue(self.anotheruser.has_perm("unit.review", unit))
+        response = self.client.post(
+            self.translate_url, {"checksum": unit.checksum, "revert": change.pk}
+        )
+        self.assertEqual(response.status_code, 302)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, original)
+        self.assertEqual(unit.state, STATE_APPROVED)
+
+    def test_revert_approved_when_reviews_disabled(self) -> None:
+        unit = self.get_unit()
+        original = "Previously approved translation\n"
+        unit.translate(self.user, original, STATE_APPROVED)
+        unit.translate(self.user, "Current translation\n", STATE_TRANSLATED)
+        change = (
+            Change.objects.content()
+            .filter(unit=unit, user=self.user)
+            .order_by("-timestamp", "-pk")[0]
+        )
+        self.assertEqual(change.get_revert_state(), STATE_APPROVED)
+
+        self.assertTrue(change.revert(self.user))
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, original)
+        self.assertEqual(unit.state, STATE_TRANSLATED)
 
     def test_edit_fixup(self) -> None:
         # Save with failing check
@@ -1007,10 +3752,12 @@ class EditComplexTest(ViewTestCase):
 
         # Ignore check
         check_id = unit.active_checks[0].id
-        response = self.client.post(
-            reverse("js-ignore-check", kwargs={"check_id": check_id})
-        )
-        self.assertContains(response, "ok")
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                reverse("js-ignore-check", kwargs={"check_id": check_id})
+            )
+        self.assertEqual(response.headers["Content-Type"], "application/json")
+        self.assertJSONEqual(response.content.decode("utf-8"), {})
 
         # Should have one less failing check
         unit = self.get_unit()
@@ -1028,7 +3775,8 @@ class EditComplexTest(ViewTestCase):
         self.assertEqual(response.status_code, 403)
         self.user.is_superuser = True
         self.user.save()
-        response = self.client.post(ignore_url)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(ignore_url)
         self.assertEqual(response.headers["Content-Type"], "application/json")
 
         # Should have one less check
@@ -1057,6 +3805,18 @@ class EditComplexTest(ViewTestCase):
         self.assertEqual(unit.translation.stats.allchecks, 0)
         self.assert_backend(1)
 
+    def test_newly_failing_checks_message_pluralization_and_order(self) -> None:
+        self.assertEqual(
+            format_newly_failing_checks_message({"end_newline"}),
+            "The translation has been saved, however there is a newly failing "
+            "check: Trailing newline",
+        )
+        self.assertEqual(
+            format_newly_failing_checks_message({"end_newline", "same"}),
+            "The translation has been saved, however there are some newly "
+            "failing checks: Trailing newline, Unchanged translation",
+        )
+
     def test_enforced_check(self) -> None:
         # Enforce same check
         self.component.enforced_checks = ["same"]
@@ -1067,11 +3827,41 @@ class EditComplexTest(ViewTestCase):
         self.assert_redirects_offset(response, self.translate_url, 1)
         unit = self.get_unit()
         self.assertEqual(unit.target, "Hello, world!\n")
-        self.assertEqual(unit.state, STATE_FUZZY)
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
         self.assertTrue(unit.has_failing_check)
         self.assertEqual(len(unit.all_checks), 1)
         self.assertEqual(len(unit.active_checks), 1)
         self.assertEqual(unit.translation.stats.allchecks, 1)
+        # There should be a change for enforced check
+        self.assertTrue(
+            unit.change_set.filter(action=ActionEvents.ENFORCED_CHECK).exists()
+        )
+        # The pending change should be only fuzzy
+        pending_changes = unit.pending_changes.all()
+        self.assertEqual(len(pending_changes), 1)
+        self.assertEqual(pending_changes[0].state, STATE_NEEDS_REWRITING)
+
+    def test_enforced_check_noop(self) -> None:
+        # Update unit object to match edits in test_enforced_check
+        unit = self.get_unit()
+        unit.state = STATE_TRANSLATED
+        unit.target = "Hello, world!\n"
+        unit.save_backend(self.user)
+        unit.pending_changes.all().delete()
+
+        # Enforce same check, the unit should become fuzzy with pending change
+        self.component.enforced_checks = ["same"]
+        self.component.save(update_fields=["enforced_checks"])
+        self.assertEqual(unit.pending_changes.count(), 1)
+        unit = self.get_unit()
+        self.assertEqual(unit.state, STATE_NEEDS_REWRITING)
+
+        # Remove pending units and make the string in the database translated
+        unit.pending_changes.all().delete()
+        Unit.objects.filter(pk=unit.pk).update(state=STATE_TRANSLATED)
+
+        # Now test the actual no-op edit
+        self.test_enforced_check()
 
     def test_commit_push(self) -> None:
         response = self.edit_unit("Hello, world!\n", "Nazdar svete!\n")
@@ -1135,7 +3925,7 @@ class EditComplexTest(ViewTestCase):
         form = response.context["form"]
         params = {field: form[field].value() for field in form.fields}
         params["target_0"] = "Nazdar svete!\n"
-        response = self.client.post(url, params)
+        self.client.post(url, params)
         unit = self.get_unit()
         self.assertEqual(unit.target, "Nazdar svete!\n")
         self.assertEqual(unit.state, STATE_TRANSLATED)
@@ -1165,6 +3955,47 @@ class EditComplexTest(ViewTestCase):
         # The source unit should be now removed as well
         self.assertFalse(Unit.objects.filter(pk=source_unit.pk).exists())
         self.assertEqual(unit_count - 4, Unit.objects.count())
+
+    def test_remove_source_unit(self) -> None:
+        self.component.manage_units = True
+        self.component.save()
+        self.user.is_superuser = True
+        self.user.save()
+
+        unit_count = Unit.objects.count()
+        unit = self.get_unit()
+        source_unit = unit.source_unit
+
+        response = self.client.post(
+            reverse("delete-unit", kwargs={"unit_id": source_unit.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+
+        # The source unit should be now removed as well
+        self.assertFalse(Unit.objects.filter(pk=source_unit.pk).exists())
+        self.assertEqual(unit_count - 4, Unit.objects.count())
+
+        # Verify that reparsing will not bring the unit back
+        self.component.create_translations_immediate(force=True)
+        self.assertFalse(Unit.objects.filter(pk=source_unit.pk).exists())
+        self.assertEqual(unit_count - 4, Unit.objects.count())
+
+    def test_edit_checks(self) -> None:
+        source = "Thank you for using Weblate."
+        self.change_unit(
+            target="Díky za použití Weblate",
+            source=source,
+            user=self.anotheruser,
+        )
+        self.change_unit(
+            target="Díky za použití Weblate.",
+            source=source,
+            user=self.user,
+        )
+        unit = self.get_unit(source=source)
+        self.assertEqual(set(unit.check_set.values_list("name", flat=True)), set())
+        self.component.commit_pending("test", None)
+        self.assertEqual(set(unit.check_set.values_list("name", flat=True)), set())
 
 
 class EditSourceTest(ViewTestCase):

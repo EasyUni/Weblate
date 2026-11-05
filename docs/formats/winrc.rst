@@ -7,8 +7,6 @@ Windows RC files
 
     Support for Windows RC files has been rewritten.
 
-.. include:: /snippets/format-in-development.rst
-
 .. index::
     pair: RC; file format
 
@@ -26,6 +24,8 @@ Example Windows RC file:
 
 .. literalinclude:: ../../weblate/trans/tests/data/cs-CZ.rc
     :language: c
+
+.. include:: /snippets/format-features/rc-features.rst
 
 Weblate configuration
 +++++++++++++++++++++

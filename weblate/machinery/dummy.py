@@ -1,21 +1,33 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from .base import (
-    DownloadTranslations,
+    MACHINERY_DEFAULT_THRESHOLD,
     GlossaryMachineTranslationMixin,
     MachineTranslation,
 )
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import (
+        DownloadTranslations,
+    )
 
 
 class DummyTranslation(MachineTranslation):
     """Dummy machine translation for testing purposes."""
 
     name = "Dummy"
+    sends_data_to_third_party = False
     settings_form = None
 
-    def download_languages(self):
+    def download_languages(self) -> tuple[str, ...]:
         """
         List supported languages.
 
@@ -25,12 +37,12 @@ class DummyTranslation(MachineTranslation):
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """
         Download translations.
@@ -64,6 +76,13 @@ class DummyTranslation(MachineTranslation):
                 "service": "Dummy",
                 "source": text,
             }
+        if source_language == "en" and text.strip() == r"Hello, [X7X] C:\Windows!":
+            yield {
+                "text": r"Nazdar [X7X ] C:\Windows!",
+                "quality": self.max_score,
+                "service": "Dummy",
+                "source": text,
+            }
 
 
 class DummyGlossaryTranslation(DummyTranslation, GlossaryMachineTranslationMixin):
@@ -73,12 +92,12 @@ class DummyGlossaryTranslation(DummyTranslation, GlossaryMachineTranslationMixin
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Translate with glossary."""
         self.get_glossary_id(source_language, target_language, unit)

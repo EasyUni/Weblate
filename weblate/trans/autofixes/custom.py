@@ -4,11 +4,18 @@
 
 """Auto fixes implemented for specific environments and not enabled by default."""
 
+from __future__ import annotations
+
 import re
+from typing import TYPE_CHECKING
 
 from django.utils.translation import gettext_lazy
 
 from weblate.trans.autofixes.base import AutoFix
+
+if TYPE_CHECKING:
+    from weblate.trans.models import Unit
+
 
 QUOTE_PARAM = re.compile(r"'(\{[^}]+\})'")
 SINGLE_APO = re.compile(r"'{1,3}")
@@ -30,11 +37,11 @@ class DoubleApostrophes(AutoFix):
     fix_id = "java-messageformat"
     name = gettext_lazy("Apostrophes in Java MessageFormat")
 
-    def fix_single_target(self, target, source, unit):
+    def fix_single_target(
+        self, target: str, source: str, unit: Unit
+    ) -> tuple[str, bool]:
         flags = unit.all_flags
-        if ("auto-java-messageformat" not in flags or "{0" not in source) and (
-            "java-format" not in flags
-        ):
+        if not flags.is_active("java-format", source):
             return target, False
         # Split on apostrophe
         new = SINGLE_APO.sub(

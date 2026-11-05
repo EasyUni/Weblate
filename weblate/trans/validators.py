@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext
@@ -13,9 +14,50 @@ from pyparsing import ParseException
 from weblate.checks.flags import FlagsValidator
 from weblate.lang.models import Language
 from weblate.trans.defines import LANGUAGE_CODE_LENGTH
+from weblate.utils.params import validate_params
+
+if TYPE_CHECKING:
+    from weblate.trans.models.unit import Unit
+
+SUGGESTION_REJECTION_REASON_LENGTH = 200
+DEFAULT_TRANSLATION_MAX_LENGTH = 10000
+MAX_TRANSLATION_ALTERNATIVES = 100
+MAX_TRANSLATION_TOTAL_LENGTH = 100000
 
 
-def validate_filemask(val) -> None:
+def validate_multivalue_size(is_multivalue: bool, value: list[str]) -> None:
+    """Validate the cardinality and aggregate size of multivalue text."""
+    if is_multivalue and (
+        len(value) > MAX_TRANSLATION_ALTERNATIVES
+        or sum(map(len, value)) > MAX_TRANSLATION_TOTAL_LENGTH
+    ):
+        raise ValidationError(gettext("Translation text too long!"))
+
+
+def get_translation_text_max_length(unit: Unit) -> int:
+    """Return maximum accepted translation text length for a unit."""
+    # Add extra margin to allow XML tags which might be ignored for length checks.
+    # On the other side, do not process arbitrarily long strings here.
+    try:
+        max_length = unit.get_max_length()
+    except ValueError:
+        max_length = DEFAULT_TRANSLATION_MAX_LENGTH
+    return 10 * (max_length + 100)
+
+
+def validate_translation_text_length(
+    unit: Unit, target: list[str], *, add_alternative: bool = False
+) -> None:
+    """Validate translation text length for a unit."""
+    max_length = get_translation_text_max_length(unit)
+    if add_alternative:
+        target = [*target, ""]
+    validate_multivalue_size(unit.translation.component.is_multivalue, target)
+    if any(len(text) > max_length for text in target):
+        raise ValidationError(gettext("Translation text too long!"))
+
+
+def validate_filemask(val: str) -> None:
     """Validate that the filemask contains *."""
     if "*" not in val:
         raise ValidationError(
@@ -23,7 +65,7 @@ def validate_filemask(val) -> None:
         )
 
 
-def validate_autoaccept(val) -> None:
+def validate_autoaccept(val: int) -> None:
     """Validate correct value for automatic acceptance."""
     if val == 1:
         raise ValidationError(
@@ -34,13 +76,26 @@ def validate_autoaccept(val) -> None:
         )
 
 
-def validate_check_flags(val) -> None:
+def validate_check_flags(val: str) -> None:
     """Validate check-influencing flags."""
     try:
         flags = FlagsValidator(val)
     except (ParseException, re.error) as error:
         raise ValidationError(gettext("Could not parse flags: %s") % error) from error
     flags.validate()
+
+
+def validate_enforced_checks(value: list[str]) -> None:
+    """Validate enforced checks names."""
+    if not isinstance(value, list):
+        raise ValidationError(gettext("Enforced checks has to be a list."))
+
+    # ruff: ignore[import-outside-top-level]
+    from weblate.checks.models import CHECKS
+
+    for name in value:
+        if not isinstance(name, str) or name not in CHECKS:
+            raise ValidationError(gettext("Unsupported enforced check: %s") % name)
 
 
 def validate_language_code(code: str | None, filename: str, required: bool = False):
@@ -60,3 +115,37 @@ def validate_language_code(code: str | None, filename: str, required: bool = Fal
         raise ValidationError({"filemask": message})
 
     return Language.objects.auto_get_or_create(code=code, create=False)
+
+
+def validate_file_format_parameters(value: dict | None) -> None:
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.file_format_params import FILE_FORMATS_PARAMS
+
+    if value is not None and not isinstance(value, dict):
+        raise ValidationError(
+            gettext("File format parameters must be a dictionary of key-value pairs.")
+        )
+
+    validate_params(
+        FILE_FORMATS_PARAMS,
+        value,
+        gettext('Unknown file format parameter: "%(param_name)s".'),
+    )
+
+
+def validate_vcs_parameters(value: dict | None) -> None:
+    # ruff: ignore[import-outside-top-level]
+    from weblate.vcs.params import VCS_PARAMS
+
+    if value is not None and not isinstance(value, dict):
+        raise ValidationError(
+            gettext(
+                "Version control parameters must be a dictionary of key-value pairs."
+            )
+        )
+
+    validate_params(
+        VCS_PARAMS,
+        value,
+        gettext('Unknown version control parameter: "%(param_name)s".'),
+    )

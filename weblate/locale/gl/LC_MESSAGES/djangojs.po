@@ -1,15 +1,17 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
-# "Miguel A. Bouzada" <mbouzada@gmail.com>, 2024.
+# "Miguel A. Bouzada" <mbouzada@gmail.com>, 2024, 2025.
 # xuars <yago.rana.gayoso@gmail.com>, 2025.
+# GitHub webhook <noreply-webhook-github@weblate.org>, 2026.
 msgid ""
 msgstr ""
-"Project-Id-Version: Weblate 5.13\n"
-"Report-Msgid-Bugs-To: https://github.com/WeblateOrg/weblate/issues\n"
-"POT-Creation-Date: 2025-08-12 08:54+0000\n"
-"PO-Revision-Date: 2025-07-30 01:18+0000\n"
-"Last-Translator: Anonymous <noreply@weblate.org>\n"
+"Project-Id-Version: Weblate 5.16.1\n"
+"Report-Msgid-Bugs-To: https://hosted.weblate.org/projects/weblate/"
+"javascript/\n"
+"POT-Creation-Date: 2026-10-29 23:03-0500\n"
+"PO-Revision-Date: 2026-06-18 13:36+0000\n"
+"Last-Translator: GitHub webhook <noreply-webhook-github@weblate.org>\n"
 "Language-Team: Galician <https://hosted.weblate.org/projects/weblate/"
 "javascript/gl/>\n"
 "Language: gl\n"
@@ -17,294 +19,485 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=n != 1;\n"
-"X-Generator: Weblate 5.13-dev\n"
+"X-Generator: Weblate 2026.7.dev0\n"
 
-#: weblate/static/editor/base.js:54
 msgid "Unsaved changes!"
 msgstr "Cambios sen gardar!"
 
-#: weblate/static/editor/base.js:132
 msgid "Please select target plural by clicking."
 msgstr "Prema para seleccionar o plural de destino."
 
-#: weblate/static/editor/base.js:213
 msgid "You have unsaved changes. Are you sure you want to skip?"
 msgstr "Ten algúns cambios sen gardar, confirma que quere omitilos?"
 
-#: weblate/static/editor/base.js:256
 #, javascript-format
 msgid "Cmd+%s"
 msgstr "Cmd+ %s"
 
-#: weblate/static/editor/base.js:258
 #, javascript-format
 msgid "Ctrl+%s"
 msgstr "Ctrl+%s"
 
-#: weblate/static/editor/full.js:268
 msgid "Translation memory entry removed."
 msgstr "Foi retirada a entrada da memoria da tradución."
 
-#: weblate/static/editor/full.js:302
 msgid "The request for machine translation has failed:"
 msgstr "Produciuse un fallo na solicitude de tradución automática:"
 
-#: weblate/static/editor/full.js:312
 #, javascript-format
 msgid "The request for machine translation using %s has failed:"
 msgstr "Produciuse un fallo na solicitude de tradución automática usando %s:"
 
-#: weblate/static/editor/full.js:347
 #, javascript-format
 msgid "Cmd+M then %s"
 msgstr "Cmd+M e após %s"
 
-#: weblate/static/editor/full.js:349
 #, javascript-format
 msgid "Ctrl+M then %s"
 msgstr "Ctrl+M e após %s"
 
-#: weblate/static/editor/full.js:451
 #, javascript-format
 msgid "Press Cmd+I then %s to dismiss this."
 msgstr "Prema Cmd+I e após %s para rexeitar isto."
 
-#: weblate/static/editor/full.js:456
 #, javascript-format
 msgid "Press Ctrl+I then %s to dismiss this."
 msgstr "Prema Ctrl+I e após %s para rexeitar isto."
 
-#: weblate/static/editor/full.js:598
-msgid "Clone to translation"
-msgstr "Clonar a tradución"
+msgid "Slug"
+msgstr ""
 
-#: weblate/static/editor/full.js:600
-msgid "Accept"
-msgstr "Aceptar"
+#, javascript-format
+msgid "%s more origin"
+msgid_plural "%s more origins"
+msgstr[0] ""
+msgstr[1] ""
 
-#: weblate/static/editor/full.js:609
-msgid "Accept and approve"
-msgstr "Aceptar e aprobar"
-
-#: weblate/static/editor/full.js:621
-msgid "Delete entry"
-msgstr "Eliminar a entrada"
-
-#: weblate/static/editor/tools/search.js:50
 msgid "No results found"
 msgstr "Non se atoparon resultados"
 
-#: weblate/static/editor/tools/search.js:103
 #, javascript-format
 msgid "%s matching string"
 msgid_plural "%s matching strings"
 msgstr[0] "%s cadea coincidente"
 msgstr[1] "%s cadeas coincidentes"
 
-#: weblate/static/editor/zen.js:110
+msgid ""
+"Your previous search results are no longer available. Refresh results to "
+"continue."
+msgstr ""
+
 msgid "There are some unsaved changes, are you sure you want to leave?"
 msgstr "Hai algúns cambios sen gardar, confirma que quere saír?"
 
-#: weblate/static/js/screenshots/clipboard-paste.js:38
+msgid "Save or discard your changes before accepting a suggestion."
+msgstr ""
+
+#, javascript-format
+msgid "%s suggestion"
+msgid_plural "%s suggestions"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid ""
+"The translation was changed while you were editing it, your unsaved changes "
+"were kept."
+msgstr ""
+
+#, fuzzy
+#| msgid "Accept and approve"
+msgid "Hide suggestions"
+msgstr "Aceptar e aprobar"
+
+msgid "Show suggestions"
+msgstr ""
+
+#, javascript-format
+msgid "Results of action %s"
+msgstr ""
+
+msgid "This workflow is not valid YAML, so the editor cannot show it."
+msgstr ""
+
+msgid ""
+"This workflow uses parts the editor does not handle yet, such as nested "
+"conditions or branches. Edit it as YAML."
+msgstr ""
+
+#, javascript-format
+msgid "Added %s."
+msgstr ""
+
+#, javascript-format
+msgid "Removed %s."
+msgstr ""
+
+#, javascript-format
+msgid "Moved %s."
+msgstr ""
+
+msgid "Security token missing. Please reload the page."
+msgstr ""
+
+#, javascript-format
+msgid "Loading suggestion count for %s"
+msgstr ""
+
+msgid "Bulk accept cancelled."
+msgstr ""
+
+#, javascript-format
+msgid "Scheduling bulk accept for %s"
+msgstr ""
+
+msgid "Unknown error"
+msgstr ""
+
+#, fuzzy, javascript-format
+#| msgid "Error details:"
+msgid "Error: %s"
+msgstr "Detalles do erro:"
+
+msgid "Network error"
+msgstr ""
+
+msgid "Invalid server response"
+msgstr ""
+
+msgid ""
+"Accepting the suggestions takes longer than expected, reload the page to see "
+"the result."
+msgstr ""
+
+#, javascript-format
+msgid "Server error (%s)"
+msgstr ""
+
+msgid "There are no pending suggestions from %(username)s in %(translation)s."
+msgstr ""
+
+msgid ""
+"This will accept %(count)s suggestion from %(username)s in %(translation)s."
+msgid_plural ""
+"This will accept %(count)s suggestions from %(username)s in %(translation)s."
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "Accept all suggestions?"
+msgstr ""
+
+msgid "Close"
+msgstr "Pechar"
+
+msgid "Cancel"
+msgstr "Cancelar"
+
+msgid "Accept suggestions"
+msgstr ""
+
+#, fuzzy
+#| msgid "Accept and approve"
+msgid "Accept and approve suggestions"
+msgstr "Aceptar e aprobar"
+
+msgid "No strings selected"
+msgstr ""
+
+#, javascript-format
+msgid "%s string selected"
+msgid_plural "%s strings selected"
+msgstr[0] ""
+msgstr[1] ""
+
+msgctxt "Short name of day"
+msgid "Su"
+msgstr "dom"
+
+msgctxt "Short name of day"
+msgid "Mo"
+msgstr "lun"
+
+msgctxt "Short name of day"
+msgid "Tu"
+msgstr "mar"
+
+msgctxt "Short name of day"
+msgid "We"
+msgstr "mér"
+
+msgctxt "Short name of day"
+msgid "Th"
+msgstr "xov"
+
+msgctxt "Short name of day"
+msgid "Fr"
+msgstr "ven"
+
+msgctxt "Short name of day"
+msgid "Sa"
+msgstr "sáb"
+
+msgctxt "Short name of month"
+msgid "Jan"
+msgstr "xan"
+
+msgctxt "Short name of month"
+msgid "Feb"
+msgstr "feb"
+
+msgctxt "Short name of month"
+msgid "Mar"
+msgstr "mar"
+
+msgctxt "Short name of month"
+msgid "Apr"
+msgstr "abr"
+
+msgctxt "Short name of month"
+msgid "May"
+msgstr "mai"
+
+msgctxt "Short name of month"
+msgid "Jun"
+msgstr "xuñ"
+
+msgctxt "Short name of month"
+msgid "Jul"
+msgstr "xul"
+
+msgctxt "Short name of month"
+msgid "Aug"
+msgstr "ago"
+
+msgctxt "Short name of month"
+msgid "Sep"
+msgstr "set"
+
+msgctxt "Short name of month"
+msgid "Oct"
+msgstr "out"
+
+msgctxt "Short name of month"
+msgid "Nov"
+msgstr "nov"
+
+msgctxt "Short name of month"
+msgid "Dec"
+msgstr "dec"
+
+msgid "Today"
+msgstr "Hoxe"
+
+msgid "Yesterday"
+msgstr "Onte"
+
+msgid "Last 7 days"
+msgstr "Últimos 7 días"
+
+msgid "Last 30 days"
+msgstr "Últimos 30 días"
+
+msgid "This month"
+msgstr "Este mes"
+
+msgid "Last month"
+msgstr "O mes pasado"
+
+msgid "This year"
+msgstr "Este ano"
+
+msgid "Last year"
+msgstr "O ano pasado"
+
+msgid "Select date range"
+msgstr ""
+
+#, fuzzy
+#| msgid "This month"
+msgid "Previous month"
+msgstr "Este mes"
+
+#, fuzzy
+#| msgid "Last month"
+msgid "Next month"
+msgstr "O mes pasado"
+
+msgid "Clear"
+msgstr "Limpar"
+
+msgid "Apply"
+msgstr "Aplicar"
+
+msgid "Custom"
+msgstr "Personalizado"
+
+msgid "Add a flag…"
+msgstr ""
+
+#, javascript-format
+msgid ""
+"No matching flag found for \"%s\"; press Enter to add it as a custom flag."
+msgstr ""
+
 msgid "Image Pasted!"
 msgstr "Imaxe pegada!"
 
-#: weblate/static/js/screenshots/clipboard-paste.js:40
-#: weblate/static/js/screenshots/clipboard-paste.js:56
-msgid "Something went wrong!"
-msgstr "Algo foi mal!"
+msgid "Press Ctrl+V or Command+V to paste an image."
+msgstr ""
 
-#: weblate/static/js/screenshots/clipboard-paste.js:53
 msgid "No image found in clipboard"
 msgstr "Non se atopou ningunha imaxe no portapapeis"
 
-#: weblate/static/loader-bootstrap.js:178
-msgid "Error loading search results!"
-msgstr "Produciuse un erro ao cargar os resultados da busca!"
+#, fuzzy
+#| msgid "Loading…"
+msgid "Loading screenshots…"
+msgstr "Cargando…"
 
-#: weblate/static/loader-bootstrap.js:182
-msgid "No new matching source strings found."
-msgstr "Non se atoparon cadeas de orixe novas que coincidan."
+msgid "Could not load screenshots. Please try again."
+msgstr ""
 
-#: weblate/static/loader-bootstrap.js:266
-msgid "Sort this column"
-msgstr "Ordenar esta columna"
+#, fuzzy
+#| msgid "Add to screenshot"
+msgid "Adding screenshot…"
+msgstr "Engadir á captura da pantalla"
 
-#: weblate/static/loader-bootstrap.js:579
-msgid "Error while loading page:"
-msgstr "Produciuse un erro ao cargar a páxina:"
+msgid "Could not add screenshot. Please try again."
+msgstr ""
 
-#: weblate/static/loader-bootstrap.js:867
+msgid ""
+"A pull or merge request will be created from a branch in the repository."
+msgstr ""
+
+msgid ""
+"A push URL is set but no push branch is given. Set a push branch that "
+"differs from the translated branch."
+msgstr ""
+
+msgid ""
+"The push branch must differ from the translated branch when creating a pull "
+"or merge request."
+msgstr ""
+
+msgid "A pull or merge request will be created from a fork of the repository."
+msgstr ""
+
+#, javascript-format
+msgid ""
+"A pull or merge request will be created from the “%s” branch in the "
+"repository."
+msgstr ""
+
+#, javascript-format
+msgid ""
+"Changes will be sent as a Gerrit review request targeting the “%s” branch."
+msgstr ""
+
+msgid "Changes will be sent as a Gerrit review request."
+msgstr ""
+
+msgid ""
+"Changes will not be pushed automatically. You can still push them manually "
+"from the repository maintenance."
+msgstr ""
+
+#, javascript-format
+msgid ""
+"Changes will be pushed directly to the “%s” branch in the push repository."
+msgstr ""
+
+msgid ""
+"Changes will be pushed directly to the default branch of the push repository."
+msgstr ""
+
 msgid "Text copied to clipboard."
 msgstr "Copiouse o texto no portapapeis."
 
-#: weblate/static/loader-bootstrap.js:871
+#, fuzzy
+#| msgid "Text copied to clipboard."
+msgid "Error copying to clipboard."
+msgstr "Copiouse o texto no portapapeis."
+
+#, fuzzy
+#| msgid "No new matching source strings found."
+msgid "Could not remove the source string."
+msgstr "Non se atoparon cadeas de orixe novas que coincidan."
+
+msgid "Some source strings could not be assigned."
+msgstr ""
+
+msgid "Error loading search results!"
+msgstr "Produciuse un erro ao cargar os resultados da busca!"
+
+msgid "No new matching source strings found."
+msgstr "Non se atoparon cadeas de orixe novas que coincidan."
+
+msgid "Sort this column"
+msgstr "Ordenar esta columna"
+
+msgid "Error while loading page:"
+msgstr "Produciuse un erro ao cargar a páxina:"
+
+msgid "Could not load text recognition progress. Please try again."
+msgstr ""
+
+msgid "Could not load strings from the image. Please try again."
+msgstr ""
+
+msgid "Finding strings in image…"
+msgstr ""
+
+msgid "Finding strings is taking longer than expected. Please try again later."
+msgstr ""
+
 msgid "Please press Ctrl+C to copy."
 msgstr "Prema Ctrl+C para copiar."
 
-#: weblate/static/loader-bootstrap.js:894
 msgid "Search…"
 msgstr "Buscar…"
 
-#: weblate/static/loader-bootstrap.js:895
-msgid "Available:"
-msgstr "Dispoñíbel:"
+msgid "Loading…"
+msgstr "Cargando…"
 
-#: weblate/static/loader-bootstrap.js:896
-msgid "Chosen:"
-msgstr "Escolla:"
+#, fuzzy
+#| msgid "Error while loading page:"
+msgid "Error while loading form:"
+msgstr "Produciuse un erro ao cargar a páxina:"
 
-#: weblate/static/loader-bootstrap.js:1232
+msgid "Select a component to load repository branches."
+msgstr ""
+
+#, fuzzy
+#| msgid "Loading…"
+msgid "Loading repository branches…"
+msgstr "Cargando…"
+
+msgid "Repository branches loaded."
+msgstr ""
+
+msgid "No additional repository branches are available."
+msgstr ""
+
+msgid "Could not load repository branches. Please try again."
+msgstr ""
+
 msgid "Weblate is now scanning the repository, please be patient."
 msgstr "Weblate está a escanear o repositorio, teña paciencia."
 
-#: weblate/static/loader-bootstrap.js:1346
+msgid "Nothing to preview."
+msgstr ""
+
+msgid "Please sign in again."
+msgstr ""
+
 msgid ""
 "Notification settings removed, please do not forget to save the changes."
 msgstr ""
 "Foi retirada a configuración de notificacións, non esqueza gardar os cambios."
 
-#: weblate/static/loader-bootstrap.js:1505
-msgid "Custom range"
-msgstr "Intervalo personalizado"
-
-#: weblate/static/loader-bootstrap.js:1506
-msgid "Clear"
-msgstr "Limpar"
-
-#: weblate/static/loader-bootstrap.js:1508
-msgctxt "Short name of day"
-msgid "Su"
-msgstr "dom"
-
-#: weblate/static/loader-bootstrap.js:1509
-msgctxt "Short name of day"
-msgid "Mo"
-msgstr "lun"
-
-#: weblate/static/loader-bootstrap.js:1510
-msgctxt "Short name of day"
-msgid "Tu"
-msgstr "mar"
-
-#: weblate/static/loader-bootstrap.js:1511
-msgctxt "Short name of day"
-msgid "We"
-msgstr "mér"
-
-#: weblate/static/loader-bootstrap.js:1512
-msgctxt "Short name of day"
-msgid "Th"
-msgstr "xov"
-
-#: weblate/static/loader-bootstrap.js:1513
-msgctxt "Short name of day"
-msgid "Fr"
-msgstr "ven"
-
-#: weblate/static/loader-bootstrap.js:1514
-msgctxt "Short name of day"
-msgid "Sa"
-msgstr "sáb"
-
-#: weblate/static/loader-bootstrap.js:1517
-msgctxt "Short name of month"
-msgid "Jan"
-msgstr "xan"
-
-#: weblate/static/loader-bootstrap.js:1518
-msgctxt "Short name of month"
-msgid "Feb"
-msgstr "feb"
-
-#: weblate/static/loader-bootstrap.js:1519
-msgctxt "Short name of month"
-msgid "Mar"
-msgstr "mar"
-
-#: weblate/static/loader-bootstrap.js:1520
-msgctxt "Short name of month"
-msgid "Apr"
-msgstr "abr"
-
-#: weblate/static/loader-bootstrap.js:1521
-msgctxt "Short name of month"
-msgid "May"
-msgstr "mai"
-
-#: weblate/static/loader-bootstrap.js:1522
-msgctxt "Short name of month"
-msgid "Jun"
-msgstr "xuñ"
-
-#: weblate/static/loader-bootstrap.js:1523
-msgctxt "Short name of month"
-msgid "Jul"
-msgstr "xul"
-
-#: weblate/static/loader-bootstrap.js:1524
-msgctxt "Short name of month"
-msgid "Aug"
-msgstr "ago"
-
-#: weblate/static/loader-bootstrap.js:1525
-msgctxt "Short name of month"
-msgid "Sep"
-msgstr "set"
-
-#: weblate/static/loader-bootstrap.js:1526
-msgctxt "Short name of month"
-msgid "Oct"
-msgstr "out"
-
-#: weblate/static/loader-bootstrap.js:1527
-msgctxt "Short name of month"
-msgid "Nov"
-msgstr "nov"
-
-#: weblate/static/loader-bootstrap.js:1528
-msgctxt "Short name of month"
-msgid "Dec"
-msgstr "dec"
-
-#: weblate/static/loader-bootstrap.js:1532
-msgid "Today"
-msgstr "Hoxe"
-
-#: weblate/static/loader-bootstrap.js:1533
-msgid "Yesterday"
-msgstr "Onte"
-
-#: weblate/static/loader-bootstrap.js:1537
-msgid "Last 7 days"
-msgstr "Últimos 7 días"
-
-#: weblate/static/loader-bootstrap.js:1538
-msgid "Last 30 days"
-msgstr "Últimos 30 días"
-
-#: weblate/static/loader-bootstrap.js:1539
-msgid "This month"
-msgstr "Este mes"
-
-#: weblate/static/loader-bootstrap.js:1543
-msgid "Last month"
-msgstr "O mes pasado"
-
-#: weblate/static/loader-bootstrap.js:1547
-msgid "This year"
-msgstr "Este ano"
-
-#: weblate/static/loader-bootstrap.js:1551
-msgid "Last year"
-msgstr "O ano pasado"
-
-#: weblate/static/loader-bootstrap.js:1632
 msgctxt "Alert to user when opening browser developer console"
 msgid "Stop!"
 msgstr "Pare!"
 
-#: weblate/static/loader-bootstrap.js:1638
 msgid ""
 "This is a browser feature intended for developers. If someone told you to "
 "copy-paste something here, they are likely trying to compromise your Weblate "
@@ -314,10 +507,57 @@ msgstr ""
 "di que copie e pegue algo aquí, é probábel que estea a tentar comprometer a "
 "súa conta de Weblate."
 
-#: weblate/static/loader-bootstrap.js:1644
 msgid "See https://en.wikipedia.org/wiki/Self-XSS for more information."
 msgstr ""
 "Vexa https://en.wikipedia.org/wiki/Self-XSS para obter máis información."
+
+msgid "just now"
+msgstr "agora mesmo"
+
+#, javascript-format
+msgid "%s second ago"
+msgid_plural "%s seconds ago"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "a minute ago"
+msgstr ""
+
+#, javascript-format
+msgid "%s minute ago"
+msgid_plural "%s minutes ago"
+msgstr[0] ""
+msgstr[1] ""
+
+msgid "an hour ago"
+msgstr ""
+
+#, javascript-format
+msgid "%s hour ago"
+msgid_plural "%s hours ago"
+msgstr[0] ""
+msgstr[1] ""
+
+#~ msgid "Clone to translation"
+#~ msgstr "Clonar a tradución"
+
+#~ msgid "Accept"
+#~ msgstr "Aceptar"
+
+#~ msgid "Accept and approve"
+#~ msgstr "Aceptar e aprobar"
+
+#~ msgid "Delete entry"
+#~ msgstr "Eliminar a entrada"
+
+#~ msgid "Something went wrong!"
+#~ msgstr "Algo foi mal!"
+
+#~ msgid "Available:"
+#~ msgstr "Dispoñíbel:"
+
+#~ msgid "Chosen:"
+#~ msgstr "Escolla:"
 
 #~ msgid "Weblate feedback"
 #~ msgstr "Comentarios de Weblate"
@@ -445,9 +685,6 @@ msgstr ""
 #~ msgid "Copy and save"
 #~ msgstr "Copiar e gardar"
 
-#~ msgid "Add to screenshot"
-#~ msgstr "Engadir á captura da pantalla"
-
 #~ msgid "Ctrl/Command+%s"
 #~ msgstr "Ctrl/Comando+%s"
 
@@ -463,9 +700,6 @@ msgstr ""
 #~ msgid "Now"
 #~ msgstr "Nov"
 
-#~ msgid "Cancel"
-#~ msgstr "Cancelar"
-
 #~ msgid "Fuzzy strings"
 #~ msgstr "Cadeas revisábeis"
 
@@ -478,17 +712,11 @@ msgstr ""
 #~ msgid "AJAX request to load this content has failed!"
 #~ msgstr "Fallou a solicitude AJAX ao cargar este contido!"
 
-#~ msgid "Loading…"
-#~ msgstr "Cargando…"
-
 #~ msgid "Confirm resetting repository"
 #~ msgstr "Confirmar o restabelecemento do repositorio"
 
 #~ msgid "Resetting the repository will throw away all local changes!"
 #~ msgstr "O reinicio do repositorio desfará todos os cambios locais!"
-
-#~ msgid "Error details:"
-#~ msgstr "Detalles do erro:"
 
 #~ msgid "Translate using Apertium"
 #~ msgstr "Traducir con Apertium"

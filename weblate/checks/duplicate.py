@@ -11,15 +11,16 @@ from django.utils.html import format_html
 from django.utils.translation import gettext_lazy, ngettext
 
 from weblate.checks.base import TargetCheck
-from weblate.checks.data import NON_WORD_CHARS
-from weblate.checks.same import replace_format_placeholder, strip_format
+from weblate.checks.utils import placeholder_replacement, replace_highlighted
 from weblate.utils.html import format_html_join_comma
+from weblate.utils.unicodechars import NON_WORD_CHARS
 
 if TYPE_CHECKING:
+    from weblate.checks.models import Check
     from weblate.trans.models import Unit
 
 # Regexp for non word chars
-NON_WORD = re.compile("[{}\\]]+".format("".join(NON_WORD_CHARS)))
+NON_WORD = re.compile(f"[{''.join(NON_WORD_CHARS)}\\]]+")
 
 # Per language ignore list
 IGNORES = {
@@ -28,6 +29,7 @@ IGNORES = {
     "hi": {"कर"},
     "tr": {"tek", "adım", "gıcır", "sık"},
     "sq": {"të"},
+    "vi": {"luôn", "song"},
 }
 
 
@@ -37,10 +39,30 @@ class DuplicateCheck(TargetCheck):
     check_id = "duplicate"
     name = gettext_lazy("Consecutive duplicated words")
     description = gettext_lazy("Text contains the same word twice in a row.")
+    version_added = "4.1"
 
     def should_skip(self, unit: Unit) -> bool:
-        # Ignore the check for Toki Pona which often uses repeating words
-        if unit.translation.language.is_base({"tok"}):
+        # These languages productively repeat words for grammatical meaning.
+        if unit.translation.language.is_base(
+            {
+                "as",  # Assamese
+                "bn",  # Bengali
+                "gu",  # Gujarati
+                "hi",  # Hindi
+                "kn",  # Kannada
+                "ml",  # Malayalam
+                "mr",  # Marathi
+                "ne",  # Nepali
+                "or",  # Odia
+                "pa",  # Punjabi
+                "sd",  # Sindhi
+                "si",  # Sinhala
+                "ta",  # Tamil
+                "te",  # Telugu; codespell:ignore
+                "tok",  # Toki Pona
+                "ur",  # Urdu
+            }
+        ):
             return True
         return super().should_skip(unit)
 
@@ -68,20 +90,19 @@ class DuplicateCheck(TargetCheck):
         return groups, words
 
     def check_single(self, source: str, target: str, unit: Unit):
-        source_code = unit.translation.component.source_language.base_code
+        source_code = unit.effective_source_language.base_code
         lang_code = unit.translation.language.base_code
 
-        source_groups, source_words = self.extract_groups(
-            strip_format(
-                source, unit.all_flags, replacement=replace_format_placeholder
-            ),
-            source_code,
-        )
         target_groups, target_words = self.extract_groups(
-            strip_format(
-                target, unit.all_flags, replacement=replace_format_placeholder
-            ),
+            replace_highlighted(target, unit, placeholder_replacement),
             lang_code,
+        )
+        if not target_groups:
+            return {}
+
+        source_groups, source_words = self.extract_groups(
+            replace_highlighted(source, unit, placeholder_replacement),
+            source_code,
         )
 
         # The same groups in source and target
@@ -90,10 +111,10 @@ class DuplicateCheck(TargetCheck):
 
         return set(target_words) - set(source_words)
 
-    def get_description(self, check_obj):
+    def get_description(self, check_obj: Check):
         duplicate = set()
         unit = check_obj.unit
-        source = unit.source_string
+        source = unit.effective_source_string
         for target in unit.get_target_plurals():
             duplicate.update(self.check_single(source, target, unit))
         return format_html(

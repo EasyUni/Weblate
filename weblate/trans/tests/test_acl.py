@@ -4,17 +4,49 @@
 
 """Test for ACL management."""
 
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
+
 from django.conf import settings
 from django.core import mail
-from django.test.utils import override_settings
+from django.core.exceptions import ValidationError
+from django.test.utils import modify_settings, override_settings
 from django.urls import reverse
+from social_django.models import UserSocialAuth
 
-from weblate.auth.models import Group, Invitation, Role, User, get_anonymous
+from weblate.accounts.models import VerifiedEmail
+from weblate.auth.data import SELECTION_ALL
+from weblate.auth.models import (
+    Group,
+    Invitation,
+    InvitationBlockedAdminError,
+    Permission,
+    Role,
+    TeamMembership,
+    User,
+    get_anonymous,
+)
+from weblate.lang.forms import LimitLanguagesField, validate_language_code
 from weblate.lang.models import Language
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Project
+from weblate.trans.forms import ProjectUserGroupForm, UserAddTeamForm
+from weblate.trans.models import Change, Comment, Project, Suggestion
+from weblate.trans.tasks import (
+    cleanup_user_contributions as cleanup_user_contributions_task,
+)
+from weblate.trans.tasks import (
+    revert_user_edits as revert_user_edits_task,
+)
 from weblate.trans.tests.test_views import FixtureTestCase, RegistrationTestMixin
+from weblate.trans.tests.utils import enable_login_required_settings
 from weblate.utils.pii import mask_email
+from weblate.utils.state import STATE_APPROVED, STATE_TRANSLATED
+
+if TYPE_CHECKING:
+    from weblate.accounts.models import AuditLog
 
 
 class ACLTest(FixtureTestCase, RegistrationTestMixin):
@@ -30,9 +62,23 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         self.admin_group = self.project.defined_groups.get(name="Administration")
         self.translate_group = self.project.defined_groups.get(name="Translate")
 
+    def get_project_user_groups_url(self, user: User) -> str:
+        return reverse(
+            "js-project-user-groups",
+            kwargs={**self.kw_project, "user_id": user.id},
+        )
+
     def add_acl(self) -> None:
         """Add user to ACL."""
         self.project.add_user(self.user, "Translate")
+
+    def create_sitewide_project_group(self) -> Group:
+        role = Role.objects.create(name="Site-wide user manager")
+        role.permissions.add(Permission.objects.get(codename="user.edit"))
+        group = Group.objects.create(name="Site-wide project team")
+        group.roles.add(role)
+        group.projects.add(self.project)
+        return group
 
     def test_acl_denied(self) -> None:
         """No access to the project without ACL."""
@@ -52,6 +98,16 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         response = self.client.get(self.translate_url)
         self.assertContains(response, ' name="save"')
 
+    def test_anonymous_translate_view_checksum_access(self) -> None:
+        self.project.access_control = Project.ACCESS_PUBLIC
+        self.project.save()
+        get_anonymous().clear_permissions_cache()
+        unit = self.get_unit()
+
+        response = self.client.get(self.translate_url, {"checksum": unit.checksum})
+
+        self.assertContains(response, ' name="save"')
+
     def test_acl_protected(self) -> None:
         """Test ACL protected project."""
         response = self.client.get(self.access_url)
@@ -63,7 +119,7 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         self.assertEqual(response.status_code, 403)
         response = self.client.get(self.translate_url)
         self.assertContains(
-            response, "Insufficient privileges for saving translations."
+            response, "You do not have permission to save translations in this project."
         )
 
     def test_acl(self) -> None:
@@ -86,6 +142,85 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         response = self.client.get(self.access_url)
         self.assertContains(response, "Users")
 
+    def test_edit_acl_user_group_form_is_lazy_loaded(self) -> None:
+        """Project user team forms are not rendered in every user row."""
+        self.project.add_user(self.user, "Administration")
+        self.project.add_user(self.second_user, "Translate")
+        form_url = self.get_project_user_groups_url(self.second_user)
+
+        response = self.client.get(self.access_url)
+
+        self.assertContains(response, form_url)
+        self.assertContains(response, 'id="project-user-groups-modal"')
+        self.assertNotContains(response, f'id="edit_user_{self.second_user.id}"')
+        self.assertNotContains(response, "project-membership-team-toggle")
+        self.assertNotContains(
+            response,
+            f"id_user_{self.second_user.id}_limit_languages_{self.translate_group.pk}",
+        )
+
+    def test_edit_acl_user_group_form_fragment(self) -> None:
+        """Project user team form is rendered by the JS endpoint."""
+        self.project.add_user(self.user, "Administration")
+        self.project.add_user(self.second_user, "Translate")
+
+        response = self.client.get(self.get_project_user_groups_url(self.second_user))
+
+        self.assertContains(response, self.second_user.username)
+        self.assertContains(response, "project-membership-team-toggle")
+        self.assertContains(
+            response,
+            f"id_user_{self.second_user.id}_limit_languages_{self.translate_group.pk}",
+        )
+
+    def test_edit_acl_user_group_form_fragment_denied(self) -> None:
+        """Regular project users can not load team management forms."""
+        self.add_acl()
+        self.project.add_user(self.second_user, "Translate")
+
+        response = self.client.get(self.get_project_user_groups_url(self.second_user))
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_edit_acl_user_group_form_fragment_project_scope(self) -> None:
+        """Team management form is available only for project users."""
+        self.project.add_user(self.user, "Administration")
+        outside_user = User.objects.create_user(
+            "outsideuser", "outside@example.org", "testpassword"
+        )
+
+        response = self.client.get(self.get_project_user_groups_url(outside_user))
+
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(DEFAULT_PAGE_LIMIT=10)
+    def test_edit_acl_users_pagination(self) -> None:
+        """Project user list should be paginated."""
+        self.project.add_user(self.user, "Administration")
+        users = []
+        for idx in range(11):
+            user = User.objects.create_user(
+                f"acl-page-{idx:02d}",
+                f"acl-page-{idx:02d}@example.org",
+                "testpassword",
+            )
+            self.project.add_user(user, "Translate")
+            users.append(user)
+
+        response = self.client.get(self.access_url)
+
+        self.assertContains(response, "acl-page-00")
+        self.assertContains(response, "acl-page-09")
+        self.assertNotContains(response, "acl-page-10")
+        self.assertNotContains(response, f"edit_user_{users[10].id}")
+        self.assertContains(response, "?page=2&amp;limit=10#users")
+
+        response = self.client.get(f"{self.access_url}?page=2")
+
+        self.assertContains(response, "acl-page-10")
+        self.assertContains(response, self.user.username)
+        self.assertNotContains(response, "acl-page-00")
+
     def add_user(self) -> None:
         self.add_acl()
         self.project.add_user(self.user, "Administration")
@@ -104,10 +239,15 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         # Accept invitation
         invitation = Invitation.objects.get()
         invitation.accept(None, self.second_user)
+        self.assertTrue(
+            self.second_user.profile.watched.filter(pk=self.project.pk).exists()
+        )
 
         # Ensure user is now listed
         response = self.client.get(self.access_url)
         self.assertContains(response, self.second_user.username)
+        invitation_audit = self.second_user.auditlog_set.get(activity="invited")
+        self.assertIsNone(invitation_audit.address)
 
     def test_invite_invalid(self) -> None:
         """Test inviting invalid form."""
@@ -136,10 +276,406 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         change = Project.objects.get(pk=self.project.pk).change_set.get(
             action=ActionEvents.INVITE_USER
         )
-        self.assertEqual(change.get_details_display(), self.user.username)
+        self.assertEqual(
+            change.get_details_display(viewer=self.user), self.user.username
+        )
+
+    def test_invite_forms_limit_language_fields(self) -> None:
+        """User additions and new-user invitations can specify language limits."""
+        self.project.add_user(self.user, "Administration")
+        response = self.client.get(self.access_url)
+
+        self.assertEqual(
+            list(response.context["invite_user_form"].fields),
+            ["user", "group", "limit_languages"],
+        )
+        self.assertEqual(
+            list(response.context["invite_email_form"].fields),
+            ["email", "username", "full_name", "group", "limit_languages"],
+        )
+        self.assertEqual(
+            list(response.context["bulk_invite_form"].fields),
+            ["group", "emails", "limit_languages"],
+        )
+        self.assertContains(response, "id_project_add_user_limit_languages")
+        self.assertContains(response, "id_project_invite_limit_languages")
+        self.assertContains(response, "id_project_bulk_invite_limit_languages")
+
+    def test_invite_forms_exclude_sitewide_project_group(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        group = self.create_sitewide_project_group()
+
+        response = self.client.get(self.access_url)
+
+        for context_name in (
+            "invite_user_form",
+            "invite_email_form",
+            "bulk_invite_form",
+        ):
+            self.assertNotIn(
+                group,
+                response.context[context_name].fields["group"].queryset,
+            )
 
     @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
-    def test_invite_user(self) -> None:
+    def test_invite_forms_reject_sitewide_project_group(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        group = self.create_sitewide_project_group()
+
+        requests = (
+            (
+                "add-user",
+                {"user": self.second_user.username, "group": group.pk},
+            ),
+            (
+                "invite-user",
+                {"email": "single@example.com", "group": group.pk},
+            ),
+            (
+                "invite-user",
+                {"emails": "bulk@example.com", "group": group.pk},
+            ),
+        )
+        for view_name, data in requests:
+            response = self.client.post(
+                reverse(view_name, kwargs=self.kw_project), data
+            )
+            self.assertRedirects(response, self.access_url)
+            self.assertFalse(Invitation.objects.exists())
+            self.assertFalse(group.memberships.exists())
+
+    def test_limit_languages_form_uses_model_validation(self) -> None:
+        language = Language.objects.get(code="cs")
+        field = LimitLanguagesField(Language.objects.filter(pk=language.pk))
+
+        # ruff: ignore[private-member-access]
+        language_code_field = Language._meta.get_field("code")
+        with patch.object(language_code_field, "clean") as clean:
+            validate_language_code(language.code)
+        clean.assert_called_once_with(language.code, None)
+
+        self.assertEqual(list(field.clean([language.code])), [language])
+        for code in (
+            "xx/test",
+            "cs\x00",
+        ):
+            with self.assertRaises(ValidationError):
+                field.clean([code])
+
+    def test_add_user_limit_languages(self) -> None:
+        """Existing-user invitations apply selected language limits."""
+        self.add_acl()
+        self.project.add_user(self.user, "Administration")
+        czech = Language.objects.get(code="cs")
+        response = self.client.post(
+            reverse("add-user", kwargs=self.kw_project),
+            {
+                "user": self.second_user.username,
+                "group": self.translate_group.pk,
+                "limit_languages": [czech.code],
+            },
+        )
+
+        self.assertRedirects(response, self.access_url)
+        invitation = Invitation.objects.get()
+        self.assertEqual(
+            list(invitation.limit_languages.values_list("code", flat=True)), ["cs"]
+        )
+
+        invitation.accept(None, self.second_user)
+        membership = TeamMembership.objects.get(
+            user=self.second_user, group=self.translate_group
+        )
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)), ["cs"]
+        )
+
+    def test_empty_invitation_limit_clears_membership_limit(self) -> None:
+        """An invitation without limits makes the resulting membership unrestricted."""
+        self.second_user.groups.add(self.translate_group)
+        czech = Language.objects.get(code="cs")
+        membership = TeamMembership.objects.get(
+            user=self.second_user, group=self.translate_group
+        )
+        membership.limit_languages.set([czech])
+        invitation = Invitation.objects.create(
+            author=self.user, user=self.second_user, group=self.translate_group
+        )
+
+        invitation.accept(None, self.second_user)
+
+        membership.refresh_from_db()
+        self.assertFalse(membership.limit_languages.exists())
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_invite_user_limit_languages(self) -> None:
+        """Single new-user invitation applies selected language limits."""
+        self.project.add_user(self.user, "Administration")
+        czech = Language.objects.get(code="cs")
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "email": "limited@example.com",
+                "group": self.translate_group.pk,
+                "limit_languages": [czech.code],
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "User invitation e-mail was sent.")
+        invitation = Invitation.objects.get()
+        self.assertEqual(
+            list(invitation.limit_languages.values_list("code", flat=True)), ["cs"]
+        )
+
+        response = self.client.get(self.access_url)
+        self.assertContains(response, "(cs)")
+
+        invited_user = User.objects.create_user(
+            "limited", "limited@example.com", "testpassword"
+        )
+        invitation.accept(None, invited_user)
+        membership = TeamMembership.objects.get(
+            user=invited_user, group=self.translate_group
+        )
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)), ["cs"]
+        )
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_bulk_invite_user_limit_languages(self) -> None:
+        """Bulk new-user invitations apply selected language limits."""
+        self.project.add_user(self.user, "Administration")
+        czech = Language.objects.get(code="cs")
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": "bulk-limited@example.com another-limited@example.com",
+                "group": self.translate_group.pk,
+                "limit_languages": [czech.code],
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "2 invitation e-mails were sent.")
+        self.assertEqual(Invitation.objects.count(), 2)
+        for invitation in Invitation.objects.all():
+            self.assertEqual(
+                list(invitation.limit_languages.values_list("code", flat=True)), ["cs"]
+            )
+
+        invitation = Invitation.objects.get(email="bulk-limited@example.com")
+        invited_user = User.objects.create_user(
+            "bulk-limited", "bulk-limited@example.com", "testpassword"
+        )
+        invitation.accept(None, invited_user)
+        membership = TeamMembership.objects.get(
+            user=invited_user, group=self.translate_group
+        )
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)), ["cs"]
+        )
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_bulk_invite_user(self) -> None:
+        """Bulk invite creates invitations and skips invalid addresses."""
+        self.project.add_user(self.user, "Administration")
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": (
+                    f"{self.user.email}\n"
+                    "new@example.com invalid-address new@example.com"
+                ),
+                "group": self.admin_group.pk,
+            },
+            follow=True,
+        )
+        self.assertContains(response, "2 invitation e-mails were sent.")
+        self.assertContains(response, "Skipped 2 addresses")
+        self.assertContains(response, "invalid-address: Enter a valid e-mail address.")
+        self.assertContains(
+            response, "new@example.com: duplicate address in the submission"
+        )
+        self.assertEqual(Invitation.objects.count(), 2)
+        self.assertEqual(len(mail.outbox), 2)
+
+        invitation = Invitation.objects.get(user=self.user)
+        self.assertEqual(invitation.group, self.admin_group)
+
+        change = Project.objects.get(pk=self.project.pk).change_set.filter(
+            action=ActionEvents.INVITE_USER
+        )
+        self.assertEqual(change.count(), 2)
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_bulk_invite_skips_pending_invitation(self) -> None:
+        """Bulk invite skips equivalent pending invitations."""
+        self.project.add_user(self.user, "Administration")
+        self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {"email": "existing@example.com", "group": self.admin_group.pk},
+            follow=True,
+        )
+        mail.outbox = []
+
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": "existing@example.com another@example.com",
+                "group": self.admin_group.pk,
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "1 invitation e-mail was sent.")
+        self.assertContains(
+            response, "existing@example.com: pending invitation already exists"
+        )
+        self.assertEqual(Invitation.objects.count(), 2)
+        self.assertEqual(len(mail.outbox), 1)
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_bulk_invite_keeps_ambiguous_verified_email_email_based(self) -> None:
+        """Bulk invite does not bind ambiguous verified e-mails to one user."""
+        self.project.add_user(self.user, "Administration")
+        first_user = User.objects.create_user(
+            "verified-one", "verified-one@example.org", "testpassword"
+        )
+        second_user = User.objects.create_user(
+            "verified-two", "verified-two@example.net", "testpassword"
+        )
+        first_social = UserSocialAuth.objects.create(
+            user=first_user, provider="github", uid="verified-one", id_key="id"
+        )
+        second_social = UserSocialAuth.objects.create(
+            user=second_user, provider="gitlab", uid="verified-two", id_key="id"
+        )
+        VerifiedEmail.objects.create(
+            social=first_social, email="shared-verified@example.com"
+        )
+        VerifiedEmail.objects.create(
+            social=second_social, email="shared-verified@example.com"
+        )
+
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": "shared-verified@example.com",
+                "group": self.admin_group.pk,
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "1 invitation e-mail was sent.")
+        invitation = Invitation.objects.get()
+        self.assertIsNone(invitation.user)
+        self.assertEqual(invitation.email, "shared-verified@example.com")
+
+    @override_settings(
+        REGISTRATION_OPEN=True,
+        REGISTRATION_CAPTCHA=False,
+        REGISTRATION_EMAIL_MATCH=r"^allowed@example\.com$",
+    )
+    def test_bulk_invite_uses_weblate_email_validation(self) -> None:
+        """Bulk invite reuses the same e-mail validation as single invite."""
+        self.project.add_user(self.user, "Administration")
+
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": "blocked@example.com",
+                "group": self.admin_group.pk,
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "No invitations were created.")
+        self.assertContains(
+            response, "blocked@example.com: This e-mail address is disallowed."
+        )
+        self.assertEqual(Invitation.objects.count(), 0)
+        self.assertEqual(len(mail.outbox), 0)
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_bulk_invite_clears_email_when_verified_user_resolved(self) -> None:
+        """Bulk invite keeps user-bound invitations in the expected either/or state."""
+        self.project.add_user(self.user, "Administration")
+        invited_user = User.objects.create_user(
+            "verified-match", "primary@example.org", "testpassword"
+        )
+        social = UserSocialAuth.objects.create(
+            user=invited_user, provider="github", uid="verified-match", id_key="id"
+        )
+        VerifiedEmail.objects.create(social=social, email="secondary@example.com")
+
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": "secondary@example.com",
+                "group": self.admin_group.pk,
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "1 invitation e-mail was sent.")
+        invitation = Invitation.objects.get()
+        self.assertEqual(invitation.user, invited_user)
+        self.assertEqual(invitation.email, "")
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_bulk_invite_skips_second_address_for_same_resolved_user(self) -> None:
+        """Bulk invite avoids duplicate invitations for one resolved account."""
+        self.project.add_user(self.user, "Administration")
+        invited_user = User.objects.create_user(
+            "same-user", "primary@example.org", "testpassword"
+        )
+        social = UserSocialAuth.objects.create(
+            user=invited_user, provider="github", uid="same-user", id_key="id"
+        )
+        VerifiedEmail.objects.create(social=social, email="secondary@example.com")
+
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {
+                "emails": "primary@example.org secondary@example.com",
+                "group": self.admin_group.pk,
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "1 invitation e-mail was sent.")
+        self.assertContains(
+            response, "secondary@example.com: pending invitation already exists"
+        )
+        self.assertEqual(Invitation.objects.count(), 1)
+        self.assertEqual(len(mail.outbox), 1)
+        invitation = Invitation.objects.get()
+        self.assertEqual(invitation.user, invited_user)
+        self.assertEqual(invitation.email, "")
+
+    @override_settings(REGISTRATION_OPEN=False, REGISTRATION_CAPTCHA=False)
+    def test_invite_user_closed(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {"email": "user@example.com", "group": self.admin_group.pk},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # It should work for the superuser
+        self.user.is_superuser = True
+        self.user.save()
+        response = self.client.post(
+            reverse("invite-user", kwargs=self.kw_project),
+            {"email": "user@example.com", "group": self.admin_group.pk},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+
+    @override_settings(REGISTRATION_OPEN=True, REGISTRATION_CAPTCHA=False)
+    def test_invite_user_open(self) -> None:
         """Test inviting user."""
         self.project.add_user(self.user, "Administration")
         response = self.client.post(
@@ -163,7 +699,9 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         change = Project.objects.get(pk=self.project.pk).change_set.get(
             action=ActionEvents.INVITE_USER
         )
-        self.assertEqual(change.get_details_display(), mask_email("user@example.com"))
+        self.assertEqual(
+            change.get_details_display(viewer=self.user), mask_email("user@example.com")
+        )
 
         self.assertEqual(Invitation.objects.count(), 1)
 
@@ -190,6 +728,7 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         response = user_client.get(invitation.get_absolute_url(), follow=True)
         self.assertRedirects(response, reverse("register"))
         self.assertContains(response, "user@example.com")
+        self.assertContains(response, "You were invited")
 
         # Perform registration
         response = user_client.post(
@@ -202,12 +741,32 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
             follow=True,
         )
         url = self.assert_registration_mailbox()
-        response = user_client.get(url, follow=True)
+        response = self.confirm_registration_url(url, user_client, follow=True)
+
+        # Accept terms if using legal
+        if "weblate.legal.pipeline.tos_confirm" in settings.SOCIAL_AUTH_PIPELINE:
+            response = self.confirm_tos(user_client, response)
+
         self.assertRedirects(response, reverse("password"))
 
         # Verify user was added
         response = self.client.get(self.access_url)
         self.assertContains(response, "example-username")
+
+        user = User.objects.get(username="example-username")
+        self.assertTrue(user.profile.watched.filter(pk=self.project.pk).exists())
+
+        # Inspect audit log
+        audit: AuditLog | None = None
+        for current in user.auditlog_set.filter(activity="team-add"):
+            if current.params["team"] == "Administration":
+                audit = current
+                break
+
+        self.assertIsNotNone(
+            audit, "Audit log entry for adding to the Administration team not found"
+        )
+        self.assertEqual(cast("AuditLog", audit).params["username"], self.user.username)
 
     def remove_user(self) -> None:
         # Remove user
@@ -253,7 +812,9 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         change = Project.objects.get(pk=self.project.pk).change_set.get(
             action=ActionEvents.ADD_USER
         )
-        self.assertIn(self.translate_group.name, change.get_details_display())
+        self.assertIn(
+            self.translate_group.name, change.get_details_display(viewer=self.user)
+        )
 
         self.assertFalse(
             User.objects.all_admins(self.project)
@@ -261,6 +822,96 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
             .exists()
         )
         self.remove_user()
+
+    def test_set_group_limit_languages(self) -> None:
+        """Editing ACL groups can set per-membership language limits."""
+        self.add_user()
+        czech = Language.objects.get(code="cs")
+        german = Language.objects.get(code="de")
+        self.client.post(
+            reverse("set-groups", kwargs=self.kw_project),
+            {
+                "user": self.second_user.username,
+                "groups": [self.translate_group.pk],
+                f"limit_languages_{self.translate_group.pk}": [czech.code],
+            },
+        )
+
+        membership = TeamMembership.objects.get(
+            user=self.second_user, group=self.translate_group
+        )
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)), ["cs"]
+        )
+
+        response = self.client.get(self.access_url)
+        self.assertContains(response, str(self.translate_group))
+        self.assertInHTML(
+            f'<span class="badge text-bg-secondary">{self.translate_group} (cs)</span>',
+            response.content.decode(),
+        )
+
+        self.client.post(
+            reverse("set-groups", kwargs=self.kw_project),
+            {
+                "user": self.second_user.username,
+                "groups": [self.translate_group.pk],
+                f"limit_languages_{self.translate_group.pk}": [german.code],
+            },
+        )
+        membership.refresh_from_db()
+        self.assertEqual(
+            list(membership.limit_languages.values_list("code", flat=True)), ["de"]
+        )
+        change = Project.objects.get(pk=self.project.pk).change_set.get(
+            action=ActionEvents.USER_ACCESS_CHANGE
+        )
+        self.assertEqual(
+            change.get_details_display(viewer=self.user),
+            f"{self.second_user.username} ({self.translate_group.name})",
+        )
+        self.assertEqual(change.details["previous_limit_languages"], ["cs"])
+        self.assertEqual(change.details["limit_languages"], ["de"])
+        audit = self.second_user.auditlog_set.get(activity="team-change")
+        self.assertEqual(audit.params["team"], self.translate_group.name)
+        self.assertEqual(audit.params["username"], self.user.username)
+        self.assertEqual(audit.params["previous_limit_languages"], ["cs"])
+        self.assertEqual(audit.params["limit_languages"], ["de"])
+
+        self.client.post(
+            reverse("set-groups", kwargs=self.kw_project),
+            {
+                "user": self.second_user.username,
+                "groups": [self.translate_group.pk],
+                f"limit_languages_{self.translate_group.pk}": [german.code],
+            },
+        )
+        self.assertEqual(
+            Project.objects.get(pk=self.project.pk)
+            .change_set.filter(action=ActionEvents.USER_ACCESS_CHANGE)
+            .count(),
+            1,
+        )
+
+    def test_group_edit_form_plain_dict_selection(self) -> None:
+        form = ProjectUserGroupForm(
+            self.project,
+            data={
+                "user": self.second_user.username,
+                "groups": [self.translate_group.pk],
+            },
+        )
+
+        self.assertFalse(
+            form.fields[
+                ProjectUserGroupForm.get_limit_languages_field(self.translate_group)
+            ].disabled
+        )
+        self.assertTrue(
+            form.fields[
+                ProjectUserGroupForm.get_limit_languages_field(self.admin_group)
+            ].disabled
+        )
 
     def test_delete_owner(self) -> None:
         """Adding and deleting owners from the ACL project."""
@@ -317,9 +968,38 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         )
         self.assertContains(response, "Could not find any such user")
 
+    def test_special_users_denied_project_membership(self) -> None:
+        """Test that special users can not be assigned to project teams."""
+        self.project.add_user(self.user, "Administration")
+        inactive = User.objects.create_user(
+            "inactive-acl", "inactive-acl@example.org", "testpassword"
+        )
+        inactive.is_active = False
+        inactive.save()
+        users = [get_anonymous(), inactive]
+
+        for user in users:
+            response = self.client.post(
+                reverse("add-user", kwargs=self.kw_project),
+                {"user": user.username, "group": self.admin_group.pk},
+                follow=True,
+            )
+            self.assertContains(response, "can not be assigned to teams")
+            self.assertFalse(
+                Invitation.objects.filter(user=user, group=self.admin_group).exists()
+            )
+            self.assertFalse(user.groups.filter(pk=self.admin_group.pk).exists())
+
+            response = self.client.post(
+                reverse("set-groups", kwargs=self.kw_project),
+                {"user": user.username, "groups": [self.admin_group.pk]},
+                follow=True,
+            )
+            self.assertContains(response, "can not be assigned to teams")
+            self.assertFalse(user.groups.filter(pk=self.admin_group.pk).exists())
+
     def test_acl_groups(self) -> None:
         """Test handling ACL groups."""
-        billing_group = 1 if "weblate.billing" in settings.INSTALLED_APPS else 0
         self.project.defined_groups.all().delete()
         self.project.access_control = Project.ACCESS_PUBLIC
         self.project.translation_review = False
@@ -328,21 +1008,21 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         self.project.access_control = Project.ACCESS_PROTECTED
         self.project.translation_review = True
         self.project.save()
-        self.assertEqual(10 + billing_group, self.project.defined_groups.count())
+        self.assertEqual(11, self.project.defined_groups.count())
         self.project.access_control = Project.ACCESS_PRIVATE
         self.project.translation_review = True
         self.project.save()
-        self.assertEqual(10 + billing_group, self.project.defined_groups.count())
+        self.assertEqual(11, self.project.defined_groups.count())
         self.project.access_control = Project.ACCESS_CUSTOM
         self.project.save()
-        self.assertEqual(10 + billing_group, self.project.defined_groups.count())
+        self.assertEqual(11, self.project.defined_groups.count())
         self.project.access_control = Project.ACCESS_CUSTOM
         self.project.save()
-        self.assertEqual(10 + billing_group, self.project.defined_groups.count())
+        self.assertEqual(11, self.project.defined_groups.count())
         self.project.defined_groups.all().delete()
         self.project.access_control = Project.ACCESS_PRIVATE
         self.project.save()
-        self.assertEqual(10 + billing_group, self.project.defined_groups.count())
+        self.assertEqual(11, self.project.defined_groups.count())
         self.project.delete()
 
     def test_restricted_component(self) -> None:
@@ -386,6 +1066,15 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         )
         self.assertRedirects(response, self.access_url)
         self.assertEqual(self.project.userblock_set.count(), 1)
+        self.assertEqual(self.project.userblock_set.filter(note="").count(), 1)
+        audit = self.second_user.auditlog_set.get(activity="blocked")
+        self.assertEqual(audit.params["username"], self.user.username)
+        self.assertIsNone(audit.address)
+        message = audit.get_extra_message()
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertIn("Triggered by", message)
+        self.assertIn("Please contact project maintainers", message)
 
         # Block user, for second time
         response = self.client.post(
@@ -403,6 +1092,584 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         self.assertRedirects(response, self.access_url)
         self.assertEqual(self.project.userblock_set.count(), 0)
 
+        # Block user with a note
+        response = self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username, "note": "Spamming"},
+        )
+        self.assertRedirects(response, self.access_url)
+        self.assertEqual(self.project.userblock_set.count(), 1)
+        self.assertEqual(self.project.userblock_set.filter(note="Spamming").count(), 1)
+
+    def test_cannot_block_project_admin(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.project.add_user(self.second_user, "Administration")
+        response = self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+            follow=True,
+        )
+        self.assertContains(
+            response, "Remove project administration rights before blocking this user."
+        )
+        self.assertFalse(
+            self.second_user.userblock_set.filter(project=self.project).exists()
+        )
+
+    def test_cannot_block_broad_team_admin(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        group = Group.objects.create(
+            name="Broad administration", project_selection=SELECTION_ALL
+        )
+        group.roles.add(Role.objects.get(name="Administration"))
+        self.second_user.groups.add(group)
+        response = self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+            follow=True,
+        )
+        self.assertContains(
+            response, "Remove project administration rights before blocking this user."
+        )
+        self.assertFalse(
+            self.second_user.userblock_set.filter(project=self.project).exists()
+        )
+
+    def test_cannot_assign_blocked_user_to_broad_admin_team(self) -> None:
+        self.second_user.userblock_set.create(project=self.project)
+        group = Group.objects.create(
+            name="Broad administration", project_selection=SELECTION_ALL
+        )
+        group.roles.add(Role.objects.get(name="Administration"))
+        form = UserAddTeamForm({"user": self.second_user.username}, team=group)
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            "Blocked users cannot be granted project administration rights.",
+            form.non_field_errors(),
+        )
+
+    def test_cannot_make_blocked_user_team_admin(self) -> None:
+        self.second_user.userblock_set.create(project=self.project)
+        form = UserAddTeamForm(
+            {"user": self.second_user.username, "make_admin": True},
+            team=self.translate_group,
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            "Blocked users cannot be granted project administration rights.",
+            form.non_field_errors(),
+        )
+
+    def test_language_limited_admin_membership_is_allowed(self) -> None:
+        self.second_user.userblock_set.create(project=self.project)
+        czech = Language.objects.get(code="cs")
+        team_form = UserAddTeamForm(
+            {"user": self.second_user.username, "limit_languages": [czech.code]},
+            team=self.admin_group,
+        )
+        self.assertTrue(team_form.is_valid(), team_form.errors)
+
+        self.project.add_user(self.second_user, "Translate")
+        project_form = ProjectUserGroupForm(
+            self.project,
+            data={
+                "user": self.second_user.username,
+                "groups": [self.admin_group.pk],
+                f"limit_languages_{self.admin_group.pk}": [czech.code],
+            },
+        )
+        self.assertTrue(project_form.is_valid(), project_form.errors)
+
+    def test_language_limited_admin_can_be_blocked(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.project.add_user(self.second_user, "Administration")
+        membership = TeamMembership.objects.get(
+            user=self.second_user, group=self.admin_group
+        )
+        membership.limit_languages.add(Language.objects.get(code="cs"))
+        response = self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+        )
+        self.assertRedirects(response, self.access_url)
+        self.assertTrue(
+            self.second_user.userblock_set.filter(project=self.project).exists()
+        )
+
+    def test_cannot_clear_blocked_admin_membership_limit(self) -> None:
+        self.second_user.userblock_set.create(project=self.project)
+        self.project.add_user(self.second_user, "Administration")
+        membership = TeamMembership.objects.get(
+            user=self.second_user, group=self.admin_group
+        )
+        membership.limit_languages.add(Language.objects.get(code="cs"))
+        form = ProjectUserGroupForm(
+            self.project,
+            data={"user": self.second_user.username, "groups": [self.admin_group.pk]},
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            "Blocked users cannot be granted project administration rights.",
+            form.non_field_errors(),
+        )
+
+    def test_invalid_admin_membership_language_shows_field_error(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.project.add_user(self.second_user, "Translate")
+        self.second_user.userblock_set.create(project=self.project)
+        field_name = f"limit_languages_{self.admin_group.pk}"
+        data = {
+            "user": self.second_user.username,
+            "groups": [self.admin_group.pk],
+            field_name: ["not-a-language"],
+        }
+        form = ProjectUserGroupForm(self.project, data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn(field_name, form.errors)
+        self.assertFalse(form.non_field_errors())
+
+        response = self.client.post(
+            reverse("set-groups", kwargs=self.kw_project), data, follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            self.second_user.groups.filter(pk=self.admin_group.pk).exists()
+        )
+
+    def test_cannot_grant_project_admin_to_blocked_user(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.project.add_user(self.second_user, "Translate")
+        self.second_user.userblock_set.create(project=self.project)
+        response = self.client.post(
+            reverse("set-groups", kwargs=self.kw_project),
+            {"user": self.second_user.username, "groups": [self.admin_group.pk]},
+            follow=True,
+        )
+        self.assertContains(
+            response, "Blocked users cannot be granted project administration rights."
+        )
+        self.assertFalse(
+            self.second_user.groups.filter(pk=self.admin_group.pk).exists()
+        )
+
+    def test_blocked_user_cannot_accept_admin_invitation(self) -> None:
+        self.second_user.userblock_set.create(project=self.project)
+        invitation = Invitation.objects.create(
+            author=self.user,
+            user=self.second_user,
+            group=self.admin_group,
+        )
+        with self.assertRaises(InvitationBlockedAdminError):
+            invitation.accept(None, self.second_user)
+        self.assertTrue(Invitation.objects.filter(pk=invitation.pk).exists())
+        self.assertFalse(
+            self.second_user.groups.filter(pk=self.admin_group.pk).exists()
+        )
+
+    def test_blocked_user_can_accept_language_limited_admin_invitation(self) -> None:
+        self.second_user.userblock_set.create(project=self.project)
+        invitation = Invitation.objects.create(
+            author=self.user,
+            user=self.second_user,
+            group=self.admin_group,
+        )
+        invitation.limit_languages.add(Language.objects.get(code="cs"))
+        invitation.accept(None, self.second_user)
+        self.assertTrue(self.second_user.groups.filter(pk=self.admin_group.pk).exists())
+        self.assertFalse(self.second_user.has_perm("project.edit", self.project))
+
+    def test_blocked_user_email_visibility(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+        )
+
+        response = self.client.get(self.access_url)
+        self.assertNotContains(response, self.second_user.email)
+
+        group = self.create_sitewide_project_group()
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        response = self.client.get(self.access_url)
+        self.assertContains(response, self.second_user.email)
+
+    def test_block_user_revert_edits(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        unit = self.get_unit()
+        self.change_unit("Nazdar svete!\n", user=self.second_user)
+
+        with patch(
+            "weblate.trans.views.acl.revert_user_edits_task.delay",
+            return_value=SimpleNamespace(id="task-1"),
+        ) as mocked_delay:
+            response = self.client.post(
+                reverse("block-user", kwargs=self.kw_project),
+                {
+                    "user": self.second_user.username,
+                    "revert_edits": "on",
+                },
+                follow=True,
+            )
+
+        mocked_delay.assert_called_once_with(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            sitewide=False,
+        )
+        self.assertContains(
+            response, "Reverting edits by seconduser in this project was scheduled."
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Nazdar svete!\n")
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+        self.assertFalse(
+            Change.objects.filter(action=ActionEvents.USER_REVERT).exists()
+        )
+
+    def test_block_user_revert_edits_already_blocked(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+        )
+
+        with patch(
+            "weblate.trans.views.acl.revert_user_edits_task.delay",
+            return_value=SimpleNamespace(id="task-3"),
+        ) as mocked_delay:
+            response = self.client.post(
+                reverse("block-user", kwargs=self.kw_project),
+                {
+                    "user": self.second_user.username,
+                    "revert_edits": "on",
+                },
+                follow=True,
+            )
+
+        mocked_delay.assert_called_once_with(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            sitewide=False,
+        )
+        self.assertContains(
+            response, "Reverting edits by seconduser in this project was scheduled."
+        )
+        self.assertNotContains(response, "User is already blocked on this project.")
+
+    def test_block_user_cleanup_contributions(self) -> None:
+        self.project.add_user(self.user, "Administration")
+
+        with patch(
+            "weblate.trans.views.acl.cleanup_user_contributions_task.delay",
+            return_value=SimpleNamespace(id="task-cleanup"),
+        ) as mocked_delay:
+            response = self.client.post(
+                reverse("block-user", kwargs=self.kw_project),
+                {
+                    "user": self.second_user.username,
+                    "reject_suggestions": "on",
+                    "delete_comments": "on",
+                },
+                follow=True,
+            )
+
+        mocked_delay.assert_called_once_with(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            sitewide=False,
+            reject_suggestions=True,
+            delete_comments=True,
+        )
+        self.assertContains(
+            response,
+            "Cleaning up contributions by seconduser in this project was scheduled.",
+        )
+
+    def test_revert_blocked_user_cleanup_contributions(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+        )
+
+        with (
+            patch(
+                "weblate.trans.views.acl.revert_user_edits_task.delay",
+                return_value=SimpleNamespace(id="task-revert"),
+            ) as mocked_revert,
+            patch(
+                "weblate.trans.views.acl.cleanup_user_contributions_task.delay",
+                return_value=SimpleNamespace(id="task-cleanup"),
+            ) as mocked_cleanup,
+        ):
+            response = self.client.post(
+                reverse("revert-blocked-user-edits", kwargs=self.kw_project),
+                {
+                    "user": self.second_user.username,
+                    "cleanup_user_contributions": "1",
+                    "reject_suggestions": "on",
+                },
+                follow=True,
+            )
+
+        mocked_revert.assert_not_called()
+        mocked_cleanup.assert_called_once_with(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            sitewide=False,
+            reject_suggestions=True,
+            delete_comments=False,
+        )
+        self.assertContains(
+            response,
+            "Cleaning up contributions by seconduser in this project was scheduled.",
+        )
+
+    def test_revert_blocked_user_cleanup_with_revert_edits(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+        )
+
+        with patch(
+            "weblate.trans.views.acl.revert_user_edits_task.delay",
+            return_value=SimpleNamespace(id="task-revert"),
+        ) as mocked_revert:
+            response = self.client.post(
+                reverse("revert-blocked-user-edits", kwargs=self.kw_project),
+                {
+                    "user": self.second_user.username,
+                    "cleanup_user_contributions": "1",
+                    "revert_edits": "on",
+                },
+                follow=True,
+            )
+
+        mocked_revert.assert_called_once_with(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            sitewide=False,
+        )
+        self.assertContains(
+            response, "Reverting edits by seconduser in this project was scheduled."
+        )
+
+    def test_revert_user_edits_task(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        unit = self.get_unit()
+        self.change_unit("Ahoj svete!\n", user=self.user)
+        self.change_unit("Nazdar svete!\n", user=self.second_user)
+        self.change_unit("Cus svete!\n", user=self.second_user)
+
+        result = revert_user_edits_task(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "reverted": 1,
+                "skipped": 0,
+                "skipped_newer": 0,
+                "skipped_failed": 0,
+            },
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Ahoj svete!\n")
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+
+        change = Change.objects.get(action=ActionEvents.USER_REVERT, unit=unit)
+        self.assertEqual(change.user, self.user)
+        self.assertEqual(
+            change.get_details_display(viewer=self.user), self.second_user.username
+        )
+
+    def test_revert_user_edits_task_requires_review_for_approved_state(self) -> None:
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        self.project.add_user(self.second_user, "Administration")
+        self.project.add_user(self.user, "Translate")
+        target_user = User.objects.create_user(
+            "targetuser", "targetuser@example.org", "testpassword"
+        )
+        unit = self.get_unit()
+        original = "Approved translation\n"
+        self.change_unit(original, user=self.second_user, state=STATE_APPROVED)
+        self.change_unit("First revision\n", user=target_user)
+        self.change_unit("Second revision\n", user=target_user)
+        self.assertTrue(self.user.has_perm("unit.edit", unit))
+        self.assertFalse(self.user.has_perm("unit.review", unit))
+
+        result = revert_user_edits_task(
+            target_user_id=target_user.pk,
+            acting_user_id=self.user.pk,
+            project_id=self.project.pk,
+        )
+
+        self.assertEqual(result["reverted"], 1)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, original)
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+        self.assertEqual(
+            Change.objects.get(unit=unit, action=ActionEvents.USER_REVERT).user,
+            self.user,
+        )
+
+    def test_revert_user_edits_task_invalid_old_state(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        unit = self.get_unit()
+        self.change_unit("Ahoj svete!\n", user=self.user)
+        self.change_unit("Nazdar svete!\n", user=self.second_user)
+        self.change_unit("Cus svete!\n", user=self.second_user)
+        change = Change.objects.filter(unit=unit, user=self.second_user).order_by(
+            "-timestamp", "-pk"
+        )[0]
+        change.details["old_state"] = -1
+        change.save(update_fields=["details"])
+
+        result = revert_user_edits_task(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "reverted": 0,
+                "skipped": 1,
+                "skipped_newer": 0,
+                "skipped_failed": 1,
+            },
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Cus svete!\n")
+        self.assertFalse(
+            Change.objects.filter(action=ActionEvents.USER_REVERT).exists()
+        )
+
+    def test_block_user_revert_edits_skips_newer_changes(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        unit = self.get_unit()
+        self.change_unit("Nazdar svete!\n", user=self.second_user)
+        self.change_unit("Ahoj svete!\n", user=self.user)
+
+        result = revert_user_edits_task(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "reverted": 0,
+                "skipped": 1,
+                "skipped_newer": 1,
+                "skipped_failed": 0,
+            },
+        )
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Ahoj svete!\n")
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+        self.assertFalse(
+            Change.objects.filter(action=ActionEvents.USER_REVERT).exists()
+        )
+
+    def test_cleanup_user_contributions_task(self) -> None:
+        unit = self.get_unit()
+        other_user = User.objects.create_user(
+            "cleanup-other", "cleanup-other@example.org", "testpassword"
+        )
+        target_suggestion = Suggestion.objects.create(
+            unit=unit, target="Bad suggestion!\n", user=self.second_user
+        )
+        other_suggestion = Suggestion.objects.create(
+            unit=unit, target="Other suggestion!\n", user=other_user
+        )
+        target_comment = Comment.objects.create(
+            unit=unit, comment="Bad comment", user=self.second_user
+        )
+        other_comment = Comment.objects.create(
+            unit=unit, comment="Other comment", user=other_user
+        )
+
+        result = cleanup_user_contributions_task(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            reject_suggestions=True,
+            delete_comments=True,
+        )
+
+        self.assertEqual(result, {"comments": 1, "suggestions": 1})
+        self.assertFalse(Suggestion.objects.filter(pk=target_suggestion.pk).exists())
+        self.assertTrue(Suggestion.objects.filter(pk=other_suggestion.pk).exists())
+        self.assertFalse(Comment.objects.filter(pk=target_comment.pk).exists())
+        self.assertTrue(Comment.objects.filter(pk=other_comment.pk).exists())
+        self.assertTrue(
+            Change.objects.filter(
+                action=ActionEvents.SUGGESTION_DELETE,
+                target="Bad suggestion!\n",
+                user=self.user,
+                unit=unit,
+            ).exists()
+        )
+        self.assertTrue(
+            Change.objects.filter(
+                action=ActionEvents.COMMENT_DELETE,
+                details={
+                    "comment": "Bad comment",
+                    "change_origin": {"scope": "system"},
+                },
+                user=self.user,
+                unit=unit,
+            ).exists()
+        )
+
+    def test_revert_blocked_user_edits(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        unit = self.get_unit()
+        self.change_unit("Nazdar svete!\n", user=self.second_user)
+        self.client.post(
+            reverse("block-user", kwargs=self.kw_project),
+            {"user": self.second_user.username},
+        )
+
+        with patch(
+            "weblate.trans.views.acl.revert_user_edits_task.delay",
+            return_value=SimpleNamespace(id="task-2"),
+        ) as mocked_delay:
+            response = self.client.post(
+                reverse("revert-blocked-user-edits", kwargs=self.kw_project),
+                {"user": self.second_user.username},
+                follow=True,
+            )
+
+        mocked_delay.assert_called_once_with(
+            target_user_id=self.second_user.id,
+            acting_user_id=self.user.id,
+            project_id=self.project.id,
+            sitewide=False,
+        )
+        self.assertContains(
+            response, "Reverting edits by seconduser in this project was scheduled."
+        )
+        self.assertEqual(self.project.userblock_set.count(), 1)
+        unit.refresh_from_db()
+        self.assertEqual(unit.target, "Nazdar svete!\n")
+        self.assertEqual(unit.state, STATE_TRANSLATED)
+
     def test_delete_group(self) -> None:
         self.project.add_user(self.user, "Administration")
         group = self.project.defined_groups.get(name="Memory")
@@ -410,10 +1677,10 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
             group.get_absolute_url(),
             {"delete": group.pk},
         )
-        self.assertRedirects(response, self.access_url + "#teams")
+        self.assertRedirects(response, f"{self.access_url}#teams")
         self.assertFalse(Group.objects.filter(pk=group.pk).exists())
 
-    def create_test_group(self):
+    def create_test_group(self) -> Group:
         self.project.add_user(self.user, "Administration")
         response = self.client.post(
             reverse("create-project-group", kwargs=self.kw_project),
@@ -422,13 +1689,12 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
                 "roles": list(
                     Role.objects.filter(name="Power user").values_list("pk", flat=True)
                 ),
-                "language_selection": 0,
                 "languages": list(
                     Language.objects.filter(code="cs").values_list("pk", flat=True)
                 ),
             },
         )
-        self.assertRedirects(response, self.access_url + "#teams")
+        self.assertRedirects(response, f"{self.access_url}#teams")
         return Group.objects.get(name="Czech team")
 
     def test_create_group(self) -> None:
@@ -440,6 +1706,105 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
             set(group.roles.values_list("name", flat=True)), {"Power user"}
         )
 
+    def test_create_duplicate_group(self) -> None:
+        group = self.create_test_group()
+        response = self.client.post(
+            reverse("create-project-group", kwargs=self.kw_project),
+            {
+                "name": group.name,
+                "roles": list(group.roles.values_list("pk", flat=True)),
+            },
+            follow=True,
+        )
+        self.assertContains(
+            response, "A team with this name already exists in this project."
+        )
+        self.assertEqual(self.project.defined_groups.filter(name=group.name).count(), 1)
+
+    def test_create_group_reports_late_name_conflict(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        error = ValidationError(
+            {"name": "A team with this name already exists in this project."}
+        )
+        with patch.object(Group, "save", side_effect=error):
+            response = self.client.post(
+                reverse("create-project-group", kwargs=self.kw_project),
+                {
+                    "name": "Concurrent team",
+                    "roles": [Role.objects.get(name="Translate").pk],
+                },
+                follow=True,
+            )
+        self.assertContains(
+            response, "A team with this name already exists in this project."
+        )
+        self.assertFalse(
+            self.project.defined_groups.filter(name="Concurrent team").exists()
+        )
+
+    def test_edit_legacy_duplicate_builtin_team(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        group = self.project.defined_groups.get(name="Translate", internal=True)
+        Group.objects.bulk_create(
+            [Group(name=group.name, defining_project=self.project, internal=True)]
+        )
+        response = self.client.post(
+            group.get_absolute_url(),
+            {
+                "name": group.name,
+                "roles": list(group.roles.values_list("pk", flat=True)),
+                "enforced_2fa": True,
+                "all_languages": True,
+                "autogroup_set-TOTAL_FORMS": "0",
+                "autogroup_set-INITIAL_FORMS": "0",
+            },
+        )
+        self.assertRedirects(response, group.get_absolute_url())
+        group.refresh_from_db()
+        self.assertTrue(group.enforced_2fa)
+        self.assertEqual(group.name, "Translate")
+
+    def test_edit_group_reports_late_name_conflict(self) -> None:
+        group = self.create_test_group()
+        error = ValidationError(
+            {"name": "A team with this name already exists in this project."}
+        )
+        with patch.object(Group, "save", side_effect=error):
+            response = self.client.post(
+                group.get_absolute_url(),
+                {
+                    "name": "Concurrent team",
+                    "roles": list(group.roles.values_list("pk", flat=True)),
+                    "autogroup_set-TOTAL_FORMS": "1",
+                    "autogroup_set-INITIAL_FORMS": "0",
+                    "autogroup_set-0-match": "^concurrent$",
+                },
+            )
+        self.assertContains(
+            response, "A team with this name already exists in this project."
+        )
+        group.refresh_from_db()
+        self.assertEqual(group.name, "Czech team")
+        self.assertFalse(group.autogroup_set.exists())
+
+    def test_rename_group_to_duplicate(self) -> None:
+        group = self.create_test_group()
+        Group.objects.create(name="Other team", defining_project=self.project)
+        response = self.client.post(
+            group.get_absolute_url(),
+            {
+                "name": "Other team",
+                "roles": list(group.roles.values_list("pk", flat=True)),
+                "autogroup_set-TOTAL_FORMS": "0",
+                "autogroup_set-INITIAL_FORMS": "0",
+            },
+        )
+        self.assertContains(
+            response, "A team with this name already exists in this project."
+        )
+        group.refresh_from_db()
+        self.assertEqual(group.name, "Czech team")
+
     def test_create_group_all_lang(self) -> None:
         self.project.add_user(self.user, "Administration")
         response = self.client.post(
@@ -449,19 +1814,17 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
                 "roles": list(
                     Role.objects.filter(name="Power user").values_list("pk", flat=True)
                 ),
-                "language_selection": 1,
+                "all_languages": "on",
                 "languages": list(
                     Language.objects.filter(code="cs").values_list("pk", flat=True)
                 ),
             },
         )
-        self.assertRedirects(response, self.access_url + "#teams")
+        self.assertRedirects(response, f"{self.access_url}#teams")
         group = Group.objects.get(name="All team")
         self.assertEqual(group.defining_project, self.project)
         self.assertEqual(group.language_selection, 1)
-        self.assertNotEqual(
-            list(group.languages.values_list("code", flat=True)), ["cs"]
-        )
+        self.assertFalse(group.languages.exists())
         self.assertEqual(
             set(group.roles.values_list("name", flat=True)), {"Power user"}
         )
@@ -476,10 +1839,7 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
                 "roles": list(
                     Role.objects.filter(name="Power user").values_list("pk", flat=True)
                 ),
-                "language_selection": 1,
-                "languages": list(
-                    Language.objects.filter(code="cs").values_list("pk", flat=True)
-                ),
+                "all_languages": "on",
                 "autogroup_set-TOTAL_FORMS": "0",
                 "autogroup_set-INITIAL_FORMS": "0",
             },
@@ -488,6 +1848,35 @@ class ACLTest(FixtureTestCase, RegistrationTestMixin):
         group = Group.objects.get(name="Global team")
         self.assertEqual(group.defining_project, self.project)
         self.assertEqual(group.language_selection, 1)
-        self.assertNotEqual(
-            list(group.languages.values_list("code", flat=True)), ["cs"]
+        # The manual selection is preserved when switching to all languages
+        self.assertEqual(list(group.languages.values_list("code", flat=True)), ["cs"])
+
+        # Unchecking the box goes back to the preserved manual selection
+        response = self.client.post(
+            group.get_absolute_url(),
+            {
+                "name": "Global team",
+                "roles": list(
+                    Role.objects.filter(name="Power user").values_list("pk", flat=True)
+                ),
+                "languages": list(
+                    Language.objects.filter(code="cs").values_list("pk", flat=True)
+                ),
+                "autogroup_set-TOTAL_FORMS": "0",
+                "autogroup_set-INITIAL_FORMS": "0",
+            },
         )
+        self.assertRedirects(response, group.get_absolute_url())
+        group.refresh_from_db()
+        self.assertEqual(group.language_selection, 0)
+        self.assertEqual(list(group.languages.values_list("code", flat=True)), ["cs"])
+
+
+@enable_login_required_settings()
+class ACLLoginRequiredTestCase(ACLTest):
+    pass
+
+
+@modify_settings(SOCIAL_AUTH_PIPELINE={"append": "weblate.legal.pipeline.tos_confirm"})
+class ACLLegalTestCase(ACLLoginRequiredTestCase):
+    pass

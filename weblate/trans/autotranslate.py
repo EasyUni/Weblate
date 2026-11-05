@@ -4,140 +4,534 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from celery import current_task
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.db.models import Value
+from django.db.models import Case, F, IntegerField, Q, QuerySet, Value, When
 from django.db.models.functions import MD5, Lower
 from django.utils.translation import gettext, ngettext
 
-from weblate.machinery.base import (
-    BatchMachineTranslation,
-    MachineTranslationError,
-    UnitMemoryResultDict,
+from weblate.logger import LOGGER
+from weblate.machinery.base import MachineTranslationError
+from weblate.machinery.models import (
+    MACHINERY,
+    MachineryAmbiguousError,
+    selected_machinery_settings,
 )
-from weblate.machinery.models import MACHINERY
 from weblate.trans.actions import ActionEvents
-from weblate.trans.models import Component, Suggestion, Translation, Unit
-from weblate.trans.util import split_plural
+from weblate.trans.coordination import (
+    AutomaticTranslationBusyError,
+    AutomaticTranslationSessionLostError,
+    ensure_translation_session,
+    translation_continuation,
+    translation_guard,
+)
+from weblate.trans.models import (
+    Category,
+    Component,
+    Project,
+    Suggestion,
+    SuggestionAddResult,
+    Translation,
+    Unit,
+    WorkflowSetting,
+)
+from weblate.trans.models.source import source_operation, source_operation_method
+from weblate.trans.util import is_plural, split_plural
 from weblate.utils.state import (
     STATE_APPROVED,
     STATE_FUZZY,
     STATE_READONLY,
     STATE_TRANSLATED,
-    StringState,
 )
+from weblate.utils.stats import ProjectLanguage
+from weblate.utils.task_log import make_task_log_entry
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
     from weblate.auth.models import User
+    from weblate.auth.results import PermissionResult
+    from weblate.machinery.base import BatchMachineTranslation, UnitMemoryResultDict
+    from weblate.utils.state import StringState
+    from weblate.utils.task_log import TaskLogEntry
 
 
-class AutoTranslate:
+class WarningDetail(TypedDict):
+    message: str
+    public_message: str
+    component_ids: list[int]
+
+
+def fetch_machinery_matches(
+    *,
+    units: list[Unit],
+    user: User | None,
+    services: Sequence[BatchMachineTranslation],
+    threshold: int,
+    set_progress: Callable[[int], None] | None = None,
+    log_translation: Translation | None = None,
+    on_error: Callable[[str], None] | None = None,
+) -> dict[int, UnitMemoryResultDict]:
+    """Fetch machinery matches without applying them to units."""
+    num_units = len(units)
+
+    for pos, translation_service in enumerate(services):
+        batch_size = translation_service.batch_size
+        if log_translation is not None:
+            log_translation.log_info(
+                "fetching translations for %d units from %s, %d per request",
+                num_units,
+                translation_service.name,
+                batch_size,
+            )
+
+        for batch_start in range(0, num_units, batch_size):
+            ensure_translation_session()
+            if set_progress is not None:
+                set_progress(pos * num_units + batch_start)
+            try:
+                translation_service.batch_translate(
+                    units[batch_start : batch_start + batch_size],
+                    user,
+                    threshold=threshold,
+                )
+                ensure_translation_session()
+            except MachineTranslationError as error:
+                if on_error is not None:
+                    on_error(
+                        f"{translation_service.name} (batch {batch_start // batch_size + 1}): {error}"
+                    )
+                if log_translation is not None:
+                    log_translation.log_error("failed automatic translation: %s", error)
+                else:
+                    LOGGER.warning(
+                        "failed machinery translation from %s: %s",
+                        translation_service.name,
+                        error,
+                    )
+
+    return {
+        unit.id: unit.machinery
+        for unit in units
+        if unit.machinery and any(unit.machinery["quality"])
+    }
+
+
+def check_auto_translate_permission(
+    user: User | None, translation: Translation, mode: str
+) -> bool | PermissionResult:
+    # Add-on users identify generated changes rather than authorize the operation.
+    if user is None or (user.is_bot and user.username.startswith("addon:")):
+        return True
+    if not (permission := user.has_perm("translation.auto", translation)):
+        return permission
+    if mode == "suggest":
+        if not translation.restrict_direct_editing:
+            return True
+        return user.has_perm("suggestion.add", translation)
+    return user.has_perm("meta:unit.direct_edit", translation)
+
+
+class BaseAutoTranslate:
+    updated: int = 0
+    progress_steps: int = 0
+
     def __init__(
         self,
         *,
         user: User | None,
-        translation: Translation,
         q: str,
         mode: str,
         component_wide: bool = False,
+        unit_ids: list[int] | None = None,
+        allow_non_shared_tm_source_components: bool = False,
     ) -> None:
         self.user: User | None = user
-        self.translation: Translation = translation
-        translation.component.batch_checks = True
-
         self.q: str = q
         self.mode: str = mode
-        self.updated = 0
-        self.progress_steps = 0
-        self.progress_base = 0
-        self.target_state = STATE_TRANSLATED
-        if mode == "fuzzy":
-            self.target_state = STATE_FUZZY
-        elif mode == "approved" and translation.enable_review:
-            self.target_state = STATE_APPROVED
         self.component_wide: bool = component_wide
+        self.unit_ids: list[int] | None = unit_ids
+        self.allow_non_shared_tm_source_components = (
+            allow_non_shared_tm_source_components
+        )
+        self.failure_message: str | None = None
+        self.busy = False
+        self.errors: list[str] = []
+        self.error_details: list[TaskLogEntry] = []
+        self.warnings: list[str] = []
+        self.warning_details: list[WarningDetail] = []
+        self.affected_unit_ids: set[int] = set()
+        self.affected_source_unit_ids: set[int] = set()
+
+    def get_message(self) -> str:
+        if self.errors:
+            if self.updated == 0:
+                return gettext(
+                    "Automatic translation completed with errors, no strings were updated."
+                )
+            return (
+                ngettext(
+                    "Automatic translation completed with errors, %d string was updated.",
+                    "Automatic translation completed with errors, %d strings were updated.",
+                    self.updated,
+                )
+                % self.updated
+            )
+        if self.updated == 0:
+            return gettext("Automatic translation completed, no strings were updated.")
+        message = ngettext(
+            "Automatic translation completed, %d string was updated.",
+            "Automatic translation completed, %d strings were updated.",
+            self.updated,
+        )
+        try:
+            return message % self.updated
+        except TypeError:
+            return message
+
+    def get_task_meta(self) -> dict[str, Any]:
+        """Return a metadata dictionary for Celery task progress tracking."""
+        raise NotImplementedError
+
+    def get_errors(self) -> list[str]:
+        return self.errors
+
+    def get_error_details(self) -> list[TaskLogEntry]:
+        return self.error_details
+
+    def add_warning(
+        self,
+        warning: str,
+        *,
+        public_message: str | None = None,
+        component_ids: Sequence[int] = (),
+    ) -> None:
+        if warning not in self.warnings:
+            self.warnings.append(warning)
+            self.warning_details.append(
+                {
+                    "message": warning,
+                    "public_message": public_message
+                    if public_message is not None
+                    else warning,
+                    "component_ids": sorted(set(component_ids)),
+                }
+            )
+        else:
+            detail = self.warning_details[self.warnings.index(warning)]
+            detail["component_ids"] = sorted(
+                set(detail["component_ids"]) | set(component_ids)
+            )
+
+    def get_warning_details(self) -> list[WarningDetail]:
+        return self.warning_details
+
+    def get_warnings(self) -> list[str]:
+        return self.warnings
+
+    def set_progress(self, current: int) -> None:
+        if current_task and current_task.request.id and self.progress_steps:
+            steps = self.progress_steps
+            meta = self.get_task_meta()
+            continuation = translation_continuation.get()
+            if continuation is not None and isinstance(self, AutoTranslate):
+                # Map provider progress into the parent batch, reserving the
+                # last step for committed writes and finalization.
+                current = len(continuation.completed) * steps + min(current, steps - 1)
+                steps *= len(continuation.payload["targets"])
+                meta = continuation.task_meta
+            current_task.update_state(
+                state="PROGRESS",
+                meta=meta | {"progress": 100 * current // steps},
+            )
+
+
+class AutoTranslate(BaseAutoTranslate):
+    def add_error(self, message: str) -> None:
+        entry = make_task_log_entry(
+            self.translation.component,
+            message,
+            suffix=f"/{self.translation.language_code}",
+            sensitive=True,
+        )
+        self.errors.append(entry["message"])
+        self.error_details.append(entry)
+
+    def __init__(
+        self,
+        *,
+        translation: Translation,
+        user: User | None,
+        q: str,
+        mode: str,
+        component_wide: bool = False,
+        unit_ids: list[int] | None = None,
+        allow_non_shared_tm_source_components: bool = False,
+        enforce_permissions: bool = True,
+    ) -> None:
+        super().__init__(
+            user=user,
+            q=q,
+            mode=mode,
+            component_wide=component_wide,
+            unit_ids=unit_ids,
+            allow_non_shared_tm_source_components=(
+                allow_non_shared_tm_source_components
+            ),
+        )
+        self.translation: Translation = translation
+        self.enforce_permissions = enforce_permissions
+        translation.component.start_batched_checks()
+        self.progress_base = 0
+        self.mt_source_hashes: dict[int, int] = {}
+        self.target_state = STATE_TRANSLATED
+        if self.mode == "fuzzy":
+            self.target_state = STATE_FUZZY
+        elif self.mode == "approved" and translation.enable_review:
+            self.target_state = STATE_APPROVED
 
     def get_units(self):
         units = self.translation.unit_set.exclude(state=STATE_READONLY)
+        if self.unit_ids is not None:
+            units = units.filter(pk__in=self.unit_ids)
         if self.mode == "suggest":
             units = units.filter(suggestion__isnull=True)
-        return units.search(self.q, parser="unit")
+        return units.search(
+            self.q,
+            parser="unit",
+            project=self.translation.component.project,
+            user=self.user,
+            enforce_contributor_permissions=self.enforce_permissions,
+        )
 
-    def set_progress(self, current) -> None:
-        if current_task and current_task.request.id and self.progress_steps:
-            current_task.update_state(
-                state="PROGRESS",
-                meta={
-                    "progress": 100 * current // self.progress_steps,
-                    "translation": self.translation.pk,
-                },
-            )
+    def get_task_meta(self) -> dict[str, Any]:
+        return {"translation": self.translation.pk}
 
     def update(
         self, unit: Unit, state: StringState, target: list[str], user=None
     ) -> None:
+        ensure_translation_session()
         if isinstance(target, str):
             target = [target]
         max_length = unit.get_max_length()
         if self.mode == "suggest" or any(len(item) > max_length for item in target):
-            suggestion = Suggestion.objects.add(
-                unit, target, request=None, vote=False, user=user, raise_exception=False
+            _, result = Suggestion.objects.add(
+                unit,
+                target,
+                request=None,
+                vote=False,
+                user=user or self.user,
+                raise_exception=False,
             )
-            if suggestion:
+            if result == SuggestionAddResult.CREATED:
                 self.updated += 1
+                self.affected_unit_ids.add(unit.pk)
+                self.affected_source_unit_ids.add(unit.source_unit_id or unit.pk)
         else:
+            if self.enforce_permissions and self.user is not None:
+                if not self.user.has_perm("unit.edit", unit):
+                    return
+                if state == STATE_APPROVED and not self.user.has_perm(
+                    "unit.review", unit
+                ):
+                    return
+            # Ensure deferred changes accumulate on the right Translation instance
+            unit.translation = self.translation
             unit.is_batch_update = True
-            unit.translate(
+            saved = unit.translate(
                 user or self.user,
                 target,
                 state,
                 change_action=ActionEvents.AUTO,
                 propagate=False,
+                select_for_update=False,
             )
             self.updated += 1
+            if saved:
+                self.affected_unit_ids.add(unit.pk)
+                self.affected_source_unit_ids.add(unit.source_unit_id or unit.pk)
 
     def post_process(self) -> None:
+        ensure_translation_session()
         if self.updated > 0:
             self.translation.log_info("finalizing automatic translation")
+            self.translation.store_update_changes()
             if not self.component_wide:
-                self.translation.component.update_source_checks()
                 self.translation.component.run_batched_checks()
             self.translation.invalidate_cache()
             if self.user:
                 self.user.profile.increase_count("translated", self.updated)
 
-    @transaction.atomic
-    def process_others(self, source: int | None) -> None:
-        """Perform automatic translation based on other components."""
-        kwargs = {
-            "translation__plural": self.translation.plural,
-            "state__gte": STATE_TRANSLATED,
+    def collect_other_translations(
+        self,
+        filtered_sources,
+        component_ids: list[int],
+        *,
+        source_field: str = "source",
+    ) -> tuple[dict[tuple[str, str], list[str]], dict[str, list[str]]]:
+        """Collect context matches and source fallbacks preserving source priority."""
+        translations: dict[str, list[str]] = {}
+        context_translations: dict[tuple[str, str], list[str]] = {}
+        translation_priority: dict[str, int] = {}
+        context_priority: dict[tuple[str, str], int] = {}
+        component_priority = {
+            component_id: index for index, component_id in enumerate(component_ids)
         }
-        source_language = self.translation.component.source_language
-        exclude = {}
-        if source:
-            component = Component.objects.get(id=source)
+        mismatched_translation_ids: set[int] = set()
+        target_plural_id = self.translation.plural_id
 
-            if (
-                not component.project.contribute_shared_tm
-                and component.project != self.translation.component.project
-            ):
-                msg = "Project has disabled contribution to shared translation memory."
-                raise PermissionDenied(msg)
-            if component.source_language != source_language:
-                msg = "Component have different source languages."
-                raise PermissionDenied(msg)
-            kwargs["translation__component"] = component
+        if component_ids:
+            filtered_sources = filtered_sources.annotate(
+                component_priority=Case(
+                    *[
+                        When(translation__component_id=component_id, then=priority)
+                        for component_id, priority in component_priority.items()
+                    ],
+                    output_field=IntegerField(),
+                )
+            ).order_by("component_priority", "translation_id", "pk")
         else:
-            project = self.translation.component.project
-            kwargs["translation__component__project"] = project
-            kwargs["translation__component__source_language"] = source_language
-            exclude["translation"] = self.translation
-        sources = Unit.objects.filter(**kwargs)
+            filtered_sources = filtered_sources.order_by("translation_id", "pk")
+
+        source_units = filtered_sources.values_list(
+            "translation__component_id",
+            source_field,
+            "context",
+            "target",
+            "translation_id",
+            "translation__plural_id",
+        )
+        for (
+            component_id,
+            source,
+            context,
+            target,
+            translation_id,
+            plural_id,
+        ) in source_units:
+            if plural_id != target_plural_id and (
+                is_plural(source) or is_plural(target)
+            ):
+                mismatched_translation_ids.add(translation_id)
+                continue
+            priority = component_priority.get(component_id, 0)
+            context_key = (source, context)
+            target_plurals = split_plural(target)
+            if priority < translation_priority.get(source, len(component_ids) + 1):
+                translations[source] = target_plurals
+                translation_priority[source] = priority
+            if priority < context_priority.get(context_key, len(component_ids) + 1):
+                context_translations[context_key] = target_plurals
+                context_priority[context_key] = priority
+
+        mismatched_components = (
+            Component.objects.filter(translation__in=mismatched_translation_ids)
+            .defer_huge()
+            .prefetch()
+            .distinct()
+            .order_project()
+        )
+        for component in mismatched_components:
+            self.add_warning(
+                gettext(
+                    "Plural forms in %(component)s do not match the target translation. "
+                    "Automatic translation skipped pluralized strings and processed only single-form strings."
+                )
+                % {"component": component},
+                public_message=gettext(
+                    "Plural forms in some source components do not match the target translation. "
+                    "Automatic translation skipped pluralized strings and processed only single-form strings."
+                ),
+                component_ids=[component.pk],
+            )
+
+        return context_translations, translations
+
+    @transaction.atomic
+    @source_operation_method
+    def process_others(self, source_component_ids: list[int] | None) -> None:
+        """Perform automatic translation based on other components."""
+        sources = Unit.objects.filter(
+            translation__language=self.translation.language,
+            state__gte=STATE_TRANSLATED,
+        )
+        components = Component.objects.all()
+        if self.enforce_permissions and self.user is not None:
+            sources = sources.filter_access(self.user)
+            components = components.filter_access(self.user)
+        # Read-only units can have STATE_READONLY even when their target is
+        # empty, so state__gte=STATE_TRANSLATED is not enough to find usable
+        # translations. The lower-MD5 lookup matches the trans_unit_target_md5
+        # index and keeps this exclusion cheap on large components.
+        sources = sources.exclude(target__lower__md5=MD5(Value("")))
+        project = self.translation.component.project
+        custom_sources = bool(project.translation_parent_language_ids)
+        if custom_sources:
+            target_units = self.get_units().annotate(
+                reuse_source=Unit.objects.effective_source_expression(),
+                reuse_language=Unit.objects.effective_source_language_expression(),
+            )
+            source_language_ids = set(
+                target_units.values_list("reuse_language", flat=True)
+            )
+            if not source_language_ids:
+                source_language_ids.add(self.translation.effective_source_language.pk)
+        else:
+            language_id = self.translation.component.source_language_id
+            target_units = self.get_units().annotate(
+                reuse_source=F("source"), reuse_language=Value(language_id)
+            )
+            source_language_ids = {language_id}
+        donor_custom_sources = custom_sources
+        component_ids = list(dict.fromkeys(source_component_ids or []))
+        if component_ids:
+            source_components = list(components.filter(id__in=component_ids))
+            component_map = {component.id: component for component in source_components}
+            if len(component_map) != len(component_ids):
+                msg = "Component not found."
+                raise Component.DoesNotExist(msg)
+
+            other_project_ids = {
+                component.project_id
+                for component in source_components
+                if component.project_id != project.pk
+            }
+            if not donor_custom_sources and other_project_ids:
+                donor_custom_sources = WorkflowSetting.objects.filter(
+                    project_id__in=other_project_ids,
+                    source_language__isnull=False,
+                ).exists()
+
+            for component_id in component_ids:
+                component = component_map[component_id]
+                if not self.allow_non_shared_tm_source_components and (
+                    not component.project.contribute_shared_tm
+                    and component.project != self.translation.component.project
+                ):
+                    msg = "Project has disabled contribution to shared translation memory."
+                    raise PermissionDenied(msg)
+                if component.source_language_id not in source_language_ids and not (
+                    donor_custom_sources
+                    and Unit.objects.filter(
+                        translation__component=component,
+                        translation__language=self.translation.language,
+                        translation_parent__translation__language_id__in=source_language_ids,
+                    ).exists()
+                ):
+                    msg = "Component have different source languages."
+                    raise PermissionDenied(msg)
+            sources = sources.filter(translation__component_id__in=component_ids)
+        else:
+            sources = sources.filter(
+                translation__component__project=project,
+            ).exclude(translation=self.translation)
+
+        sources = sources.exclude_blocked(custom_sources=donor_custom_sources)
 
         # Use memory_db for the query in case it exists. This is supposed
         # to be a read-only replica for offloading expensive translation
@@ -145,32 +539,82 @@ class AutoTranslate:
         if "memory_db" in settings.DATABASES:
             sources = sources.using("memory_db")
 
-        if exclude:
-            sources = sources.exclude(**exclude)
+        for language_id in source_language_ids:
+            self.process_others_language(
+                sources,
+                target_units.filter(reuse_language=language_id),
+                component_ids,
+                language_id,
+                custom_sources=donor_custom_sources,
+            )
+        self.post_process()
 
-        # Get source MD5s
+    def process_others_language(
+        self,
+        sources,
+        target_units,
+        component_ids: list[int],
+        language_id: int,
+        *,
+        custom_sources: bool,
+    ) -> None:
+        """Reuse translations whose effective source text and language match."""
         source_md5s = list(
-            self.get_units()
-            .annotate(source__lower__md5=MD5(Lower("source")))
-            .values_list("source__lower__md5", flat=True)
+            target_units.annotate(reuse_md5=MD5(Lower("reuse_source"))).values_list(
+                "reuse_md5", flat=True
+            )
+        )
+        if custom_sources:
+            # Keep the indexed canonical-source and parent-target lookups separate.
+            filtered_sources = sources.filter(
+                Q(
+                    translation_parent__isnull=True,
+                    translation__component__source_language_id=language_id,
+                    source__lower__md5__in=source_md5s,
+                )
+                | Q(
+                    translation_parent__translation__language_id=language_id,
+                    translation_parent__target__lower__md5__in=source_md5s,
+                )
+            ).annotate(reuse_source=Unit.objects.effective_source_expression())
+        else:
+            filtered_sources = sources.filter(
+                translation__component__source_language_id=language_id,
+                source__lower__md5__in=source_md5s,
+            ).annotate(reuse_source=F("source"))
+        if custom_sources:
+            target_units = target_units.with_effective_source()
+            filtered_sources = filtered_sources.with_effective_source().filter(
+                details__translation_parent__missing__isnull=True,
+            )
+            fields = (
+                "check_source_number",
+                "check_source_formula",
+                "check_source_type",
+            )
+            for rules in target_units.order_by().values_list(*fields).distinct():
+                matching_rules = dict(zip(fields, rules, strict=True))
+                self.reuse_other_translations(
+                    filtered_sources.filter(**matching_rules),
+                    target_units.filter(**matching_rules),
+                    component_ids,
+                )
+        else:
+            self.reuse_other_translations(filtered_sources, target_units, component_ids)
+
+    def reuse_other_translations(
+        self, filtered_sources, target_units, component_ids
+    ) -> None:
+        """Apply translations after matching effective source language and plural rules."""
+        context_translations, translations = self.collect_other_translations(
+            filtered_sources, component_ids, source_field="reuse_source"
         )
 
-        # Fetch available translations
-        translations = {
-            source: split_plural(target)
-            for source, target in sources.filter(
-                source__lower__md5__in=source_md5s
-            ).values_list("source", "target")
-        }
-
-        # Fetch translated unit IDs
-        # Cannot use get_units() directly as SELECT FOR UPDATE cannot be used with JOIN
+        # Resolve IDs before locking: the effective-source lookup uses nullable joins.
         unit_ids = list(
-            self.get_units()
+            target_units.annotate(reuse_md5=MD5(Lower("reuse_source")))
             .filter(
-                source__lower__md5__in=[
-                    MD5(Lower(Value(translation))) for translation in translations
-                ]
+                reuse_md5__in=[MD5(Lower(Value(source))) for source in translations]
             )
             .values_list("id", flat=True)
         )
@@ -181,39 +625,45 @@ class AutoTranslate:
             .select_for_update()
         )
         self.progress_steps = len(units)
-
         for pos, unit in enumerate(units):
-            # Get update
+            source = unit.effective_source
             try:
-                target = translations[unit.source]
+                target = context_translations.get(
+                    (source, unit.context), translations[source]
+                )
             except KeyError:
-                # Happens due to case-insensitive lookup
+                # The indexed lookup is case-insensitive; require an exact match.
                 continue
-
             self.set_progress(pos)
-
-            # No save if translation is same or unit does not exist
             if unit.state == self.target_state and unit.target == target:
                 continue
-            # Copy translation
             self.update(unit, self.target_state, target)
-
-        self.post_process()
 
     def fetch_mt(
         self, engines_list: list[str], threshold: int
     ) -> dict[int, UnitMemoryResultDict]:
         """Get the translations."""
-        units: list[Unit] = list(self.get_units().select_related("source_unit"))
+        queryset = self.get_units()
+        if self.translation.component.project.translation_parent_language_ids:
+            queryset = queryset.prefetch_source()
+        else:
+            queryset = queryset.select_related("source_unit")
+        units: list[Unit] = list(queryset)
+        self.mt_source_hashes = {unit.pk: unit.edit_content_hash for unit in units}
         num_units = len(units)
 
-        machinery_settings = self.translation.component.project.get_machinery_settings()
+        try:
+            machinery_settings = selected_machinery_settings(
+                self.translation.component.project, engines_list
+            )
+        except MachineryAmbiguousError as error:
+            raise MachineTranslationError(str(error)) from error
 
         engines: list[BatchMachineTranslation] = sorted(
             (
-                MACHINERY[engine](setting)
+                MACHINERY[engine.partition(":")[0]](setting)
                 for engine, setting in machinery_settings.items()
-                if engine in MACHINERY and engine in engines_list
+                if engine.partition(":")[0] in MACHINERY
             ),
             key=lambda engine: engine.get_rank(),
             reverse=True,
@@ -223,44 +673,27 @@ class AutoTranslate:
         # Estimate number of strings to translate, this is adjusted in process_mt
         self.progress_steps = self.progress_base + num_units
 
-        for pos, translation_service in enumerate(engines):
-            batch_size = translation_service.batch_size
-            self.translation.log_info(
-                "fetching translations for %d units from %s, %d per request",
-                num_units,
-                translation_service.name,
-                batch_size,
-            )
-
-            for batch_start in range(0, num_units, batch_size):
-                self.set_progress(pos * num_units + batch_start)
-                try:
-                    translation_service.batch_translate(
-                        units[batch_start : batch_start + batch_size],
-                        self.user,
-                        threshold=threshold,
-                    )
-                except MachineTranslationError as error:
-                    # Ignore errors here to complete fetching
-                    self.translation.log_error(
-                        "failed automatic translation: %s", error
-                    )
-
+        translations = fetch_machinery_matches(
+            units=units,
+            user=self.user,
+            services=engines,
+            threshold=threshold,
+            set_progress=self.set_progress,
+            log_translation=self.translation,
+            on_error=self.add_error,
+        )
         self.set_progress(self.progress_base)
-        return {
-            unit.id: unit.machinery
-            for unit in units
-            if unit.machinery and any(unit.machinery["quality"])
-        }
+        return translations
 
     def process_mt(self, engines: list[str], threshold: int) -> None:
         """Perform automatic translation based on machine translation."""
         translations = self.fetch_mt(engines, int(threshold))
+        ensure_translation_session()
 
         # Adjust total number to show correct progress
         self.progress_steps = self.progress_base + len(translations)
 
-        with transaction.atomic():
+        with transaction.atomic(), source_operation(self.translation.component):
             # Perform the translation
             self.translation.log_info("updating %d strings", len(translations))
             for pos, unit in enumerate(
@@ -269,6 +702,13 @@ class AutoTranslate:
                 .select_for_update()
             ):
                 translation: UnitMemoryResultDict = translations[unit.pk]
+                if (
+                    unit.state == STATE_READONLY
+                    or unit.edit_content_hash != self.mt_source_hashes[unit.pk]
+                ):
+                    # A provider response must still belong to the source the
+                    # translator will see after this operation commits.
+                    continue
                 # Use first existing origin for user
                 # (there can be blanks for missing plurals)
                 user: User | None = None
@@ -293,34 +733,404 @@ class AutoTranslate:
         auto_source: Literal["mt", "others"],
         engines: list[str],
         threshold: int,
-        source: int | None,
+        source_component_ids: list[int] | None,
+    ) -> str:
+        self.busy = False
+        try:
+            with translation_guard(self.translation.pk):
+                return self._perform(
+                    auto_source=auto_source,
+                    engines=engines,
+                    threshold=threshold,
+                    source_component_ids=source_component_ids,
+                )
+        except AutomaticTranslationBusyError as error:
+            continuation = translation_continuation.get()
+            if continuation is not None and continuation.defer:
+                raise
+            if isinstance(error, AutomaticTranslationSessionLostError):
+                message = gettext(
+                    "Automatic translation lost its database connection. "
+                    "Please try again later."
+                )
+            else:
+                message = gettext(
+                    "Automatic translation is already running for this translation. "
+                    "Please try again later."
+                )
+            self.failure_message = message
+            self.busy = True
+            self.add_error(message)
+            return message
+
+    def _perform(
+        self,
+        *,
+        auto_source: Literal["mt", "others"],
+        engines: list[str],
+        threshold: int,
+        source_component_ids: list[int] | None,
     ) -> str:
         translation = self.translation
+        self.failure_message = None
+        self.errors.clear()
+        self.error_details.clear()
         translation.log_info(
             "starting automatic translation (%s) %s: %s: %s",
             self.mode,
             current_task.request.id if current_task and current_task.request.id else "",
             auto_source,
-            ", ".join(engines) if engines else source,
+            ", ".join(engines)
+            if engines
+            else ", ".join(str(item) for item in source_component_ids or []),
         )
         try:
             if auto_source == "mt":
                 self.process_mt(engines, threshold)
             else:
-                self.process_others(source)
+                self.process_others(source_component_ids)
         except (MachineTranslationError, Component.DoesNotExist) as error:
             translation.log_error("failed automatic translation: %s", error)
-            return gettext("Automatic translation failed: %s") % error
+            self.add_error(str(error))
+            self.failure_message = gettext("Automatic translation failed: %s") % error
+            return self.failure_message
 
         translation.log_info("completed automatic translation")
 
-        if self.updated == 0:
-            return gettext("Automatic translation completed, no strings were updated.")
-        return (
-            ngettext(
-                "Automatic translation completed, %d string was updated.",
-                "Automatic translation completed, %d strings were updated.",
-                self.updated,
-            )
-            % self.updated
+        return self.get_message()
+
+
+class BatchAutoTranslate(BaseAutoTranslate):
+    translations: QuerySet[Translation] | Sequence[Translation]
+
+    def __init__(
+        self,
+        obj: Translation | Component | Category | ProjectLanguage | Workspace,
+        *,
+        user: User | None,
+        q: str,
+        mode: str,
+        component_wide: bool = False,
+        unit_ids: list[int] | None = None,
+        allow_non_shared_tm_source_components: bool = False,
+        enforce_permissions: bool = True,
+    ) -> None:
+        super().__init__(
+            user=user,
+            q=q,
+            mode=mode,
+            component_wide=component_wide,
+            unit_ids=unit_ids,
+            allow_non_shared_tm_source_components=(
+                allow_non_shared_tm_source_components
+            ),
         )
+        self._task_meta: dict[str, Any] = {}
+        self.workspace_source_component_ids: dict[int, list[int]] | None = None
+        self.enforce_permissions = enforce_permissions
+
+        match obj:
+            case Translation():
+                self.translations = [obj]
+                self._task_meta = {"translation": obj.pk}
+            case Component():
+                self.translations = obj.translation_set.select_related(
+                    "language"
+                ).exclude_source()
+                self._task_meta = {"component": obj.pk}
+            case Category():
+                self.translations = (
+                    Translation.objects.filter(component__category=obj)
+                    .select_related("language", "component", "component__project")
+                    .exclude_source()
+                )
+                self._task_meta = {"category": obj.pk}
+            case ProjectLanguage():
+                self.translations = list(
+                    obj.action_translation_set.select_related("language")
+                    .exclude_source()
+                    .prefetch()
+                )
+                self._task_meta = {
+                    "project": obj.project.pk,
+                    "language": obj.language.pk,
+                }
+            case Workspace():
+                components = Component.objects.filter(project__workspace=obj)
+                if user is not None:
+                    components = components.filter_access(user)
+                self.translations = (
+                    Translation.objects.filter(component__in=components)
+                    .select_related("language", "component", "component__project")
+                    .exclude_source()
+                )
+                source_component_ids: dict[int, list[int]] = {}
+                for source_language_id, component_id in components.filter(
+                    source_language_id__isnull=False
+                ).values_list("source_language_id", "pk"):
+                    source_component_ids.setdefault(source_language_id, []).append(
+                        component_id
+                    )
+                self.workspace_source_component_ids = source_component_ids
+                self.allow_non_shared_tm_source_components = True
+                self._task_meta = {"workspace": str(obj.pk)}
+            case _:  # pragma: no cover
+                msg = "Unsupported object type for BatchAutoTranslate"
+                raise ValueError(msg)
+        self._preload_workflow_settings()
+        self.progress_steps = len(self.translations)
+
+    def _preload_workflow_settings(self) -> None:
+        self.translations = list(self.translations)
+        projects: dict[int, Project] = {}
+        project_languages: dict[int, dict[int, ProjectLanguage]] = {}
+
+        for translation in self.translations:
+            project = translation.component.project
+            project = projects.setdefault(project.pk, project)
+            languages = project_languages.setdefault(project.pk, {})
+            if translation.language_id not in languages:
+                languages[translation.language_id] = ProjectLanguage(
+                    project, translation.language
+                )
+
+        for project_id, languages in project_languages.items():
+            projects[project_id].project_languages.preload_workflow_settings(
+                languages.values()
+            )
+
+        for translation in self.translations:
+            translation.__dict__["workflow_settings"] = project_languages[
+                translation.component.project_id
+            ][translation.language_id].workflow_settings
+
+    def get_task_meta(self) -> dict[str, Any]:
+        return self._task_meta
+
+    def _can_process_translation(self, translation: Translation) -> bool:
+        return not self.enforce_permissions or bool(
+            check_auto_translate_permission(self.user, translation, self.mode)
+        )
+
+    def _get_workspace_effective_sources(
+        self, selected_ids: list[int] | None
+    ) -> dict[tuple[int, int], list[int]] | None:
+        """Match workspace donors by target language and actual effective sources."""
+        if self.workspace_source_component_ids is None:
+            return None
+        workspace_ids = {
+            component_id
+            for ids in self.workspace_source_component_ids.values()
+            for component_id in ids
+        }
+        donor_ids = sorted(workspace_ids) if selected_ids is None else selected_ids
+        component_ids = workspace_ids | set(donor_ids)
+        if not WorkflowSetting.objects.filter(
+            project__component__pk__in=component_ids,
+            source_language__isnull=False,
+        ).exists():
+            return None
+
+        donors: dict[tuple[int, int], list[int]] = {}
+        for target_language, source_language, component_id in (
+            Unit.objects.filter(translation__component_id__in=donor_ids)
+            .exclude_blocked()
+            .with_effective_source()
+            .values_list(
+                "translation__language_id",
+                "check_source_language",
+                "translation__component_id",
+            )
+            .distinct()
+        ):
+            donors.setdefault((target_language, source_language), []).append(
+                component_id
+            )
+        return donors
+
+    def _workspace_sources(
+        self,
+        auto_translate: AutoTranslate,
+        source_component_ids: list[int] | None,
+        workspace_effective_sources: dict[tuple[int, int], list[int]] | None,
+        selected_workspace_source_component_ids: dict[int, list[int]] | None,
+    ) -> list[int] | None:
+        translation = auto_translate.translation
+        source_language_id = translation.component.source_language_id
+        if workspace_effective_sources is not None:
+            source_languages = set(
+                auto_translate.get_units()
+                .with_effective_source()
+                .values_list("check_source_language", flat=True)
+                .distinct()
+            ) or {translation.effective_source_language.pk}
+            effective_source_component_ids = list(
+                dict.fromkeys(
+                    component_id
+                    for language_id in source_languages
+                    for component_id in workspace_effective_sources.get(
+                        (translation.language_id, language_id), []
+                    )
+                )
+            )
+            if not effective_source_component_ids and source_component_ids is not None:
+                self.add_warning(
+                    gettext(
+                        "Automatic translation skipped some translations because "
+                        "selected source components use a different source language."
+                    )
+                )
+        elif selected_workspace_source_component_ids is None:
+            effective_source_component_ids = (
+                []
+                if source_language_id is None
+                else (self.workspace_source_component_ids or {}).get(
+                    source_language_id, []
+                )
+            )
+        elif source_language_id is None:
+            self.add_warning(
+                gettext(
+                    "Automatic translation skipped some translations because "
+                    "selected source components use a different source language."
+                )
+            )
+            return None
+        else:
+            effective_source_component_ids = (
+                selected_workspace_source_component_ids.get(source_language_id, [])
+            )
+            if not effective_source_component_ids:
+                self.add_warning(
+                    gettext(
+                        "Automatic translation skipped some translations because "
+                        "selected source components use a different source language."
+                    )
+                )
+                return None
+
+        effective_source_component_ids = [
+            component_id
+            for component_id in effective_source_component_ids
+            if component_id != translation.component_id
+        ]
+        if not effective_source_component_ids:
+            if source_component_ids is not None:
+                return None
+            self.add_warning(
+                gettext(
+                    "Automatic translation skipped some translations because "
+                    "no other source components were available."
+                )
+            )
+            return None
+        return effective_source_component_ids
+
+    def _complete_translation(self, translation_id: int, position: int) -> None:
+        continuation = translation_continuation.get()
+        if continuation is not None:
+            continuation.checkpoint(self, translation_id)
+            position = len(continuation.completed)
+        self.set_progress(position)
+
+    def perform(
+        self,
+        *,
+        auto_source: Literal["mt", "others"],
+        engines: list[str],
+        threshold: int,
+        source_component_ids: list[int] | None,
+    ) -> str:
+        selected_workspace_source_component_ids: dict[int, list[int]] | None = None
+        self.failure_message = None
+        self.errors.clear()
+        self.error_details.clear()
+        continuation = translation_continuation.get()
+        if continuation is not None:
+            continuation.restore(self)
+            self.set_progress(len(continuation.completed))
+        deferred: list[int] = []
+        workspace_effective_sources = (
+            self._get_workspace_effective_sources(source_component_ids)
+            if auto_source == "others"
+            else None
+        )
+        if (
+            auto_source == "others"
+            and workspace_effective_sources is None
+            and source_component_ids is not None
+            and self.workspace_source_component_ids is not None
+        ):
+            selected_workspace_source_component_ids = {}
+            for selected_source_language_id, component_id in Component.objects.filter(
+                pk__in=source_component_ids, source_language_id__isnull=False
+            ).values_list("source_language_id", "pk"):
+                if selected_source_language_id is not None:
+                    selected_workspace_source_component_ids.setdefault(
+                        selected_source_language_id, []
+                    ).append(component_id)
+
+        for pos, translation in enumerate(self.translations, start=1):
+            if not self._can_process_translation(translation):
+                self._complete_translation(translation.pk, pos)
+                continue
+
+            auto_translate = AutoTranslate(
+                user=self.user,
+                translation=translation,
+                q=self.q,
+                mode=self.mode,
+                component_wide=self.component_wide,
+                unit_ids=self.unit_ids,
+                allow_non_shared_tm_source_components=(
+                    self.allow_non_shared_tm_source_components
+                ),
+                enforce_permissions=self.enforce_permissions,
+            )
+
+            effective_source_component_ids = source_component_ids
+            if (
+                auto_source == "others"
+                and self.workspace_source_component_ids is not None
+            ):
+                effective_source_component_ids = self._workspace_sources(
+                    auto_translate,
+                    source_component_ids,
+                    workspace_effective_sources,
+                    selected_workspace_source_component_ids,
+                )
+                if effective_source_component_ids is None:
+                    self._complete_translation(translation.pk, pos)
+                    continue
+
+            try:
+                auto_translate.perform(
+                    auto_source=auto_source,
+                    engines=engines,
+                    threshold=threshold,
+                    source_component_ids=effective_source_component_ids,
+                )
+            except AutomaticTranslationBusyError:
+                deferred.append(translation.pk)
+                continue
+            self.updated += auto_translate.updated
+            self.busy |= auto_translate.busy
+            self.errors.extend(auto_translate.get_errors())
+            self.error_details.extend(auto_translate.get_error_details())
+            self.affected_unit_ids.update(auto_translate.affected_unit_ids)
+            self.affected_source_unit_ids.update(
+                auto_translate.affected_source_unit_ids
+            )
+            if auto_translate.failure_message and self.failure_message is None:
+                self.failure_message = auto_translate.failure_message
+            for warning in auto_translate.get_warning_details():
+                self.add_warning(
+                    warning["message"],
+                    public_message=warning["public_message"],
+                    component_ids=warning["component_ids"],
+                )
+            self._complete_translation(translation.pk, pos)
+
+        if deferred:
+            raise AutomaticTranslationBusyError(deferred[0])
+        return self.get_message()

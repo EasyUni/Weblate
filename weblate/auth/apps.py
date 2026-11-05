@@ -12,9 +12,11 @@ class AuthConfig(AppConfig):
     verbose_name = "Authentication"
 
     def ready(self) -> None:
-        from weblate.auth.models import sync_create_groups
+        # ruff: ignore[import-outside-top-level]
+        from weblate.auth.models import sync_create_groups, sync_internal_bot_emails
 
         post_migrate.connect(sync_create_groups, sender=self)
+        post_migrate.connect(sync_internal_bot_emails, sender=self)
 
         # Disconnect Django permissions as these are not used
         post_migrate.disconnect(

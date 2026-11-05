@@ -1,9 +1,18 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
-from .base import DownloadTranslations, ResponseStatusMachineTranslation
+from typing import TYPE_CHECKING
+
+from .base import MACHINERY_DEFAULT_THRESHOLD, ResponseStatusMachineTranslation
 from .forms import MyMemoryMachineryForm
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import DownloadTranslations
 
 
 class MyMemoryTranslation(ResponseStatusMachineTranslation):
@@ -26,7 +35,7 @@ class MyMemoryTranslation(ResponseStatusMachineTranslation):
         )
 
     @staticmethod
-    def lang_supported(language):
+    def lang_supported(language) -> bool:
         """Almost any language without modifiers is supported."""
         if language in {"ia", "tt", "ug"}:
             return False
@@ -51,12 +60,12 @@ class MyMemoryTranslation(ResponseStatusMachineTranslation):
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from MyMemory."""
         args = {

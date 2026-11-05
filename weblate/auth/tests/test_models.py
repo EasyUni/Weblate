@@ -2,16 +2,420 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from __future__ import annotations
+
+from secrets import token_hex
+from typing import TYPE_CHECKING, Never, cast
+from unittest.mock import patch
+
+from django.conf import settings
 from django.contrib.auth.models import Group as DjangoGroup
+from django.core.exceptions import ValidationError
+from django.test import RequestFactory, TestCase
+from django.test.utils import override_settings
+from django.utils import timezone
 
+from weblate.auth import permissions as auth_permissions
+from weblate.auth.bots import InternalBot
 from weblate.auth.data import SELECTION_ALL, SELECTION_MANUAL
-from weblate.auth.models import Group, Role, User
+from weblate.auth.models import (
+    Group,
+    Invitation,
+    Permission,
+    Role,
+    TeamMembership,
+    User,
+    UserBlock,
+    bot_cache,
+    format_internal_bot_email,
+    get_anonymous,
+    sync_internal_bot_emails,
+)
+from weblate.auth.utils import format_membership_limit_language_codes
 from weblate.lang.models import Language
-from weblate.trans.models import ComponentList, Project
-from weblate.trans.tests.test_views import FixtureTestCase
+from weblate.trans.models import (
+    Category,
+    Component,
+    ComponentLink,
+    ComponentList,
+    Project,
+    Translation,
+)
+from weblate.trans.tests.test_views import FixtureComponentTestCase
+from weblate.utils.stats import CategoryLanguage, ProjectLanguage
+
+if TYPE_CHECKING:
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 
-class ModelTest(FixtureTestCase):
+class SkipWeblateAuthMigrationsRouter:
+    def allow_migrate(self, db, app_label, model_name=None, **hints) -> bool | None:
+        if app_label == "weblate_auth":
+            return False
+        return None
+
+
+class InternalBotEmailTest(TestCase):
+    def setUp(self) -> None:
+        bot_cache.get({}).clear()
+
+    def tearDown(self) -> None:
+        bot_cache.get({}).clear()
+
+    def test_fixed_bot_identities(self) -> None:
+        expected = (
+            (InternalBot.ALERTS, "weblate:alerts", "Automatic alerts"),
+            (InternalBot.BACKUP, "weblate:backup", "Automatic backups"),
+            (InternalBot.COMMIT, "weblate:commit", "Background commit"),
+            (InternalBot.UPDATE, "weblate:update", "Background update"),
+            (InternalBot.PUSH, "weblate:push", "Background push"),
+            (InternalBot.REPOSITORY, "weblate:repository", "Repository maintenance"),
+            (
+                InternalBot.SCREENSHOTS,
+                "weblate:screenshots",
+                "Screenshots from repository",
+            ),
+            (InternalBot.GLOSSARY_SYNC, "glossary:sync", "Glossary sync"),
+        )
+        for bot, username, full_name in expected:
+            with self.subTest(bot=bot):
+                user = bot.get_user()
+                self.assertEqual(user.username, username)
+                self.assertEqual(user.full_name, full_name)
+                self.assertTrue(user.is_bot)
+                self.assertFalse(user.is_active)
+                self.assertFalse(user.has_usable_password())
+                self.assertEqual(bot.get_user().pk, user.pk)
+
+    @override_settings(INTERNAL_BOT_EMAIL_TEMPLATE="{scope}-{name}@example.com")
+    def test_fixed_bot_custom_email_template(self) -> None:
+        for bot in InternalBot:
+            with self.subTest(bot=bot):
+                user = bot.get_user()
+                self.assertEqual(
+                    user.email, f"{user.username.replace(':', '-')}@example.com"
+                )
+
+    def test_get_or_create_bot_default_email(self) -> None:
+        user = User.objects.get_or_create_bot(
+            scope="mt", name="addon", verbose="Machine translation"
+        )
+
+        self.assertTrue(user.is_bot)
+        self.assertFalse(user.is_active)
+        self.assertEqual(user.username, "mt:addon")
+        self.assertEqual(user.email, "noreply-mt-addon@weblate.org")
+        self.assertFalse(user.groups.exists())
+
+    @override_settings(INTERNAL_BOT_EMAIL_TEMPLATE="weblate-{scope}-{name}@example.com")
+    def test_get_or_create_bot_custom_email_template(self) -> None:
+        user = User.objects.get_or_create_bot(
+            scope="mt", name="addon", verbose="Machine translation"
+        )
+
+        self.assertEqual(user.email, "weblate-mt-addon@example.com")
+
+    @override_settings(REGISTRATION_EMAIL_MATCH=r"^.*@example\.com$")
+    def test_get_or_create_bot_ignores_registration_email_filter(self) -> None:
+        user = User.objects.get_or_create_bot(
+            scope="mt", name="addon", verbose="Machine translation"
+        )
+
+        self.assertEqual(user.email, "noreply-mt-addon@weblate.org")
+
+    @override_settings(INTERNAL_BOT_EMAIL_TEMPLATE="weblate-{scope}-{name}@example.com")
+    def test_sync_internal_bot_emails(self) -> None:
+        user = User.objects.create(
+            username="mt:addon",
+            full_name="Machine translation",
+            email="noreply-mt-addon@weblate.org",
+            is_bot=True,
+            is_active=False,
+        )
+
+        sync_internal_bot_emails(None)
+
+        user.refresh_from_db()
+        self.assertEqual(user.email, "weblate-mt-addon@example.com")
+
+    @override_settings(REGISTRATION_EMAIL_MATCH=r"^.*@example\.com$")
+    def test_sync_internal_bot_emails_ignores_registration_email_filter(self) -> None:
+        user = User.objects.create(
+            username="mt:addon",
+            full_name="Machine translation",
+            email="old@example.com",
+            is_bot=True,
+            is_active=False,
+        )
+
+        sync_internal_bot_emails(None)
+
+        user.refresh_from_db()
+        self.assertEqual(user.email, "noreply-mt-addon@weblate.org")
+
+    @override_settings(INTERNAL_BOT_EMAIL_TEMPLATE="weblate-{scope}-{name}@example.com")
+    def test_sync_internal_bot_emails_skips_non_internal_bots(self) -> None:
+        non_bot = User.objects.create_user(
+            username="user:name", email="person@example.com", full_name="Person"
+        )
+        project_bot = User.objects.create(
+            username="bot-project-token",
+            full_name="Project token",
+            email="bot-project-token@bots.noreply.weblate.org",
+            is_bot=True,
+            is_active=False,
+        )
+        malformed_bot = User.objects.create(
+            username="too:many:parts",
+            full_name="Malformed bot",
+            email="malformed@example.com",
+            is_bot=True,
+            is_active=False,
+        )
+
+        sync_internal_bot_emails(None)
+
+        non_bot.refresh_from_db()
+        project_bot.refresh_from_db()
+        malformed_bot.refresh_from_db()
+        self.assertEqual(non_bot.email, "person@example.com")
+        self.assertEqual(
+            project_bot.email, "bot-project-token@bots.noreply.weblate.org"
+        )
+        self.assertEqual(malformed_bot.email, "malformed@example.com")
+
+    @override_settings(INTERNAL_BOT_EMAIL_TEMPLATE="{username}@example.com")
+    def test_format_internal_bot_email_validates_email(self) -> None:
+        with self.assertRaises(ValidationError):
+            format_internal_bot_email("mt", "addon")
+
+    @override_settings(
+        DATABASE_ROUTERS=[
+            "weblate.auth.tests.test_models.SkipWeblateAuthMigrationsRouter"
+        ]
+    )
+    def test_sync_internal_bot_emails_skips_unmigrated_database(self) -> None:
+        with patch.object(User.objects, "filter") as filter_mock:
+            sync_internal_bot_emails(None, using="default")
+
+        filter_mock.assert_not_called()
+
+
+class ModelTest(FixtureComponentTestCase):
+    def test_legacy_duplicate_names_allow_unrelated_updates(self) -> None:
+        teams = Group.objects.bulk_create(
+            [Group(name="Legacy", defining_project=self.project) for _ in range(2)]
+        )
+        for team in teams:
+            team.enforced_2fa = True
+            team.clean()
+            team.save(update_fields=["enforced_2fa"])
+            team.refresh_from_db()
+            self.assertTrue(team.enforced_2fa)
+            self.assertEqual(team.name, "Legacy")
+        with self.assertRaises(ValidationError):
+            Group.objects.create(name="Legacy", defining_project=self.project)
+        other = Group.objects.create(name="Other", defining_project=self.project)
+        other.name = "Legacy"
+        with self.assertRaises(ValidationError):
+            other.save()
+        teams[1].name = "Repaired"
+        teams[1].save()
+
+    def test_project_save_repairs_legacy_duplicate_names(self) -> None:
+        builtin = self.project.defined_groups.get(name="Translate", internal=True)
+        duplicates = Group.objects.bulk_create(
+            [
+                Group(name="Translate", defining_project=self.project),
+                Group(name="Translate", defining_project=self.project, internal=True),
+                Group(name="Translate (2)", defining_project=self.project),
+            ]
+        )
+        duplicate = duplicates[1]
+        duplicate.user_set.add(self.user)
+        duplicate.admins.add(self.user)
+        duplicate.roles.add(Role.objects.get(name="Review strings"))
+        duplicate.enforced_2fa = True
+        duplicate.save(update_fields=["enforced_2fa"])
+        self.project.save()
+        builtin.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertEqual(builtin.name, "Translate")
+        self.assertTrue(builtin.internal)
+        self.assertEqual(duplicate.name, "Translate (3)")
+        self.assertFalse(duplicate.internal)
+        self.assertTrue(duplicate.enforced_2fa)
+        self.assertEqual(list(duplicate.user_set.all()), [self.user])
+        self.assertEqual(list(duplicate.admins.all()), [self.user])
+        self.assertEqual(
+            list(duplicate.roles.values_list("name", flat=True)), ["Review strings"]
+        )
+        duplicates[0].refresh_from_db()
+        self.assertEqual(duplicates[0].name, "Translate (4)")
+        self.assertEqual(
+            self.project.renamed_teams,
+            [("Translate", "Translate (3)"), ("Translate", "Translate (4)")],
+        )
+        self.project.save()
+        self.assertEqual(self.project.renamed_teams, [])
+
+    def test_project_save_prefers_later_builtin_over_custom_duplicate(self) -> None:
+        self.project.defined_groups.filter(name="Translate", internal=True).delete()
+        custom = Group.objects.create(name="Translate", defining_project=self.project)
+        builtin = Group.objects.bulk_create(
+            [Group(name="Translate", defining_project=self.project, internal=True)]
+        )[0]
+        self.project.save()
+        custom.refresh_from_db()
+        builtin.refresh_from_db()
+        self.assertEqual(custom.name, "Translate (2)")
+        self.assertFalse(custom.internal)
+        self.assertEqual(builtin.name, "Translate")
+        self.assertTrue(builtin.internal)
+
+    def test_enabling_reviews_renames_custom_team(self) -> None:
+        self.project.translation_review = False
+        self.project.source_review = False
+        self.project.save()
+        self.project.defined_groups.filter(name="Review", internal=True).delete()
+        custom = Group.objects.create(name="Review", defining_project=self.project)
+        custom.roles.add(Role.objects.get(name="Translate"))
+        custom.user_set.add(self.user)
+        custom.admins.add(self.user)
+        custom.languages.add(Language.objects.get(code="cs"))
+        Group.objects.create(name="Review (2)", defining_project=self.project)
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        custom.refresh_from_db()
+        self.assertEqual(custom.name, "Review (3)")
+        self.assertFalse(custom.internal)
+        self.assertEqual(list(custom.user_set.all()), [self.user])
+        self.assertEqual(list(custom.admins.all()), [self.user])
+        self.assertEqual(
+            list(custom.roles.values_list("name", flat=True)), ["Translate"]
+        )
+        self.assertEqual(list(custom.languages.values_list("code", flat=True)), ["cs"])
+        self.assertTrue(self.project.defined_groups.get(name="Review").internal)
+        self.assertEqual(self.project.renamed_teams, [("Review", "Review (3)")])
+
+    def test_builtin_setup_preserves_changed_selection_settings(self) -> None:
+        team = self.project.defined_groups.get(name="Translate")
+        team.language_selection = SELECTION_MANUAL
+        team.save(update_fields=["language_selection"])
+        self.project.translation_review = not self.project.translation_review
+        self.project.save(update_fields=["translation_review"])
+        team.refresh_from_db()
+        self.assertEqual(team.language_selection, SELECTION_MANUAL)
+        self.assertEqual(
+            self.project.defined_groups.filter(name="Translate").count(), 1
+        )
+
+    def test_builtin_setup_failure_rolls_back_settings_and_rename(self) -> None:
+        self.project.translation_review = False
+        self.project.source_review = False
+        self.project.save()
+        self.project.defined_groups.filter(name="Review", internal=True).delete()
+        custom = Group.objects.create(name="Review", defining_project=self.project)
+        Group.objects.bulk_create(
+            [Group(name="Legacy", defining_project=self.project) for _ in range(2)]
+        )
+        self.project.translation_review = True
+        with (
+            patch.object(Role.objects, "get", side_effect=RuntimeError("missing role")),
+            self.assertRaisesMessage(RuntimeError, "missing role"),
+        ):
+            self.project.save(update_fields=["translation_review"])
+        self.project.refresh_from_db()
+        custom.refresh_from_db()
+        self.assertFalse(self.project.translation_review)
+        self.assertEqual(custom.name, "Review")
+        self.assertFalse(
+            self.project.defined_groups.filter(name="Review", internal=True).exists()
+        )
+        self.assertEqual(self.project.defined_groups.filter(name="Legacy").count(), 2)
+        self.assertFalse(self.project.defined_groups.filter(name="Legacy (2)").exists())
+
+    def check_retry_after_builtin_setup_failure(
+        self, setting: str, value: int | bool, team_name: str
+    ) -> None:
+        self.project.access_control = Project.ACCESS_PUBLIC
+        self.project.translation_review = False
+        self.project.source_review = False
+        self.project.save()
+        self.project.defined_groups.exclude(name="Administration").delete()
+        custom = Group.objects.create(name=team_name, defining_project=self.project)
+        trackers = (
+            self.project.old_access_control,
+            self.project.old_translation_review,
+            self.project.old_source_review,
+        )
+        original = getattr(self.project, setting)
+        change_count = self.project.change_set.count()
+        setattr(self.project, setting, value)
+        with (
+            patch.object(Role.objects, "get", side_effect=RuntimeError("missing role")),
+            self.assertRaisesMessage(RuntimeError, "missing role"),
+        ):
+            self.project.save(update_fields=[setting])
+        self.assertEqual(
+            (
+                self.project.old_access_control,
+                self.project.old_translation_review,
+                self.project.old_source_review,
+            ),
+            trackers,
+        )
+        self.assertEqual(self.project.renamed_teams, [])
+        self.assertEqual(self.project.change_set.count(), change_count)
+        self.assertEqual(getattr(self.project, setting), value)
+        self.assertEqual(
+            getattr(Project.objects.get(pk=self.project.pk), setting), original
+        )
+        custom.refresh_from_db()
+        self.assertEqual(custom.name, team_name)
+
+        # Retry the same instance with the intended setting still in memory.
+        self.project.save(update_fields=[setting])
+        self.assertEqual(
+            getattr(Project.objects.get(pk=self.project.pk), setting), value
+        )
+        builtin = self.project.defined_groups.get(name=team_name, internal=True)
+        self.assertTrue(builtin.roles.exists())
+        custom.refresh_from_db()
+        self.assertEqual(custom.name, f"{team_name} (2)")
+        self.assertEqual(self.project.renamed_teams, [(team_name, f"{team_name} (2)")])
+        self.assertEqual(self.project.change_set.count(), change_count + 1)
+
+    def test_retry_access_control_after_builtin_setup_failure(self) -> None:
+        self.check_retry_after_builtin_setup_failure(
+            "access_control", Project.ACCESS_PRIVATE, "Translate"
+        )
+
+    def test_retry_translation_review_after_builtin_setup_failure(self) -> None:
+        self.check_retry_after_builtin_setup_failure(
+            "translation_review", True, "Review"
+        )
+
+    def test_retry_source_review_after_builtin_setup_failure(self) -> None:
+        self.check_retry_after_builtin_setup_failure("source_review", True, "Review")
+
+    def test_project_team_name_validation(self) -> None:
+        team = Group.objects.create(name="Unique team", defining_project=self.project)
+        with self.assertRaisesMessage(
+            ValidationError, "A team with this name already exists in this project."
+        ):
+            Group.objects.create(name=team.name, defining_project=self.project)
+        other = Group.objects.create(name="Other team", defining_project=self.project)
+        other.name = team.name
+        with self.assertRaises(ValidationError):
+            other.save()
+        team.save()
+        another_project = Project.objects.create(
+            name="Other project", slug="other-project", web="https://example.com/"
+        )
+        Group.objects.create(name=team.name, defining_project=another_project)
+        Group.objects.create(name=team.name)
+
     def setUp(self) -> None:
         super().setUp()
         self.project.access_control = Project.ACCESS_PRIVATE
@@ -21,8 +425,148 @@ class ModelTest(FixtureTestCase):
         self.group.projects.add(self.project)
 
     def test_num_queries(self) -> None:
-        with self.assertNumQueries(8):
-            self.user._fetch_permissions()  # noqa: SLF001
+        with self.assertNumQueries(4):
+            self.assertEqual(len(self.user.component_permissions), 0)
+            self.assertEqual(len(self.user.project_permissions), 2)
+
+    def test_cached_memberships_are_materialized(self) -> None:
+        self.group.projects.remove(self.project)
+        power_user = Role.objects.get(name="Power user")
+        czech = Language.objects.get(code="cs")
+        german = Language.objects.get(code="de")
+        other_component = self.create_link_existing(
+            slug="test-cached", name="Test cached"
+        )
+
+        component_group = Group.objects.create(
+            name="Cached components", language_selection=SELECTION_MANUAL
+        )
+        component_group.roles.add(power_user)
+        component_group.components.add(self.component)
+        component_group.languages.add(czech)
+
+        componentlist = ComponentList.objects.create(
+            name="Cached memberships", slug="cached-memberships"
+        )
+        componentlist.components.add(other_component)
+        componentlist_group = Group.objects.create(
+            name="Cached component lists", language_selection=SELECTION_MANUAL
+        )
+        componentlist_group.roles.add(power_user)
+        componentlist_group.componentlists.add(componentlist)
+        componentlist_group.languages.add(czech)
+
+        project_group = Group.objects.create(
+            name="Cached projects", language_selection=SELECTION_MANUAL
+        )
+        project_group.roles.add(power_user)
+        project_group.projects.add(self.project)
+        project_group.languages.add(czech, german)
+
+        self.user.groups.add(component_group, componentlist_group, project_group)
+        TeamMembership.objects.get(
+            user=self.user, group=project_group
+        ).limit_languages.add(czech)
+        self.user.clear_permissions_cache()
+
+        memberships = self.user.cached_memberships
+
+        self.assertIsInstance(memberships, list)
+        self.assertNotIsInstance(memberships[0], TeamMembership)
+        with self.assertNumQueries(1) as context:
+            self.assertIn(self.component.pk, self.user.component_permissions)
+            self.assertIn(other_component.pk, self.user.component_permissions)
+            self.assertIn(self.project.pk, self.user.project_permissions)
+            self.assertFalse(self.user.group_enforces_2fa())
+        self.assertIn("weblate_auth_userblock", context.captured_queries[0]["sql"])
+
+    def test_anonymous_project_permissions(self) -> None:
+        anonymous = User.objects.get(username=settings.ANONYMOUS_USER_NAME)
+        group = Group.objects.create(
+            name="Anonymous projects",
+            project_selection=SELECTION_ALL,
+            language_selection=SELECTION_ALL,
+        )
+        anonymous.groups.add(group)
+        anonymous.clear_permissions_cache()
+
+        self.assertIn(-SELECTION_ALL, anonymous.project_permissions)
+
+    def test_anonymous_user_is_not_shared(self) -> None:
+        anonymous = get_anonymous()
+        self.assertIsInstance(anonymous.cached_memberships, list)
+        self.assertEqual(anonymous.profile.second_factors, [])
+
+        fresh_anonymous = get_anonymous()
+
+        self.assertIsNot(anonymous, fresh_anonymous)
+        self.assertIsNot(anonymous.profile, fresh_anonymous.profile)
+        self.assertIs(anonymous.profile.user, anonymous)
+        self.assertIs(fresh_anonymous.profile.user, fresh_anonymous)
+        self.assertNotIn("cached_memberships", fresh_anonymous.__dict__)
+        self.assertNotIn("second_factors", fresh_anonymous.profile.__dict__)
+
+    def test_anonymous_user_cache_clear_refreshes_prototype(self) -> None:
+        self.addCleanup(get_anonymous.cache_clear)
+        anonymous = get_anonymous()
+        User.objects.filter(pk=anonymous.pk).update(full_name="Updated anonymous")
+
+        self.assertEqual(get_anonymous().full_name, anonymous.full_name)
+
+        get_anonymous.cache_clear()
+
+        self.assertEqual(get_anonymous().full_name, "Updated anonymous")
+
+    def test_format_membership_limit_language_codes_order(self) -> None:
+        membership = TeamMembership.objects.create(user=self.user, group=self.group)
+        membership.limit_languages.add(Language.objects.get(code="de"))
+        membership.limit_languages.add(Language.objects.get(code="cs"))
+
+        self.assertEqual(format_membership_limit_language_codes(membership), "cs, de")
+
+    def test_num_queries_mixed_group_resolution(self) -> None:
+        self.group.projects.remove(self.project)
+
+        power_user = Role.objects.get(name="Power user")
+        cs = Language.objects.get(code="cs")
+        de = Language.objects.get(code="de")
+        other_component = self.create_link_existing(
+            slug="test-second", name="Test second"
+        )
+
+        component_group = Group.objects.create(
+            name="Components", language_selection=SELECTION_MANUAL
+        )
+        component_group.roles.add(power_user)
+        component_group.components.add(self.component)
+        component_group.languages.add(cs)
+
+        componentlist = ComponentList.objects.create(
+            name="Component list", slug="component-list"
+        )
+        componentlist.components.add(other_component)
+        componentlist_group = Group.objects.create(
+            name="Component lists", language_selection=SELECTION_MANUAL
+        )
+        componentlist_group.roles.add(power_user)
+        componentlist_group.componentlists.add(componentlist)
+        componentlist_group.languages.add(cs)
+
+        project_group = Group.objects.create(
+            name="Projects", language_selection=SELECTION_MANUAL
+        )
+        project_group.roles.add(power_user)
+        project_group.projects.add(self.project)
+        project_group.languages.add(cs, de)
+
+        self.user.groups.add(component_group, componentlist_group, project_group)
+        self.user.clear_permissions_cache()
+
+        with self.assertNumQueries(9):
+            self.assertEqual(len(self.user.component_permissions), 2)
+            self.assertIn(self.component.pk, self.user.component_permissions)
+            self.assertIn(other_component.pk, self.user.component_permissions)
+            self.assertIn(self.project.pk, self.user.project_permissions)
 
     def test_project(self) -> None:
         # No permissions
@@ -30,13 +574,13 @@ class ModelTest(FixtureTestCase):
         self.assertFalse(self.user.has_perm("unit.edit", self.translation))
 
         # Access permission on adding to group
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.user.groups.add(self.group)
         self.assertTrue(self.user.can_access_project(self.project))
         self.assertFalse(self.user.has_perm("unit.edit", self.translation))
 
         # Translate permission on adding role to group
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.group.roles.add(Role.objects.get(name="Power user"))
         self.assertTrue(self.user.can_access_project(self.project))
         self.assertTrue(self.user.has_perm("unit.edit", self.translation))
@@ -53,10 +597,287 @@ class ModelTest(FixtureTestCase):
         self.assertFalse(self.user.has_perm("unit.edit", self.translation))
 
         # Permissions should exist after adding to a component list
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.group.components.add(self.component)
         self.assertTrue(self.user.can_access_project(self.project))
         self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+
+    def test_permission_scope_querysets(self) -> None:
+        download_role = Role.objects.create(name="Download scope")
+        download_role.permissions.add(
+            Permission.objects.get(codename="translation.download")
+        )
+        self.group.roles.add(download_role)
+        self.user.groups.add(self.group)
+        self.user.clear_permissions_cache()
+
+        self.assertTrue(
+            Component.objects.filter_permission_scope(self.user, "translation.download")
+            .filter(pk=self.component.pk)
+            .exists()
+        )
+        self.assertEqual(
+            set(
+                Translation.objects.filter_permission_scope(
+                    self.user, "translation.download"
+                )
+                .filter(component=self.component)
+                .values_list("language__code", flat=True)
+            ),
+            set(
+                self.component.translation_set.values_list("language__code", flat=True)
+            ),
+        )
+
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.assertFalse(
+            Component.objects.filter_permission_scope(self.user, "translation.download")
+            .filter(pk=self.component.pk)
+            .exists()
+        )
+        self.assertFalse(
+            Translation.objects.filter_permission_scope(
+                self.user, "translation.download"
+            )
+            .filter(component=self.component)
+            .exists()
+        )
+
+        czech = Language.objects.get(code="cs")
+        component_group = Group.objects.create(
+            name="Czech component download", language_selection=SELECTION_MANUAL
+        )
+        component_group.roles.add(download_role)
+        component_group.components.add(self.component)
+        component_group.languages.add(czech)
+        self.user.groups.add(component_group)
+        self.user.clear_permissions_cache()
+
+        self.assertTrue(
+            Component.objects.filter_permission_scope(self.user, "translation.download")
+            .filter(pk=self.component.pk)
+            .exists()
+        )
+        self.assertEqual(
+            list(
+                Translation.objects.filter_permission_scope(
+                    self.user, "translation.download"
+                )
+                .filter(component=self.component)
+                .values_list("language__code", flat=True)
+            ),
+            ["cs"],
+        )
+
+        self.project.enforced_2fa = True
+        self.project.save(update_fields=["enforced_2fa"])
+        self.assertFalse(
+            Component.objects.filter_permission_scope(self.user, "translation.download")
+            .filter(pk=self.component.pk)
+            .exists()
+        )
+        self.assertFalse(
+            Translation.objects.filter_permission_scope(
+                self.user, "translation.download"
+            )
+            .filter(component=self.component)
+            .exists()
+        )
+
+    def test_repository_permissions_require_owner(self) -> None:
+        linked = self.create_link_existing(
+            name="Repository permission child",
+            slug="repository-permission-child",
+        )
+        permissions = ("vcs.commit", "vcs.push", "vcs.reset", "vcs.update")
+        role = Role.objects.create(name="Repository permissions")
+        role.permissions.add(*Permission.objects.filter(codename__in=permissions))
+
+        child_group = Group.objects.create(
+            name="Repository child", language_selection=SELECTION_ALL
+        )
+        child_group.components.add(linked)
+        child_group.roles.add(role)
+        self.user.groups.add(child_group)
+        self.user.clear_permissions_cache()
+
+        for permission in permissions:
+            with self.subTest(permission=permission, scope="child-only"):
+                self.assertFalse(self.user.has_perm(permission, linked))
+                self.assertFalse(self.user.has_perm(permission, self.component))
+                self.assertFalse(self.user.has_perm(permission, self.translation))
+        self.assertFalse(self.user.has_perm("meta:vcs.status", linked))
+        self.assertTrue(self.user.has_perm("meta:vcs.maintenance", linked))
+
+        owner_group = Group.objects.create(
+            name="Repository owner", language_selection=SELECTION_ALL
+        )
+        owner_group.components.add(self.component)
+        owner_group.roles.add(role)
+        self.user.groups.remove(child_group)
+        self.user.groups.add(owner_group)
+        self.user.clear_permissions_cache()
+
+        for permission in permissions:
+            with self.subTest(permission=permission, scope="owner-only"):
+                self.assertTrue(self.user.has_perm(permission, linked))
+                self.assertTrue(self.user.has_perm(permission, self.component))
+                self.assertTrue(self.user.has_perm(permission, self.translation))
+        self.assertTrue(self.user.has_perm("meta:vcs.status", linked))
+
+    def test_repository_permission_scope_query_is_cached(self) -> None:
+        linked_components = [
+            self.create_link_existing(
+                name=f"Repository query child {index}",
+                slug=f"repository-query-child-{index}",
+                filemask=f"repository-query-{index}/*.po",
+            )
+            for index in range(10)
+        ]
+        role = Role.objects.create(name="Repository query permissions")
+        role.permissions.add(Permission.objects.get(codename="vcs.reset"))
+        group = Group.objects.create(
+            name="Repository query components", language_selection=SELECTION_ALL
+        )
+        group.components.add(self.component, *linked_components)
+        group.roles.add(role)
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+        _ = self.user.profile
+        _ = self.user.component_permissions
+
+        component = self.component.__class__.objects.select_related("project").get(
+            pk=self.component.pk
+        )
+        with self.assertNumQueries(1):
+            self.assertTrue(self.user.has_perm("vcs.reset", component))
+        with self.assertNumQueries(0):
+            self.assertTrue(self.user.has_perm("vcs.reset", component))
+
+    def test_project_repository_permission_accepts_complete_component_scope(
+        self,
+    ) -> None:
+        linked = self.create_link_existing(
+            name="Repository component scope child",
+            slug="repository-component-scope-child",
+        )
+        role = Role.objects.create(name="Repository component scope permission")
+        role.permissions.add(Permission.objects.get(codename="vcs.reset"))
+        group = Group.objects.create(
+            name="Repository component scope", language_selection=SELECTION_ALL
+        )
+        group.components.add(self.component, linked)
+        group.roles.add(role)
+        self.user.groups.clear()
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        self.assertFalse(
+            auth_permissions.check_permission(self.user, "vcs.reset", self.project)
+        )
+        self.assertTrue(self.user.has_perm("vcs.reset", self.project))
+        self.assertTrue(self.user.has_perm("meta:vcs.status", self.project))
+
+        selection = auth_permissions.get_project_repository_selection(
+            self.user, self.project, ("vcs.reset",)
+        )
+        self.assertEqual(selection.repositories, (self.component,))
+        self.assertEqual(
+            selection.included_components,
+            tuple(sorted((self.component, linked), key=lambda item: item.full_slug)),
+        )
+
+    def test_project_repository_permission_covers_cross_project_links(self) -> None:
+        independent = self.create_po(project=self.project, name="Independent")
+        other_project = Project.objects.create(
+            name="Repository child project",
+            slug="repository-child-project",
+            web="https://example.com/child",
+        )
+        linked = self.create_link_existing(
+            name="Cross-project repository child",
+            slug="cross-project-repository-child",
+            project=other_project,
+        )
+        for index in range(2):
+            self.create_link_existing(
+                name=f"Internal repository child {index}",
+                slug=f"internal-repository-child-{index}",
+            )
+        self.create_link_existing(
+            name="Second cross-project child",
+            slug="second-cross-project-child",
+            project=other_project,
+        )
+        role = Role.objects.create(name="Project repository permission")
+        role.permissions.add(Permission.objects.get(codename="vcs.reset"))
+        self.group.roles.add(role)
+        self.user.groups.add(self.group)
+        self.user.clear_permissions_cache()
+
+        self.assertTrue(self.user.has_perm("vcs.reset", self.project))
+        self.assertTrue(self.user.has_perm("meta:vcs.status", self.project))
+        self.assertTrue(self.user.has_perm("vcs.reset", independent))
+        self.assertTrue(self.user.has_perm("vcs.reset", self.component))
+        self.assertTrue(self.user.has_perm("vcs.reset", linked))
+
+        selection = auth_permissions.get_project_repository_selection(
+            self.user, self.project, ("vcs.reset",)
+        )
+        self.assertEqual(selection.repositories, (independent, self.component))
+        self.assertEqual(
+            set(selection.included_components), set(self.project.component_set.all())
+        )
+        self.assertEqual(selection.skipped_components, ())
+        self.assertEqual(selection.permission_blockers, ())
+
+        child_group = Group.objects.create(
+            name="Cross-project repository permission",
+            language_selection=SELECTION_ALL,
+        )
+        child_group.components.add(linked)
+        child_group.roles.add(role)
+        self.user.groups.add(child_group)
+        self.user.clear_permissions_cache()
+
+        self.assertTrue(self.user.has_perm("vcs.reset", self.project))
+        self.assertTrue(self.user.has_perm("vcs.reset", self.component))
+        self.assertTrue(self.user.has_perm("vcs.reset", linked))
+
+        selection = auth_permissions.get_project_repository_selection(
+            self.user, self.project, ("vcs.reset",)
+        )
+        self.assertEqual(selection.repositories, (independent, self.component))
+
+    def test_repository_permission_preserves_owner_restrictions(self) -> None:
+        linked = self.create_link_existing(name="Owner restrictions")
+        self.group.roles.add(Role.objects.get(name="Administration"))
+        self.user.groups.add(self.group)
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("vcs.reset", linked))
+
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        linked.__dict__.pop("_repository_permission_components", None)
+        self.assertFalse(self.user.has_perm("vcs.reset", linked))
+        self.component.restricted = False
+        self.component.save(update_fields=["restricted"])
+
+        membership = TeamMembership.objects.get(user=self.user, group=self.group)
+        membership.limit_languages.add(Language.objects.get(code="cs"))
+        self.user.clear_permissions_cache()
+        linked.__dict__.pop("_repository_permission_components", None)
+        self.assertFalse(self.user.has_perm("vcs.reset", linked))
+        membership.limit_languages.clear()
+        self.user.clear_permissions_cache()
+
+        self.project.enforced_2fa = True
+        self.project.save(update_fields=["enforced_2fa"])
+        linked.__dict__.pop("_repository_permission_components", None)
+        self.assertFalse(self.user.has_perm("vcs.reset", linked))
+        self.user.is_superuser = True
+        self.assertTrue(self.user.has_perm("vcs.reset", linked))
 
     def test_componentlist(self) -> None:
         # Add user to group of power users
@@ -68,12 +889,12 @@ class ModelTest(FixtureTestCase):
         self.group.componentlists.add(clist)
 
         # No permissions as component list is empty
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.assertFalse(self.user.can_access_project(self.project))
         self.assertFalse(self.user.has_perm("unit.edit", self.translation))
 
         # Permissions should exist after adding to a component list
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         clist.components.add(self.component)
         self.assertTrue(self.user.can_access_project(self.project))
         self.assertTrue(self.user.has_perm("unit.edit", self.translation))
@@ -87,15 +908,351 @@ class ModelTest(FixtureTestCase):
         self.group.languages.set(Language.objects.filter(code="de"), clear=True)
 
         # Permissions should deny access
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.assertTrue(self.user.can_access_project(self.project))
         self.assertFalse(self.user.has_perm("unit.edit", self.translation))
 
         # Adding Czech language should unlock it
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.group.languages.add(Language.objects.get(code="cs"))
         self.assertTrue(self.user.can_access_project(self.project))
         self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+
+    def test_all_languages_keeps_manual_selection(self) -> None:
+        # Add user to group with German language only
+        self.user.groups.add(self.group)
+        self.group.language_selection = SELECTION_MANUAL
+        self.group.save()
+        self.group.roles.add(Role.objects.get(name="Power user"))
+        self.group.languages.set(Language.objects.filter(code="de"), clear=True)
+
+        # Czech translation is not covered by the manual selection
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("unit.edit", self.translation))
+
+        # Switching to all languages grants access and keeps the selection
+        self.group.language_selection = SELECTION_ALL
+        self.group.save()
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+        self.assertEqual(
+            list(self.group.languages.values_list("code", flat=True)), ["de"]
+        )
+
+        # Switching back restores the manual restriction
+        self.group.language_selection = SELECTION_MANUAL
+        self.group.save()
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("unit.edit", self.translation))
+
+    def test_all_projects_selection_clears_projects(self) -> None:
+        # Unlike languages, the projects assignment is cleared as it is
+        # queried directly, for example by UserQuerySet.having_perm
+        group = Group.objects.create(
+            name="All projects clearing", project_selection=SELECTION_ALL
+        )
+        group.projects.add(self.project)
+        group.save()
+        self.assertFalse(group.projects.exists())
+
+    def test_membership_limit_languages(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.roles.add(Role.objects.get(name="Power user"))
+        membership = TeamMembership.objects.get(user=self.user, group=self.group)
+        membership.limit_languages.set(Language.objects.filter(code="de"))
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.can_access_project(self.project))
+        self.assertFalse(self.user.has_perm("unit.edit", self.translation))
+
+        membership.limit_languages.add(Language.objects.get(code="cs"))
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+
+    def test_membership_limit_excludes_global_permissions(self) -> None:
+        user = User.objects.create_user("limited-global", "limited-global@example.com")
+        user.groups.clear()
+        role = Role.objects.create(name="Limited global")
+        role.permissions.add(Permission.objects.get(codename="user.edit"))
+        group = Group.objects.create(
+            name="Limited global", language_selection=SELECTION_ALL
+        )
+        group.roles.add(role)
+        user.groups.add(group)
+
+        user.clear_permissions_cache()
+        self.assertTrue(user.has_perm("user.edit"))
+
+        membership = TeamMembership.objects.get(user=user, group=group)
+        membership.limit_languages.set(Language.objects.filter(code="cs"))
+
+        user.clear_permissions_cache()
+        self.assertFalse(user.has_perm("user.edit"))
+
+    def test_membership_limit_intersects_team_languages(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.language_selection = SELECTION_MANUAL
+        self.group.save()
+        self.group.roles.add(Role.objects.get(name="Power user"))
+        self.group.languages.set(Language.objects.filter(code="de"), clear=True)
+        membership = TeamMembership.objects.get(user=self.user, group=self.group)
+        membership.limit_languages.set(Language.objects.filter(code="cs"))
+
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.can_access_project(self.project))
+        self.assertEqual(self.user.get_project_permissions(self.project), [])
+        self.assertFalse(self.user.has_perm("unit.edit", self.translation))
+
+        self.group.languages.add(Language.objects.get(code="cs"))
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.can_access_project(self.project))
+        self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+
+    def test_team_language_selection_keeps_project_permissions(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.language_selection = SELECTION_MANUAL
+        self.group.save()
+        self.group.roles.add(Role.objects.get(name="Administration"))
+        self.group.languages.set(Language.objects.filter(code="cs"), clear=True)
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("project.edit", self.project))
+        self.assertTrue(self.user.has_perm("translation.add", self.component))
+        self.assertEqual(
+            list(self.user.managed_projects.values_list("slug", flat=True)),
+            [self.project.slug],
+        )
+
+    def test_membership_limit_per_role(self) -> None:
+        self.project.translation_review = True
+        self.project.save(update_fields=["translation_review"])
+        review_group = Group.objects.create(
+            name="Review", language_selection=SELECTION_ALL
+        )
+        review_group.projects.add(self.project)
+        review_group.roles.add(Role.objects.get(name="Review strings"))
+
+        translate_group = Group.objects.create(
+            name="Translate", language_selection=SELECTION_ALL
+        )
+        translate_group.projects.add(self.project)
+        translate_group.roles.add(Role.objects.get(name="Translate"))
+
+        self.user.groups.add(review_group, translate_group)
+        TeamMembership.objects.get(
+            user=self.user, group=review_group
+        ).limit_languages.set(Language.objects.filter(code="de"))
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.has_perm("unit.edit", self.translation))
+        self.assertFalse(self.user.has_perm("unit.review", self.translation))
+
+        TeamMembership.objects.get(
+            user=self.user, group=review_group
+        ).limit_languages.add(Language.objects.get(code="cs"))
+
+        self.user.clear_permissions_cache()
+        result = self.user.has_perm("unit.review", self.translation)
+        self.assertTrue(result, getattr(result, "reason", result))
+
+    def test_membership_limit_project_language_permissions(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.roles.add(
+            Role.objects.get(name="Automatic translation"),
+            Role.objects.get(name="Manage languages"),
+        )
+        membership = TeamMembership.objects.get(user=self.user, group=self.group)
+        membership.limit_languages.set(Language.objects.filter(code="de"))
+        unlimited = User.objects.create_user("unlimited", "unlimited@example.com")
+        unlimited.groups.add(self.group)
+
+        czech = Language.objects.get(code="cs")
+        german = Language.objects.get(code="de")
+        category = Category.objects.create(
+            project=self.project,
+            name="Membership limit",
+            slug=f"membership-limit-{token_hex(4)}",
+        )
+        self.component.category = category
+        self.component.save(update_fields=["category"])
+
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("translation.auto", self.project))
+        self.assertFalse(self.user.has_perm("translation.auto", category))
+        self.assertFalse(self.user.has_perm("translation.auto", self.component))
+        self.assertFalse(self.user.has_perm("translation.add", self.component))
+        self.assertFalse(
+            self.user.has_perm(
+                "translation.delete", ProjectLanguage(self.project, czech)
+            )
+        )
+        self.assertFalse(
+            self.user.has_perm("translation.auto", ProjectLanguage(self.project, czech))
+        )
+        self.assertFalse(
+            self.user.has_perm("translation.delete", CategoryLanguage(category, czech))
+        )
+        self.assertFalse(
+            self.user.has_perm("translation.auto", CategoryLanguage(category, czech))
+        )
+        self.assertTrue(
+            self.user.has_perm(
+                "translation.delete", ProjectLanguage(self.project, german)
+            )
+        )
+        self.assertTrue(
+            self.user.has_perm(
+                "translation.auto", ProjectLanguage(self.project, german)
+            )
+        )
+        self.assertTrue(
+            self.user.has_perm("translation.delete", CategoryLanguage(category, german))
+        )
+        self.assertTrue(
+            self.user.has_perm("translation.auto", CategoryLanguage(category, german))
+        )
+
+        def fail_translation_set(_obj) -> Never:
+            msg = "Permission checks should not materialize translations"
+            raise AssertionError(msg)
+
+        def fail_component_scope(_obj) -> Never:
+            msg = "Unrestricted project permissions should not check components"
+            raise AssertionError(msg)
+
+        with (
+            patch.object(
+                ProjectLanguage, "translation_set", property(fail_translation_set)
+            ),
+            patch.object(
+                CategoryLanguage, "translation_set", property(fail_translation_set)
+            ),
+            patch.object(
+                auth_permissions,
+                "_get_language_scope_components",
+                side_effect=fail_component_scope,
+            ),
+        ):
+            self.assertTrue(
+                self.user.has_perm(
+                    "translation.delete", ProjectLanguage(self.project, german)
+                )
+            )
+            self.assertTrue(
+                self.user.has_perm(
+                    "translation.delete", CategoryLanguage(category, german)
+                )
+            )
+
+        shared_project = Project.objects.create(
+            name="Shared membership limit",
+            slug=f"shared-membership-limit-{token_hex(4)}",
+            access_control=Project.ACCESS_PRIVATE,
+        )
+        shared_category = Category.objects.create(
+            project=shared_project,
+            name="Shared membership limit",
+            slug=f"shared-membership-limit-{token_hex(4)}",
+        )
+        ComponentLink.objects.create(
+            component=self.component,
+            project=shared_project,
+            category=shared_category,
+        )
+        self.group.projects.add(shared_project)
+        self.user.clear_permissions_cache()
+        shared_project_language = ProjectLanguage(shared_project, german)
+        shared_category_language = CategoryLanguage(shared_category, german)
+        self.assertTrue(shared_project_language.translation_set)
+        self.assertTrue(shared_category_language.translation_set)
+        self.assertFalse(shared_project_language.action_translation_set.exists())
+        self.assertFalse(shared_category_language.action_translation_set.exists())
+        self.assertFalse(
+            self.user.has_perm("translation.delete", shared_project_language)
+        )
+        self.assertFalse(
+            self.user.has_perm("translation.delete", shared_category_language)
+        )
+
+        self.component.restricted = True
+        self.component.save(update_fields=["restricted"])
+        self.user.clear_permissions_cache()
+        self.assertFalse(
+            self.user.has_perm(
+                "translation.delete", ProjectLanguage(self.project, german)
+            )
+        )
+        self.assertFalse(
+            self.user.has_perm("translation.delete", CategoryLanguage(category, german))
+        )
+
+        self.group.components.add(self.component)
+        self.user.clear_permissions_cache()
+        self.assertTrue(
+            self.user.has_perm(
+                "translation.delete", ProjectLanguage(self.project, german)
+            )
+        )
+        self.assertTrue(
+            self.user.has_perm("translation.delete", CategoryLanguage(category, german))
+        )
+
+        source = self.component.source_language
+        membership.limit_languages.add(source)
+        self.user.clear_permissions_cache()
+        self.assertFalse(
+            self.user.has_perm(
+                "translation.delete", ProjectLanguage(self.project, source)
+            )
+        )
+        self.assertFalse(
+            self.user.has_perm("translation.delete", CategoryLanguage(category, source))
+        )
+
+        self.group.roles.add(Role.objects.get(name="Administration"))
+        self.user.clear_permissions_cache()
+        self.assertFalse(self.user.has_perm("project.edit", self.project))
+        self.assertFalse(self.user.managed_projects.filter(pk=self.project.pk).exists())
+        self.assertFalse(
+            User.objects.all_admins(self.project).filter(pk=self.user.pk).exists()
+        )
+        self.assertFalse(
+            User.objects.all_admins(self.project).filter(pk=unlimited.pk).exists()
+        )
+
+    def test_group_removal_removes_admin(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.admins.add(self.user)
+
+        self.user.groups.remove(self.group)
+
+        self.assertFalse(self.group.admins.filter(pk=self.user.pk).exists())
+
+    def test_group_reverse_clear_removes_admin(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.admins.add(self.user)
+
+        self.group.user_set.clear()
+
+        self.assertFalse(self.group.admins.filter(pk=self.user.pk).exists())
+
+    def test_group_reverse_set_removes_admin(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.admins.add(self.user)
+
+        self.group.user_set.set([])
+
+        self.assertFalse(self.group.admins.filter(pk=self.user.pk).exists())
+
+    def test_membership_delete_removes_admin(self) -> None:
+        self.user.groups.add(self.group)
+        self.group.admins.add(self.user)
+
+        TeamMembership.objects.get(user=self.user, group=self.group).delete()
+
+        self.assertFalse(self.group.admins.filter(pk=self.user.pk).exists())
 
     def test_groups(self) -> None:
         # Add test group
@@ -125,6 +1282,70 @@ class ModelTest(FixtureTestCase):
         # Set Django group
         self.user.groups.set(DjangoGroup.objects.filter(name="Second"))
         self.assertEqual(self.user.groups.count(), 1)
+
+    def test_store_and_log_audit_state(self) -> None:
+        actor = User.objects.create_user("auditor", "auditor@example.com", "x")
+        audit_group = Group.objects.create(
+            name="Audit group",
+            defining_project=self.project,
+            language_selection=SELECTION_ALL,
+        )
+
+        self.user.store_audit_state()
+        self.user.is_superuser = True
+        self.user.save(update_fields=["is_superuser"])
+        self.user.groups.add(audit_group)
+        self.user.log_audit_state(None, actor=actor)
+
+        self.user.auditlog_set.get(
+            activity="superuser-granted", params__username=actor.username
+        )
+        self.user.auditlog_set.get(
+            activity="team-add",
+            params__team=audit_group.name,
+            params__username=actor.username,
+        )
+        self.user.store_audit_state()
+
+    def test_store_audit_state_requires_consumption(self) -> None:
+        self.user.store_audit_state()
+
+        with self.assertRaisesMessage(ValueError, "Audit state is already stored!"):
+            self.user.store_audit_state()
+
+    def test_unchanged_audit_state(self) -> None:
+        count = self.user.auditlog_set.count()
+        self.user.store_audit_state()
+        self.user.save()
+        self.user.log_audit_state(None)
+        self.assertEqual(self.user.auditlog_set.count(), count)
+
+    def test_expiry_audit_without_actor(self) -> None:
+        self.user.date_expires = timezone.now()
+        self.user.save(update_fields=["date_expires"])
+        self.user.is_active = False
+        self.user.save()
+        audit = self.user.auditlog_set.get(activity="disabled-expiry")
+        self.assertNotIn("username", audit.params)
+        self.assertIsNone(audit.address)
+
+    def test_invitation_superuser_actor(self) -> None:
+        actor = User.objects.create_user("inviter", "inviter@example.com", "x")
+        invitation = Invitation.objects.create(
+            author=actor,
+            user=self.user,
+            group=Group.objects.get(name="Users"),
+            is_superuser=True,
+        )
+        request = RequestFactory().post("/")
+        request.user = self.user
+        invitation.accept(cast("AuthenticatedHttpRequest", request), self.user)
+        audit = self.user.auditlog_set.get(activity="superuser-granted")
+        self.assertEqual(audit.params["username"], actor.username)
+        message = audit.get_extra_message()
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertIn("inviter", message)
 
     def test_user(self) -> None:
         # Create user with Django User fields
@@ -165,7 +1386,7 @@ class ModelTest(FixtureTestCase):
         protected_project = Project.objects.create(
             slug="protected", name="Protected", access_control=Project.ACCESS_PROTECTED
         )
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.assertEqual(
             set(self.user.allowed_projects.values_list("slug", flat=True)),
             {public_project.slug, protected_project.slug},
@@ -174,8 +1395,66 @@ class ModelTest(FixtureTestCase):
             name="All projects", project_selection=SELECTION_ALL
         )
         self.user.groups.add(group)
-        self.user.clear_cache()
+        self.user.clear_permissions_cache()
         self.assertEqual(
             set(self.user.allowed_projects.values_list("slug", flat=True)),
             {public_project.slug, protected_project.slug, self.project.slug},
         )
+
+    def test_blocked_project_access_query(self) -> None:
+        public_project = Project.objects.create(
+            slug="public", name="Public", access_control=Project.ACCESS_PUBLIC
+        )
+        UserBlock.objects.create(user=self.user, project=public_project)
+
+        self.user.clear_permissions_cache()
+
+        self.assertNotIn(public_project, self.user.allowed_projects)
+
+    def test_needs_project_filter(self) -> None:
+        Project.objects.create(
+            slug="public", name="Public", access_control=Project.ACCESS_PUBLIC
+        )
+
+        self.user.clear_permissions_cache()
+        self.assertTrue(self.user.needs_project_filter)
+
+        group = Group.objects.create(
+            name="All projects", project_selection=SELECTION_ALL
+        )
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        self.assertFalse(self.user.needs_project_filter)
+
+    def test_needs_project_filter_all_projects_query(self) -> None:
+        group = Group.objects.create(
+            name="All projects", project_selection=SELECTION_ALL
+        )
+        self.user.groups.add(group)
+        self.user.clear_permissions_cache()
+
+        self.assertIn(-SELECTION_ALL, self.user.project_permissions)
+        with self.assertNumQueries(0):
+            self.assertFalse(self.user.needs_project_filter)
+
+    def test_needs_project_filter_all_projects_with_block_query(self) -> None:
+        group = Group.objects.create(
+            name="All projects", project_selection=SELECTION_ALL
+        )
+        self.user.groups.add(group)
+        UserBlock.objects.create(user=self.user, project=self.project)
+        self.user.clear_permissions_cache()
+
+        self.assertIn(-SELECTION_ALL, self.user.project_permissions)
+        self.assertEqual(self.user.project_permissions[self.project.pk], [(None, None)])
+        with self.assertNumQueries(0):
+            self.assertTrue(self.user.needs_project_filter)
+
+    def test_needs_project_filter_avoids_count_query(self) -> None:
+        self.assertNotIn(-SELECTION_ALL, self.user.project_permissions)
+
+        with self.assertNumQueries(1) as context:
+            self.assertTrue(self.user.needs_project_filter)
+
+        self.assertNotIn("COUNT(", context.captured_queries[0]["sql"].upper())

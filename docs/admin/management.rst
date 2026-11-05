@@ -19,15 +19,15 @@ Invoking management commands
 
 As mentioned before, invocation depends on how you installed Weblate.
 
-If using virtualenv for Weblate, you can either specify the full path to
-:command:`weblate`, or activate the virtualenv prior to invoking it:
+If using a Python environment for Weblate, you can either specify the full path to
+:command:`weblate`, or activate the Python environment prior to invoking it:
 
 .. code-block:: sh
 
    # Direct invocation
    ~/weblate-env/bin/weblate
 
-   # Activating virtualenv adds it to search path
+   # Activating Python environment adds it to search path
    . ~/weblate-env/bin/activate
    weblate
 
@@ -40,7 +40,7 @@ To run it:
     python ./manage.py list_versions
 
 If you've installed Weblate using the pip installer, or by using the :file:`./setup.py`
-script, the :command:`weblate` is installed to your path (or virtualenv path),
+script, the :command:`weblate` is installed to your path (or Python environment path),
 from where you can use it to control Weblate:
 
 .. code-block:: sh
@@ -79,10 +79,15 @@ In case you need to pass it a file, you can temporary add a volume:
 add_suggestions
 ---------------
 
-.. weblate-admin:: add_suggestions <project> <component> <language> <file>
+.. weblate-admin:: add_suggestions --user USERNAME <project> <component> <language> <file>
 
 Imports a translation from the file to use as a suggestion for the given translation.
 It skips duplicated translations; only different ones are added.
+
+.. weblate-admin-option:: --user USERNAME
+
+    Existing user to record as the import actor in history. This is independent of
+    the suggestion author selected with ``--author``.
 
 .. weblate-admin-option:: --author USER@EXAMPLE.COM
 
@@ -93,7 +98,60 @@ Example:
 
 .. code-block:: sh
 
-    weblate --author michal@cihar.com add_suggestions weblate application cs /tmp/suggestions-cs.po
+    weblate add_suggestions --user admin --author michal@cihar.com weblate application cs /tmp/suggestions-cs.po
+
+
+analyze_translator_work
+-----------------------
+
+.. weblate-admin:: analyze_translator_work
+
+Analyzes change history to estimate realistic translator throughput per day.
+The command includes only active human users and unit-backed manual translation
+changes, and applies daily minimum and maximum thresholds to skip obvious outliers,
+bots, bulk imports, uploads, and other events that would pollute the result.
+
+.. weblate-admin-option:: --days DAYS
+
+    Number of recent days to analyze when ``--since`` is not specified.
+
+.. weblate-admin-option:: --since YYYY-MM-DD
+
+    Start date for the analysis.
+
+.. weblate-admin-option:: --until YYYY-MM-DD
+
+    End date for the analysis.
+
+.. weblate-admin-option:: --project PROJECT
+
+    Limit the analysis to a project slug.
+
+.. weblate-admin-option:: --component PROJECT/COMPONENT
+
+    Limit the analysis to a component.
+
+.. weblate-admin-option:: --language LANGUAGE
+
+    Limit the analysis to a language code.
+
+.. weblate-admin-option:: --min-changes COUNT
+
+    Minimum translated strings per user day to include.
+
+.. weblate-admin-option:: --max-changes COUNT
+
+    Maximum translated strings per user day to include.
+
+.. weblate-admin-option:: --max-words COUNT
+
+    Maximum translated source words per user day to include.
+
+Example:
+
+.. code-block:: sh
+
+    weblate analyze_translator_work --project weblate --since 2026-01-01
 
 
 auto_translate
@@ -133,6 +191,8 @@ Performs automatic translation based on other component translations.
 .. weblate-admin-option:: --mt MT
 
     Use machine translation instead of other components as machine translations.
+    Select an installed service with its name, ``service:id``, or ``service:slug``
+    as described in :ref:`machine-translation-setup`.
 
 .. weblate-admin-option:: --threshold THRESHOLD
 
@@ -152,6 +212,54 @@ Example:
 .. seealso::
 
    :ref:`auto-translation`
+
+.. _backup-management-command:
+
+backup
+------
+
+.. weblate-admin:: backup
+
+Runs configured backups synchronously, without using Celery. It first updates
+the settings and database backup dumps in :setting:`DATA_DIR`, then runs the
+selected Borg backup service or services.
+
+.. weblate-admin-option:: --list
+
+    Lists configured backup service IDs.
+
+.. weblate-admin-option:: --service ID
+
+    Runs one backup service by ID.
+
+.. weblate-admin-option:: --all
+
+    Runs all enabled backup services.
+
+Use Django's standard ``--verbosity 2`` option to show backup service output.
+Failed backup service output is shown even without increased verbosity.
+
+Examples:
+
+.. code-block:: sh
+
+    weblate backup --list
+    weblate backup --service 1 --verbosity 2
+    weblate backup --all
+
+For Docker Compose deployments, you can stop the regular Weblate container and
+run the command in a one-off container using :command:`docker compose run`. The
+database and configured backup storage still need to be available.
+
+.. code-block:: sh
+
+    docker compose stop weblate
+    docker compose run --rm --user weblate weblate weblate backup --list
+    docker compose run --rm --user weblate weblate weblate backup --service 1 --verbosity 2
+
+.. seealso::
+
+   :ref:`automated-backup`
 
 benchmark
 ---------
@@ -183,6 +291,23 @@ Imports given content into Weblate, useful for benchmarking.
 
    # Display it
    fixefox memray-flamegraph-manage.py.2554179.html
+
+billing_demo
+------------
+
+.. weblate-admin:: billing_demo
+
+.. versionadded:: 5.15
+
+Creates a demo billing project. Can be executed multiple times to add
+additional invoices and billing events.
+
+This can be useful when developing Weblate. Needs :ref:`billing` installed.
+
+.. seealso::
+
+   * :wladmin:`import_demo`
+   * :ref:`devel-demo`
 
 
 celery_queues
@@ -339,7 +464,7 @@ Dumps userdata to a file for later use by :wladmin:`importuserdata`.
 import_demo
 -----------
 
-.. weblate-admin:: import_demo
+.. weblate-admin:: import_demo --user USERNAME
 
 .. versionadded:: 4.1
 
@@ -348,21 +473,36 @@ Make sure the celery tasks are running before running this command.
 
 This can be useful when developing Weblate.
 
+.. weblate-admin-option:: --user USERNAME
+
+   Required. Existing account to attribute the imported components and add-on
+   configuration to. Anonymous users are not accepted.
+
 .. weblate-admin-option:: --delete
 
    Removes existing demo project.
+
+.. seealso::
+
+   * :wladmin:`billing_demo`
+   * :ref:`devel-demo`
 
 
 import_json
 -----------
 
-.. weblate-admin:: import_json <json-file>
+.. weblate-admin:: import_json --user USERNAME <json-file>
 
 Batch import of components based on JSON data.
 
 The imported JSON file structure pretty much corresponds to the component
 object (see :http:get:`/api/components/(string:project)/(string:component)/`).
 You have to include the ``name`` and ``filemask`` fields.
+
+.. weblate-admin-option:: --user USERNAME
+
+    Required. Existing account to attribute imported components and configuration
+    changes to. Anonymous users are not accepted.
 
 .. weblate-admin-option:: --project PROJECT
 
@@ -431,7 +571,7 @@ for formats other than JSON and TMX.
 import_project
 --------------
 
-.. weblate-admin:: import_project <project> <gitrepo> <branch> <filemask>
+.. weblate-admin:: import_project --user USERNAME <project> <gitrepo> <branch> <filemask>
 
 Batch imports components into project based on the file mask. It is based on
 the :ref:`addon-weblate.discovery.discovery` add-on, so you might want to use
@@ -456,6 +596,11 @@ for example: ``(?P<language>[^/]*)/(?P<component>[^-/]*)\.po``.
 
 The import matches existing components based on files and adds the ones that
 do not exist. It does not change already existing ones.
+
+.. weblate-admin-option:: --user USERNAME
+
+    Required. Record the import and its configuration changes as this existing
+    Weblate user. Anonymous users cannot perform imports.
 
 .. weblate-admin-option:: --name-template TEMPLATE
 
@@ -510,7 +655,7 @@ separate a folder with the translations of each chapter:
 
 .. code-block:: sh
 
-    weblate import_project \
+    weblate import_project --user admin \
         debian-handbook \
         https://salsa.debian.org/hertzog/debian-handbook.git \
         bullseye/main \
@@ -522,7 +667,7 @@ are located in single folder:
 
 .. code-block:: sh
 
-    weblate import_project \
+    weblate import_project --user admin \
         --file-format=properties \
         --base-file-template=web-app/tgol-web-app/src/main/resources/i18n/%s-I18N.properties \
         tanaguru \
@@ -536,7 +681,7 @@ language out of a filename like
 
 .. code-block:: sh
 
-    weblate import_project \
+    weblate import_project --user admin \
         tails \
         git://git.tails.boum.org/tails master \
         'wiki/src/security/(?P<component>.*)\.(?P<language>[^.]*)\.po$'
@@ -545,7 +690,7 @@ Filtering only translations in a chosen language:
 
 .. code-block:: sh
 
-    ./manage import_project \
+    ./manage import_project --user admin \
         --language-regex '^(cs|sk)$' \
         weblate \
         https://github.com/WeblateOrg/weblate.git \
@@ -555,7 +700,7 @@ Importing Sphinx documentation split to multiple files:
 
 .. code-block:: console
 
-    $ weblate import_project --name-template 'Documentation: %s' \
+    $ weblate import_project --user admin --name-template 'Documentation: %s' \
         --file-format po \
         project https://github.com/project/docs.git master \
         'docs/locale/*/LC_MESSAGES/**.po'
@@ -564,11 +709,11 @@ Importing Sphinx documentation split to multiple files and directories:
 
 .. code-block:: console
 
-    $ weblate import_project --name-template 'Directory 1: %s' \
+    $ weblate import_project --user admin --name-template 'Directory 1: %s' \
         --file-format po \
         project https://github.com/project/docs.git master \
         'docs/locale/*/LC_MESSAGES/dir1/**.po'
-    $ weblate import_project --name-template 'Directory 2: %s' \
+    $ weblate import_project --user admin --name-template 'Directory 2: %s' \
         --file-format po \
         project https://github.com/project/docs.git master \
         'docs/locale/*/LC_MESSAGES/dir2/**.po'
@@ -611,18 +756,31 @@ Imports users from JSON dump of the Django auth_users database.
     With this option it will just check whether a given file can be imported and
     report possible conflicts arising from usernames or e-mails.
 
-You can dump users from the existing Django installation using:
+You can dump users from the existing Django site using:
 
 .. code-block:: sh
 
-    weblate dumpdata auth.User > users.json
+    ./manage.py dumpdata auth.User > users.json
+
+.. hint::
+
+   Use :wladmin:`dumpuserdata` for dumping data from other Weblate server as that includes user settings as well.
+
+.. seealso::
+
+   :ref:`pootle-migration`
 
 install_addon
 -------------
 
-.. weblate-admin:: install_addon --addon ADDON <project|project/component>
+.. weblate-admin:: install_addon --user USERNAME --addon ADDON <project|project/component>
 
 Installs an add-on to a set of components.
+
+.. weblate-admin-option:: --user USERNAME
+
+   Required. Existing account to attribute add-on configuration changes to.
+   Anonymous users are not accepted.
 
 .. weblate-admin-option:: --addon ADDON
 
@@ -643,7 +801,7 @@ To install :ref:`addon-weblate.gettext.mo` for all components:
 
 .. code-block:: shell
 
-   weblate install_addon --addon weblate.gettext.mo --configuration '{"fuzzy": true}' --update --all
+   weblate install_addon --user admin --addon weblate.gettext.mo --configuration '{"fuzzy": true}' --update --all
 
 .. seealso::
 
@@ -656,7 +814,7 @@ install_machinery
 
 .. weblate-admin:: install_machinery --service SERVICE
 
-Installs an site-wide automatic suggestion service.
+Installs a site-wide translation service.
 
 .. weblate-admin-option:: --service SERVICE
 
@@ -674,7 +832,7 @@ To install :ref:`mt-deepl`:
 
 .. code-block:: shell
 
-   weblate install_machinery --service deepl --configuration '{"key": "x", "url": "https://api.deepl.com/v2/"}' --update
+   weblate install_machinery --service deepl --configuration '{"key": "x", "url": "https://api.deepl.com/"}' --update
 
 .. seealso::
 
@@ -687,9 +845,25 @@ list_addons
 
 Lists add-ons in reStructuredText as a template for :doc:`/admin/addons`.
 
+.. weblate-admin-option:: --sections {events,addons,parameters}
+
+   Filter the generated output to just the add-on event sections, the built-in
+   add-on sections, or the shared add-on parameter sections. If omitted, all
+   generated sections are shown.
+
 .. seealso::
 
    :doc:`/contributing/documentation`
+
+list_automation
+---------------
+
+.. weblate-admin:: list_automation
+
+Generates the :doc:`automation reference </admin/automation>` from the workflow
+JSON Schema, including action names, parameters, and introduction versions.
+With ``--output``, replaces generated blocks while preserving manual descriptions
+and cookbook examples outside those blocks.
 
 list_permissions
 ----------------
@@ -709,6 +883,18 @@ list_checks
 
 Lists quality checks in reStructuredText as a template for :doc:`/admin/checks` and :doc:`/user/checks`.
 
+.. weblate-admin-option:: --sections {checks,flags}
+
+   Filter the generated output to just the quality check sections or the
+   shared check flag sections. If omitted, all generated sections are shown.
+
+.. note::
+
+   Using ``--output`` requires selecting exactly one value in ``--sections`` so
+   each generated snippet is written to its own file. This matches the
+   :doc:`/contributing/documentation` workflow and the ``make -C docs
+   update-docs`` targets.
+
 .. seealso::
 
    :doc:`/contributing/documentation`
@@ -722,14 +908,25 @@ list_languages
 Lists supported languages in MediaWiki markup - language codes, English names
 and localized names.
 
-This is used to generate <https://wiki.l10n.cz/Slovn%C3%ADk_s_n%C3%A1zvy_jazyk%C5%AF>.
+This is used to generate <https://www.l10n.cz/wiki/Slovn%C3%ADky/Slovn%C3%ADk_s_n%C3%A1zvy_jazyk%C5%AF/>.
 
 list_machinery
 --------------
 
 .. weblate-admin:: list_machinery
 
-Lists automatic suggestions services in reStructuredText as a template for :doc:`/admin/machine`.
+Lists translation services in reStructuredText as a template for :doc:`/admin/machine`.
+
+.. seealso::
+
+   :doc:`/contributing/documentation`
+
+list_notification_config
+------------------------
+
+.. weblate-admin:: list_notification_config
+
+Lists notification scopes, frequencies and handlers in reStructuredText as a template for :doc:`/admin/config`.
 
 .. seealso::
 
@@ -770,6 +967,31 @@ list_file_format_params
 .. weblate-admin:: list_file_format_params
 
 Lists File format parameters.
+
+list_change_events
+------------------
+
+.. weblate-admin:: list_change_events
+
+Lists all possible change event types.
+
+list_format_features
+--------------------
+
+.. weblate-admin:: list_format_features
+
+Generates RST documentation snippets describing the supported features for every file format.
+
+The command generates one file for every format, that can be found in the specified output directory.
+
+.. weblate-admin-option:: --output PATH
+
+    Directory where the format feature snippets will be written.
+
+.. note::
+
+    The generated documentation files are meant to be included in documentation sources such as :doc:`/formats`. See also :file:`weblate/formats/management/commands/list_format_features.py` for customization and merging logic.
+
 
 loadpo
 ------
@@ -814,6 +1036,18 @@ You can either define which project or component to update (for example
 
    :wladmin:`unlock_translation`
 
+metrics
+-------
+
+.. weblate-admin:: metrics
+
+Outputs the server metrics exposed by :http:get:`/api/metrics/`.
+
+.. weblate-admin-option:: --format FORMAT
+
+    Selects the output format. Supported formats are ``json``, ``csv``, and
+    ``openmetrics``. The default is ``json``.
+
 migrate
 -------
 
@@ -843,6 +1077,13 @@ version which contains aliases for previously unknown languages that have been
 created with the :samp:`(generated)` suffix. It moves all content from the `source`
 language to the `target` one.
 
+If both languages have a translation in the same component, or different
+workflow settings or font overrides for the same scope, the move is skipped
+without changing either language. Resolve the reported conflict before retrying.
+Identical workflow settings and font overrides are consolidated. Automatic
+language updates use the same checks and continue with other languages when a
+move is skipped.
+
 Example:
 
 .. code-block:: sh
@@ -871,6 +1112,20 @@ You can either define which project or component to update (for example
 
     Weblate pushes changes automatically if :ref:`component-push_on_commit` in
     :ref:`component` is turned on, which is the default.
+
+refresh_github_repositories
+---------------------------
+
+.. weblate-admin:: refresh_github_repositories
+
+.. versionadded:: 2026.10.1
+
+Refreshes the repository list of all connected GitHub accounts and retargets
+components whose repository was renamed or transferred on GitHub.
+
+.. seealso::
+
+   :ref:`code-hosting-github-app-webhook`
 
 unlock_translation
 ------------------

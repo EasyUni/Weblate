@@ -5,31 +5,56 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from collections import Counter
+from contextlib import nullcontext
+from dataclasses import dataclass
+from html import unescape
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict
 
-import sentry_sdk
 from django.http import Http404
-from django.utils.html import format_html, format_html_join
-from django.utils.safestring import mark_safe
+from django.utils.html import escape, format_html, format_html_join, strip_tags
+from django.utils.safestring import SafeData, mark_safe
 from django.utils.translation import gettext
 from lxml import etree
 from siphashc import siphash
 
 from weblate.utils.classloader import ClassLoaderProtocol
-from weblate.utils.docs import get_doc_url
+from weblate.utils.docs import DocVersionsMixin, get_doc_url
 from weblate.utils.html import format_html_join_comma
+from weblate.utils.tracing import start_span
 from weblate.utils.xml import parse_xml
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable
 
+    from django.utils.safestring import SafeString
     from django_stubs_ext import StrOrPromise
 
     from weblate.auth.models import AuthenticatedHttpRequest, User
     from weblate.trans.models import Component, Unit
+    from weblate.trans.models.unit import UnitQuerySet
 
     from .flags import Flags
     from .models import Check
+
+FixupType = (
+    tuple[Literal["regex"], str, str, str] | tuple[Literal["plurals"], list[str]]
+)
+type HighlightKind = Literal["grammar", "markup", "syntax"]
+
+
+@dataclass(frozen=True, slots=True)
+class Highlight:
+    """Highlighted source span and its translation semantics."""
+
+    start: int
+    end: int
+    text: str
+    kind: HighlightKind = "syntax"
+    group: str | None = None
+    role: str | None = None
+    translatable: bool = False
+    forbidden_text: tuple[str, ...] = ()
 
 
 class MissingExtraDict(TypedDict, total=False):
@@ -38,7 +63,21 @@ class MissingExtraDict(TypedDict, total=False):
     errors: list[str]
 
 
-class BaseCheck(ClassLoaderProtocol):
+def merge_diagnostics(failures: Iterable[MissingExtraDict]) -> MissingExtraDict:
+    """Combine alternative diagnostics without losing repeated markup counts."""
+    failures = list(failures)
+    result: MissingExtraDict = {}
+    key: Literal["missing", "extra", "errors"]
+    for key in ("missing", "extra", "errors"):
+        counts: Counter[str] = Counter()
+        for failure in failures:
+            if key in failure:
+                counts |= Counter(failure[key])
+                result[key] = sorted(counts.elements())
+    return result
+
+
+class BaseCheck(ClassLoaderProtocol, DocVersionsMixin):
     """Basic class for checks."""
 
     check_id = ""
@@ -55,7 +94,7 @@ class BaseCheck(ClassLoaderProtocol):
     always_display = False
     batch_project_wide = False
     skip_suggestions = False
-    extra_enable_strings: list[str] = []
+    extra_enable_strings: tuple[str, ...] = ()
 
     def get_identifier(self) -> str:
         return self.check_id
@@ -91,6 +130,38 @@ class BaseCheck(ClassLoaderProtocol):
             return False
         return self.ignore_untranslated and (not unit.state or unit.readonly)
 
+    def applies_to_propagated_unit(self, unit: Unit) -> bool:
+        """Use the same check selection as an ordinary unit check update."""
+        from weblate.checks.models import CHECKS  # ruff: ignore[import-outside-top-level]
+
+        if unit.translation.component.is_glossary:
+            checks = CHECKS.glossary
+        elif unit.is_source:
+            checks = CHECKS.source
+        elif unit.readonly:
+            return False
+        elif unit.state:
+            checks = CHECKS.target
+        else:
+            checks = CHECKS.target_untranslated
+        return self.check_id in checks
+
+    def evaluate_propagated(self, units: UnitQuerySet) -> Iterable[tuple[Unit, bool]]:
+        """Evaluate just this check; custom checks can override for bulk evaluation."""
+        for unit in units.iterator(chunk_size=500):
+            failed = False
+            if self.applies_to_propagated_unit(unit):
+                sources = unit.get_effective_source_plurals()
+                if unit.is_source and not unit.translation.component.is_glossary:
+                    failed = bool(self.check_source(sources, unit))
+                else:
+                    failed = bool(
+                        self.check_target_with_flags(
+                            sources, unit.get_target_plurals(), unit, unit.all_flags
+                        )
+                    )
+            yield unit, failed
+
     def should_display(self, unit: Unit) -> bool:
         """Display the check always, not only when failing."""
         if self.ignore_state(unit):
@@ -114,13 +185,65 @@ class BaseCheck(ClassLoaderProtocol):
         )
         return result
 
+    def check_target_with_flags(
+        self, sources: list[str], targets: list[str], unit: Unit, all_flags: Flags
+    ) -> bool:
+        """Check target strings with precomputed flags."""
+        # Only inline the base target-check flow for checks that did not
+        # override it. Custom should_skip() and check_target() methods can
+        # inspect arbitrary unit state.
+        if (
+            self.__class__.should_skip is BaseCheck.should_skip
+            and self.__class__.check_target is BaseCheck.check_target
+        ):
+            if self.ignore_state(unit):
+                return False
+            if self.is_ignored(all_flags):
+                return False
+            if self.default_disabled and not all_flags.has_any(
+                {self.enable_string, *self.extra_enable_strings}
+            ):
+                return False
+            if self.check_id in unit.check_cache:
+                return unit.check_cache[self.check_id]
+            unit.check_cache[self.check_id] = result = self.check_target_unit(
+                sources, targets, unit
+            )
+            return result
+        return self.check_target(sources, targets, unit)
+
     def check_target_generator(
         self, sources: list[str], targets: list[str], unit: Unit
     ) -> Generator[bool | MissingExtraDict]:
         """Check single unit, handling plurals."""
-        from weblate.lang.models import PluralMapper
+        # Singular units do not need plural metadata or PluralMapper.
+        if len(sources) == 1 and len(targets) == 1:
+            yield self.check_single(sources[0], targets[0], unit)
+            return
 
-        source_plural = unit.translation.component.source_language.plural
+        if unit.has_multiple_values(sources, targets):
+            # Each target alternative can correspond to any source alternative.
+            for target in targets:
+                failures = [
+                    self.check_single(source, target, unit) for source in sources
+                ]
+                if failures and all(failures):
+                    yield (
+                        merge_diagnostics(
+                            failure for failure in failures if isinstance(failure, dict)
+                        )
+                        or True
+                    )
+                else:
+                    yield False
+            return
+
+        # ruff: ignore[import-outside-top-level]
+        from weblate.lang.models import (
+            PluralMapper,
+        )
+
+        source_plural = unit.effective_source_plural
         target_plural = unit.translation.plural
         if len(sources) != source_plural.number or len(targets) != target_plural.number:
             for target in targets:
@@ -134,6 +257,9 @@ class BaseCheck(ClassLoaderProtocol):
         self, sources: list[str], targets: list[str], unit: Unit
     ) -> bool:
         """Check single unit, handling plurals."""
+        # Avoid creating a generator for the common singular case.
+        if len(sources) == 1 and len(targets) == 1:
+            return bool(self.check_single(sources[0], targets[0], unit))
         return any(self.check_target_generator(sources, targets, unit))
 
     def check_single(
@@ -146,6 +272,28 @@ class BaseCheck(ClassLoaderProtocol):
         """Check source strings."""
         if self.should_skip(unit):
             return False
+        return self.check_source_alternatives(sources, unit)
+
+    def check_source_with_flags(
+        self, sources: list[str], unit: Unit, all_flags: Flags
+    ) -> bool:
+        """Check source strings with precomputed flags."""
+        # Only inline the base skip logic for checks that did not override it.
+        # Custom should_skip() methods can inspect arbitrary unit state.
+        if self.__class__.should_skip is BaseCheck.should_skip:
+            if self.is_ignored(all_flags):
+                return False
+            if self.default_disabled and not all_flags.has_any(
+                {self.enable_string, *self.extra_enable_strings}
+            ):
+                return False
+            return self.check_source_alternatives(sources, unit)
+        return self.check_source(sources, unit)
+
+    def check_source_alternatives(self, sources: list[str], unit: Unit) -> bool:
+        """Check independent alternatives without assigning a singular form."""
+        if unit.has_multiple_values(sources, []):
+            return any(self.check_source_unit([source], unit) for source in sources)
         return self.check_source_unit(sources, unit)
 
     def check_source_unit(self, sources: list[str], unit: Unit) -> bool:
@@ -166,19 +314,33 @@ class BaseCheck(ClassLoaderProtocol):
         """Return link to documentation."""
         return get_doc_url("user/checks", self.doc_id, user=user)
 
-    def check_highlight(self, source: str, unit: Unit):
+    def check_highlight(self, source: str, unit: Unit) -> Iterable[Highlight]:
         """
         Return parts of the text that match to highlight them.
 
-        Result is list that contains lists of two elements with start position of the
-        match and the value of the match
+        Result contains highlighted spans with semantic information used by
+        formatting, automatic translation cleanup, and LLM structured
+        placeholders.
         """
         return []
 
     def get_description(self, check_obj: Check) -> StrOrPromise:
         return self.description
 
-    def get_fixup(self, unit: Unit) -> Iterable[tuple[str, str, str]] | None:
+    def get_plain_description(self, check_obj: Check) -> str:
+        """Return description text suitable for an escaped HTML attribute."""
+        description = str(self.get_description(check_obj))
+        if isinstance(description, SafeData):
+            # Dynamic checks separate individual errors with HTML line breaks.
+            description = re.sub(r"<br\s*/?>", "\n", description, flags=re.IGNORECASE)
+            return unescape(strip_tags(description))
+        return description
+
+    def get_documentation_description(self) -> str:
+        """Return the description formatted for reStructuredText documentation."""
+        return str(self.description).replace("\\", "\\\\")
+
+    def get_fixup(self, unit: Unit) -> Iterable[FixupType] | None:
         return None
 
     def render(self, request: AuthenticatedHttpRequest, unit: Unit) -> StrOrPromise:
@@ -186,14 +348,9 @@ class BaseCheck(ClassLoaderProtocol):
         raise Http404(msg)
 
     def get_cache_key(self, unit: Unit, pos: int) -> str:
-        return "check:{}:{}:{}:{}".format(
-            self.check_id,
-            unit.pk,
-            siphash("Weblate   Checks", unit.all_flags.format()),
-            pos,
-        )
+        return f"check:{self.check_id}:{unit.pk}:{siphash('Weblate   Checks', unit.all_flags.format())}:{pos}"
 
-    def get_replacement_function(self, unit: Unit):
+    def get_replacement_function(self, unit: Unit) -> Callable[[str], str]:
         def strip_xml(content: str) -> str:
             try:
                 tree = parse_xml(f"<x>{content}</x>")
@@ -213,7 +370,10 @@ class BaseCheck(ClassLoaderProtocol):
             return replacement
 
         # Parse the flag
-        replacements = flags.get_value("replacements")
+        try:
+            replacements = flags.get_value("replacements")
+        except ValueError:
+            return replacement
         # Create dict from that
         replacements = dict(
             replacements[pos : pos + 2] for pos in range(0, len(replacements), 2)
@@ -227,21 +387,89 @@ class BaseCheck(ClassLoaderProtocol):
         )
 
 
+class CodeDescriptionMixin(BaseCheck):
+    """Render literal examples for HTML, plain text, and documentation."""
+
+    description_template: StrOrPromise
+    description_values: ClassVar[dict[str, str]]
+
+    def get_description(self, check_obj: Check) -> SafeString:
+        return format_html(
+            escape(self.description_template),
+            **{
+                key: format_html("<code>{}</code>", value)
+                for key, value in self.description_values.items()
+            },
+        )
+
+    def get_plain_description(self, check_obj: Check) -> str:
+        return str(self.description_template).format(**self.description_values)
+
+    def get_documentation_description(self) -> str:
+        # Backslashes are literal inside RST inline code, unlike surrounding prose.
+        return (
+            str(self.description_template)
+            .replace("\\", "\\\\")
+            .format(
+                **{
+                    key: f"``{value}``"
+                    for key, value in self.description_values.items()
+                }
+            )
+        )
+
+
 class BatchCheckMixin(BaseCheck):
+    def unit_has_check(self, unit: Unit) -> bool:
+        if hasattr(unit, "has_check"):
+            return unit.has_check(self.check_id)
+        return self.check_id in unit.all_checks_names
+
     def handle_batch(self, unit: Unit, component: Component) -> bool:
         component.batched_checks.add(self.check_id)
-        return self.check_id in unit.all_checks_names
+        return self.unit_has_check(unit)
 
     def check_component(self, component: Component) -> Iterable[Unit]:
         raise NotImplementedError
 
     def perform_batch(self, component: Component) -> None:
-        with sentry_sdk.start_span(op="check.perform_batch", name=self.check_id):
+        from weblate.checks.locks import (  # ruff: ignore[import-outside-top-level]
+            check_boundary_lock,
+            check_component_session_read_lock,
+        )
+
+        if self.check_id in {"inconsistent", "reused"}:
+            with check_component_session_read_lock(component):
+                boundary_lock = (
+                    check_boundary_lock(component.project)
+                    if component.allow_translation_propagation
+                    else nullcontext()
+                )
+                with (
+                    boundary_lock,
+                    start_span(op="check.perform_batch", name=self.check_id),
+                ):
+                    self._perform_batch(component)
+            return
+
+        lock = (
+            check_boundary_lock(component.project)
+            if self.batch_project_wide and component.allow_translation_propagation
+            else nullcontext()
+        )
+        with lock, start_span(op="check.perform_batch", name=self.check_id):
             self._perform_batch(component)
 
     def _perform_batch(self, component: Component) -> None:
-        from weblate.checks.models import Check
-        from weblate.trans.models import Component
+        # ruff: ignore[import-outside-top-level]
+        from weblate.checks.models import (
+            Check,
+        )
+
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models import (
+            Component,
+        )
 
         handled = set()
         create = []
@@ -253,19 +481,24 @@ class BatchCheckMixin(BaseCheck):
             handled.add(unit.pk)
 
             # Check is already there
-            if self.check_id in unit.all_checks_names:
+            if self.unit_has_check(unit):
                 continue
 
             create.append(Check(unit=unit, dismissed=False, name=self.check_id))
             components[unit.translation.component.id] = unit.translation.component
 
+        create.sort(key=lambda check: (check.unit_id, check.name))
         Check.objects.bulk_create(create, batch_size=500, ignore_conflicts=True)
 
         # Delete stale checks
         stale_checks = Check.objects.exclude(unit_id__in=handled)
         if self.batch_project_wide and component.allow_translation_propagation:
+            from weblate.trans.propagation import propagation_filter  # ruff: ignore[import-outside-top-level]
+
             stale_checks = stale_checks.filter(
-                unit__translation__component__project=component.project,
+                propagation_filter(
+                    component.project, "unit__translation__component__", component.name
+                ),
                 unit__translation__component__allow_translation_propagation=True,
                 name=self.check_id,
             )
@@ -286,6 +519,18 @@ class BatchCheckMixin(BaseCheck):
 
         # Invalidate stats in case there were changes
         for current in components.values():
+            if component.refresh_peer_source_checks and self.check_id in {
+                "inconsistent",
+                "reused",
+            }:
+                from weblate.checks.models import CHECKS  # ruff: ignore[import-outside-top-level]
+
+                # Boundary-wide batches can change warnings on peers outside
+                # the initiating component. The propagation lock is already held,
+                # including for source checks using the same boundary.
+                for check in CHECKS.source.values():
+                    if isinstance(check, BatchCheckMixin):
+                        check._perform_batch(current)  # ruff: ignore[private-member-access]
             current.invalidate_cache()
 
 
@@ -303,7 +548,8 @@ class TargetCheck(BaseCheck):
         raise NotImplementedError
 
     def format_value(self, value: str) -> StrOrPromise:
-        from weblate.trans.templatetags.translations import Formatter
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.formatting import Formatter
 
         fmt = Formatter(0, value, None, None, None, None, None)
         fmt.parse()
@@ -353,6 +599,44 @@ class TargetCheck(BaseCheck):
             yield self.get_errors_text(set(errors))
 
 
+class PluralResultDescriptionMixin(TargetCheck):
+    """
+    Build check descriptions by merging MissingExtraDict results across plurals.
+
+    For checks whose ``check_single`` returns a ``MissingExtraDict`` (missing,
+    extra, and/or errors), this merges those results from every plural form and
+    formats them into the check description.
+    """
+
+    def get_description(self, check_obj: Check) -> StrOrPromise:
+        unit = check_obj.unit
+
+        errors: list[StrOrPromise] = []
+
+        # Merge plurals
+        results: MissingExtraDict = {}
+        for result in self.check_target_generator(
+            unit.get_effective_source_plurals(), unit.get_target_plurals(), unit
+        ):
+            if not isinstance(result, dict):
+                continue
+            if missing := result.get("missing"):
+                results.setdefault("missing", []).extend(missing)
+            if extra := result.get("extra"):
+                results.setdefault("extra", []).extend(extra)
+            if result_errors := result.get("errors"):
+                results.setdefault("errors", []).extend(result_errors)
+        if any(results.values()):
+            errors.extend(self.format_result(results))
+        if errors:
+            return format_html_join(
+                mark_safe("<br />"),
+                "{}",
+                ((error,) for error in errors),
+            )
+        return super().get_description(check_obj)
+
+
 class SourceCheck(BaseCheck):
     """Basic class for source checks."""
 
@@ -367,25 +651,39 @@ class SourceCheck(BaseCheck):
         raise NotImplementedError
 
 
-class TargetCheckParametrized(TargetCheck):
-    """Basic class for target checks with flag value."""
-
+class ParametrizedCheck(BaseCheck):
     default_disabled = True
 
-    def get_value(self, unit: Unit) -> Any:  # noqa: ANN401
+    def get_value(self, unit: Unit) -> Any:  # ruff: ignore[any-type]
         return unit.all_flags.get_value(self.enable_string)
 
     def has_value(self, unit: Unit) -> bool:
         return unit.all_flags.has_value(self.enable_string)
+
+    def get_description(self, check_obj: Check) -> StrOrPromise:
+        try:
+            self.get_value(check_obj.unit)
+        except ValueError as error:
+            return format_html(
+                gettext("Could not parse {} flag: {}"), self.enable_string, error
+            )
+        return super().get_description(check_obj)
+
+
+class TargetCheckParametrized(ParametrizedCheck, TargetCheck):
+    """Basic class for target checks with flag value."""
 
     def check_target_unit(
         self, sources: list[str], targets: list[str], unit: Unit
     ) -> bool:
         """Check flag value."""
         if unit.all_flags.has_value(self.enable_string):
-            return self.check_target_params(
-                sources, targets, unit, self.get_value(unit)
-            )
+            try:
+                value = self.get_value(unit)
+            except ValueError:
+                # Value is present, but is syntactically invalid
+                return True
+            return self.check_target_params(sources, targets, unit, value)
         return False
 
     def check_target_params(
@@ -393,7 +691,7 @@ class TargetCheckParametrized(TargetCheck):
         sources: list[str],
         targets: list[str],
         unit: Unit,
-        value: Any,  # noqa: ANN401
+        value: Any,  # ruff: ignore[any-type]
     ) -> bool:
         raise NotImplementedError
 

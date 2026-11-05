@@ -1,17 +1,27 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
 from itertools import chain
+from typing import TYPE_CHECKING
 
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext
 
 from .base import (
-    DownloadTranslations,
+    MACHINERY_DEFAULT_THRESHOLD,
     ResponseStatusMachineTranslation,
 )
 from .forms import URLMachineryForm
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import (
+        DownloadTranslations,
+    )
 
 LANGUAGE_MAP = {
     "ca": "cat",
@@ -28,6 +38,7 @@ LANGUAGE_MAP = {
     "fr": "fra",
     "sl": "slv",
     "sr": "hbs",
+    "nb": "nob",
     "nb_NO": "nob",
     "nn": "nno",
     "se": "sme",  # codespell:ignore sme
@@ -83,7 +94,7 @@ class ApertiumAPYTranslation(ResponseStatusMachineTranslation):
 
     @property
     def all_langs(self):
-        """Return all language codes known to service."""
+        """All language codes known to service."""
         return set(chain.from_iterable(self.supported_languages))
 
     def map_language_code(self, code):
@@ -124,18 +135,18 @@ class ApertiumAPYTranslation(ResponseStatusMachineTranslation):
             for item in data["responseData"]
         ]
 
-    def is_supported(self, source_language, target_language):
+    def is_supported(self, source_language, target_language) -> bool:
         """Check whether given language combination is supported."""
         return (source_language, target_language) in self.supported_languages
 
     def download_translations(
         self,
-        source_language,
-        target_language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from Apertium."""
         args = {

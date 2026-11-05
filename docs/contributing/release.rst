@@ -1,27 +1,16 @@
 Releasing Weblate
 =================
 
-.. _release-cycle:
-
 Release cycle
 -------------
 
-Weblate has two month release cycle for releases (x.y). These are usually
-followed by a bunch of bugfix releases to fix issues which slip into them
-(x.y.z). This includes bug fixes and addressing security issues.
-
-The change in the major version indicates that the upgrade process can not skip
-this version - you always have to upgrade to x.0 before upgrading to higher x.y
-releases.
-
-The Docker container includes additional digit in versioning to track changes
-in the container itself like dependencies. These updates may include security
-updates.
+Weblate's release and support lifecycle is documented in
+:ref:`release-cycle`.
 
 .. seealso::
 
+   * :doc:`../security/releases`
    * :doc:`../admin/upgrade`
-   * :ref:`security-updates`
 
 Release planning
 ----------------
@@ -38,6 +27,10 @@ Things to check prior to release:
 2. Set final version by :command:`./scripts/prepare-release`.
 3. Make sure screenshots are up to date :command:`make -j 12 -C docs update-screenshots`.
 4. Merge any possibly pending translations :command:`wlc push; git remote update; git merge origin/weblate`
+
+When building distribution packages locally, start from a clean checkout or
+remove ignored packaging artifacts such as :file:`build/`, :file:`dist/`,
+:file:`weblate.egg-info/`, and generated :file:`weblate/locale/**/*.mo` files.
 
 Perform the release:
 

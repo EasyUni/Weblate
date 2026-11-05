@@ -5,25 +5,37 @@
 from __future__ import annotations
 
 import csv
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
-from django.http import HttpResponse
+from django.db.models import Q
+from django.http import Http404, HttpResponse, QueryDict
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
 from django.urls.exceptions import NoReverseMatch
-from django.utils.translation import activate, gettext, pgettext
+from django.utils import feedgenerator, timezone
+from django.utils.http import content_disposition_header
+from django.utils.translation import activate, get_language, gettext, pgettext
 from django.views.generic.list import ListView
 
 from weblate.accounts.notifications import NOTIFICATIONS_ACTIONS
+from weblate.accounts.visibility import (
+    filter_contributor_changes,
+    prepare_contributor_visibility,
+)
 from weblate.lang.models import Language
-from weblate.trans.forms import ChangesForm
+from weblate.trans.feeds import get_change_feed_description, get_change_feed_guid
+from weblate.trans.forms import ChangesDateForm, ChangesForm
 from weblate.trans.models import Component, Project, Translation, Unit
 from weblate.trans.models.change import Change
+from weblate.utils.csv import escape_csv_formula
 from weblate.utils.site import get_site_url
 from weblate.utils.stats import ProjectLanguage
 from weblate.utils.views import PathViewMixin
+from weblate.workspaces.models import Workspace
 
 if TYPE_CHECKING:
     from django.db.models import Model
@@ -34,6 +46,7 @@ if TYPE_CHECKING:
 class ChangesView(PathViewMixin, ListView):
     """Browser for changes."""
 
+    require_contributor_access_for_author_filters = True
     paginate_by: int | None = 20
     supported_path_types = (
         None,
@@ -43,7 +56,48 @@ class ChangesView(PathViewMixin, ListView):
         Language,
         ProjectLanguage,
         Unit,
+        Workspace,
     )
+
+    def get_changes_url(self, url_name: str = "changes") -> str:
+        if self.path_object is None:
+            return reverse(url_name)
+        return reverse(url_name, kwargs={"path": self.path_object.get_url_path()})
+
+    def get_filtered_changes_url(self) -> str:
+        url = self.get_changes_url()
+        if self.changes_form.is_valid() and (
+            query_string := self.changes_form.urlencode()
+        ):
+            return f"{url}?{query_string}"
+        return url
+
+    def get_title(self):
+        if isinstance(self.path_object, Unit):
+            return (
+                pgettext(
+                    "Changes of string in a translation", "Changes of string in %s"
+                )
+                % self.path_object
+            )
+        if isinstance(self.path_object, Translation):
+            return (
+                pgettext("Changes in translation", "Changes in %s") % self.path_object
+            )
+        if isinstance(self.path_object, Component):
+            return pgettext("Changes in component", "Changes in %s") % self.path_object
+        if isinstance(self.path_object, Project):
+            return pgettext("Changes in project", "Changes in %s") % self.path_object
+        if isinstance(self.path_object, Language):
+            return pgettext("Changes in language", "Changes in %s") % self.path_object
+        if isinstance(self.path_object, ProjectLanguage):
+            return pgettext("Changes in project", "Changes in %s") % self.path_object
+        if isinstance(self.path_object, Workspace):
+            return pgettext("Changes in workspace", "Changes in %s") % self.path_object
+        if self.path_object is None:
+            return gettext("Changes")
+        msg = f"Unsupported {self.path_object}"
+        raise TypeError(msg)
 
     def get_template_names(self):
         if digest := self.request.GET.get("digest"):
@@ -56,50 +110,12 @@ class ChangesView(PathViewMixin, ListView):
         """Create context for rendering page."""
         context = super().get_context_data(**kwargs)
         context["path_object"] = self.path_object
+        context["title"] = self.get_title()
+        context["changes_rss"] = self.get_changes_url("changes-rss")
 
-        if isinstance(self.path_object, Unit):
-            context["title"] = (
-                pgettext(
-                    "Changes of string in a translation", "Changes of string in %s"
-                )
-                % self.path_object
-            )
-        elif isinstance(self.path_object, Translation):
-            context["title"] = (
-                pgettext("Changes in translation", "Changes in %s") % self.path_object
-            )
-        elif isinstance(self.path_object, Component):
-            context["title"] = (
-                pgettext("Changes in component", "Changes in %s") % self.path_object
-            )
-        elif isinstance(self.path_object, Project):
-            context["title"] = (
-                pgettext("Changes in project", "Changes in %s") % self.path_object
-            )
-        elif isinstance(self.path_object, Language):
-            context["title"] = (
-                pgettext("Changes in language", "Changes in %s") % self.path_object
-            )
-        elif isinstance(self.path_object, ProjectLanguage):
-            context["title"] = (
-                pgettext("Changes in project", "Changes in %s") % self.path_object
-            )
-        elif self.path_object is None:
-            context["title"] = gettext("Changes")
-        else:
-            msg = f"Unsupported {self.path_object}"
-            raise TypeError(msg)
-
-        if self.path_object is None:
-            context["changes_rss"] = reverse("rss")
-        else:
-            context["changes_rss"] = reverse(
-                "rss", kwargs={"path": self.path_object.get_url_path()}
-            )
-
+        context["query_params"] = QueryDict()
         if self.changes_form.is_valid():
-            context["query_string"] = self.changes_form.urlencode()
-            context["search_items"] = self.changes_form.items()
+            context["query_params"] = QueryDict(self.changes_form.urlencode())
             if period := self.changes_form.cleaned_data.get("period"):
                 self.changes_form.fields["period"].widget.attrs["data-start-date"] = (
                     period["start_date"].strftime("%m/%d/%Y")
@@ -109,6 +125,10 @@ class ChangesView(PathViewMixin, ListView):
                 )
 
         context["form"] = self.changes_form
+        context["latest_url"] = self.get_filtered_changes_url()
+        context["date_form"] = self.date_form
+        context["older_cursor"] = self.older_cursor
+        context["newer_cursor"] = self.newer_cursor
 
         # Compatibility with digest templates
         context["changes"] = context["object_list"]
@@ -119,6 +139,9 @@ class ChangesView(PathViewMixin, ListView):
     def setup(self, *args, **kwargs) -> None:
         super().setup(*args, **kwargs)
         self.changes_form = ChangesForm(data=self.request.GET)
+        self.date_form = ChangesDateForm(data=self.request.GET)
+        self.older_cursor: dict[str, str | int] | None = None
+        self.newer_cursor: dict[str, str | int] | None = None
 
     def get_request_param(self, request: AuthenticatedHttpRequest, param: str) -> str:
         value = request.GET.get(param)
@@ -126,7 +149,9 @@ class ChangesView(PathViewMixin, ListView):
             return "-"
         return value
 
-    def get(self, request: AuthenticatedHttpRequest, *args, **kwargs):  # type: ignore[override]
+    def get(  # type: ignore[override]
+        self, request: AuthenticatedHttpRequest, *args, **kwargs
+    ):
         if self.path_object is None and self.request.GET:
             # Handle GET params for filtering prior Weblate 5.0
             path = None
@@ -152,6 +177,14 @@ class ChangesView(PathViewMixin, ListView):
                     return redirect("changes", path=path)
                 except NoReverseMatch:
                     return redirect("changes")
+        if "page" in request.GET or "limit" in request.GET:
+            params = request.GET.copy()
+            params.pop("page", None)
+            params.pop("limit", None)
+            url = self.get_changes_url()
+            if params:
+                url = f"{url}?{params.urlencode()}"
+            return redirect(url)
         return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
@@ -176,6 +209,8 @@ class ChangesView(PathViewMixin, ListView):
                 "project": self.path_object.project,
                 "language": self.path_object.language,
             }
+        elif isinstance(self.path_object, Workspace):
+            params = {"workspace": self.path_object}
         else:
             msg = f"Unsupported {self.path_object}"
             raise TypeError(msg)
@@ -198,6 +233,12 @@ class ChangesView(PathViewMixin, ListView):
 
         result = Change.objects.last_changes(self.request.user, **params)
 
+        result = filter_contributor_changes(
+            result,
+            self.request.user,
+            enabled=self.require_contributor_access_for_author_filters
+            and ("user" in filters or "user" in excludes),
+        )
         if filters:
             result = result.filter(**filters)
         if excludes:
@@ -205,32 +246,136 @@ class ChangesView(PathViewMixin, ListView):
 
         return result
 
-    def paginate_queryset(self, queryset, page_size):
-        if not self.changes_form.is_valid():
-            queryset = queryset.none()
-        paginator, page, queryset, is_paginated = super().paginate_queryset(
-            queryset, page_size
+    @staticmethod
+    def cursor_params(
+        timestamp: datetime, pk: int, direction: str
+    ) -> dict[str, str | int]:
+        param = "before" if direction == "older" else "after"
+        return {
+            param: timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            "id": pk,
+        }
+
+    @staticmethod
+    def parse_cursor(params: QueryDict) -> tuple[datetime, int, str]:
+        message = gettext("Invalid history position.")
+        if ("before" in params) == ("after" in params) or len(
+            params.getlist("id")
+        ) != 1:
+            raise Http404(message)
+        param = "before" if "before" in params else "after"
+        if len(params.getlist(param)) != 1:
+            raise Http404(message)
+        try:
+            timestamp = datetime.fromisoformat(params.getlist(param)[0])
+            pk = int(params.getlist("id")[0])
+        except ValueError as error:
+            raise Http404(message) from error
+        if timezone.is_naive(timestamp) or not 0 <= pk <= 9223372036854775807:
+            raise Http404(message)
+        try:
+            timestamp = timestamp.astimezone(UTC)
+        except OverflowError as error:
+            raise Http404(message) from error
+        return timestamp, pk, "older" if param == "before" else "newer"
+
+    @staticmethod
+    def cursor_filter(timestamp: datetime, pk: int, direction: str) -> Q:
+        lookup = "lt" if direction == "older" else "gt"
+        # The redundant inclusive bound lets PostgreSQL seek into the timestamp
+        # index instead of filtering all rows before a deep cursor position.
+        return Q(**{f"timestamp__{lookup}e": timestamp}) & (
+            Q(**{f"timestamp__{lookup}": timestamp})
+            | Q(timestamp=timestamp, **{f"pk__{lookup}": pk})
         )
-        page = Change.objects.preload_list(page)
-        return paginator, page, queryset, is_paginated
+
+    def paginate_queryset(self, queryset, page_size):
+        if not self.changes_form.is_valid() or not self.date_form.is_valid():
+            return None, None, [], False
+
+        # Fetch only the keys before loading the selected page's related objects.
+        keys = queryset.select_related(None).prefetch_related(None)
+        direction = "older"
+        boundary: tuple[datetime, int] | None = None
+        if date := self.date_form.cleaned_data["date"]:
+            boundary = (date, 0)
+        elif any(param in self.request.GET for param in ("before", "after", "id")):
+            timestamp, pk, direction = self.parse_cursor(self.request.GET)
+            boundary = (timestamp, pk)
+        selected = keys
+        if boundary is not None:
+            selected = selected.filter(self.cursor_filter(*boundary, direction))
+        ordering = (
+            ("timestamp", "pk") if direction == "newer" else ("-timestamp", "-pk")
+        )
+        rows: list[tuple[datetime, int]] = list(
+            selected.order_by(*ordering).values_list("timestamp", "pk")[: page_size + 1]
+        )
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
+        if direction == "newer":
+            rows.reverse()
+
+        older: tuple[datetime, int] | None
+        newer: tuple[datetime, int] | None
+        if rows:
+            older = rows[-1]
+            newer = rows[0]
+            has_older = (
+                has_more
+                if direction == "older"
+                else keys.filter(self.cursor_filter(*older, "older")).exists()
+            )
+            has_newer = (
+                has_more
+                if direction == "newer"
+                else keys.filter(self.cursor_filter(*newer, "newer")).exists()
+            )
+        else:
+            older = newer = boundary
+            has_older = (
+                boundary is not None
+                and keys.filter(self.cursor_filter(*boundary, "older")).exists()
+            )
+            has_newer = (
+                boundary is not None
+                and keys.filter(self.cursor_filter(*boundary, "newer")).exists()
+            )
+        if has_older and older is not None:
+            self.older_cursor = self.cursor_params(*older, "older")
+        if has_newer and newer is not None:
+            self.newer_cursor = self.cursor_params(*newer, "newer")
+
+        objects = {
+            item.pk: item for item in queryset.filter(pk__in=[pk for _, pk in rows])
+        }
+        changes = Change.objects.preload_list(
+            [objects[pk] for _, pk in rows if pk in objects]
+        )
+        return None, None, changes, bool(self.older_cursor or self.newer_cursor)
 
 
 class ChangesCSVView(ChangesView):
     """CSV renderer for changes view."""
 
     paginate_by = None
+    require_contributor_access_for_author_filters = False
 
-    def get(self, request: AuthenticatedHttpRequest, *args, **kwargs):  # type: ignore[override]
-        object_list = self.get_queryset()[:2000]
-
+    def get(  # type: ignore[override]
+        self, request: AuthenticatedHttpRequest, *args, **kwargs
+    ):
         if not request.user.has_perm("change.download", self.path_object):
             raise PermissionDenied
+
+        object_list = self.get_queryset()[:2000]
 
         # Always output in english
         activate("en")
 
         response = HttpResponse(content_type="text/csv; charset=utf-8")
-        response["Content-Disposition"] = "attachment; filename=changes.csv"
+        response["Content-Disposition"] = content_disposition_header(
+            as_attachment=True, filename="changes.csv"
+        )
 
         writer = csv.writer(response)
 
@@ -244,9 +389,9 @@ class ChangesCSVView(ChangesView):
                 (
                     change.timestamp.isoformat(),
                     change.get_action_display(),
-                    change.user.username if change.user else "",
+                    escape_csv_formula(change.user.username) if change.user else "",
                     get_site_url(change.get_absolute_url()),
-                    change.target,
+                    escape_csv_formula(change.target),
                     change.get_distance(),
                 )
             )
@@ -254,18 +399,88 @@ class ChangesCSVView(ChangesView):
         return response
 
 
+class ChangesRSSView(ChangesView):
+    """RSS renderer for changes view."""
+
+    feed_count = 10
+    paginate_by = None
+
+    def get_feed_title(self):
+        if self.path_object is None:
+            # Translators: %s is site title here
+            return gettext("Recent changes on %s") % settings.SITE_TITLE
+        # Translators: %s is translation/project/component/language name
+        return gettext("Recent changes in %s") % self.path_object
+
+    def get_feed_description(self):
+        if self.path_object is None:
+            # Translators: %s is site title here
+            return gettext("All recent changes made using Weblate on %s.") % (
+                settings.SITE_TITLE
+            )
+        # Translators: %s is translation/project/component/language name
+        return (
+            gettext("All recent changes made using Weblate in %s.") % self.path_object
+        )
+
+    def get(  # type: ignore[override]
+        self, request: AuthenticatedHttpRequest, *args, **kwargs
+    ):
+        if self.changes_form.is_valid():
+            object_list = Change.objects.preload_list(
+                list(self.get_queryset()[: self.feed_count])
+            )
+        else:
+            object_list = []
+
+        feed = feedgenerator.Rss201rev2Feed(
+            title=self.get_feed_title(),
+            link=get_site_url(self.get_filtered_changes_url()),
+            description=self.get_feed_description(),
+            language=get_language(),
+            feed_url=get_site_url(request.get_full_path()),
+        )
+
+        viewer = prepare_contributor_visibility(request.user, object_list)
+        for change in object_list:
+            link = get_site_url(change.get_absolute_url())
+            feed.add_item(
+                title=change.get_action_display(),
+                link=link,
+                description=get_change_feed_description(change),
+                author_name=change.get_user_display(False, viewer=viewer),
+                pubdate=change.timestamp,
+                unique_id=get_change_feed_guid(change),
+                unique_id_is_permalink=False,
+            )
+
+        response = HttpResponse(content_type=feed.content_type)
+        feed.write(response, "utf-8")
+        return response
+
+
 @login_required
 def show_change(request: AuthenticatedHttpRequest, pk: int):
-    change = get_object_or_404(Change, pk=pk)
+    accessible_changes = Change.objects.last_changes(request.user)
+    change = get_object_or_404(accessible_changes, pk=pk)
     acl_obj = change.translation or change.component or change.project
     if not request.user.has_perm("unit.edit", acl_obj):
         raise PermissionDenied
-    others = request.GET.getlist("other")
+    others = []
+    for other in request.GET.getlist("other"):
+        try:
+            others.append(int(other))
+        except ValueError:
+            continue
     changes = None
     if others:
-        changes = Change.objects.filter(pk__in=[*others, change.pk])
-        for change in changes:
-            acl_obj = change.translation or change.component or change.project
+        changes = accessible_changes.filter(pk__in=[*others, change.pk])
+        for related_change in changes:
+            acl_obj = (
+                related_change.translation
+                or related_change.component
+                or related_change.project
+            )
             if not request.user.has_perm("unit.edit", acl_obj):
                 raise PermissionDenied
     if change.action not in NOTIFICATIONS_ACTIONS:

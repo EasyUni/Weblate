@@ -1,18 +1,35 @@
 # Copyright © Michal Čihař <michal@weblate.org>
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
-from requests.exceptions import RequestException
+from typing import TYPE_CHECKING, ClassVar
 
-from .base import DownloadTranslations, MachineTranslation, MachineTranslationError
+import httpx2
+
+from .base import (
+    MACHINERY_DEFAULT_THRESHOLD,
+    MachineTranslation,
+    MachineTranslationError,
+)
 from .forms import KeyMachineryForm
+
+if TYPE_CHECKING:
+    from weblate.auth.models import User
+    from weblate.trans.models import Unit
+
+    from .base import DownloadTranslations
 
 GOOGLE_API_ROOT = "https://translation.googleapis.com/language/translate/v2/"
 
 
 class GoogleBaseTranslation(MachineTranslation):
+    # Per-minute content and request quotas.
+    # https://docs.cloud.google.com/translate/quotas
+    rate_limit_window = 60
+
     # Map codes used by Google to the ones used by Weblate
-    language_map = {
+    language_map: ClassVar[dict[str, str]] = {
         "nb": "no",
         "nb_NO": "no",
         "fil": "tl",
@@ -26,10 +43,10 @@ class GoogleBaseTranslation(MachineTranslation):
         """Convert language to service specific code."""
         return super().map_language_code(code).replace("_", "-").split("@")[0]
 
-    def is_supported(self, source, language):
+    def is_supported(self, source_language, target_language):
         # Avoid translation between aliases
-        return super().is_supported(source, language) and not any(
-            {source, language} == item for item in self.language_aliases
+        return super().is_supported(source_language, target_language) and not any(
+            {source_language, target_language} == item for item in self.language_aliases
         )
 
 
@@ -44,7 +61,11 @@ class GoogleTranslation(GoogleBaseTranslation):
     def get_identifier(cls) -> str:
         return "google-translate"
 
-    def check_failure(self, response) -> None:
+    def get_headers(self) -> dict[str, str]:
+        """Add authentication headers to request."""
+        return {"X-Goog-Api-Key": self.settings["key"]}
+
+    def check_failure(self, response: httpx2.Response) -> None:
         super().check_failure(response)
         payload = response.json()
 
@@ -53,31 +74,28 @@ class GoogleTranslation(GoogleBaseTranslation):
 
     def download_languages(self):
         """List of supported languages."""
-        response = self.request(
-            "get", GOOGLE_API_ROOT + "languages", params={"key": self.settings["key"]}
-        )
+        response = self.request("get", f"{GOOGLE_API_ROOT}languages")
         payload = response.json()
 
         return [d["language"] for d in payload["data"]["languages"]]
 
     def download_translations(
         self,
-        source,
-        language,
+        source_language: str,
+        target_language: str,
         text: str,
-        unit,
-        user,
-        threshold: int = 75,
+        unit: Unit | None,
+        user: User | None,
+        threshold: int = MACHINERY_DEFAULT_THRESHOLD,
     ) -> DownloadTranslations:
         """Download list of possible translations from a service."""
         response = self.request(
-            "get",
+            "post",
             GOOGLE_API_ROOT,
-            params={
-                "key": self.settings["key"],
+            json={
                 "q": text,
-                "source": source,
-                "target": language,
+                "source": source_language,
+                "target": target_language,
                 "format": "text",
             },
         )
@@ -93,7 +111,7 @@ class GoogleTranslation(GoogleBaseTranslation):
         }
 
     def get_error_message(self, exc):
-        if isinstance(exc, RequestException) and exc.response is not None:
+        if isinstance(exc, httpx2.HTTPStatusError):
             data = exc.response.json()
             try:
                 return data["error"]["message"]

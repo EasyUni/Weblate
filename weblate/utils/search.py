@@ -5,17 +5,21 @@
 from __future__ import annotations
 
 import threading
+import warnings
+from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache, reduce
+from functools import lru_cache
+from ipaddress import ip_address
 from itertools import chain
-from operator import and_, or_
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, overload
 
 from dateutil.parser import ParserError
 from dateutil.parser import parse as dateutil_parse
+from django.core.exceptions import FieldDoesNotExist
 from django.db import transaction
-from django.db.models import Count, Expression, F, Q, Value
-from django.db.utils import DataError, OperationalError
+from django.db.models import Count, Exists, F, OuterRef, Q, Subquery, Value
+from django.db.models.functions import Coalesce
+from django.db.utils import DataError
 from django.http import Http404
 from django.utils import timezone
 from django.utils.translation import gettext
@@ -23,22 +27,24 @@ from pyparsing import (
     CaselessKeyword,
     OpAssoc,
     Optional,
+    ParseException,
     ParserElement,
     ParseResults,
     Regex,
     Word,
+    alphanums,
     infix_notation,
     one_of,
 )
 
 from weblate.checks.parser import RawQuotedString
 from weblate.lang.models import Language
-from weblate.trans.models import Category, Component, Project, Translation
+from weblate.trans.models import Category, Component, Label, Project, Translation
 from weblate.trans.util import PLURAL_SEPARATOR
-from weblate.utils.db import re_escape, using_postgresql
+from weblate.utils.db import RegexAnalysisLimitError, re_escape, validate_search_regex
 from weblate.utils.state import (
+    FUZZY_STATES,
     STATE_APPROVED,
-    STATE_FUZZY,
     STATE_NAMES,
     STATE_READONLY,
     STATE_TRANSLATED,
@@ -49,11 +55,28 @@ from weblate.utils.views import parse_path
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from django.db.models import Expression, Model
+
+
+class SearchQueryError(Exception):
+    """Error in the search expression."""
+
+
+SearchParser = Literal["unit", "user", "superuser", "screenshot"]
+
 
 # Helper parsing objects
 class RegexExpr:
     def __init__(self, tokens) -> None:
         self.expr = tokens[1]
+        # Validate before a query reaches PostgreSQLRegexLookup, so search
+        # surfaces return their usual query error for excessive expressions.
+        try:
+            validate_search_regex(self.expr)
+        except RegexAnalysisLimitError as error:
+            raise SearchQueryError(
+                gettext("Regular expression is too complex.")
+            ) from error
 
 
 class RangeExpr:
@@ -71,9 +94,100 @@ OPERATOR_MAP = {
     ":>=": "gte",
 }
 
+MAX_PARSED_QUERY_CLAUSES = 64
+MAX_SEARCH_QUERY_LENGTH = 2048
+MAX_SEARCH_QUERY_TERMS = 128
+
+
+@dataclass(slots=True)
+class ParsedQueryClause:
+    query: Q
+    change_query: Q | None = None
+
+    def materialize(self) -> Q:
+        if self.change_query is None:
+            return self.query
+
+        # ruff: ignore[import-outside-top-level]
+        from weblate.trans.models import Change
+
+        return self.query & Q(
+            Exists(Change.objects.filter(self.change_query, unit_id=OuterRef("pk")))
+        )
+
+    def combine_and(self, other: ParsedQueryClause) -> ParsedQueryClause:
+        change_query: Q | None
+        if self.change_query is None:
+            change_query = other.change_query
+        elif other.change_query is None:
+            change_query = self.change_query
+        else:
+            change_query = self.change_query & other.change_query
+
+        return ParsedQueryClause(self.query & other.query, change_query)
+
+
+@dataclass(slots=True)
+class ParsedQuery:
+    clauses: list[ParsedQueryClause]
+
+    @classmethod
+    def from_query(cls, query: Q) -> ParsedQuery:
+        return cls([ParsedQueryClause(query)])
+
+    @classmethod
+    def from_change_query(cls, change_query: Q) -> ParsedQuery:
+        return cls([ParsedQueryClause(Q(), change_query)])
+
+    def materialize(self) -> Q:
+        if not self.clauses:
+            return Q()
+
+        result = self.clauses[0].materialize()
+        for clause in self.clauses[1:]:
+            result |= clause.materialize()
+        return result
+
+    def has_change_query(self) -> bool:
+        return any(clause.change_query is not None for clause in self.clauses)
+
+    def combine_and(self, other: ParsedQuery) -> ParsedQuery:
+        if not self.has_change_query() and not other.has_change_query():
+            return ParsedQuery.from_query(self.materialize() & other.materialize())
+
+        new_clause_count = len(self.clauses) * len(other.clauses)
+        if new_clause_count > MAX_PARSED_QUERY_CLAUSES:
+            msg = gettext("Search query is too complex.")
+            raise SearchQueryError(msg)
+
+        return ParsedQuery(
+            [
+                left.combine_and(right)
+                for left in self.clauses
+                for right in other.clauses
+            ]
+        )
+
+    def combine_or(self, other: ParsedQuery) -> ParsedQuery:
+        if not self.has_change_query() and not other.has_change_query():
+            return ParsedQuery.from_query(self.materialize() | other.materialize())
+
+        new_clause_count = len(self.clauses) + len(other.clauses)
+        if new_clause_count > MAX_PARSED_QUERY_CLAUSES:
+            msg = gettext("Search query is too complex.")
+            raise SearchQueryError(msg)
+
+        return ParsedQuery([*self.clauses, *other.clauses])
+
+    def negate(self) -> ParsedQuery:
+        return ParsedQuery.from_query(~self.materialize())
+
 
 def build_parser(term_expression: type[BaseTermExpr]) -> ParserElement:
     """Build parsing grammar."""
+    # The recursive infix grammar can backtrack exponentially without memoization.
+    ParserElement.enable_packrat()
+
     # Booleans
     op_and = CaselessKeyword("AND")
     op_or = Optional(CaselessKeyword("OR"))
@@ -87,7 +201,7 @@ def build_parser(term_expression: type[BaseTermExpr]) -> ParserElement:
 
     # Match token
     word = Regex(r"""[^ \r\n\(\)]([^ \r\n'"]*[^ \r\n'"\)])?""")
-    date = Word("0123456789:.-T")
+    date = Word(alphanums + ":._-")
 
     # Date range
     date_range = "[" + date + "to" + date + "]"
@@ -128,11 +242,11 @@ def build_parser(term_expression: type[BaseTermExpr]) -> ParserElement:
 
 
 class BaseTermExpr:
-    PLAIN_FIELDS: set[str] = set()
-    NONTEXT_FIELDS: dict[str, str] = {}
-    STRING_FIELD_MAP: dict[str, str] = {}
-    EXACT_FIELD_MAP: dict[str, str] = {}
-    enable_fulltext = True
+    PLAIN_FIELDS: ClassVar[set[str]] = set()
+    NONTEXT_FIELDS: ClassVar[dict[str, str]] = {}
+    STRING_FIELD_MAP: ClassVar[dict[str, str]] = {}
+    EXACT_FIELD_MAP: ClassVar[dict[str, str]] = {}
+    enable_fulltext: ClassVar[bool] = True
 
     def __init__(self, tokens) -> None:
         if len(tokens) == 1:
@@ -160,7 +274,9 @@ class BaseTermExpr:
         try:
             return STATE_NAMES[text]
         except KeyError as exc:
-            raise ValueError(gettext("Unsupported state: {}").format(text)) from exc
+            raise SearchQueryError(
+                gettext("Unsupported state: {}").format(text)
+            ) from exc
 
     def convert_bool(self, text: str) -> bool:
         ltext = text.lower()
@@ -168,8 +284,9 @@ class BaseTermExpr:
             return True
         if ltext in {"no", "false", "off", "0"}:
             return False
-        msg = f"Invalid boolean value: {text}"
-        raise ValueError(msg)
+        raise SearchQueryError(
+            gettext("Could not parse boolean value: {}").format(text)
+        )
 
     @overload
     def convert_int(self, text: RangeExpr) -> tuple[int, int]: ...
@@ -181,7 +298,12 @@ class BaseTermExpr:
                 self.convert_int(text.start),
                 self.convert_int(text.end),
             )
-        return int(text)
+        try:
+            return int(text)
+        except ValueError as error:
+            raise SearchQueryError(
+                gettext("Could not parse numeric value: {}").format(text)
+            ) from error
 
     def convert_id(self, text: str) -> int | set[int]:
         if "," in text:
@@ -192,32 +314,22 @@ class BaseTermExpr:
     def convert_datetime(
         self,
         text: RangeExpr,
-        hour: int = 5,
-        minute: int = 55,
-        second: int = 55,
-        microsecond: int = 0,
     ) -> tuple[datetime, datetime]: ...
     @overload
     def convert_datetime(
         self,
         text: str,
-        hour: int = 5,
-        minute: int = 55,
-        second: int = 55,
-        microsecond: int = 0,
     ) -> datetime: ...
-    def convert_datetime(self, text, hour=5, minute=55, second=55, microsecond=0):
-        tzinfo = timezone.get_current_timezone()
+    def convert_datetime(self, text):
         if isinstance(text, RangeExpr):
             return (
-                self.convert_datetime(
-                    text.start, hour=0, minute=0, second=0, microsecond=0
-                ),
-                self.convert_datetime(
+                self.date_parse(text.start, hour=0, minute=0, second=0, microsecond=0),
+                self.date_parse(
                     text.end, hour=23, minute=59, second=59, microsecond=999999
                 ),
             )
         if text.isdigit() and len(text) == 4:
+            tzinfo = timezone.get_current_timezone()
             year = int(text)
             return (
                 datetime(
@@ -242,49 +354,161 @@ class BaseTermExpr:
                 ),
             )
 
-        return self.human_date_parse(text, hour, minute, second, microsecond)
+        return self.date_parse(text)
 
-    def human_date_parse(
+    def get_day_range(self, timestamp: datetime) -> tuple[datetime, datetime]:
+        return (
+            timestamp.replace(hour=0, minute=0, second=0, microsecond=0),
+            timestamp.replace(hour=23, minute=59, second=59, microsecond=999999),
+        )
+
+    @overload
+    def date_parse_human(
         self,
         text: str,
-        hour: int = 5,
-        minute: int = 55,
-        second: int = 55,
-        microsecond: int = 0,
-    ) -> datetime | tuple[datetime, datetime]:
-        tzinfo = timezone.get_current_timezone()
+        hour: None = None,
+        minute: None = None,
+        second: None = None,
+        microsecond: None = None,
+    ) -> datetime | tuple[datetime, datetime]: ...
+    @overload
+    def date_parse_human(
+        self,
+        text: str,
+        hour: int,
+        minute: int,
+        second: int,
+        microsecond: int,
+    ) -> datetime: ...
+    def date_parse_human(
+        self,
+        text,
+        hour=None,
+        minute=None,
+        second=None,
+        microsecond=None,
+    ):
+        # Lazily import as this can be expensive
+        # ruff: ignore[import-outside-top-level]
+        from dateparser.date import DateDataParser
 
+        # Custom RELATIVE_BASE allows basing "1 day ago" from midnight instead
+        # of the current time
+        parser = DateDataParser(
+            locales=["en"],
+            settings={
+                "RELATIVE_BASE": timezone.now().replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+            },
+        )
+
+        # Attempts to parse the text using dateparser
+        # If the text is unparsable it will return None
+        data = parser.get_date_data(text)
+
+        date_obj: datetime | None = data.date_obj
+
+        if date_obj is None:
+            raise SearchQueryError(
+                gettext("Could not parse timestamp: {}").format(text)
+            )
+
+        # Always include timezone
+        if date_obj.tzinfo is None:
+            date_obj = date_obj.replace(tzinfo=timezone.get_current_timezone())
+
+        if data.period == "day":
+            if (
+                hour is not None
+                and minute is not None
+                and second is not None
+                and microsecond is not None
+            ):
+                # Replace timestamp when parsing range
+                return date_obj.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=second,
+                    microsecond=microsecond,
+                    tzinfo=timezone.get_current_timezone(),
+                )
+            # Create one day range from date only
+            if (
+                date_obj.hour == 0
+                and date_obj.minute == 0
+                and date_obj.second == 0
+                and date_obj.microsecond == 0
+            ):
+                return self.get_day_range(date_obj)
+
+        return date_obj
+
+    @overload
+    def date_parse(
+        self,
+        text: str,
+        hour: None = None,
+        minute: None = None,
+        second: None = None,
+        microsecond: None = None,
+    ) -> datetime | tuple[datetime, datetime]: ...
+    @overload
+    def date_parse(
+        self,
+        text: str,
+        hour: int,
+        minute: int,
+        second: int,
+        microsecond: int,
+    ) -> datetime: ...
+    def date_parse(
+        self,
+        text,
+        hour=None,
+        minute=None,
+        second=None,
+        microsecond=None,
+    ):
         result: datetime | None
 
-        try:
+        default = timezone.now()
+        if hour is None or minute is None or second is None or microsecond is None:
             # Here we inject 5:55:55 time and if that was not changed
             # during parsing, we assume it was not specified while
             # generating the query
-            result = dateutil_parse(
-                text,
-                default=timezone.now().replace(
-                    hour=hour, minute=minute, second=second, microsecond=microsecond
-                ),
+            default = default.replace(hour=5, minute=5, second=5, microsecond=5)
+        else:
+            # Apply real defaults
+            default = default.replace(
+                hour=hour, minute=minute, second=second, microsecond=microsecond
             )
+
+        try:
+            with warnings.catch_warnings():
+                # Ignore ambiguous date warning, it is gracefully handled by datetutil
+                # or raises exception.
+                warnings.filterwarnings(
+                    "ignore",
+                    "Parsing dates involving a day of month without a year specified",
+                    DeprecationWarning,
+                )
+                result = dateutil_parse(text, default=default)
         except ParserError:
-            # Lazily import as this can be expensive
-            from dateparser import parse as dateparser_parse
+            result = None
 
-            # Attempts to parse the text using dateparser
-            # If the text is unparsable it will return None
-            result = dateparser_parse(text, locales=["en"])
         if not result:
-            msg = "Could not parse timestamp"
-            raise ValueError(msg)
+            return self.date_parse_human(
+                text, hour=hour, minute=minute, second=second, microsecond=microsecond
+            )
 
-        result = result.replace(
-            hour=hour,
-            minute=minute,
-            second=second,
-            microsecond=microsecond,
-            tzinfo=tzinfo,
-        )
-        if result.hour == 5 and result.minute == 55 and result.second == 55:
+        if (
+            hour is None
+            and result.hour == 5
+            and result.minute == 5
+            and result.second == 5
+            and result.microsecond == 5
+        ):
             return (
                 result.replace(hour=0, minute=0, second=0, microsecond=0),
                 result.replace(hour=23, minute=59, second=59, microsecond=999999),
@@ -293,12 +517,18 @@ class BaseTermExpr:
         return result
 
     def convert_change_action(self, text: str) -> int:
+        # ruff: ignore[import-outside-top-level]
         from weblate.trans.models import Change
 
         try:
             return Change.ACTION_NAMES[text]
         except KeyError:
-            return Change.ACTION_STRINGS[text]
+            try:
+                return Change.ACTION_STRINGS[text]
+            except KeyError:
+                raise SearchQueryError(
+                    gettext("Unknown change action: {}").format(text)
+                ) from None
 
     def convert_change_time(self, text: str) -> datetime | tuple[datetime, datetime]:
         return self.convert_datetime(text)
@@ -324,10 +554,50 @@ class BaseTermExpr:
             if suffix not in {"substring", "iexact"}:
                 return f"{self.NONTEXT_FIELDS[field]}__{suffix}"
             return self.NONTEXT_FIELDS[field]
-        msg = f"Unsupported field: {field}"
-        raise ValueError(msg)
+        raise SearchQueryError(gettext("Unknown search field: {}").format(field))
 
-    def convert_non_field(self) -> Q:
+    def build_field_query(
+        self,
+        field: str,
+        # ruff: ignore[any-type]
+        match: Any,
+        field_name: Callable[[str, str | None], str] | None = None,
+    ) -> Q:
+        if field_name is None:
+            field_name = self.field_name
+
+        if isinstance(match, RegexExpr):
+            # Regular expression
+            # ruff: ignore[import-outside-top-level]
+            from weblate.trans.models import Unit
+
+            with transaction.atomic():
+                try:
+                    Unit.objects.annotate(test=Value("")).filter(
+                        test__trgm_regex=match.expr
+                    ).exists()
+                except DataError as error:
+                    raise SearchQueryError(
+                        gettext("Invalid regular expression: {}").format(error)
+                    ) from error
+            return Q(**{field_name(field, "trgm_regex"): match.expr})
+
+        if isinstance(match, tuple):
+            start, end = match
+            # Ranges
+            if self.operator in {":", ":="}:
+                return Q(**{field_name(field, "range"): (start, end)})
+            if self.operator in {":>", ":>="}:
+                return Q(**{field_name(field, "gte"): start})
+            return Q(**{field_name(field, "lte"): end})
+
+        if isinstance(match, set):
+            return Q(**{field_name(field, "in"): match})
+
+        # Generic query
+        return Q(**{field_name(field, None): match})
+
+    def convert_non_field(self, context: dict) -> Q:
         raise NotImplementedError
 
     def as_query(self, context: dict) -> Q:
@@ -335,7 +605,7 @@ class BaseTermExpr:
         match = self.match
         # Simple term based search
         if not field:
-            return self.convert_non_field()
+            return self.convert_non_field(context)
 
         # Field specific code
         field_method: Callable[[str, dict], Q] | None = cast(
@@ -350,89 +620,232 @@ class BaseTermExpr:
         if convert_method is not None:
             match = convert_method(match)
 
-        if isinstance(match, RegexExpr):
-            # Regular expression
-            from weblate.trans.models import Unit
+        return self.field_extra(field, self.build_field_query(field, match), match)
 
-            with transaction.atomic():
-                try:
-                    Unit.objects.annotate(test=Value("")).filter(
-                        test__trgm_regex=match.expr
-                    ).exists()
-                except (DataError, OperationalError) as error:
-                    # PostgreSQL raises DataError, MySQL OperationalError
-                    raise ValueError(
-                        gettext("Invalid regular expression: {}").format(error)
-                    ) from error
-            return Q(**{self.field_name(field, "trgm_regex"): match.expr})
-
-        if isinstance(match, tuple):
-            start, end = match
-            # Ranges
-            if self.operator in {":", ":="}:
-                query = Q(**{self.field_name(field, "range"): (start, end)})
-            elif self.operator in {":>", ":>="}:
-                query = Q(**{self.field_name(field, "gte"): start})
-            else:
-                query = Q(**{self.field_name(field, "lte"): end})
-
-        elif isinstance(match, set):
-            query = Q(**{self.field_name(field, "in"): match})
-        else:
-            # Generic query
-            query = Q(**{self.field_name(field): match})
-
-        return self.field_extra(field, query, match)
+    def as_parsed_query(self, context: dict) -> ParsedQuery:
+        return ParsedQuery.from_query(self.as_query(context))
 
     def get_annotations(self, context: dict) -> dict[str, Expression]:
         return {}
 
-    def field_extra(self, field: str, query: Q, match: Any) -> Q:  # noqa: ANN401
+    # ruff: ignore[any-type]
+    def field_extra(self, field: str, query: Q, match: Any) -> Q:
         return query
 
     def is_field(self, text: str, context: dict) -> Q:
-        msg = f"Unsupported is lookup: {text}"
-        raise ValueError(msg)
+        raise SearchQueryError(
+            gettext("Unsupported lookup for {field}: {value}").format(
+                field="is", value=text
+            )
+        )
 
     def has_field(self, text: str, context: dict) -> Q:
-        msg = f"Unsupported has lookup: {text}"
-        raise ValueError(msg)
+        raise SearchQueryError(
+            gettext("Unsupported lookup for {field}: {value}").format(
+                field="has", value=text
+            )
+        )
 
 
 class UnitTermExpr(BaseTermExpr):
-    PLAIN_FIELDS: set[str] = {"source", "target", "context", "note", "location"}
-    NONTEXT_FIELDS: dict[str, str] = {
+    CHANGE_FIELDS: ClassVar[set[str]] = {
+        "changed",
+        "changed_by",
+        "change_action",
+        "change_time",
+    }
+    CHANGE_CONTENT_FIELDS: ClassVar[set[str]] = {"changed", "changed_by"}
+    CHANGE_FIELD_MAP: ClassVar[dict[str, str]] = {
+        "changed": "timestamp",
+        "changed_by": "author__username",
+        "change_action": "action",
+        "change_time": "timestamp",
+    }
+    PLAIN_FIELDS: ClassVar[set[str]] = {
+        "source",
+        "target",
+        "context",
+        "note",
+        "location",
+    }
+    NONTEXT_FIELDS: ClassVar[dict[str, str]] = {
         "priority": "priority",
         "id": "id",
         "state": "state",
         "source_state": "source_unit__state",
         "position": "position",
         "pending": "pending_changes__isnull",
-        "changed": "change__timestamp",
         "source_changed": "source_unit__last_updated",
-        "change_time": "change__timestamp",
+        "last_changed": "last_updated",
         "added": "timestamp",
-        "change_action": "change__action",
         "labels_count": "labels_count",
     }
-    STRING_FIELD_MAP: dict[str, str] = {
+    STRING_FIELD_MAP: ClassVar[dict[str, str]] = {
         "suggestion": "suggestion__target",
         "comment": "comment__comment",
         "resolved_comment": "comment__comment",
+        "source_comment": "source_unit__comment__comment",
+        "resolved_source_comment": "source_unit__comment__comment",
         "key": "context",
         "explanation": "source_unit__explanation",
     }
-    EXACT_FIELD_MAP: dict[str, str] = {
-        "check": "check__name",
-        "dismissed_check": "check__name",
+    EXACT_FIELD_MAP: ClassVar[dict[str, str]] = {
         "language": "translation__language__code",
         "project": "translation__component__project__slug",
-        "changed_by": "change__author__username",
         "suggestion_author": "suggestion__user__username",
         "comment_author": "comment__user__username",
-        "label": "source_unit__labels__name",
-        "screenshot": "source_unit__screenshots__name",
+        "source_comment_author": "source_unit__comment__user__username",
     }
+
+    def language_field(self, text: str | RegexExpr | RangeExpr, context: dict) -> Q:
+        if isinstance(text, str) and self.operator in {":", ":="}:
+            lookup = "code__exact" if self.operator == ":=" else "code__iexact"
+            # Materialize IDs so PostgreSQL can use language-frequency statistics
+            # on translations instead of estimating through a language-code join.
+            language_ids = list(
+                Language.objects.filter(**{lookup: text}).values_list("pk", flat=True)
+            )
+            return Q(translation__language_id__in=language_ids)
+        return self.build_field_query("language", text)
+
+    @staticmethod
+    def effective_source_query(canonical: Q, parent: Q, context: dict) -> Q:
+        project = context.get("project")
+        if project is not None and not project.translation_parent_language_ids:
+            return canonical
+        return (
+            Q(
+                translation_parent__isnull=True,
+                details__translation_parent__missing__isnull=True,
+            )
+            & canonical
+        ) | (Q(translation_parent__isnull=False) & parent)
+
+    def source_field(self, text: str | RegexExpr, context: dict) -> Q:
+        return self.effective_source_query(
+            self.build_field_query("source", text),
+            self.build_field_query(
+                "target",
+                text,
+                lambda field, suffix: (
+                    "translation_parent__" + self.field_name(field, suffix)
+                ),
+            ),
+            context,
+        )
+
+    def source_comments_query(
+        self,
+        context: dict,
+        *,
+        text: str | RegexExpr | None = None,
+        resolved: bool | None = None,
+        author: bool = False,
+    ) -> Q:
+        relations = ["source_unit"]
+        project = context.get("project")
+        if project is None or project.translation_parent_language_ids:
+            relations.append("translation_parent")
+        result = Q()
+        for relation in relations:
+            query = Q()
+            if text is not None:
+
+                def field_name(
+                    field: str, suffix: str | None, relation: str = relation
+                ) -> str:
+                    return self.field_name(field, suffix).replace(
+                        "source_unit__", f"{relation}__"
+                    )
+
+                query = self.build_field_query(
+                    "source_comment_author" if author else "source_comment",
+                    text,
+                    field_name,
+                )
+            if resolved is not None:
+                query &= Q(**{f"{relation}__comment__resolved": resolved})
+            if author and context.get("enforce_contributor_permissions", True):
+                from weblate.auth.models import get_anonymous  # ruff: ignore[import-outside-top-level]
+                from weblate.auth.scope import get_permission_scope_query  # ruff: ignore[import-outside-top-level]
+
+                query &= get_permission_scope_query(
+                    context.get("user") or get_anonymous(),
+                    "contribution.view_author",
+                    component_path=f"{relation}__translation__component",
+                    language_path=f"{relation}__translation__language_id",
+                )
+            result |= query
+        return result
+
+    def source_comment_field(self, text: str | RegexExpr, context: dict) -> Q:
+        return self.source_comments_query(context, text=text, resolved=False)
+
+    def resolved_source_comment_field(self, text: str | RegexExpr, context: dict) -> Q:
+        return self.source_comments_query(context, text=text, resolved=True)
+
+    def source_comment_author_field(self, text: str | RegexExpr, context: dict) -> Q:
+        return self.source_comments_query(context, text=text, author=True)
+
+    def change_field_name(self, field: str, suffix: str | None = None) -> str:
+        if suffix is None:
+            suffix = OPERATOR_MAP[self.operator]
+
+        if field == "changed_by":
+            if suffix == "substring":
+                suffix = "iexact"
+            return f"{self.CHANGE_FIELD_MAP[field]}__{suffix}"
+        if suffix not in {"substring", "iexact"}:
+            return f"{self.CHANGE_FIELD_MAP[field]}__{suffix}"
+        return self.CHANGE_FIELD_MAP[field]
+
+    def as_change_query(self, context: dict) -> Q:
+        field = cast("str", self.field)
+        match = self.match
+
+        if field == "changed_by" and not match and self.operator in {":", ":="}:
+            query = Q(author__isnull=True)
+        else:
+            convert_method = getattr(self, f"convert_{field}", None)
+            if convert_method is not None:
+                match = convert_method(match)
+            query = self.build_field_query(field, match, self.change_field_name)
+
+        if field in self.CHANGE_CONTENT_FIELDS:
+            # ruff: ignore[import-outside-top-level]
+            from weblate.trans.models import Change
+
+            query &= Q(action__in=Change.ACTIONS_CONTENT)
+        return query
+
+    def as_parsed_query(self, context: dict) -> ParsedQuery:
+        if self.field in self.CHANGE_FIELDS:
+            result = ParsedQuery.from_change_query(self.as_change_query(context))
+        else:
+            result = super().as_parsed_query(context)
+        if context.get("enforce_contributor_permissions", True) and self.field in {
+            "changed_by",
+            "suggestion_author",
+            "comment_author",
+            "source_comment_author",
+        }:
+            from weblate.auth.models import get_anonymous  # ruff: ignore[import-outside-top-level]
+            from weblate.auth.scope import get_permission_scope_query  # ruff: ignore[import-outside-top-level]
+
+            viewer = context.get("user") or get_anonymous()
+            scope = get_permission_scope_query(
+                viewer,
+                "contribution.view_author",
+                component_path="translation__component",
+                language_path="translation__language_id",
+            )
+            result = result.combine_and(ParsedQuery.from_query(scope))
+        return result
+
+    def as_query(self, context: dict) -> Q:
+        if self.field in self.CHANGE_FIELDS:
+            return self.as_parsed_query(context).materialize()
+        return super().as_query(context)
 
     def is_field(self, text: str, context: dict) -> Q:
         if text in {"read-only", "readonly"}:
@@ -440,19 +853,26 @@ class UnitTermExpr(BaseTermExpr):
         if text == "approved":
             return Q(state=STATE_APPROVED)
         if text in {"fuzzy", "needs-editing"}:
-            return Q(state=STATE_FUZZY)
+            return Q(state__in=FUZZY_STATES)
         if text == "translated":
             return Q(state__gte=STATE_TRANSLATED)
         if text == "untranslated":
             return Q(state__lt=STATE_TRANSLATED)
         if text == "pending":
             return Q(pending_changes__isnull=False)
+        if text in {"automatically-translated", "automatically_translated"}:
+            return Q(automatically_translated=True)
 
         return super().is_field(text, context)
 
-    def has_field(self, text: str, context: dict) -> Q:  # noqa: C901
+    # ruff: ignore[complex-structure]
+    def has_field(self, text: str, context: dict) -> Q:
         if text == "plural":
-            return Q(source__search=PLURAL_SEPARATOR)
+            return self.effective_source_query(
+                Q(source__trgm_search=PLURAL_SEPARATOR),
+                Q(translation_parent__target__trgm_search=PLURAL_SEPARATOR),
+                context,
+            )
         if text == "suggestion":
             return Q(suggestion__isnull=False)
         if text == "explanation":
@@ -465,6 +885,10 @@ class UnitTermExpr(BaseTermExpr):
             return Q(comment__resolved=False)
         if text in {"resolved-comment", "resolved_comment"}:
             return Q(comment__resolved=True)
+        if text in {"source-comment", "source_comment"}:
+            return self.source_comments_query(context, resolved=False)
+        if text in {"resolved-source-comment", "resolved_source_comment"}:
+            return self.source_comments_query(context, resolved=True)
         if text in {"check", "failing-check", "failing_check"}:
             return Q(check__dismissed=False)
         if text in {
@@ -482,7 +906,7 @@ class UnitTermExpr(BaseTermExpr):
                 & Q(context__regex=F("variant__variant_regex"))
             )
         if text == "label":
-            return Q(source_unit__labels__isnull=False) | Q(labels__isnull=False)
+            return Q(source_unit__labels__isnull=False)
         if text == "context":
             return ~Q(context="")
         if text == "screenshot":
@@ -492,30 +916,56 @@ class UnitTermExpr(BaseTermExpr):
         if text == "flags":
             return ~Q(source_unit__extra_flags="")
         if text == "glossary":
-            project = context.get("project")
-            if not project:
-                return Q(source__isnull=True)
-            terms = set(
-                chain.from_iterable(
-                    glossary.glossary_sources for glossary in project.glossaries
-                )
-            )
-            if not terms:
-                return Q(source__isnull=True)
-            if using_postgresql():
-                template = r"[[:<:]]({})[[:>:]]"
-            else:
-                template = r"(^|[ \t\n\r\f\v])({})($|[ \t\n\r\f\v])"
-            return Q(
-                source__iregex=template.format(
-                    "|".join(re_escape(term) for term in terms)
-                )
-            )
+            return self.glossary_query(context)
 
         return super().has_field(text, context)
 
-    def convert_source_state(self, text: str) -> int | None:
-        return self.convert_state(text)
+    def glossary_query(self, context: dict) -> Q:
+        project = context.get("project")
+        if not project:
+            return Q(source__isnull=True)
+        terms = set(
+            chain.from_iterable(
+                glossary.glossary_sources for glossary in project.glossaries
+            )
+        )
+        if not terms:
+            return Q(source__isnull=True)
+        template = r"[[:<:]]({})[[:>:]]"
+        pattern = template.format("|".join(re_escape(term) for term in terms))
+        return self.effective_source_query(
+            Q(source__iregex=pattern),
+            Q(translation_parent__target__iregex=pattern),
+            context,
+        )
+
+    def source_state_field(self, text: str, context: dict) -> Q:
+        state = self.convert_state(text)
+        return self.effective_source_query(
+            self.build_field_query("source_state", state),
+            self.build_field_query(
+                "state",
+                state,
+                lambda field, suffix: (
+                    "translation_parent__" + self.field_name(field, suffix)
+                ),
+            ),
+            context,
+        )
+
+    def source_changed_field(self, text: str, context: dict) -> Q:
+        changed = self.convert_source_changed(text)
+        return self.effective_source_query(
+            self.build_field_query("source_changed", changed),
+            self.build_field_query(
+                "last_changed",
+                changed,
+                lambda field, suffix: (
+                    "translation_parent__" + self.field_name(field, suffix)
+                ),
+            ),
+            context,
+        )
 
     def component_field(self, text: str, context: dict) -> Q:
         if self.operator == ":=":
@@ -569,10 +1019,84 @@ class UnitTermExpr(BaseTermExpr):
         boolean_value = self.convert_bool(text)
         return Q(pending_changes__isnull=not boolean_value)
 
+    def label_field(self, text: str, context: dict) -> Q:
+        """
+        Handle label filtering.
+
+        This is needed because filtering on a reverse ManyToMany relation
+        with and using exists ensures each label condition gets its own join.
+        """
+        lookup = "name__iexact" if self.operator == ":=" else "name__icontains"
+        label_filter = {lookup: text}
+        label_query = Label.objects.filter(**label_filter)
+        project = context.get("project")
+        if project:
+            label_query = label_query.filter(project=project)
+
+        return Q(Exists(label_query.filter(unit__id=OuterRef("source_unit_id"))))
+
+    def check_field(self, text: str, context: dict) -> Q:
+        """
+        Handle check filtering.
+
+        This is needed because filtering on a reverse ForeignKey relation
+        with AND using exists ensures each check condition gets its own subquery.
+        """
+        # ruff: ignore[import-outside-top-level]
+        from weblate.checks.models import Check
+
+        lookup = "name__iexact" if self.operator == ":=" else "name__icontains"
+        return Q(
+            Exists(
+                Check.objects.filter(
+                    **{lookup: text}, dismissed=False, unit_id=OuterRef("pk")
+                )
+            )
+        )
+
+    def dismissed_check_field(self, text: str, context: dict) -> Q:
+        """
+        Handle dismissed check filtering.
+
+        This is needed because filtering on a reverse ForeignKey relation
+        with AND using exists ensures each check condition gets its own subquery.
+        """
+        # ruff: ignore[import-outside-top-level]
+        from weblate.checks.models import Check
+
+        lookup = "name__iexact" if self.operator == ":=" else "name__icontains"
+        return Q(
+            Exists(
+                Check.objects.filter(
+                    **{lookup: text}, dismissed=True, unit_id=OuterRef("pk")
+                )
+            )
+        )
+
+    def screenshot_field(self, text: str, context: dict) -> Q:
+        """
+        Handle screenshot filtering.
+
+        This is needed because filtering on ManyToMany relations
+        with AND using exists ensures each screenshot condition gets its own subquery.
+        """
+        # ruff: ignore[import-outside-top-level]
+        from weblate.screenshots.models import Screenshot
+
+        lookup = "name__iexact" if self.operator == ":=" else "name__icontains"
+        screenshot_query = Screenshot.objects.filter(**{lookup: text})
+        return Q(
+            Exists(screenshot_query.filter(units__id=OuterRef("source_unit_id")))
+            | Exists(screenshot_query.filter(units__id=OuterRef("pk")))
+        )
+
     def convert_changed(self, text: str) -> datetime | tuple[datetime, datetime]:
         return self.convert_datetime(text)
 
     def convert_source_changed(self, text: str) -> datetime | tuple[datetime, datetime]:
+        return self.convert_datetime(text)
+
+    def convert_last_changed(self, text: str) -> datetime | tuple[datetime, datetime]:
         return self.convert_datetime(text)
 
     def convert_added(self, text: str) -> datetime | tuple[datetime, datetime]:
@@ -587,19 +1111,8 @@ class UnitTermExpr(BaseTermExpr):
     def convert_labels_count(self, text: str) -> int:
         return self.convert_int(text)
 
-    def field_extra(self, field: str, query: Q, match: Any) -> Q:  # noqa: ANN401
-        from weblate.trans.models import Change
-
-        if field in {"changed", "changed_by"}:
-            return query & Q(change__action__in=Change.ACTIONS_CONTENT)
-        if field == "check":
-            return query & Q(check__dismissed=False)
-        if field == "dismissed_check":
-            return query & Q(check__dismissed=True)
-        if field == "label":
-            return query | Q(labels__name__iexact=match)
-        if field == "screenshot":
-            return query | Q(screenshots__name__iexact=match)
+    # ruff: ignore[any-type]
+    def field_extra(self, field: str, query: Q, match: Any) -> Q:
         if field == "comment":
             return query & Q(comment__resolved=False)
         if field == "resolved_comment":
@@ -607,61 +1120,116 @@ class UnitTermExpr(BaseTermExpr):
 
         return super().field_extra(field, query, match)
 
-    def convert_non_field(self) -> Q:
+    def convert_non_field(self, context: dict) -> Q:
         return (
-            Q(source__substring=self.match)
+            self.source_field(self.match, context)
             | Q(target__substring=self.match)
             | Q(context__substring=self.match)
         )
 
     def get_annotations(self, context: dict) -> dict[str, Expression]:
         if self.field == "labels_count":
-            return {"labels_count": Count("source_unit__labels") + Count("labels")}
+            labels = (
+                Label.objects.filter(unit=OuterRef("source_unit_id"))
+                .order_by()
+                .values("unit")
+                .annotate(count=Count("pk"))
+                .values("count")
+            )
+            return {"labels_count": Coalesce(Subquery(labels), 0)}
         return super().get_annotations(context)
 
 
 class UserTermExpr(BaseTermExpr):
-    PLAIN_FIELDS: set[str] = {"username", "full_name"}
-    NONTEXT_FIELDS: dict[str, str] = {
+    PLAIN_FIELDS: ClassVar[set[str]] = {"username", "full_name"}
+    NONTEXT_FIELDS: ClassVar[dict[str, str]] = {
         "joined": "date_joined",
         "change_time": "change__timestamp",
         "change_action": "change__action",
     }
-    EXACT_FIELD_MAP: dict[str, str] = {
+    EXACT_FIELD_MAP: ClassVar[dict[str, str]] = {
         "language": "profile__languages__code",
         "translates": "change__language__code",
     }
-    enable_fulltext = False
+    enable_fulltext: ClassVar[bool] = False
 
     def convert_joined(self, text: str) -> datetime | tuple[datetime, datetime]:
         return self.convert_datetime(text)
 
-    def convert_non_field(self) -> Q:
+    def convert_non_field(self, context: dict) -> Q:
         return Q(username__icontains=self.match) | Q(full_name__icontains=self.match)
 
     def contributes_field(self, text: str, context: dict) -> Q:
-        from weblate.trans.models import Component
-
-        if "/" not in text:
-            return Q(change__project__slug__iexact=text)
-        return Q(
-            change__component_id__in=list(
-                Component.objects.filter_by_path(text).values_list("id", flat=True)
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or any(char in text for char in "*?")
+            or any(not part for part in text.split("/"))
+        ):
+            raise SearchQueryError(
+                gettext("A concrete project or component is required.")
             )
-        )
+        user = context["user"]
+        if "/" not in text:
+            slug_filter = Q(change__project__slug__iexact=text)
+            if user.needs_component_restrictions_filter:
+                slug_filter &= Q(
+                    change__component__isnull=True
+                ) | user.get_component_access_query("change__component")
+        else:
+            slug_filter = Q(
+                change__component_id__in=list(
+                    Component.objects.filter_access(user)
+                    .filter_by_path(text)
+                    .values_list("id", flat=True)
+                )
+            )
+        result = slug_filter & Q(change__project__in=user.allowed_projects)
+        if not user.is_superuser:
+            from weblate.accounts.visibility import filter_contributor_changes  # ruff: ignore[import-outside-top-level]
+            from weblate.trans.models import Change  # ruff: ignore[import-outside-top-level]
+
+            result &= Q(
+                change__pk__in=filter_contributor_changes(
+                    Change.objects.all(), user
+                ).values("pk")
+            )
+        return result
 
 
 class SuperuserUserTermExpr(UserTermExpr):
-    STRING_FIELD_MAP: dict[str, str] = {
+    STRING_FIELD_MAP: ClassVar[dict[str, str]] = {
         "email": "social_auth__verifiedemail__email",
     }
 
-    def convert_non_field(self) -> Q:
-        return (
+    def convert_ip(self, text: str) -> str:
+        try:
+            return str(ip_address(text))
+        except ValueError as exc:
+            raise SearchQueryError(
+                gettext("Could not parse IP address: {}").format(text)
+            ) from exc
+
+    def ip_field(self, text: str, context: dict) -> Q:
+        if self.operator not in {":", ":="}:
+            raise SearchQueryError(
+                gettext("Unsupported lookup for {field}: {value}").format(
+                    field="ip", value=text
+                )
+            )
+        return Q(auditlog__address=self.convert_ip(text))
+
+    def convert_non_field(self, context: dict) -> Q:
+        result = (
             Q(username__icontains=self.match)
             | Q(full_name__icontains=self.match)
             | Q(social_auth__verifiedemail__email__iexact=self.match)
         )
+        try:
+            address = self.convert_ip(self.match)
+        except SearchQueryError:
+            return result
+        return result | Q(auditlog__address=address)
 
     def is_field(self, text: str, context: dict) -> Q:
         if text == "active":
@@ -674,46 +1242,165 @@ class SuperuserUserTermExpr(UserTermExpr):
         return super().is_field(text, context)
 
 
-PARSERS: dict[Literal["unit", "user", "superuser"], ParserElement] = {
+class ScreenshotTermExpr(BaseTermExpr):
+    PLAIN_FIELDS: ClassVar[set[str]] = {"name"}
+    NONTEXT_FIELDS: ClassVar[dict[str, str]] = {
+        "id": "id",
+        "strings": "strings",
+        "timestamp": "timestamp",
+    }
+    STRING_FIELD_MAP: ClassVar[dict[str, str]] = {
+        "context": "units__context",
+        "location": "units__location",
+        "path": "repository_filename",
+        "repository": "repository_filename",
+        "string": "units__source",
+    }
+    enable_fulltext: ClassVar[bool] = False
+
+    def fixup(self) -> None:
+        if self.field in {
+            "context",
+            "language",
+            "location",
+            "path",
+            "repository",
+            "string",
+        } and self.operator not in {":", ":="}:
+            self.match = f"{self.operator[1:]}{self.match}"
+            self.operator = ":"
+        super().fixup()
+
+    def convert_non_field(self, context: dict) -> Q:
+        return Q(name__icontains=self.match)
+
+    def language_field(self, text: str | RegexExpr, context: dict) -> Q:
+        if isinstance(text, RegexExpr):
+            return self.build_field_query(
+                "language_code",
+                text,
+                lambda _field, suffix: f"translation__language__code__{suffix}",
+            ) | self.build_field_query(
+                "language_name",
+                text,
+                lambda _field, suffix: f"translation__language__name__{suffix}",
+            )
+        if self.operator == ":=":
+            return Q(translation__language__code__iexact=text) | Q(
+                translation__language__name__iexact=text
+            )
+        return Q(translation__language__code__icontains=text) | Q(
+            translation__language__name__icontains=text
+        )
+
+    def field_name(self, field: str, suffix: str | None = None) -> str:
+        if field in self.NONTEXT_FIELDS:
+            if suffix is None:
+                suffix = OPERATOR_MAP[self.operator]
+            if suffix in {"substring", "iexact", "icontains"}:
+                return self.NONTEXT_FIELDS[field]
+            return f"{self.NONTEXT_FIELDS[field]}__{suffix}"
+        return super().field_name(field, suffix)
+
+    def has_field(self, text: str, context: dict) -> Q:
+        if text == "string":
+            return Q(units__isnull=False)
+        if text in {"path", "repository"}:
+            return ~Q(repository_filename="")
+
+        return super().has_field(text, context)
+
+    def reject_regex(
+        self, text: str | RangeExpr | RegexExpr, field: str
+    ) -> str | RangeExpr:
+        if isinstance(text, RegexExpr):
+            raise SearchQueryError(
+                gettext("Regular expression not supported for field {}").format(field)
+            )
+        return text
+
+    def convert_strings(
+        self, text: str | RangeExpr | RegexExpr
+    ) -> int | tuple[int, int]:
+        text = self.reject_regex(text, "strings")
+        return self.convert_int(text)
+
+    def convert_timestamp(
+        self, text: str | RangeExpr | RegexExpr
+    ) -> datetime | tuple[datetime, datetime]:
+        text = self.reject_regex(text, "timestamp")
+        return self.convert_datetime(text)
+
+    def convert_id(self, text: str | RangeExpr | RegexExpr) -> int | set[int]:
+        text = self.reject_regex(text, "id")
+        if isinstance(text, RangeExpr):
+            raise SearchQueryError(
+                gettext("Range not supported for field {}").format("id")
+            )
+        return super().convert_id(text)
+
+    def get_annotations(self, context: dict) -> dict[str, Expression]:
+        if self.field == "strings":
+            return {"strings": Count("units", distinct=True)}
+        return super().get_annotations(context)
+
+
+PARSERS: dict[SearchParser, ParserElement] = {
     "unit": build_parser(UnitTermExpr),
     "user": build_parser(UserTermExpr),
     "superuser": build_parser(SuperuserUserTermExpr),
+    "screenshot": build_parser(ScreenshotTermExpr),
 }
 PARSER_LOCK = threading.Lock()
 
 
-def parser_to_query(obj: ParseResults | BaseTermExpr, context: dict) -> Q:
+def parser_to_parsed_query(
+    obj: ParseResults | BaseTermExpr, context: dict
+) -> ParsedQuery:
     # Simple lookups
     if isinstance(obj, BaseTermExpr):
-        return obj.as_query(context)
+        return obj.as_parsed_query(context)
 
     # Operators
     operator = ""
-    expressions: list[Q] = []
+    expressions: list[ParsedQuery] = []
     was_operator = False
     for item in obj:
         if isinstance(item, str) and (current := item.upper()) in {"OR", "AND", "NOT"}:
             if operator and current != operator:
-                msg = "Mixed operators!"
-                raise ValueError(msg)
+                msg = gettext("Mixed operators!")
+                raise SearchQueryError(msg)
             operator = current
             was_operator = True
             continue
         if not was_operator and expressions:
             # Implicit AND
-            expressions[-1] &= parser_to_query(item, context)
+            expressions[-1] = expressions[-1].combine_and(
+                parser_to_parsed_query(item, context)
+            )
         else:
-            expressions.append(parser_to_query(item, context))
+            expressions.append(parser_to_parsed_query(item, context))
         was_operator = False
 
     if not expressions:
-        return Q()
+        return ParsedQuery.from_query(Q())
 
     if operator == "NOT":
-        return ~expressions[0]
+        return expressions[0].negate()
     if operator == "AND":
-        return reduce(and_, expressions)
-    return reduce(or_, expressions)
+        result = expressions[0]
+        for expression in expressions[1:]:
+            result = result.combine_and(expression)
+        return result
+
+    result = expressions[0]
+    for expression in expressions[1:]:
+        result = result.combine_or(expression)
+    return result
+
+
+def parser_to_query(obj: ParseResults | BaseTermExpr, context: dict) -> Q:
+    return parser_to_parsed_query(obj, context).materialize()
 
 
 def parser_annotations(
@@ -729,19 +1416,98 @@ def parser_annotations(
     return result
 
 
-@lru_cache(maxsize=512)
-def parse_string(
-    text: str, parser: Literal["unit", "user", "superuser"]
-) -> ParseResults:
+def parse_string(text: str, parser: SearchParser) -> ParseResults:
+    if len(text) > MAX_SEARCH_QUERY_LENGTH:
+        raise SearchQueryError(gettext("Search query is too long."))
     if "\x00" in text:
-        msg = "Invalid query string."
-        raise ValueError(msg)
+        raise SearchQueryError(gettext("Invalid character in the query string"))
     with PARSER_LOCK:
-        return PARSERS[parser].parse_string(text, parse_all=True)
+        try:
+            parsed = PARSERS[parser].parse_string(text, parse_all=True)
+        except ParseException as error:
+            raise SearchQueryError(
+                gettext("Failed to parse the query string: {}").format(error)
+            ) from error
+
+    remaining = [parsed]
+    term_count = 0
+    while remaining:
+        for item in remaining.pop():
+            if isinstance(item, BaseTermExpr):
+                term_count += 1
+                if term_count > MAX_SEARCH_QUERY_TERMS:
+                    raise SearchQueryError(gettext("Search query is too complex."))
+            elif isinstance(item, ParseResults):
+                remaining.append(item)
+    return parsed
+
+
+@lru_cache(maxsize=128)
+def unit_lookup_spawns_duplicates(lookup: str) -> bool:
+    """Identify lookups which can match several related rows per unit."""
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.models import Unit
+
+    model: type[Model] = Unit
+    for part in lookup.split("__"):
+        try:
+            field = model._meta.get_field(part)  # ruff: ignore[private-member-access]
+        except FieldDoesNotExist:
+            # The remainder is a lookup, transform, or annotation.
+            return False
+        if field.one_to_many or field.many_to_many:
+            return True
+        related_model = field.related_model if field.is_relation else None
+        if related_model is None:
+            return False
+        model = related_model
+    return False
+
+
+def unit_query_spawns_duplicates(query: Q) -> bool:
+    """Check predicates without inspecting Django's compiled query joins."""
+    return any(
+        unit_query_spawns_duplicates(child)
+        if isinstance(child, Q)
+        else isinstance(child, tuple) and unit_lookup_spawns_duplicates(child[0])
+        for child in query.children
+    )
+
+
+def unit_query_without_duplicates(query: Q, annotations: dict[str, Expression]) -> Q:
+    """Keep related-row matching inside a single correlated existence check."""
+    if not unit_query_spawns_duplicates(query):
+        return query
+
+    # ruff: ignore[import-outside-top-level]
+    from weblate.trans.models import Unit
+
+    # Keep scalar predicates outside the subquery where AND permits it. Related
+    # predicates must stay together: separate EXISTS expressions would allow
+    # comment text and author, for example, to match different comments. Keeping
+    # the original Q tree also preserves Django's multivalued negation rules.
+    scalar = Q()
+    related = Q()
+    if query.connector == Q.AND and not query.negated:
+        for child in query.children:
+            condition = child if isinstance(child, Q) else Q(child)
+            if unit_query_spawns_duplicates(condition):
+                related &= condition
+            else:
+                scalar &= condition
+    else:
+        related = query
+
+    matches = Unit.objects.alias(**annotations).filter(related, pk=OuterRef("pk"))
+    return scalar & Q(Exists(matches))
 
 
 def parse_query(
-    text: str, parser: Literal["unit", "user", "superuser"] = "unit", **context
+    text: str, parser: SearchParser = "unit", **context
 ) -> tuple[Q, dict[str, Expression]]:
     parsed = parse_string(text, parser)
-    return parser_to_query(parsed, context), parser_annotations(parsed, context)
+    filters = parser_to_query(parsed, context)
+    annotations = parser_annotations(parsed, context)
+    if parser == "unit":
+        filters = unit_query_without_duplicates(filters, annotations)
+    return filters, annotations

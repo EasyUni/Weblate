@@ -4,14 +4,72 @@
 
 """Tests for quality checks."""
 
-from weblate.checks.same import SameCheck
-from weblate.checks.tests.test_checks import CheckTestCase, MockUnit
+from __future__ import annotations
+
+from time import monotonic
+
+from weblate.checks.same import SameCheck, strip_domains, strip_emails
+from weblate.checks.tests.test_checks import CheckTestCase
+from weblate.trans.tests.factories import make_unit
 from weblate.trans.tests.test_views import ViewTestCase
 from weblate.utils.state import STATE_TRANSLATED
 
 
 class SameCheckTest(CheckTestCase):
     check = SameCheck()
+
+    def test_long_address_candidates(self) -> None:
+        for source, expected in (("a" * 100_000, True), ("a." * 50_000, False)):
+            with self.subTest(source=source[:20]):
+                unit = make_unit(source=source, target=source)
+                self.assertEqual(
+                    self.check.check_target([source], [source], unit), expected
+                )
+
+    def test_strip_emails_long_candidates(self) -> None:
+        for source in ("a" * 100_000, "a." * 50_000):
+            with self.subTest(source=source[:20]):
+                started = monotonic()
+                result = strip_emails(source)
+                elapsed = monotonic() - started
+                self.assertEqual(result, source)
+                # Catch pathological matching while allowing for CI load.
+                self.assertLess(elapsed, 10)
+
+    def test_strip_domains_long_candidates(self) -> None:
+        for source in ("a" * 100_000, "a." * 50_000):
+            with self.subTest(source=source[:20]):
+                started = monotonic()
+                result = strip_domains(source)
+                elapsed = monotonic() - started
+                self.assertEqual(result, source)
+                # Catch pathological matching while allowing for CI load.
+                self.assertLess(elapsed, 10)
+
+    def test_strip_emails(self) -> None:
+        for text, expected in (
+            ("Write a@b.cc please", "Write  please"),
+            ("a@b.cc.d@e.ff", ""),
+            ("a@b.c", "a@b.c"),
+            ("İ@ſ.KK", ""),
+            ("abc@@example.com", "abc@@example.com"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(strip_emails(text), expected)
+
+    def test_strip_domains(self) -> None:
+        for text, expected in (
+            ("See demo.weblate.org!", "See !"),
+            ("a." * 10, "a." * 10),
+            ("a." * 10 + "org", ""),
+            ("a.abcdefghi", "ghi"),
+            ("a." + "b" * 64 + ".com", ""),
+            ("-example.org", "-"),
+            ("a.--", ""),
+            ("İ.ſK", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(strip_domains(text), expected)
 
     def setUp(self) -> None:
         super().setUp()
@@ -21,30 +79,72 @@ class SameCheckTest(CheckTestCase):
         self.test_failure_1 = ("retezec", "retezec", "")
 
     def test_same_source_language(self) -> None:
-        unit = MockUnit(code="en")
+        unit = make_unit(code="en")
         # Is template
-        unit.translation.is_template = True
-        unit.translation.is_source = True
-        unit.is_source = True
+        unit.translation.__dict__["is_template"] = True
+        unit.translation.__dict__["is_source"] = True
+        unit.__dict__["is_source"] = True
         self.assertTrue(self.check.should_skip(unit))
         # Is same as source
-        unit.translation.template = False
+        unit.translation.__dict__["is_template"] = False
         self.assertTrue(self.check.should_skip(unit))
         # Interlingua special case
         unit.translation.language.code = "ia"
         self.assertTrue(self.check.should_skip(unit))
 
+    def test_multivalue_matches_any_source(self) -> None:
+        for file_format in ("tbx", "csv-multi"):
+            for sources in (["application", "app"], ["app", "application"]):
+                for targets in (["application"], ["app"], ["aplikace", "app"]):
+                    with self.subTest(
+                        file_format=file_format, sources=sources, targets=targets
+                    ):
+                        unit = make_unit(
+                            source=sources, target=targets, flags="strict-same"
+                        )
+                        unit.translation.component.file_format = file_format
+                        self.assertTrue(self.check.check_target(sources, targets, unit))
+
+    def test_multivalue_unchanged_exemptions(self) -> None:
+        for file_format in ("tbx", "csv-multi"):
+            for targets, flags in (
+                (["aplikace", "program"], ""),
+                (["alarm"], ""),
+                (["application"], "ignore-same"),
+            ):
+                with self.subTest(
+                    file_format=file_format, targets=targets, flags=flags
+                ):
+                    sources = ["application", "alarm"]
+                    unit = make_unit(source=sources, target=targets, flags=flags)
+                    unit.translation.component.file_format = file_format
+                    self.assertFalse(self.check.check_target(sources, targets, unit))
+
     def test_same_db_screen(self) -> None:
         self.assertTrue(
             self.check.check_single(
-                "some long text is here", "some long text is here", MockUnit(code="de")
+                "some long text is here", "some long text is here", make_unit(code="de")
             )
         )
         self.assertFalse(
             self.check.check_single(
                 "some long text is here",
                 "some long text is here",
-                MockUnit(code="de", note="Tag: screen"),
+                make_unit(code="de", note="Tag: screen"),
+            )
+        )
+
+    def test_same_asciidoc_block(self) -> None:
+        self.assertTrue(
+            self.check.check_single(
+                "some text is here", "some text is here", make_unit(code="de")
+            )
+        )
+        self.assertFalse(
+            self.check.check_single(
+                "some text is here",
+                "some text is here",
+                make_unit(code="de", note="type: delimited block -"),
             )
         )
 
@@ -154,6 +254,14 @@ class SameCheckTest(CheckTestCase):
                 "",
             ),
         )
+        self.do_test(
+            False,
+            (
+                "https://<FQDN_MLM>/rhn/manager/sso/sls",
+                "https://<FQDN_MLM>/rhn/manager/sso/sls",
+                "",
+            ),
+        )
 
     def test_same_channel(self) -> None:
         self.do_test(False, ("#weblate", "#weblate", ""))
@@ -196,12 +304,8 @@ class SameCheckTest(CheckTestCase):
         self.do_test(
             False,
             (
-                "!\"#$%%&amp;'()*+,-./0123456789:;&lt;=&gt;?@"
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`"
-                "abcdefghijklmnopqrstuvwxyz{|}~",
-                "!\"#$%%&amp;'()*+,-./0123456789:;&lt;=&gt;?@"
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`"
-                "abcdefghijklmnopqrstuvwxyz{|}~",
+                "!\"#$%%&amp;'()*+,-./0123456789:;&lt;=&gt;?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",
+                "!\"#$%%&amp;'()*+,-./0123456789:;&lt;=&gt;?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",
                 "",
             ),
         )
@@ -224,6 +328,14 @@ class SameCheckTest(CheckTestCase):
                 "%SCHOOLING_PERIOD%",
                 "%SCHOOLING_PERIOD%",
                 r'placeholders:r"%\w+%",strict-same',
+            ),
+        )
+        self.do_test(
+            False,
+            (
+                '<x id="INTERPOLATION" equiv-text="{{ count }}"/>',
+                '<x id="INTERPOLATION" equiv-text="{{ count }}"/>',
+                r'placeholders:r"<x\s[^>]*/>"',
             ),
         )
 

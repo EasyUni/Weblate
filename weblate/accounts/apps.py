@@ -7,16 +7,20 @@ from __future__ import annotations
 from ssl import CertificateError
 from typing import TYPE_CHECKING
 
+import httpx2
 from django.apps import AppConfig
 from django.conf import settings
-from django.core.checks import CheckMessage, register
+from django.core.checks import register
 
 from weblate.accounts.avatar import download_avatar_image
+from weblate.accounts.data import NotificationFrequency, NotificationScope
 from weblate.auth.utils import get_auth_keys
 from weblate.utils.checks import weblate_check
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+
+    from django.core.checks import CheckMessage
 
 
 @register(deploy=True)
@@ -24,7 +28,7 @@ def check_auth(
     *,
     app_configs: Sequence[AppConfig] | None,
     databases: Sequence[str] | None,
-    **kwargs,
+    **kwargs: object,
 ) -> Iterable[CheckMessage]:
     result: list[CheckMessage] = []
     if settings.REGISTRATION_ALLOW_BACKENDS:
@@ -46,15 +50,83 @@ def check_avatars(
     *,
     app_configs: Sequence[AppConfig] | None,
     databases: Sequence[str] | None,
-    **kwargs,
+    **kwargs: object,
 ) -> Iterable[CheckMessage]:
     if not settings.ENABLE_AVATARS:
         return []
     try:
-        download_avatar_image("noreply@weblate.org", 32)
-    except (OSError, CertificateError) as error:
+        download_avatar_image("noreply@weblate.org", settings.ANONYMOUS_USER_NAME, 32)
+    except (OSError, CertificateError, httpx2.HTTPError) as error:
         return [weblate_check("weblate.E018", f"Could not download avatar: {error}")]
     return []
+
+
+@register()
+def check_notification_settings(
+    *,
+    app_configs: Sequence[AppConfig] | None,
+    databases: Sequence[str] | None,
+    **kwargs: object,
+) -> Iterable[CheckMessage]:
+    # ruff: ignore[import-outside-top-level]
+    from weblate.accounts.notifications import NOTIFICATIONS
+
+    errors: list[str] = []
+    name = "DEFAULT_NOTIFICATIONS"
+
+    if not isinstance(settings.DEFAULT_NOTIFICATIONS, list):
+        errors.append(
+            f"{name} configuration must be a list",
+        )
+    else:
+        for notification in settings.DEFAULT_NOTIFICATIONS:
+            if not isinstance(notification, tuple) or len(notification) != 3:
+                errors.append(
+                    f"Each item in {name} must be a tuple with three entries",
+                )
+            else:
+                scope, frequency, handler = notification
+
+                try:
+                    scope = int(scope)
+                    if scope not in [n.value for n in NotificationScope.configurable()]:
+                        errors.append(
+                            f"{name}: invalid notification scope '{scope}'",
+                        )
+                except (ValueError, TypeError):
+                    errors.append(
+                        f"{name}: scope '{scope}' is not a number",
+                    )
+
+                try:
+                    frequency = int(frequency)
+                    if frequency not in NotificationFrequency.values:
+                        errors.append(
+                            f"{name}: invalid notification frequency '{frequency}'",
+                        )
+                except (ValueError, TypeError):
+                    errors.append(
+                        f"{name}: frequency '{frequency}' is not a number",
+                    )
+
+                if not isinstance(handler, str):
+                    errors.append(
+                        f"{name}: invalid notification handler '{handler}'",
+                    )
+                if handler not in [n.__name__ for n in NOTIFICATIONS]:
+                    errors.append(
+                        f"{name}: unknown notification handler '{handler}'",
+                    )
+                elif frequency not in [
+                    fq[0]
+                    for fq in next(
+                        h for h in NOTIFICATIONS if h.__name__ == handler
+                    ).get_freq_choices()
+                ]:
+                    errors.append(
+                        f"{name}: invalid combination of notification handler '{handler}' and frequency '{frequency}'",
+                    )
+    return [weblate_check("weblate.C051", message) for message in errors]
 
 
 class AccountsConfig(AppConfig):

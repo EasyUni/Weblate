@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from django.contrib.auth.decorators import login_not_required
 from django.core.cache import cache
 from django.http import HttpResponse
 from django.template.loader import render_to_string
@@ -21,7 +22,8 @@ if TYPE_CHECKING:
     from weblate.auth.models import AuthenticatedHttpRequest
 
 
-@method_decorator(cache_control(max_age=7200), name="get")
+@method_decorator(cache_control(max_age=7200), name="dispatch")
+@method_decorator(login_not_required, name="dispatch")
 class CustomCSSView(TemplateView):
     template_name = "configuration/custom.css"
     cache_key = "css:custom"
@@ -62,6 +64,12 @@ class CustomCSSView(TemplateView):
                 "focus_color_dark": split_colors(settings.get("focus_color"))[1],
                 "hover_color_light": split_colors(settings.get("hover_color"))[0],
                 "hover_color_dark": split_colors(settings.get("hover_color"))[1],
+                "link_color_light": split_colors(settings.get("link_color"))[0],
+                "link_color_dark": split_colors(settings.get("link_color"))[1],
+                "progress_color_light": split_colors(settings.get("progress_color"))[0],
+                "progress_color_dark": split_colors(settings.get("progress_color"))[1],
+                "progress_background_color_light": split_colors(settings.get("progress_background_color"))[0],
+                "progress_background_color_dark": split_colors(settings.get("progress_background_color"))[1],
                 "hide_footer": settings.get("hide_footer"),
                 "page_font": settings.get("page_font"),
                 "brand_font": settings.get("brand_font"),

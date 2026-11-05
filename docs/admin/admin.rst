@@ -17,7 +17,8 @@ It includes basic overview of your Weblate:
 * :ref:`manage-performance` to review Weblate health and length of Celery queues.
 * SSH keys management, see :ref:`ssh-repos`.
 * Alerts overview for all components, see :ref:`alerts`.
-* Users and teams, see :ref:`custom-acl`.
+* Users and teams, see :ref:`custom-acl`; site administrators can also
+  :ref:`clean up user contributions <cleanup-user-contributions>`.
 * :ref:`manage-appearance`.
 * Configure :ref:`machine-translation-setup`.
 * Configure site-wide addons, see :ref:`addons`.
@@ -41,12 +42,18 @@ silenced using :setting:`django:SILENCED_SYSTEM_CHECKS`, see also
 should be close to zero. The same can be obtained on the command line using
 :wladmin:`celery_queues`.
 
+:guilabel:`HTTP environment` allows you to see HTTP environment observed by
+Weblate. This is useful when debugging reverse proxy configuration, see
+:ref:`reverse-proxy`. :guilabel:`HTTP headers` shows complete HTTP request headers to provide additional information.
+
 :guilabel:`System encoding` should list ``UTF-8`` encoding in all processes.
 This needs to be configured in your system, see :ref:`production-encoding`.
 
-:guilabel:`Connectivity` shows latencies to the database, cache, and Celery.
-This might be useful to diagnose connectivity issues.
+:guilabel:`Connectivity` shows latencies to the database, cache, Celery, and
+the filesystems used for data and cache directories. This might be useful to
+diagnose connectivity and storage performance issues.
 
+.. image:: /screenshots/performance-report.webp
 
 .. _manage-appearance:
 
@@ -77,60 +84,35 @@ The Django admin interface
    in most cases as most things are comfortably approachable through Weblate UI or API.
 
 Here you can manage objects stored in the database, such as users, translations
-and other settings:
+and other settings.
 
-.. image:: /screenshots/admin.webp
+Use the search box to find users by team name or by the name or slug of the
+team's defining project, or by the workspace name. Team searches also match
+their defining project or workspace. Project, component, and workspace relations
+use search instead of listing every object in sidebar filters; large editable
+relations provide autocomplete controls.
 
 In the :guilabel:`Reports` section, you can check the status of your site, tweak
 it for :ref:`production`, or manage SSH keys used to access :ref:`vcs-repos`.
 
-Manage database objects under any of the sections.
-The most interesting one is probably :guilabel:`Weblate translations`,
-where you can manage translatable projects, see :ref:`project` and :ref:`component`.
-
-:guilabel:`Weblate languages` holds language definitions, explained further in
-:ref:`languages`.
-
-Adding a project
-----------------
-
-Adding a project serves as container for all components.
-Usually you create one project for one piece of software, or book
-(See :ref:`project` for info on individual parameters):
-
-.. image:: /screenshots/add-project.webp
-
-.. seealso::
-
-   :ref:`project`
+Use the Weblate UI or API for normal operations such as creating projects,
+creating components, managing users, or posting announcements.
 
 .. _bilingual:
-
-Bilingual components
---------------------
-
-Once you have added a project, translation components can be added to it.
-(See :ref:`component` for info regarding individual parameters):
-
-.. image:: /screenshots/add-component.webp
-
-.. seealso::
-
-   * :ref:`component`
-   * :ref:`bimono`
-
 .. _monolingual:
 
-Monolingual components
-----------------------
+Project and component creation
+------------------------------
 
-For easier translation of these, provide a template file containing the
-mapping of message IDs to its respective source language (usually English).
-(See :ref:`component` for info regarding individual parameters):
-
-.. image:: /screenshots/add-component-mono.webp
+Projects and components are created from the regular Weblate UI. Projects serve
+as containers for translation components, and components can use bilingual or
+monolingual translation files. See :ref:`project` and :ref:`component` for the
+available settings, and :ref:`bimono` for how bilingual and monolingual
+formats differ.
 
 .. seealso::
 
+   * :ref:`adding-projects`
+   * :ref:`project`
    * :ref:`component`
    * :ref:`bimono`

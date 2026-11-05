@@ -4,41 +4,265 @@
 
 """Tests for user middleware."""
 
-from django.http import HttpRequest, HttpResponseRedirect
-from django.test import TestCase
-from django.test.utils import override_settings
+from __future__ import annotations
 
-from weblate.accounts.middleware import RequireLoginMiddleware
+import asyncio
+from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
+
+from asgiref.sync import async_to_sync
+from django.conf import settings
+from django.contrib.auth.decorators import login_not_required
+from django.http import HttpResponse
+from django.test import (
+    AsyncClient,
+    RequestFactory,
+    TestCase,
+    modify_settings,
+    override_settings,
+)
+from django.urls import reverse
+from django.utils.decorators import method_decorator
+from django.utils.module_loading import import_string
+from sentry_sdk.integrations.django.middleware import (
+    _wrap_middleware,  # ruff: ignore[import-private-name]
+)
+
+from weblate.accounts.middleware import AuthenticationMiddleware
 from weblate.auth.models import User, get_anonymous
+from weblate.legal.models import Agreement
+from weblate.utils.change_origin import acting_user_context, get_acting_user
+
+if TYPE_CHECKING:
+    from django.http import HttpRequest
+
+    from weblate.auth.models import AuthenticatedHttpRequest
 
 
 class MiddlewareTest(TestCase):
-    def view_method(self) -> str:
-        return "VIEW"
+    """
+    Tests for Django's LoginRequiredMiddleware integration.
 
-    def test_disabled(self) -> None:
-        middleware = RequireLoginMiddleware()
-        request = HttpRequest()
-        self.assertIsNone(middleware.process_view(request, self.view_method, (), {}))
+    Since Django 5.1, Weblate uses the built-in LoginRequiredMiddleware
+    instead of the custom RequireLoginMiddleware. These tests verify that
+    the middleware correctly enforces authentication when REQUIRE_LOGIN is enabled.
+    """
 
-    @override_settings(LOGIN_REQUIRED_URLS=(r"/project/(.*)$",))
-    def test_protect_project(self) -> None:
-        middleware = RequireLoginMiddleware()
-        request = HttpRequest()
-        request.user = User()
-        request.META["SERVER_NAME"] = "testserver"
-        request.META["SERVER_PORT"] = "80"
-        # No protection for not protected path
-        self.assertIsNone(middleware.process_view(request, self.view_method, (), {}))
-        request.path = "/project/foo/"
-        # No protection for protected path and signed in user
-        self.assertIsNone(middleware.process_view(request, self.view_method, (), {}))
-        # Protection for protected path and not signed in user
-        request.user = get_anonymous()
-        self.assertIsInstance(
-            middleware.process_view(request, self.view_method, (), {}),
-            HttpResponseRedirect,
+    @method_decorator(login_not_required)
+    def public_view(self, request: HttpRequest) -> str:
+        """View not requiring login."""
+        return "PUBLIC_VIEW"
+
+    def protected_view(self, request: HttpRequest) -> str:
+        """View requiring login."""
+        return "PROTECTED_VIEW"
+
+    @override_settings(
+        REQUIRE_LOGIN=True,
+        MIDDLEWARE=[
+            "django.contrib.sessions.middleware.SessionMiddleware",
+            "weblate.accounts.middleware.AuthenticationMiddleware",
+            "django.contrib.auth.middleware.LoginRequiredMiddleware",
+        ],
+    )
+    def test_login_required_middleware(self) -> None:
+        """Test that LoginRequiredMiddleware protects views when REQUIRE_LOGIN is True."""
+        # Test public endpoint (health check)
+        response = self.client.get("/healthz/")
+        self.assertEqual(response.status_code, 200)
+
+        # Test that anonymous users are redirected from protected views
+        response = self.client.get("/projects/")
+        self.assertRedirects(
+            response, "/accounts/login/?next=/projects/", fetch_redirect_response=False
         )
-        # No protection for login and not signed in user
-        request.path = "/accounts/login/"
-        self.assertIsNone(middleware.process_view(request, self.view_method, (), {}))
+
+        # Test that authenticated users can access protected views
+        user = User.objects.create_user(username="testuser", password="testpass")
+        self.client.force_login(user)
+        response = self.client.get("/projects/")
+        self.assertEqual(response.status_code, 200)
+
+        # Test that admin login page is accessible without authentication
+        self.client.logout()
+        response = self.client.get("/admin/login/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Sign in")
+
+    def test_no_login_required(self) -> None:
+        """Test that views are accessible without authentication when REQUIRE_LOGIN is False."""
+        # Test that anonymous users can access public endpoints
+        response = self.client.get("/healthz/")
+        self.assertEqual(response.status_code, 200)
+
+        # With default settings (REQUIRE_LOGIN=False), most views are accessible
+        response = self.client.get("/projects/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_authenticated_session_expiry_is_not_refreshed_every_request(self) -> None:
+        user = User.objects.create_user(username="testuser", password="testpass")
+        self.client.force_login(user)
+
+        response = self.client.get("/healthz/")
+        self.assertIn(settings.SESSION_COOKIE_NAME, response.cookies)
+
+        response = self.client.get("/healthz/")
+        self.assertNotIn(settings.SESSION_COOKIE_NAME, response.cookies)
+
+    def test_authenticated_html_is_not_cached(self) -> None:
+        response = self.client.get(reverse("about"))
+        self.assertNotIn("Cache-Control", response)
+
+        user = User.objects.create_user(username="testuser", password="testpass")
+        self.client.force_login(user)
+        response = self.client.get(reverse("about"))
+
+        cache_control = response.headers["Cache-Control"]
+        for directive in (
+            "max-age=0",
+            "no-cache",
+            "no-store",
+            "must-revalidate",
+            "private",
+        ):
+            self.assertIn(directive, cache_control)
+
+    def test_authenticated_non_html_cache_control_is_unchanged(self) -> None:
+        user = User.objects.create_user(username="testuser", password="testpass")
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/"))
+        response = HttpResponse(content_type="application/json")
+        response.headers["Cache-Control"] = "private, max-age=3600"
+
+        response = AuthenticationMiddleware.finalize_response(request, response, user)
+
+        self.assertEqual(response.headers["Cache-Control"], "private, max-age=3600")
+
+
+@modify_settings(MIDDLEWARE={"append": "weblate.legal.middleware.RequireTOSMiddleware"})
+class ASGIMiddlewareTest(TestCase):
+    """Exercise authentication and legal middleware through the async handler."""
+
+    @staticmethod
+    def import_sentry_middleware(path: str) -> type:
+        # Exercise Sentry's async dispatch without installing global SDK patches.
+        return _wrap_middleware(import_string(path), path)
+
+    def test_anonymous_home(self) -> None:
+        for sentry in (False, True):
+            with (
+                self.subTest(sentry=sentry),
+                patch(
+                    "django.core.handlers.base.import_string",
+                    self.import_sentry_middleware if sentry else import_string,
+                ),
+            ):
+                response = async_to_sync(AsyncClient().get)("/")
+                self.assertEqual(response.status_code, 200)
+                request = cast("AuthenticatedHttpRequest", response.asgi_request)
+                self.assertEqual(request.user, get_anonymous())
+                self.assertFalse(request.user.is_authenticated)
+                self.assertIs(async_to_sync(request.auser)(), request.user)
+                self.assertFalse(request.user.is_verified())
+
+    def test_authenticated_home(self) -> None:
+        user = User.objects.create_user(username="asgiuser", password="testpass")
+        user.profile.language = "cs"
+        user.profile.save()
+        Agreement.objects.update_or_create(
+            user=user, defaults={"tos": Agreement.current_tos_date()}
+        )
+
+        for sentry in (False, True):
+            with (
+                self.subTest(sentry=sentry),
+                patch(
+                    "django.core.handlers.base.import_string",
+                    self.import_sentry_middleware if sentry else import_string,
+                ),
+            ):
+                client = AsyncClient()
+                client.force_login(user)
+                response = async_to_sync(client.get)("/")
+                self.assertEqual(response.status_code, 200)
+                request = cast("AuthenticatedHttpRequest", response.asgi_request)
+                self.assertEqual(request.user, user)
+                self.assertIs(async_to_sync(request.auser)(), request.user)
+                self.assertFalse(request.user.is_verified())
+                self.assertEqual(request.LANGUAGE_CODE, "cs")
+                self.assertEqual(
+                    response.cookies[settings.LANGUAGE_COOKIE_NAME].value, "cs"
+                )
+
+    def test_outdated_terms(self) -> None:
+        user = User.objects.create_user(username="asgiuser", password="testpass")
+        Agreement.objects.update_or_create(user=user, defaults={"tos": "1970-01-01"})
+
+        for sentry in (False, True):
+            with (
+                self.subTest(sentry=sentry),
+                patch(
+                    "django.core.handlers.base.import_string",
+                    self.import_sentry_middleware if sentry else import_string,
+                ),
+            ):
+                client = AsyncClient()
+                client.force_login(user)
+                response = async_to_sync(client.get)("/")
+                self.assertRedirects(
+                    response,
+                    f"{reverse('legal:confirm')}?next=%2F",
+                    fetch_redirect_response=False,
+                )
+
+
+class AuthenticationActorTest(TestCase):
+    """Authentication scopes actors even without change-origin middleware."""
+
+    def make_request(self, user: User) -> AuthenticatedHttpRequest:
+        request = cast("AuthenticatedHttpRequest", RequestFactory().get("/"))
+        request.session = self.client.session
+        request.weblate_cached_user = user
+        return request
+
+    def test_actor_and_exception_cleanup(self) -> None:
+        user = User.objects.create_user(username="actor", password="testpass")
+        request = self.make_request(user)
+        anonymous = get_anonymous()
+
+        def response(request: AuthenticatedHttpRequest) -> HttpResponse:
+            self.assertEqual(get_acting_user(), request.user)
+            raise ValueError
+
+        with acting_user_context(anonymous):
+            with self.assertRaises(ValueError):
+                AuthenticationMiddleware(response)(request)
+            self.assertIs(get_acting_user(), anonymous)
+
+    def test_async_actor_and_cleanup(self) -> None:
+        user = User.objects.create_user(username="actor", password="testpass")
+        request = self.make_request(user)
+        anonymous = get_anonymous()
+
+        async def response(request: AuthenticatedHttpRequest) -> HttpResponse:
+            await asyncio.sleep(0)
+            self.assertEqual(get_acting_user(), request.user)
+            return HttpResponse()
+
+        with acting_user_context(anonymous):
+            result = async_to_sync(AuthenticationMiddleware(response).__acall__)(
+                request
+            )
+            self.assertEqual(result.status_code, 200)
+            self.assertIs(get_acting_user(), anonymous)
+
+    def test_anonymous_actor(self) -> None:
+        anonymous = get_anonymous()
+        request = self.make_request(anonymous)
+
+        def response(request: AuthenticatedHttpRequest) -> HttpResponse:
+            self.assertEqual(get_acting_user(), anonymous)
+            return HttpResponse()
+
+        with acting_user_context(None):
+            AuthenticationMiddleware(response)(request)
+            self.assertIsNone(get_acting_user())

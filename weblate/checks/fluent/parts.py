@@ -36,23 +36,14 @@ class _PartsDifference:
     ) -> None:
         # We don't expect any duplicate part names since that should raise a
         # syntax error in the translation toolkit.
+        source_names = {part.name for part in source_parts}
+        target_names = {part.name for part in target_parts}
         self._missing = [
-            part.name
-            for part in source_parts
-            if not self._has_matching_part(target_parts, part)
+            part.name for part in source_parts if part.name not in target_names
         ]
         self._extra = [
-            part.name
-            for part in target_parts
-            if not self._has_matching_part(source_parts, part)
+            part.name for part in target_parts if part.name not in source_names
         ]
-
-    @staticmethod
-    def _has_matching_part(
-        part_list: list[FluentPart],
-        find_part: FluentPart,
-    ) -> bool:
-        return any(part.name == find_part.name for part in part_list)
 
     def __bool__(self) -> bool:
         return bool(self._missing or self._extra)
@@ -112,6 +103,7 @@ class FluentPartsCheck(TargetCheck):
     name = gettext_lazy("Fluent parts")
     description = gettext_lazy("Fluent parts should match.")
     default_disabled = True
+    version_added = "5.0"
 
     @classmethod
     def _compare_parts(
@@ -174,10 +166,10 @@ class FluentPartsCheck(TargetCheck):
             highlight_patterns.append(r"^ *\." + re.escape(part.name) + r" *=")
         return FluentPatterns.highlight_source(source, highlight_patterns)
 
-    def get_description(self, check_model: CheckModel) -> StrOrPromise:
-        (unit, source, target) = translation_from_check(check_model)
+    def get_description(self, check_obj: CheckModel) -> StrOrPromise:
+        (unit, source, target) = translation_from_check(check_obj)
         difference = self._compare_parts(unit, source, target)
         if not difference:
-            return super().get_description(check_model)
+            return super().get_description(check_obj)
 
         return difference.description()

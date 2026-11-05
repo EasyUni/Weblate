@@ -6,7 +6,9 @@ from __future__ import annotations
 
 from contextlib import suppress
 from functools import wraps
-from typing import TYPE_CHECKING, cast
+from time import monotonic, sleep
+from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth import logout
@@ -14,51 +16,22 @@ from django.core.cache import cache
 from django.middleware.csrf import rotate_token
 from django.shortcuts import redirect
 from django.template.loader import render_to_string
+from siphashc import siphash
 
 from weblate.logger import LOGGER
 from weblate.utils import messages
-from weblate.utils.cache import is_redis_cache
 from weblate.utils.docs import get_doc_url
 from weblate.utils.hash import calculate_checksum
 from weblate.utils.request import get_ip_address
 
+NOTIFY_RATE_LIMIT_LOCK_EXPIRY = 30
+NOTIFY_RATE_LIMIT_LOCK_INTERVAL = 0.01
+NOTIFY_RATE_LIMIT_LOCK_WAIT = 5
+
 if TYPE_CHECKING:
     from django.http import HttpResponse
-    from django_redis.cache import RedisCache
 
     from weblate.auth.models import AuthenticatedHttpRequest, User
-
-
-def get_cache_key(
-    scope: str,
-    request: AuthenticatedHttpRequest | None = None,
-    address: str | None = None,
-    user: User | None = None,
-) -> str:
-    """Generate cache key for request."""
-    if request is not None and request.user.is_authenticated and user is None:
-        user = request.user
-    if user is not None:
-        key = user.id
-        origin = "user"
-    else:
-        if address is None:
-            address = get_ip_address(request)
-            if not address:
-                LOGGER.error(
-                    "could not obtain remote IP address, see %s",
-                    get_doc_url("admin/install", "reverse-proxy"),
-                )
-        origin = "ip"
-        key = calculate_checksum(address)
-    return f"ratelimit-{origin}-{scope}-{key}"
-
-
-def reset_rate_limit(
-    scope, request: AuthenticatedHttpRequest | None = None, address=None, user=None
-) -> None:
-    """Reset rate limit."""
-    cache.delete(get_cache_key(scope, request, address, user))
 
 
 def get_rate_setting(scope: str, suffix: str):
@@ -68,38 +41,22 @@ def get_rate_setting(scope: str, suffix: str):
     return getattr(settings, f"RATELIMIT_{suffix}")
 
 
+def reset_rate_limit(
+    scope, request: AuthenticatedHttpRequest | None = None, address=None, user=None
+) -> None:
+    """Reset rate limit."""
+    limiter = RateLimitHttpRequest(scope, request, address, user)
+    limiter.reset()
+
+
 def revert_rate_limit(scope, request: AuthenticatedHttpRequest) -> None:
     """
     Revert rate limit to previous state.
 
     This can be used when rate limiting POST, but ignoring some events.
     """
-    key = get_cache_key(scope, request)
-
-    with suppress(ValueError):
-        # Try to increase bucket if it exists
-        cache.incr(key)
-
-
-def rate_limit(key: str, attempts: int, window: int) -> bool:
-    """Verify rate limiting limits."""
-    # Initialize the bucket (atomically on redis)
-    if not is_redis_cache():
-        if cache.get(key) is None:
-            cache.set(key, attempts, window)
-    else:
-        cast("RedisCache", cache).set(key, attempts, window, nx=True)
-
-    try:
-        # Count current event
-        cache.decr(key)
-    except ValueError:
-        current = 0
-    else:
-        # Get remaining bucket
-        current = cache.get(key, 0)
-
-    return current < 0
+    limiter = RateLimitHttpRequest(scope, request)
+    limiter.revert()
 
 
 def check_rate_limit(scope: str, request: AuthenticatedHttpRequest) -> bool:
@@ -107,16 +64,31 @@ def check_rate_limit(scope: str, request: AuthenticatedHttpRequest) -> bool:
     if request.user.is_superuser:
         return True
 
-    key = get_cache_key(scope, request)
-    window = get_rate_setting(scope, "WINDOW")
-    attempts = get_rate_setting(scope, "ATTEMPTS")
+    limiter = RateLimitHttpRequest(scope, request)
+    is_exceeded, _ = limiter.is_limit_exceeded()
 
-    if rate_limit(key, attempts, window):
+    if is_exceeded:
         # Set key to longer expiry for lockout period
-        cache.touch(key, get_rate_setting(scope, "LOCKOUT"))
+        lockout = get_rate_setting(scope, "LOCKOUT")
+        limiter.touch(lockout)
+        if (
+            request.user.is_authenticated
+            and request.user.pk is not None
+            and limiter.should_create_audit_log(lockout)
+        ):
+            # ruff: ignore[import-outside-top-level]
+            from weblate.accounts.models import AuditLog
+
+            AuditLog.objects.create(
+                request.user,
+                request,
+                "rate-limit",
+                scope=scope,
+                path=request.path,
+            )
         LOGGER.info(
             "rate-limit lockout for %s in %s scope from %s",
-            key,
+            limiter.key,
             scope,
             get_ip_address(request),
         )
@@ -159,3 +131,176 @@ def session_ratelimit_post(scope: str, logout_user: bool = True):
         return wraps(function)(_rate_wrap)
 
     return _session_ratelimit_post_controller
+
+
+def rate_limit_notify(address: str) -> tuple[bool, str]:
+    """
+    Multi-level rate limiting for email notifications.
+
+    Returns: tuple: (is_blocked, reason)
+    """
+    rate_limits = settings.RATELIMIT_NOTIFICATION_LIMITS
+    encoded_email = siphash("Weblate notifier", address)
+    limiter = RateLimitNotify(f"{encoded_email}", rate_limits)
+    return limiter.is_limit_exceeded()
+
+
+class RateLimitBase:
+    cache_items: list[CacheCounterItem]
+    key: str
+
+    def __init__(self, base_key: str, rate_limits: list[tuple[int, int]]) -> None:
+        self.key = base_key
+
+        self.cache_items = [
+            CacheCounterItem(self.key, attempts, window)
+            for attempts, window in rate_limits
+        ]
+
+    def is_limit_exceeded(self) -> tuple[bool, str]:
+        for cache_item in self.cache_items:
+            remaining = cache_item.decrement()
+            if remaining <= 0:
+                # Keep rejected attempts consumed. Rolling them back could add
+                # capacity to a new generation if this bucket expires meanwhile.
+                return (
+                    True,
+                    f"rate limit exceeded ({cache_item.attempts}/{cache_item.window}s)",
+                )
+        return False, ""
+
+    def touch(self, timeout: int) -> None:
+        for cache_item in self.cache_items:
+            cache_item.touch(timeout)
+
+    def revert(self) -> None:
+        for cache_item in self.cache_items:
+            cache_item.increment()
+
+    def reset(self) -> None:
+        for cache_item in self.cache_items:
+            cache_item.delete()
+
+
+class RateLimitNotify(RateLimitBase):
+    def __init__(self, base_key: str, rate_limits: list[tuple[int, int]]) -> None:
+        RateLimitBase.__init__(self, f"notify:rate:{base_key}", rate_limits)
+
+    def is_limit_exceeded(self) -> tuple[bool, str]:
+        if not self.cache_items:
+            return False, ""
+
+        lock_key = f"{self.key}:reservation-lock"
+        lock_value = uuid4().hex
+        deadline = monotonic() + NOTIFY_RATE_LIMIT_LOCK_WAIT
+        while not cache.add(
+            lock_key, lock_value, timeout=NOTIFY_RATE_LIMIT_LOCK_EXPIRY
+        ):
+            if monotonic() >= deadline:
+                return True, "could not reserve notification rate limit"
+            sleep(NOTIFY_RATE_LIMIT_LOCK_INTERVAL)
+
+        try:
+            # Notification rate limits can have multiple buckets. The lock makes
+            # checking all buckets before consuming capacity safe.
+            for cache_item in self.cache_items:
+                if cache_item.count_remaining <= 1:
+                    return (
+                        True,
+                        f"rate limit exceeded ({cache_item.attempts}/{cache_item.window}s)",
+                    )
+            return super().is_limit_exceeded()
+        finally:
+            if cache.get(lock_key) == lock_value:
+                cache.delete(lock_key)
+
+
+class RateLimitHttpRequest(RateLimitBase):
+    def __init__(
+        self,
+        scope: str,
+        request: AuthenticatedHttpRequest | None = None,
+        address: str | None = None,
+        user: User | None = None,
+    ) -> None:
+        if request is not None and request.user.is_authenticated and user is None:
+            user = request.user
+        key: int | str
+        if user is not None:
+            key = user.id
+            origin = "user"
+        else:
+            if address is None:
+                address = get_ip_address(request)
+                if not address:
+                    LOGGER.error(
+                        "could not obtain remote IP address, see %s",
+                        get_doc_url("admin/install", "reverse-proxy"),
+                    )
+            origin = "ip"
+            key = calculate_checksum(address)
+
+        base_key = f"ratelimit-{origin}-{scope}-{key}"
+        window = get_rate_setting(scope, "WINDOW")
+        attempts = get_rate_setting(scope, "ATTEMPTS")
+
+        RateLimitBase.__init__(self, base_key, [(attempts, window)])
+
+    @property
+    def audit_cache_key(self) -> str:
+        return f"{self.key}:audit"
+
+    def should_create_audit_log(self, timeout: int) -> bool:
+        """Return whether this lockout needs an audit log entry."""
+        created = cache.add(self.audit_cache_key, True, timeout)
+        if not created:
+            cache.touch(self.audit_cache_key, timeout)
+        return created
+
+    def reset(self) -> None:
+        super().reset()
+        cache.delete(self.audit_cache_key)
+
+
+class CacheCounterItem:
+    cache_key: str
+    attempts: int
+    window: int
+
+    def __init__(self, base_key: str, attempts: int, window: int) -> None:
+        self.cache_key = f"{base_key}:{attempts}:{window}"
+        self.attempts = attempts
+        self.window = window
+        # The extra sentinel value distinguishes the last allowed decrement
+        # from an exhausted Memcached counter, which saturates at zero.
+        cache.add(self.cache_key, attempts + 1, window)
+
+    @property
+    def count_remaining(self) -> int:
+        remaining = cache.get(self.cache_key)
+        if remaining is None:
+            cache.add(self.cache_key, self.attempts + 1, self.window)
+            remaining = cache.get(self.cache_key)
+        return remaining if remaining is not None else 0
+
+    def increment(self) -> None:
+        with suppress(ValueError):
+            cache.incr(self.cache_key)
+
+    def decrement(self) -> int:
+        for _unused in range(2):
+            try:
+                remaining = cache.decr(self.cache_key)
+            except ValueError:
+                # The item can expire or be evicted between initialization and use.
+                cache.add(self.cache_key, self.attempts + 1, self.window)
+            else:
+                # A cache configured to ignore backend errors can return None.
+                return remaining if remaining is not None else -1
+        return -1
+
+    def touch(self, timeout: int) -> None:
+        cache.touch(self.cache_key, timeout)
+
+    def delete(self) -> None:
+        cache.delete(self.cache_key)

@@ -2,6 +2,7 @@ Translating using Weblate
 =========================
 
 Thank you for your interest in translating with Weblate!
+If you are new here, follow :ref:`translator-start` for a guided first contribution.
 
 Generally, there are two most used modes of translation:
 
@@ -42,6 +43,8 @@ to find a specific string or term.
 
 .. image:: /screenshots/strings-to-check.webp
 
+.. _suggestions:
+
 Suggestions
 -----------
 
@@ -51,10 +54,26 @@ Suggestions
 
 Anonymous users (by default) can only forward suggestions. Doing so is still
 available to signed-in users, in cases where uncertainty about a translation
-arises, prompting other translators to review it.
+arises, prompting other translators to review it. Any user can clone an existing
+suggestion into the translation fields, including plural forms, and use it
+as the basis for a new suggestion or translation.
 
 All suggestions are scanned on a daily basis to remove duplicates and
 those matching current translations.
+
+If you have the :guilabel:`Accept suggestions` permission, you can bulk accept
+all suggestions from a specific user by clicking the account check icon next
+to their suggestion. This is useful for quickly processing suggestions from
+trusted contributors. Suggestions failing quality checks are skipped and
+remain for manual review. Weblate shows the number of matching suggestions for
+confirmation and processes the acceptance in the background. If you can review
+the translation, you can accept and approve the suggestions in the same step.
+
+Bulk acceptance selects suggestions from that user only for the current language
+in the current component. It does not select suggestions in other languages or
+components, even within the same project. For example, when translating a
+component into French, bulk acceptance selects only that user's French
+suggestions in that component.
 
 .. _user-comments:
 
@@ -73,7 +92,18 @@ the original string, for example that it should be rephrased, or to ask
 questions about it.
 
 Markdown syntax can be used in all comments, as well as mentioning other
-users by using ``@username``.
+users by using ``@username``. Use the :guilabel:`Preview` tab above the comment
+field to see how the Markdown and mentions will render before posting. Mention a
+maintainer or another translator when you need them to see a follow-up
+question; they can reply in the same :guilabel:`Comments` tab.
+
+To find comments again, open your :ref:`user-profile`; the comment count links
+to your comment activity. To find strings with comments by a specific user, use
+:doc:`/user/search`. For example, ``comment_author:USERNAME`` finds strings
+with comments by that user, and ``source_comment_author:USERNAME`` finds
+strings with source string comments by that user. When you are signed in, the
+search filter menu also includes shortcuts for comments by you and source
+comments by you.
 
 .. seealso::
 
@@ -128,8 +158,103 @@ Various bits of extra info can be shown on this page, most of which coming from 
 Translation fields for any secondary languages translators select in the preferences will be shown
 (see :ref:`secondary-languages`) above the source string.
 
-Below the translation, translators will find suggestion made by others, to be
-accepted (✓), accepted with changes (✏️), or deleted (🗑).
+Below the translation, translators will find suggestions made by others, to be accepted (✓),
+accepted with changes (✏️), bulk accepted for a specific user (👤✓),
+cloned into the translation fields (📑) or deleted (🗑).
+
+.. _translating-special-text:
+
+Translating special text safely
++++++++++++++++++++++++++++++++
+
+Some source strings contain text that the application interprets at runtime.
+Translate the human-readable parts, but keep technical markers intact unless
+the project instructions say otherwise.
+
+Placeholders and format strings
+    Keep variables such as ``%s``, ``%1$d``, ``%(name)s``, ``{count}``,
+    ``{{ value }}``, or similar markers in the translation. Named placeholders
+    describe the inserted value, but the names themselves are not translated.
+    You can usually reorder numbered or named placeholders to fit the target
+    language. Use the placeable copy shortcuts to insert them without typing
+    mistakes.
+Markup
+    Keep HTML and XML tags, tag names, and attribute names unchanged. Translate
+    the visible text between tags and any attribute value that is meant for
+    users, for example alternative text or a tooltip, when it appears as part
+    of the translatable string. Make sure opening and closing tags still match
+    after reordering the sentence.
+Program syntax
+    Leave function names, commands, environment variables, spreadsheet
+    functions, SQL keywords, and similar program syntax untranslated unless the
+    project explicitly documents a localized form.
+Punctuation and whitespace
+    Preserve punctuation and spaces that affect the interface, such as
+    trailing colons, ellipses, leading or trailing spaces, and punctuation next
+    to placeholders. Follow the target language's typography when it differs
+    from the source, and use comments when a source punctuation choice looks
+    wrong.
+Accelerators
+    Menu labels can mark keyboard accelerators with characters such as ``&``,
+    ``_``, or ``~``. When the source has an accelerator, keep one in the
+    translation. Choose a readable key in the translated label and avoid
+    obvious conflicts with nearby menu items or buttons.
+Plural forms
+    Translate each plural field Weblate shows. Do not combine forms into a
+    single construction such as ``file(s)`` unless that is correct for the
+    target language and project. If the source string uses an ambiguous plural,
+    report it with a source string comment or review.
+
+Weblate quality checks catch many technical mistakes in placeholders, markup,
+punctuation, whitespace, and plural forms. They do not replace translator
+judgment, so use :ref:`source-context`, :doc:`/user/glossary`, and
+:ref:`user-comments` when the source text needs clarification.
+
+.. seealso::
+
+   * :doc:`/user/checks`
+   * :ref:`plurals`
+   * :ref:`source-context`
+   * :ref:`user-comments`
+
+.. _edit-source:
+
+Editing source strings and keys
++++++++++++++++++++++++++++++++
+
+When :ref:`component-manage_units` is enabled and you have permission to edit
+source strings, choose :guilabel:`Tools` → :guilabel:`Edit source` in the
+translation editor. You can open this dialog from any language. Changes apply
+to the source string and its existing translations within the component.
+
+The dialog lets you change the source text, supported key or context, and source
+explanation. Existing translations, history, comments, labels, and suggestions
+are retained. Changing source text marks existing translations as needing
+editing. Changing only the key, context, or explanation preserves their states.
+Renaming a key may require corresponding changes in your application code.
+
+Changes are written to translation files through the normal pending-change
+queue and follow the project's commit policy. Keys used by pending edits remain
+reserved until those edits are written. Weblate rejects collisions rather than
+merging strings. Reload the editor if another user has changed the source since
+you opened the dialog.
+
+Source editing supports PO, TBX, plain XLIFF 1.2, XLIFF 2.0, and Apple XLIFF.
+Key editing supports JSON (plain, nested, ARB, WebExtension, and i18next), YAML,
+Ruby YAML, TOML, Go-i18n TOML, Java properties, GWT, PHP, DTD, Android, RESX, and
+simple Fluent messages. These monolingual formats also support source-text
+editing. PO contexts and TBX keys are editable; composite XLIFF keys are not.
+
+YAML and TOML keys can be renamed within their existing mapping, but cannot be
+moved between mappings or renamed inside arrays. Editing source text with
+unsupported inline markup, changing the number of plural forms or terminology
+alternatives, and editing components with an intermediate language file are
+not supported.
+
+.. seealso::
+
+   * :ref:`component-manage_units`
+   * :http:post:`/api/units/(int:id)/source/`
 
 .. _plurals:
 
@@ -215,6 +340,10 @@ The following keyboard shortcuts can be utilized during translation:
 |                                           |                                                                       |
 | :kbd:`Cmd+Shift+Enter`                    |                                                                       |
 +-------------------------------------------+-----------------------------------------------------------------------+
+| :kbd:`Ctrl+Alt+Enter` or                  | Approve the translation and save and continue.                        |
+|                                           | Only available to reviewers.                                          |
+| :kbd:`Cmd+Alt+Enter`                      |                                                                       |
++-------------------------------------------+-----------------------------------------------------------------------+
 | :kbd:`Alt+Enter` or                       | Submit the string as a suggestion; this works the same as             |
 |                                           | pressing :guilabel:`Suggest` while editing translation.               |
 | :kbd:`Option+Enter`                       |                                                                       |
@@ -294,9 +423,15 @@ This contextual description provides related info about the current string.
 
 String attributes
     Things like message ID, context (``msgctxt``) or location in source code.
+Explanation
+    Further clarification can be provided in Weblate via :ref:`additional-explanation`.
 Screenshots
-    Screenshots can be uploaded to Weblate to better inform translators
-    of where and how the string is used, see :ref:`screenshots`.
+    Screenshots can be uploaded directly from this panel using
+    :guilabel:`Upload screenshot`, or linked using :guilabel:`Add existing screenshot`
+    to show where and how the string is used. Source-language
+    screenshots are shown for every translation of the string, while
+    translation-specific screenshots are shown only for that translation; see
+    :ref:`screenshots`.
 Nearby strings
     Displays neighbouring strings from the translation file.
     These are usually also used in a similar context and prove
@@ -317,6 +452,40 @@ Project
 
 If you want direct links, the translation format has to support it.
 
+.. _add-existing-screenshot:
+
+Adding an existing screenshot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To link a screenshot that has already been uploaded, open the string in the
+translation editor:
+
+1. In the :guilabel:`Screenshots` panel, choose :guilabel:`Add existing screenshot`.
+2. Browse the thumbnails, or enter a query in :guilabel:`Search screenshots` and
+   choose :guilabel:`Search`. Use :guilabel:`Previous` and :guilabel:`Next` to
+   browse additional results.
+3. Select a screenshot by clicking its card. The card is highlighted and marked
+   :guilabel:`Selected`. To select with a keyboard, press :kbd:`Tab` to reach
+   the cards, use the arrow keys to move between them, and press :kbd:`Space`
+   to select a card.
+4. Choose :guilabel:`Add screenshot`. The editor reloads on the same string and
+   displays the associated screenshot in the :guilabel:`Screenshots` panel.
+
+.. image:: /screenshots/screenshot-picker-selected.webp
+   :alt: Screenshot picker with a highlighted card marked Selected.
+
+The picker shows screenshots from the current component in the source language
+or the current translation language. A source-language screenshot is linked to
+the source string and shown for every translation. A translation-language
+screenshot is shown only for that language. Screenshots already linked to the
+string are excluded from the picker.
+
+This action requires the :guilabel:`Edit screenshot` permission. To upload a new
+image, use :guilabel:`Upload screenshot` instead. Use :guilabel:`Manage screenshots`
+for the full :ref:`screenshot management interface <screenshots>`.
+
+.. _translation-history:
+
 Translation history
 +++++++++++++++++++
 
@@ -324,6 +493,32 @@ Every change is by default (unless turned-off in component settings) saved in
 the database, and can be reverted.
 Optionally, translations can also be reverted
 in the underlying version control system.
+
+Each change shows an origin badge next to the username:
+:guilabel:`Web`, :guilabel:`API`, :guilabel:`Repository`, or
+:guilabel:`System`. Changes made by :ref:`automation <automation-reference>` identify the installed
+add-on and its execution log in the tooltip of an :guilabel:`Automation` origin badge.
+Hover over a badge or focus it with the keyboard to see an explanation of the origin.
+Session-authenticated API requests, including requests from
+the editor, count as web actions. Token-authenticated requests count
+as API actions. Strings imported from a repository count as repository changes,
+while uploads retain their web or API origin. Background tasks
+inherit the initiating origin; unrelated background work uses system.
+Historical changes without recorded origin have no badge.
+
+Origin badges are visible to anyone who can view the change. Superusers also
+see an IP address badge when an address was recorded. Origin metadata is also
+available through the :doc:`API </api>` to users who can access the change.
+
+In the changes browser, use :guilabel:`Older` and :guilabel:`Newer` to browse
+history, or :guilabel:`Latest` to return to the newest matching changes.
+:guilabel:`Jump to date` starts with the latest changes on or before the selected
+date. You can then browse in either direction, keeping your search filters.
+Use :guilabel:`Date range` to restrict results to a particular period.
+
+CSV downloads and RSS feeds use the search filters, not your browsing position
+or jump date. CSV downloads contain up to 2,000 matching changes, and RSS feeds
+contain the latest 10. Old numbered page links open the latest matching changes.
 
 Translated string length
 ++++++++++++++++++++++++
@@ -346,7 +541,8 @@ Automatic suggestions
 ---------------------
 
 Based on configuration and your translated language, Weblate provides suggestions
-from several machine translation tools and :ref:`translation-memory`.
+from configured :ref:`translation services <machine-translation-setup>`, including
+machine translation tools and :ref:`translation-memory`.
 All machine translations are available in a single tab of each translation page.
 
 You can also perform a concordance search on the :ref:`translation-memory`.
@@ -362,15 +558,33 @@ Automatic translation
 
 You can use automatic translation to bootstrap translation based on external
 sources. This tool is called :guilabel:`Automatic translation` accessible in
-the :guilabel:`Tools` menu, once you have selected a component and a language:
+the :guilabel:`Operations` menu, once you have selected a component and a language:
 
 .. image:: /screenshots/automatic-translation.webp
+
+A similar operation :guilabel:`Batch automatic translation` is available if you have
+selected a project language, a component or a category.
+
+Only one automatic translation operation can process a component and language at
+a time. Background operations defer busy translations and resume them later,
+without repeating languages they have already completed. Synchronous API and
+command-line requests report an error immediately if the translation is busy.
 
 Two modes of operation are possible:
 
 - Using other Weblate components as a source for translations.
 - Using selected machine translation services with translations above a certain
   quality threshold.
+
+When using other components as the source, Weblate first looks for an exact match
+of both source text and context, including empty context. If none exists, it uses
+a translation matching only the source text. Context matches take precedence over
+source component order; component order breaks ties between equally matching
+candidates.
+
+Weblate applies translations only when plural forms are compatible. If the source
+component uses different plural rules, pluralized strings are skipped and Weblate shows a warning, while
+single-form strings are still translated.
 
 You can also choose which strings are to be auto-translated.
 
@@ -401,7 +615,7 @@ operations like searching, sending contact forms, or translating.
 If affected by it, you are blocked for a certain period, until you can
 perform the operation again.
 
-Default limits and fine-tuning is described in the administrative manual,
+Default limits and fine-tuning are described in the administrative manual,
 see :ref:`rate-limit`.
 
 .. _search-replace:
@@ -409,13 +623,8 @@ see :ref:`rate-limit`.
 Search and replace
 ------------------
 
-Change terminology effectively or perform bulk fixing of the
-strings using :guilabel:`Search and replace` in the :guilabel:`Tools` menu.
-
-.. hint::
-
-    Don't worry about messing up the strings, as it is a two-step process.
-    A preview of edited strings is shown before confirming the change.
+Search and replace is part of :ref:`bulk-edit`. Use it to change terminology or
+fix matching translations, with literal text or regular expressions.
 
 .. _bulk-edit:
 
@@ -424,16 +633,92 @@ Bulk edit
 
 Bulk editing allows performing one operation for multiple strings.
 Define strings by searching for them and actions to perform on matching ones.
+Flag and label changes are grouped by what they affect, with separate
+:guilabel:`Add flags` and :guilabel:`Remove flags` fields for each flag group.
 Supported operations:
 
 * Change string state (for example to approve all unreviewed strings).
-* Adjust translation flags (see :ref:`custom-checks`)
+* Clear translations by setting the state to :guilabel:`Empty`.
+* Replace text, including regular expressions and captured groups.
+* Adjust source-wide or language-specific translation flags (see :ref:`custom-checks`)
 * Adjust string labels (see :ref:`labels`)
+
+Source flag and label operations affect all languages of matching strings.
+Translation flag operations affect only matching translations and skip source
+strings. Removing translation flags removes local values; inherited flags
+remain in effect. To mark matching translations read-only, add ``read-only``
+using :guilabel:`Add flags` in the :guilabel:`Translation flags` section.
 
 .. hint::
 
     This tool is called :guilabel:`Bulk edit`, accessible in the
-    :guilabel:`Tools` menu of each project, component or translation.
+    :guilabel:`Operations` menu of each project, component or translation.
+
+Text replacement uses the strings matched by the search query or your selection.
+Choose :guilabel:`Text` for case-sensitive literal replacement, or
+:guilabel:`Regular expression` for a pattern. Leave :guilabel:`Search string`
+empty to disable replacement. An empty :guilabel:`Replacement string` removes
+matching text. Spaces and newlines in the fields are preserved, and each plural form is
+processed separately. The usual translation autofixes still apply.
+
+Regular expression replacements use Python syntax: ``\g<1>`` inserts the first
+captured group, ``\g<name>`` inserts a named group, and ``\g<0>`` inserts the
+complete match. For example, search for ``(Hello), (world)`` and replace with
+``\g<2>, \g<1>`` to swap the words. Invalid patterns or references are rejected;
+expressions that take too long to evaluate stop the operation.
+
+Replacement can be combined with state, flag, and label changes. These other
+operations apply to all strings matched by the query, including strings whose
+text does not match the replacement pattern. Setting :guilabel:`Empty` clears
+all translation plural forms and cannot be combined with replacement. Source
+strings can be replaced when editable, but cannot be cleared. These operations
+require bulk-edit and edit permissions and respect read-only strings.
+
+Each selected translation is processed independently, once per operation.
+Automatic propagation skips other selected translations so that their own
+replacement inputs are preserved. Eligible translations outside the selection
+can still receive propagated changes.
+
+:guilabel:`Preview changes` is selected by default. The preview shows up to 250
+changed strings, with checkboxes to choose which displayed strings to apply.
+Edit the parameters and choose :guilabel:`Update preview` to review a different
+operation. Select :guilabel:`Apply all matching strings` to process all current
+matches, including those not displayed. The query and permissions are checked
+again when applying changes. Source flag and label changes affect every language
+of the corresponding source, even when only one translation is selected.
+Uncheck :guilabel:`Preview changes` to apply directly.
+
+Each bulk edit is limited to 20,000 matching strings. Narrow the search query
+if it exceeds this limit. This limit also applies to Automations and the bulk-edit
+add-on. Browser bulk edits run in the background and show progress after submission.
+The query and permissions are checked again when the task starts. The selected
+strings are processed in batches; if a later batch fails, earlier batches remain
+applied and the result reports the partial progress.
+
+Regular expression replacement runs in a separate helper process with fixed
+resource limits shared across the bulk operation. Patterns and replacement
+strings are limited to 4096 characters each. Each plural form is limited to
+1 MiB of UTF-8 input and output, and the operation can return at most 64 MiB
+of replacement text, including unchanged text. Literal replacement does not
+use this helper or these regex limits.
+
+The helper has a cumulative CPU limit of 5 seconds and a 192 MiB address-space
+limit. Each match operation is limited to 0.3 seconds. The application waits at
+most 2 seconds per helper exchange and 10 seconds cumulatively; database work
+between exchanges does not count toward this waiting limit. Validation and
+replacement reuse the helper within one request, and components processed
+synchronously share its budget. A separate request or queued task gets a fresh
+budget.
+
+Exceeding a limit stops regex processing and rolls back the current batch.
+Changes to batches completed earlier remain applied. The preview and actual
+execution enforce the same limits. On macOS the helper enforces time and output
+limits but cannot enforce the address-space limit; native regex compilation or
+matching can still exhaust memory there.
+
+.. image:: /screenshots/bulk-edit.webp
+
+.. image:: /screenshots/bulk-edit-preview.webp
 
 
 
@@ -445,12 +730,14 @@ Matrix View
 -----------
 
 You can compare different languages efficiently using this view.
-It is available on every component page, from the :guilabel:`Tools` menu.
+It is available on every component page, from the :guilabel:`Operations` menu.
 First select all languages you want to compare, confirm your selection,
 then click on any translation to open and edit it.
 
 The matrix view is also a very good starting point to find missing
 translations in different languages, and quickly add them from one view.
+
+.. image:: /screenshots/matrix-view.webp
 
 .. _zen-mode:
 
@@ -466,3 +753,5 @@ You can select the Zen editor as your default editor using the
 You can also choose there between having translations listed
 :guilabel:`Top to bottom` or :guilabel:`Side by side`,
 depending on your personal preference.
+
+.. image:: /screenshots/zen-mode.webp

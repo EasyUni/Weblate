@@ -3,23 +3,30 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
+from typing import TYPE_CHECKING
 
 from django.conf import settings
 from django.core.management.base import CommandError
 
+from weblate.auth.models import User
 from weblate.formats.models import FILE_FORMATS
 from weblate.lang.models import Language
 from weblate.logger import LOGGER
 from weblate.trans.discovery import ComponentDiscovery
 from weblate.trans.models import Component, Project
 from weblate.trans.util import is_repo_link
+from weblate.utils.change_origin import acting_user_context
 from weblate.utils.files import remove_tree
 from weblate.utils.management.base import BaseCommand
 from weblate.vcs.base import RepositoryError
 from weblate.vcs.models import VCS_REGISTRY
+
+if TYPE_CHECKING:
+    from django.core.management.base import CommandParser
 
 
 class Command(BaseCommand):
@@ -27,8 +34,11 @@ class Command(BaseCommand):
 
     help = "imports projects with more components"
 
-    def add_arguments(self, parser) -> None:
+    def add_arguments(self, parser: CommandParser) -> None:
         super().add_arguments(parser)
+        parser.add_argument(
+            "--user", required=True, help="Username to record as the import actor"
+        )
         parser.add_argument(
             "--name-template",
             default="{{ component }}",
@@ -112,6 +122,7 @@ class Command(BaseCommand):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.filemask: str
+        self.user: User
         self.file_format: str
         self.language_regex: str
         self.license: str
@@ -122,7 +133,6 @@ class Command(BaseCommand):
         self.new_base_template: str
         self.vcs: str
         self.push_url: str
-        self.discovery: ComponentDiscovery | None = None
         self.logger = LOGGER
         self.push_on_commit = True
 
@@ -131,7 +141,7 @@ class Command(BaseCommand):
         # Create temporary working dir
         workdir = tempfile.mkdtemp(dir=project.full_path)
         # Make the temporary directory readable by others
-        os.chmod(workdir, 0o755)  # noqa: S103, nosec
+        os.chmod(workdir, 0o755)  # ruff: ignore[bad-file-permissions]  # nosec
 
         # Initialize git repository
         self.logger.info("Cloning git repository...")
@@ -172,12 +182,12 @@ class Command(BaseCommand):
 
         # Is file format supported?
         if self.file_format not in FILE_FORMATS:
-            msg = "Invalid file format: {}".format(options["file_format"])
+            msg = f"Invalid file format: {options['file_format']}"
             raise CommandError(msg)
 
         # Is vcs supported?
         if self.vcs not in VCS_REGISTRY:
-            msg = "Invalid vcs: {}".format(options["vcs"])
+            msg = f"Invalid vcs: {options['vcs']}"
             raise CommandError(msg)
 
         # Do we have correct mask?
@@ -209,6 +219,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options) -> None:
         """Automatic import of project."""
+        try:
+            self.user = User.objects.get(username=options["user"])
+        except User.DoesNotExist as error:
+            msg = "User does not exist!"
+            raise CommandError(msg) from error
+        if self.user.is_anonymous:
+            msg = "An anonymous user cannot import projects."
+            raise CommandError(msg)
         # Read params
         repo = options["repo"]
         branch = options["branch"]
@@ -218,9 +236,7 @@ class Command(BaseCommand):
         try:
             project = Project.objects.get(slug=options["project"])
         except Project.DoesNotExist as error:
-            msg = 'Project "{}" not found, please create it first!'.format(
-                options["project"]
-            )
+            msg = f'Project "{options["project"]}" not found, please create it first!'
             raise CommandError(msg) from error
 
         # Get or create main component
@@ -233,111 +249,123 @@ class Command(BaseCommand):
             except Component.DoesNotExist as error:
                 msg = f"Component {repo!r} not found, please create it first!"
                 raise CommandError(msg) from error
+            discovery = self.get_component_discovery(component)
+            self.validate_discovery(discovery)
         else:
-            component = self.import_initial(project, repo, branch)
+            component, preview = self.import_initial(project, repo, branch)
+            discovery = preview.with_component(component)
 
-        discovery = self.get_discovery(component)
         discovery.perform()
 
-    def get_discovery(self, component, path=None):
-        """Return discovery object after doing basic sanity check."""
-        if self.discovery is not None:
-            self.discovery.component = component
-        else:
-            self.discovery = ComponentDiscovery(
-                component,
+    def get_component_discovery(self, component: Component) -> ComponentDiscovery:
+        """Return discovery for an existing component."""
+        return ComponentDiscovery(
+            component,
+            user=self.user,
+            match=self.filemask,
+            name_template=self.name_template,
+            language_regex=self.language_regex,
+            base_file_template=self.base_file_template,
+            new_base_template=self.new_base_template,
+            file_format=self.file_format,
+        )
+
+    def validate_discovery(self, discovery: ComponentDiscovery) -> None:
+        """Perform basic discovery sanity checks."""
+        self.logger.info("Found %d matching files", len(discovery.matched_files))
+
+        if not discovery.matched_files:
+            msg = "Your mask did not match any files!"
+            raise CommandError(msg)
+
+        self.logger.info("Found %d components", len(discovery.matched_components))
+        langs = set()
+        for match in discovery.matched_components.values():
+            langs.update(match["languages"])
+        self.logger.info("Found %d languages", len(langs))
+
+        # Do some basic sanity check on languages
+        if not Language.objects.filter(code__in=langs).exists():
+            msg = (
+                "None of matched languages exists, maybe you have mixed * and ** "
+                "in the mask?"
+            )
+            raise CommandError(msg)
+
+    def import_initial(self, project, repo, branch):
+        """Import the first repository of a project."""
+        # Checkout git to temporary dir
+        with acting_user_context(self.user):
+            workdir = self.checkout_tmp(project, repo, branch)
+            discovery = ComponentDiscovery.for_repository_import(
+                user=self.user,
+                path=workdir,
                 match=self.filemask,
                 name_template=self.name_template,
                 language_regex=self.language_regex,
                 base_file_template=self.base_file_template,
                 new_base_template=self.new_base_template,
                 file_format=self.file_format,
-                path=path,
             )
-            self.logger.info(
-                "Found %d matching files", len(self.discovery.matched_files)
-            )
+            self.validate_discovery(discovery)
 
-            if not self.discovery.matched_files:
-                msg = "Your mask did not match any files!"
-                raise CommandError(msg)
+            components = project.component_set.all()
 
-            self.logger.info(
-                "Found %d components", len(self.discovery.matched_components)
-            )
-            langs = set()
-            for match in self.discovery.matched_components.values():
-                langs.update(match["languages"])
-            self.logger.info("Found %d languages", len(langs))
+            component = None
 
-            # Do some basic sanity check on languages
-            if not Language.objects.filter(code__in=langs).exists():
-                msg = (
-                    "None of matched languages exists, maybe you have "
-                    "mixed * and ** in the mask?"
+            # Create first component (this one will get full git repo)
+            if self.main_component:
+                match = None
+                for match in discovery.matched_components.values():
+                    if match["slug"] == self.main_component:
+                        break
+                if match is None or match["slug"] != self.main_component:
+                    msg = "Specified --main-component was not found in matches!"
+                    raise CommandError(msg)
+            else:
+                # Try if one is already there
+                for match in discovery.matched_components.values():
+                    try:
+                        component = components.get(repo=repo, filemask=match["mask"])
+                    except Component.DoesNotExist:
+                        continue
+                # Pick random
+                if component is None:
+                    match = next(iter(discovery.matched_components.values()))
+
+            if component is None:
+                with contextlib.suppress(Component.DoesNotExist):
+                    component = components.get(slug=match["slug"])
+
+            if component is not None:
+                self.logger.warning(
+                    "Component %s already exists, skipping and using it "
+                    "as a main component",
+                    match["slug"],
                 )
-                raise CommandError(msg)
-        return self.discovery
+                remove_tree(workdir)
+                if not component.do_update():
+                    msg = f"Could not update existing component {component.full_slug}"
+                    raise CommandError(msg)
+            else:
+                self.logger.info("Creating component %s as main one", match["slug"])
 
-    def import_initial(self, project, repo, branch):
-        """Import the first repository of a project."""
-        # Checkout git to temporary dir
-        workdir = self.checkout_tmp(project, repo, branch)
-        # Create fake discovery without existing component
-        discovery = self.get_discovery(None, workdir)
+                # Rename gitrepository to new name
+                os.rename(workdir, os.path.join(project.full_path, match["slug"]))
 
-        components = project.component_set.all()
+                # Create new component
+                component = discovery.create_component(
+                    None,
+                    match,
+                    existing_slugs=set(),
+                    existing_names=set(),
+                    project=project,
+                    source_language=self.source_language,
+                    repo=repo,
+                    branch=branch,
+                    vcs=self.vcs,
+                    push_on_commit=self.push_on_commit,
+                    license=self.license,
+                )
 
-        component = None
-
-        # Create first component (this one will get full git repo)
-        if self.main_component:
-            match = None
-            for match in discovery.matched_components.values():
-                if match["slug"] == self.main_component:
-                    break
-            if match is None or match["slug"] != self.main_component:
-                msg = "Specified --main-component was not found in matches!"
-                raise CommandError(msg)
-        else:
-            # Try if one is already there
-            for match in discovery.matched_components.values():
-                try:
-                    component = components.get(repo=repo, filemask=match["mask"])
-                except Component.DoesNotExist:
-                    continue
-            # Pick random
-            if component is None:
-                match = next(iter(discovery.matched_components.values()))
-
-        try:
-            if component is None:
-                component = components.get(slug=match["slug"])
-            self.logger.warning(
-                "Component %s already exists, skipping and using it "
-                "as a main component",
-                match["slug"],
-            )
-            remove_tree(workdir)
-        except Component.DoesNotExist:
-            self.logger.info("Creating component %s as main one", match["slug"])
-
-            # Rename gitrepository to new name
-            os.rename(workdir, os.path.join(project.full_path, match["slug"]))
-
-            # Create new component
-            component = discovery.create_component(
-                None,
-                match,
-                existing_slugs=set(),
-                existing_names=set(),
-                project=project,
-                source_language=self.source_language,
-                repo=repo,
-                branch=branch,
-                vcs=self.vcs,
-                push_on_commit=self.push_on_commit,
-                license=self.license,
-            )
-
-        return component
+            return component, discovery

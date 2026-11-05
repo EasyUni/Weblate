@@ -2,12 +2,16 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# mypy: disable-error-code="var-annotated"
+# mypy: disable-error-code="var-annotated,import-untyped"
 from __future__ import annotations
 
 import os
 import platform
+from enum import Enum
 from logging.handlers import SysLogHandler
+from pathlib import Path
+
+from dynaconf import Dynaconf
 
 from weblate.api.spectacular import (
     get_drf_settings,
@@ -15,14 +19,38 @@ from weblate.api.spectacular import (
     get_spectacular_settings,
 )
 
+
+class Env(Enum):
+    PRODUCTION = "production"
+    DEVELOPMENT = "development"
+
+
+APP_NAME = "weblate"
+# Build paths inside the project like this: BASE_DIR / 'subdir'.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+dynset = Dynaconf(
+    root_path=Path(__file__).parent,
+    core_loaders=("TOML",),
+    environments=[str(e) for e in Env],
+    settings_files=(
+        "settings.toml",
+        ".secrets.toml",
+    ),
+    envvar_prefix=APP_NAME,
+    env_switcher=f"ENV_FOR_{APP_NAME}",
+)
+
+IN_PROD = dynset.current_env == Env.PRODUCTION
+
 # Title of site to use
 SITE_TITLE = "Weblate"
 
 # Site domain
-SITE_DOMAIN = ""
+SITE_DOMAIN = dynset.SITE_DOMAIN
 
 # Whether site uses https
-ENABLE_HTTPS = False
+ENABLE_HTTPS = IN_PROD
 
 # Site URL
 SITE_URL = f"{'https' if ENABLE_HTTPS else 'http'}://{SITE_DOMAIN}"
@@ -31,28 +59,32 @@ SITE_URL = f"{'https' if ENABLE_HTTPS else 'http'}://{SITE_DOMAIN}"
 # Django settings for Weblate project.
 #
 
-DEBUG = True
+DEBUG = dynset.get("DEBUG", False)
 
-ADMINS: tuple[str, ...] = (
-    # "Your Name <your_email@example.com>",
+ADMINS: tuple[tuple[str, str], ...] = (
+    ("EasyUni Weblate", dynset.EASYUNI_WEBLATE_EMAIL),
 )
 
 MANAGERS = ADMINS
 
+DB_NAME = APP_NAME
+POSTGRES_USER: str = dynset.POSTGRES_USER
+POSTGRES_PASSWORD: str = dynset.POSTGRES_PASSWORD
+POSTGRES_HOST: str = dynset.POSTGRES_HOST
 DATABASES: dict[str, dict[str, str | int | dict | None]] = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         # Database name.
-        "NAME": "weblate",
+        "NAME": DB_NAME,
         # Database user.
-        "USER": "weblate",
+        "USER": POSTGRES_USER,
         # Name of role to alter to set parameters in PostgreSQL,
         # use in case role name is different than the user used for authentication.
-        # "ALTER_ROLE": "weblate",
+        "ALTER_ROLE": POSTGRES_USER,
         # Database password.
-        "PASSWORD": "",
+        "PASSWORD": POSTGRES_PASSWORD,
         # Set to empty string for localhost.
-        "HOST": "127.0.0.1",
+        "HOST": POSTGRES_HOST,
         # Set to empty string for default.
         "PORT": "",
         # Customizations for databases.
@@ -65,16 +97,17 @@ DATABASES: dict[str, dict[str, str | int | dict | None]] = {
     }
 }
 
-# Data directory, you can use following for the development purposes:
-# os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-DATA_DIR = "/home/weblate/data"
-CACHE_DIR = f"{DATA_DIR}/cache"
+PUBLIC_ROOT = BASE_DIR.parent / dynset.PUBLIC_REL_DIR
+# DATA_DIR is used in various other places
+# Celery requires it to be a string
+DATA_DIR = str(PUBLIC_ROOT)
+CACHE_DIR = PUBLIC_ROOT / "cache"
 
 # Local time zone for this installation. Choices can be found here:
 # http://en.wikipedia.org/wiki/List_of_tz_zones_by_name
 # although not all choices may be available on all operating systems.
 # In a Windows environment this must be set to your system time zone.
-TIME_ZONE = "UTC"
+TIME_ZONE = "Asia/Kuala_Lumpur"
 
 # Language code for this installation. All choices can be found here:
 # http://www.i18nguy.com/unicode/language-identifiers.html
@@ -150,12 +183,12 @@ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 URL_PREFIX = ""
 
 # Absolute filesystem path to the directory that will hold user-uploaded files.
-MEDIA_ROOT = os.path.join(DATA_DIR, "media")
+MEDIA_ROOT = PUBLIC_ROOT / "media"
 
 # Absolute path to the directory static files should be collected to.
 # Don't put anything in this directory yourself; store your static files
 # in apps' "static/" subdirectories and in STATICFILES_DIRS.
-STATIC_ROOT = os.path.join(CACHE_DIR, "static")
+STATIC_ROOT = PUBLIC_ROOT / "static"
 
 # URL prefix for static files.
 STATIC_URL = f"{URL_PREFIX}/static/"
@@ -188,7 +221,7 @@ STORAGES = {
 
 # Make this unique, and don't share it with anybody.
 # You can generate it using weblate-generate-secret-key
-SECRET_KEY = ""
+SECRET_KEY = dynset.SECRET_KEY
 
 TEMPLATES = [
     {
@@ -211,7 +244,12 @@ TEMPLATES = [
 
 # GitHub username and token for sending pull requests.
 # Please see the documentation for more details.
-GITHUB_CREDENTIALS = {}
+GITHUB_CREDENTIALS = {
+    "api.github.com": {
+        "username": dynset.get("GITHUB_USERNAME", ""),
+        "token": dynset.get("GITHUB_TOKEN", ""),
+    },
+}
 
 # Webhook secret for a legacy GitHub App delivering to /hooks/github/.
 GITHUB_LEGACY_APP_WEBHOOK_SECRET = ""
@@ -902,20 +940,32 @@ CRISPY_TEMPLATE_PACK = "bootstrap5"
 # )
 
 # E-mail address that error messages come from.
-SERVER_EMAIL = "noreply@example.com"
+SERVER_EMAIL = dynset.VERIFIED_EMAIL
 
 # Default email address to use for various automated correspondence from
 # the site managers. Used for registration emails.
-DEFAULT_FROM_EMAIL = "noreply@example.com"
+DEFAULT_FROM_EMAIL = dynset.VERIFIED_EMAIL
 
 # List of URLs your site is supposed to serve
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = dynset.ALLOWED_HOSTS
+
+# E-mail delivery via Mailgun (django-anymail)
+EMAIL_BACKEND = dynset.EMAIL_BACKEND
+ANYMAIL = {
+    "MAILGUN_API_KEY": dynset.get("MAILGUN_API_KEY", ""),
+    "MAILGUN_SENDER_DOMAIN": dynset.get("MAILGUN_SENDER_DOMAIN", ""),
+}
+
+# Redis
+REDIS_SOCKET_PATH = dynset.get("REDIS_SOCKET_PATH", "/var/run/redis/redis.sock")
+REDIS_DB = dynset.as_int("REDIS_DB")
+REDIS_URL = dynset.get("REDIS_URL", "") or f"unix://{REDIS_SOCKET_PATH}?db={REDIS_DB}"
 
 # Configuration for caching
 CACHES = {
     "default": {
         "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": "redis://127.0.0.1:6379/1",
+        "LOCATION": REDIS_URL,
         # If redis is running on same host as Weblate, you might
         # want to use unix sockets instead:
         # "LOCATION": "unix:///var/run/redis/redis.sock?db=1",
@@ -979,6 +1029,8 @@ SILENCED_SYSTEM_CHECKS = [
     "drf_spectacular.W001",
     "drf_spectacular.W002",
 ]
+if not IN_PROD:
+    SILENCED_SYSTEM_CHECKS.append("otp_webauthn.E031")
 
 # Celery worker configuration for testing
 # CELERY_TASK_ALWAYS_EAGER = True
@@ -986,13 +1038,14 @@ SILENCED_SYSTEM_CHECKS = [
 # CELERY_TASK_EAGER_PROPAGATES = True
 # Celery worker configuration for production
 CELERY_TASK_ALWAYS_EAGER = False
-CELERY_BROKER_URL = "redis://localhost:6379"
+CELERY_BROKER_URL = dynset.CELERY_BROKER_URL
 CELERY_RESULT_BACKEND: str | None = CELERY_BROKER_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BROKER_CONNECTION_RETRY = True
+CELERY_TIMEZONE = TIME_ZONE
 
 # Celery settings, it is not recommended to change these
-CELERY_WORKER_MAX_MEMORY_PER_CHILD = 450000
+CELERY_WORKER_MAX_MEMORY_PER_CHILD = 450000 if DEBUG else 250000
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 CELERY_TASK_ROUTES = {

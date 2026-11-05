@@ -1439,6 +1439,14 @@ max-complexity = 16  # TODO: should be lower
   "missing-type-kwargs"
 ]
 "weblate/settings_*.py" = ["undefined-local-with-import-star-usage"]
+"gunicorn_conf.py" = [
+  "hardcoded-temp-file",
+  "missing-copyright-notice",
+  "missing-return-type-undocumented-public-function",
+  "missing-type-function-argument",
+  "runtime-cast-value"
+]
+"weblate/settings.py" = ["commented-out-code"]
 "weblate/settings_example.py" = ["commented-out-code"]
 "weblate/sitemaps.py" = [
   "missing-return-type-undocumented-public-function",

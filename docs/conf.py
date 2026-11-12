@@ -366,6 +366,7 @@ linkcheck_ignore = [
     "https://help.gitee.com/webhook",
     # 403
     "https://openai.com/",
+    r"https://hosted\.weblate\.org",
     "https://platform.openai.com/api-keys",
     "https://platform.openai.com/docs/models",
     "https://translate.systran.net/en/account",
@@ -381,6 +382,8 @@ linkcheck_ignore = [
     "https://cgit.git.savannah.gnu.org/cgit/gettext.git/",
     "https://azure.microsoft.com/en-us/products/ai-services/ai-translator",
     "https://wiki.gnupg.org/",
+    # Rate limits with 429
+    "https://central.sonatype.com/artifact/org.weblate/android",
     "https://www.bis.gov/",
     "https://www.libravatar.org/",
     "https://glosbe.com/",
@@ -395,6 +398,8 @@ linkcheck_ignore = [
     "https://digital-strategy.ec.europa.eu/",
     # Responds with HTTP 418 I'm a teapot
     "https://www.freedesktop.org/",
+    # Security advisory is not published yet, remove once it is
+    "https://github.com/WeblateOrg/weblate/security/advisories/GHSA-8jpg-5gm2-hjp6",
 ]
 
 # HTTP docs

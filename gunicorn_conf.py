@@ -5,6 +5,7 @@
 # Config file for gunicorn, supposed to be run by systemd.
 
 import logging
+import os
 from logging import LogRecord
 from typing import cast
 
@@ -42,6 +43,14 @@ proc_name = "weblate-web"
 worker_tmp_dir = "/dev/shm/"
 # Production server should configure worker number in systemd service file,
 # because this file is shared.
+
+
+# Use systemd's RuntimeDirectory when available, otherwise a hidden file in CWD.
+runtime_dir = os.getenv("RUNTIME_DIRECTORY")
+if runtime_dir:
+    control_socket = runtime_dir + "/gunicorn.ctl"
+else:
+    control_socket = os.getcwd() + "/.gunicorn.ctl"
 
 # Make short log line. Some info is discarded, because it is shown by journalctl already.
 logconfig_dict = {

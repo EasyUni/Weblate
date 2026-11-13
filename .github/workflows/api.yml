@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   api-lint:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: API Lint
     env:
       PYTHONWARNINGS: default,ignore:unclosed:ResourceWarning

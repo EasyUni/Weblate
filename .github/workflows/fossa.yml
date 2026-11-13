@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   fossa-scan:
-    runs-on: ubuntu-slim
+    runs-on: [self-hosted, incus-container]
     if: ${{ github.repository == 'WeblateOrg/weblate' }}
     steps:
     - name: Checkout Code

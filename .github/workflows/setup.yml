@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   dist:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Build packages
     env:
       PYTHONUNBUFFERED: 1
@@ -125,7 +125,7 @@ jobs:
         name: dist
 
   sign_dist:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Sign packages
     if: github.event_name == 'push'
     needs:
@@ -159,7 +159,7 @@ jobs:
         name: dist-signed
 
   sbom:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Build SBOM
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -217,7 +217,7 @@ jobs:
         name: sbom
 
   attest_sbom:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Attest SBOM
     if: github.event_name == 'push'
     needs:
@@ -249,7 +249,7 @@ jobs:
         sbom-path: ${{ steps.locate-sbom.outputs.path }}
 
   lint:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Lint packages
     env:
       PYTHONUNBUFFERED: 1
@@ -309,7 +309,7 @@ jobs:
         uv pip install dist/*.whl
 
   notes:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Build release notes
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -365,7 +365,7 @@ jobs:
     - sign_dist
     - attest_sbom
     - lint
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     steps:
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
@@ -390,7 +390,7 @@ jobs:
     - sign_dist
     - attest_sbom
     - lint
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:

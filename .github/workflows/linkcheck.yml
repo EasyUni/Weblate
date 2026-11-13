@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   linkcheck:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Linkcheck
 
     steps:

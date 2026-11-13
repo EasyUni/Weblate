@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   apply-label:
-    runs-on: ubuntu-slim
+    runs-on: [self-hosted, incus-container]
     if: |
       ! github.event.issue.pull_request && github.event.issue.state == 'open'
     steps:

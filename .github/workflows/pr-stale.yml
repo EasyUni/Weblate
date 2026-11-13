@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   stale-prs:
-    runs-on: ubuntu-slim
+    runs-on: [self-hosted, incus-container]
     permissions:
       issues: write
       pull-requests: write

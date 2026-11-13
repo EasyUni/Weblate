@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:
@@ -166,7 +166,7 @@ jobs:
         report_type: test_results
 
   argos:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Argos CI upload
     needs:
     - test
@@ -195,7 +195,7 @@ jobs:
       run: yarn argos upload ../test-images/
 
   argos-pull-request:
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted, incus-container]
     name: Argos CI pull request upload
     needs:
     - test

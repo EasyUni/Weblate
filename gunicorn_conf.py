@@ -1,3 +1,7 @@
+# Copyright © Yunhan <elitetai2006@gmail.com>
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Config file for gunicorn, supposed to be run by systemd.
 
 import logging

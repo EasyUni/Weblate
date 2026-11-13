@@ -146,6 +146,7 @@ dependencies = [
   "dateparser==1.5.0",
   "diff-match-patch==20241021",
   "disposable-email-domains==0.0.293",
+  "django-anymail[mailgun]>=13.0",
   "django-appconf==1.2.0",
   "django-celery-beat==2.9.0",
   "django-cors-headers==4.9.0",
@@ -160,10 +161,12 @@ dependencies = [
   "docutils==0.21.2",
   "drf-spectacular[sidecar]==0.30.0",
   "drf-standardized-errors[openapi]==0.16.0",
+  "dynaconf>=3.2.11",
   "filelock==4.2.10",
   # Pin for translate-toolkit extra
   "fluent.syntax==0.19.0",
   "GitPython==3.2.1",
+  "gunicorn>=23.0.0",
   "hiredis==3.5.0",
   "httpx2[brotli,socks,zstd]==2.16.0",
   "idna==3.20",
@@ -222,10 +225,7 @@ dependencies = [
   "webauthn==3.0.1",
   "weblate-fonts==2026.1",
   "weblate-language-data==2026.11",
-  "weblate-schemas==2026.14",
-  "dynaconf>=3.2.11",
-  "gunicorn>=23.0.0",
-  "django-anymail[mailgun]>=13.0",
+  "weblate-schemas==2026.14"
 ]
 description = "A web-based continuous localization system with tight version control integration"
 keywords = [
@@ -345,8 +345,8 @@ ignore = [
   "docs/*/*",
   "docs/*/*/*",
   "docs/*/*/*/*",
-  "LICENSES/*",
   "gunicorn_conf.py",
+  "LICENSES/*",
   "rundev.sh",
   "scripts/*",
   "scripts/*/*",
@@ -709,6 +709,13 @@ max-complexity = 16  # TODO: should be lower
 ]
 "docs/_ext/test_*.py" = ["assert"]
 "docs/conf.py" = ["commented-out-code", "implicit-namespace-package"]
+"gunicorn_conf.py" = [
+  "hardcoded-temp-file",
+  "missing-copyright-notice",
+  "missing-return-type-undocumented-public-function",
+  "missing-type-function-argument",
+  "runtime-cast-value"
+]
 "scripts/*" = [
   "p-print",
   "print"
@@ -1440,15 +1447,8 @@ max-complexity = 16  # TODO: should be lower
   "missing-type-function-argument",
   "missing-type-kwargs"
 ]
-"weblate/settings_*.py" = ["undefined-local-with-import-star-usage"]
-"gunicorn_conf.py" = [
-  "hardcoded-temp-file",
-  "missing-copyright-notice",
-  "missing-return-type-undocumented-public-function",
-  "missing-type-function-argument",
-  "runtime-cast-value"
-]
 "weblate/settings.py" = ["commented-out-code"]
+"weblate/settings_*.py" = ["undefined-local-with-import-star-usage"]
 "weblate/settings_example.py" = ["commented-out-code"]
 "weblate/sitemaps.py" = [
   "missing-return-type-undocumented-public-function",

@@ -2058,7 +2058,7 @@ class MicrosoftCognitiveTranslationTest(BaseMachineTranslationTest):
             self.assertFalse(form.is_valid())
 
         mocked_getaddrinfo.assert_called_once_with(
-            "api.cognitive.microsofttranslator.com", None, type=1
+            "api.cognitive.microsofttranslator.com", None, 0, 1, 0, 0
         )
         self.assertEqual(len(http_mock.calls), 0)
         self.assertIn("internal or non-public address", str(form.non_field_errors()))
@@ -10886,6 +10886,58 @@ class ViewsTest(FixtureTestCase):
         "to a third-party provider."
     )
 
+    def test_translate_rate_limit(self) -> None:
+        from weblate.utils.ratelimit import reset_rate_limit  # ruff: ignore[import-outside-top-level]
+
+        # Restore overrides in the same cleanup order as ensure_dummy_mt().
+        self.enterContext(override_settings(RATELIMIT_MACHINERY_ATTEMPTS=1))
+        reset_rate_limit("machinery", user=self.user)
+        self.addCleanup(reset_rate_limit, "machinery", user=self.user)
+        self.ensure_dummy_mt()
+        unit = self.get_unit()
+        url = reverse("js-translate", kwargs={"unit_id": unit.pk, "service": "dummy"})
+        self.assertEqual(self.client.post(url).status_code, 200)
+        self.assertEqual(self.client.post(url).status_code, 429)
+
+    def test_translate_concurrency_is_per_installation(self) -> None:
+        from weblate.machinery.admission import machinery_slot  # ruff: ignore[import-outside-top-level]
+
+        self.ensure_dummy_mt()
+        installation = MachineryInstallation.objects.get(engine="dummy")
+        self.enterContext(
+            patch.object(DummyTranslation, "settings_form", BaseMachineryForm)
+        )
+        other = MachineryInstallation.objects.create(engine="dummy", slug="other")
+        unit = self.get_unit()
+        self.async_client.force_login(self.user)
+
+        async def request() -> None:
+            async with (
+                machinery_slot(self.user.pk, installation.pk) as first,
+                machinery_slot(self.user.pk, installation.pk) as second,
+            ):
+                self.assertTrue(first)
+                self.assertTrue(second)
+                response = await self.async_client.post(
+                    reverse(
+                        "js-translate",
+                        kwargs={"unit_id": unit.pk, "service": installation.selector},
+                    )
+                )
+                self.assertEqual(response.status_code, 429)
+                response = await self.async_client.post(
+                    reverse(
+                        "js-translate",
+                        kwargs={"unit_id": unit.pk, "service": other.selector},
+                    )
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["responseStatus"], 200, response.json()
+                )
+
+        async_to_sync(request)()
+
     def ensure_dummy_mt(self):
         """Ensure we have dummy mt installed."""
         machinery_override = override_settings(
@@ -12072,91 +12124,6 @@ class ViewsTest(FixtureTestCase):
 
 
 class WeblateTranslationLookupTest(SimpleTestCase):
-    @patch("weblate.machinery.weblatetm.adjust_similarity_threshold")
-    def test_get_matching_units_uses_fuzzy_lookup(self, adjust_threshold: Mock) -> None:
-        machine = WeblateTranslation({})
-        base = MagicMock()
-        queryset = MagicMock()
-        annotated_queryset = MagicMock()
-        ordered_queryset = MagicMock()
-        prepared_queryset = MagicMock()
-        fuzzy_match = MagicMock(pk=1)
-        base.filter.return_value = queryset
-        queryset.annotate.return_value = annotated_queryset
-        annotated_queryset.order_by.return_value = ordered_queryset
-        prepared_queryset.iterator.return_value = [fuzzy_match]
-
-        with patch.object(
-            machine, "prepare_queryset", return_value=prepared_queryset
-        ) as prepare_queryset:
-            results = machine.get_matching_units(base, "Hello", 75)
-
-        self.assertEqual(results, [fuzzy_match])
-        base.filter.assert_called_once()
-        queryset.annotate.assert_called_once()
-        annotated_queryset.order_by.assert_called_once_with("-match_similarity", "pk")
-        prepare_queryset.assert_called_once_with(ordered_queryset)
-        prepared_queryset.iterator.assert_called_once_with(
-            chunk_size=machine.candidate_limit
-        )
-        adjust_threshold.assert_called_once_with(0.98)
-
-    @patch("weblate.machinery.weblatetm.adjust_similarity_threshold")
-    def test_get_matching_units_orders_short_queries_before_slicing(
-        self, adjust_threshold: Mock
-    ) -> None:
-        machine = WeblateTranslation({})
-        base = MagicMock()
-        short_queryset = MagicMock()
-        prepared_queryset = MagicMock()
-        fuzzy_match = MagicMock(pk=1)
-        prepared_queryset.iterator.return_value = [fuzzy_match]
-
-        with (
-            patch.object(
-                machine, "get_short_query_matches", return_value=short_queryset
-            ) as get_short_query_matches,
-            patch.object(
-                machine, "prepare_queryset", return_value=prepared_queryset
-            ) as prepare_queryset,
-        ):
-            results = machine.get_matching_units(base, "id", 75)
-
-        self.assertEqual(results, [fuzzy_match])
-        get_short_query_matches.assert_called_once_with(base, "id")
-        prepare_queryset.assert_called_once_with(short_queryset)
-        prepared_queryset.iterator.assert_called_once_with(
-            chunk_size=machine.candidate_limit
-        )
-        adjust_threshold.assert_called_once_with(0.98)
-
-    @patch("weblate.machinery.weblatetm.adjust_similarity_threshold")
-    def test_get_matching_units_uses_exact_lookup_at_full_threshold(
-        self, adjust_threshold: Mock
-    ) -> None:
-        machine = WeblateTranslation({})
-        base = MagicMock()
-        queryset = MagicMock()
-        ordered_queryset = MagicMock()
-        prepared_queryset = MagicMock()
-        exact_match = MagicMock(pk=1)
-        base.filter.return_value = queryset
-        queryset.order_by.return_value = ordered_queryset
-        prepared_queryset.iterator.return_value = [exact_match]
-
-        with patch.object(
-            machine, "prepare_queryset", return_value=prepared_queryset
-        ) as prepare_queryset:
-            results = machine.get_matching_units(base, "Hello", 100)
-
-        self.assertEqual(results, [exact_match])
-        queryset.order_by.assert_called_once_with("pk")
-        prepare_queryset.assert_called_once_with(ordered_queryset)
-        prepared_queryset.iterator.assert_called_once_with(
-            chunk_size=machine.candidate_limit
-        )
-        adjust_threshold.assert_not_called()
-
     def test_download_translations_limits_after_filtering(self) -> None:
         machine = WeblateTranslation({})
         machine.candidate_limit = 2

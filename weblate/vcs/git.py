@@ -15,6 +15,7 @@ import re
 import shlex
 import stat
 import sys
+import tempfile
 import urllib.parse
 from configparser import NoOptionError, NoSectionError, RawConfigParser
 from contextlib import contextmanager, suppress
@@ -39,8 +40,10 @@ from urllib.parse import urlparse, urlunparse
 from zipfile import ZipFile
 
 import httpx2
+from asgiref.sync import async_to_sync
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.utils.functional import cached_property
 from django.utils.translation import gettext, gettext_lazy
 from git.config import GitConfigParser
@@ -62,11 +65,13 @@ from weblate.utils.lock import WeblateLock, WeblateLockTimeoutError
 from weblate.utils.render import render_template
 from weblate.utils.requests import (
     JSON_RESPONSE_ERRORS,
+    VCS_RESPONSE_SIZE,
     RedirectValidators,
-    create_http_client,
-    fetch_url,
+    async_open_url,
+    fetch_validated_url,
 )
 from weblate.utils.tracing import start_span
+from weblate.utils.validators import validate_filename
 from weblate.utils.xml import parse_xml
 from weblate.utils.zip import (
     ZipSafetyError,
@@ -104,7 +109,7 @@ from weblate.vcs.params import (
 from weblate.vcs.ssh import SSH_WRAPPER, resolve_ssh_destination
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
     from datetime import datetime
     from zipfile import ZipInfo
 
@@ -115,6 +120,7 @@ if TYPE_CHECKING:
     from weblate.vcs.base import (
         RawCommitInfo,
         RepositoryErrorCode,
+        RepositoryLock,
         RepositoryStructuredError,
     )
 
@@ -353,16 +359,23 @@ def _perform_git_probe(
     environment: dict[str, str] | None,
 ) -> tuple[int, str | None, str]:
     """Perform one Git smart-HTTP probe using the shared HTTP client."""
-    with (
-        create_http_client(validators=GitProbeRedirectValidators(target)) as client,
-        client.stream(
-            "GET",
-            _build_git_probe_url(repository_url),
-            headers=_get_git_probe_headers(repository_url, environment),
-            timeout=20,
-            follow_redirects=False,
-        ) as response,
-    ):
+    return async_to_sync(_async_perform_git_probe)(repository_url, target, environment)
+
+
+async def _async_perform_git_probe(
+    repository_url: str,
+    target: ResolvedRepositoryURL,
+    environment: dict[str, str] | None,
+) -> tuple[int, str | None, str]:
+    async with async_open_url(
+        "GET",
+        _build_git_probe_url(repository_url),
+        validators=GitProbeRedirectValidators(target),
+        headers=_get_git_probe_headers(repository_url, environment),
+        timeout=20,
+        follow_redirects=False,
+        raise_for_status=False,
+    ) as response:
         return (
             response.status_code,
             response.headers.get("Location"),
@@ -2900,7 +2913,7 @@ class GitMergeRequestBase(GitRepository):
                 with start_span(op="vcs.api_sleep", name=vcs_id):
                     sleep(next_api_time - now)
             try:
-                response = fetch_url(
+                response = fetch_validated_url(
                     method,
                     url,
                     headers=self.get_headers(credentials),
@@ -2909,8 +2922,16 @@ class GitMergeRequestBase(GitRepository):
                     json=json,
                     auth=self.get_auth(credentials),
                     timeout=settings.VCS_API_TIMEOUT,
+                    max_response_size=VCS_RESPONSE_SIZE,
+                    allow_private_targets=not settings.VCS_RESTRICT_PRIVATE,
+                    private_allowlist=[
+                        *settings.VCS_ALLOW_HOSTS,
+                        *settings.VCS_PRIVATE_ALLOWLIST,
+                    ],
                     raise_for_status=False,
                 )
+            except ValidationError as error:
+                raise RepositoryError(0, str(error)) from error
             except (OSError, httpx2.HTTPError) as error:
                 report_error("Git API request")
                 raise RepositoryError(0, str(error)) from error
@@ -4273,8 +4294,16 @@ class LocalRepository(GitRepository):
 
     @classmethod
     @contextmanager
-    def build_local_repo(cls, target: str, commit_message: str):
+    def build_local_repo(
+        cls,
+        target: str,
+        commit_message: str,
+        *,
+        lock: RepositoryLock | None = None,
+    ) -> Generator[Self, None, None]:
         repo = cls(target)
+        if lock is not None:
+            repo.lock.replace_lock(lock)
         with repo.lock:
             # Create empty repo
             if os.path.exists(target):
@@ -4323,15 +4352,40 @@ class LocalRepository(GitRepository):
                 return repo
 
     @classmethod
-    def from_files(cls, target: str, files: dict[str, bytes]) -> Self:
-        with cls.build_local_repo(target, "Started translation using Weblate") as repo:
+    def from_files(
+        cls,
+        target: str,
+        files: dict[str, bytes],
+        *,
+        lock: RepositoryLock | None = None,
+    ) -> Self:
+        # Check all names before build_local_repo can replace an existing tree.
+        for name in files:
+            validate_filename(name)
+        with cls.build_local_repo(
+            target, "Started translation using Weblate", lock=lock
+        ) as repo:
             # Create files
             for name, content in files.items():
                 fullname = os.path.join(target, name)
                 dirname = os.path.dirname(fullname)
+                repo.resolve_symlinks(dirname)
                 if not os.path.exists(dirname):
                     os.makedirs(dirname)
-                Path(fullname).write_bytes(content)
+                repo.resolve_symlinks(fullname)
+                temp_name = ""
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        dir=dirname, delete=False
+                    ) as handle:
+                        temp_name = handle.name
+                        handle.write(content)
+                    repo.resolve_symlinks(fullname)
+                    os.replace(temp_name, fullname)
+                    temp_name = ""
+                finally:
+                    if temp_name:
+                        Path(temp_name).unlink(missing_ok=True)
             return repo
 
 

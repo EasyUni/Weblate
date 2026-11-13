@@ -13,8 +13,9 @@ import shutil
 # ruff: ignore[suspicious-subprocess-import]
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from configparser import RawConfigParser
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from io import BytesIO
 from os import utime
@@ -27,6 +28,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import httpx2
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, TestCase
 from django.test.utils import override_settings
 from django.utils import timezone
@@ -41,6 +43,7 @@ from weblate.trans.tests.utils import (
     TempDirMixin,
 )
 from weblate.utils.files import REPO_TEMP_DIRNAME
+from weblate.utils.lock import WeblateLock, WeblateLockTimeoutError
 from weblate.utils.render import render_template
 from weblate.utils.tests import http_mock
 from weblate.utils.zip import ZipSafetyLimits
@@ -50,6 +53,7 @@ from weblate.vcs.base import (
     RepositoryCommandError,
     RepositoryError,
     RepositoryInternalError,
+    RepositoryLock,
     RepositoryRedirectError,
     RepositoryRestrictedPathError,
     RepositorySymlinkError,
@@ -2195,6 +2199,163 @@ class RepositoryRemotePinningTest(SimpleTestCase):
             )
 
         get_remote_args.assert_not_called()
+
+
+@override_settings(
+    VCS_RESTRICT_PRIVATE=True,
+    VCS_ALLOW_HOSTS=[],
+    VCS_PRIVATE_ALLOWLIST=[],
+    VCS_API_DELAY=0,
+    CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}},
+)
+class HostingAPIOutboundTest(SimpleTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = BitbucketCloudRepository(".", local=True)
+        self.credentials = git_module.GitCredentials(
+            url="https://forge.example/api",
+            owner="owner",
+            slug="repo",
+            hostname="forge.example",
+            username="bot",
+            token="secret",
+            scheme="https",
+            push_scheme="ssh",
+        )
+        self.enterContext(
+            patch("weblate.vcs.git.WeblateLock", return_value=nullcontext())
+        )
+        self.enterContext(
+            patch("weblate.utils.requests.get_environment_proxy", return_value=None)
+        )
+        self.resolve = self.enterContext(
+            patch(
+                "weblate.utils.outbound.socket.getaddrinfo",
+                return_value=[(0, 0, 0, "", ("93.184.216.34", 443))],
+            )
+        )
+        cache.clear()
+
+    @http_mock.activate
+    def test_public_redirect_pins_each_request(self) -> None:
+        http_mock.register(
+            "GET",
+            self.credentials["url"],
+            status_code=302,
+            headers={"Location": "https://other.example/api"},
+        )
+        http_mock.register("GET", "https://other.example/api", json={"values": []})
+        data, _response, error = self.repo.request(
+            "get", self.credentials, self.credentials["url"]
+        )
+        self.assertEqual(data, {"values": []})
+        self.assertEqual(error, "")
+        self.assertEqual(self.resolve.call_count, 2)
+        self.assertEqual(len(http_mock.calls), 2)
+        for request_call in http_mock.calls:
+            self.assertEqual(
+                http_mock.get_transport_url(request_call.request).host, "93.184.216.34"
+            )
+
+    @http_mock.activate
+    def test_private_initial_url_rejected(self) -> None:
+        with self.assertRaises(RepositoryError):
+            self.repo.request("get", self.credentials, "http://127.0.0.1/api")
+        self.assertEqual(len(http_mock.calls), 0)
+
+    @http_mock.activate
+    def test_private_redirect_rejected(self) -> None:
+        http_mock.register(
+            "GET",
+            self.credentials["url"],
+            status_code=302,
+            headers={"Location": "http://169.254.169.254/api"},
+        )
+        with self.assertRaises(RepositoryError):
+            self.repo.request("get", self.credentials, self.credentials["url"])
+        self.assertEqual(len(http_mock.calls), 1)
+
+    @http_mock.activate
+    def test_redirect_dns_rebinding_rejected(self) -> None:
+        self.resolve.side_effect = [
+            [(0, 0, 0, "", ("93.184.216.34", 443))],
+            [(0, 0, 0, "", ("10.0.0.1", 443))],
+        ]
+        http_mock.register(
+            "GET",
+            self.credentials["url"],
+            status_code=302,
+            headers={"Location": "/next"},
+        )
+        with self.assertRaises(RepositoryError):
+            self.repo.request("get", self.credentials, self.credentials["url"])
+        self.assertEqual(self.resolve.call_count, 2)
+        self.assertEqual(len(http_mock.calls), 1)
+
+    @http_mock.activate
+    @override_settings(VCS_PRIVATE_ALLOWLIST=["forge.example"])
+    def test_allowlisted_host_does_not_exempt_redirect_target(self) -> None:
+        http_mock.register(
+            "GET",
+            self.credentials["url"],
+            status_code=302,
+            headers={"Location": "http://127.0.0.1/api"},
+        )
+        with self.assertRaises(RepositoryError):
+            self.repo.request("get", self.credentials, self.credentials["url"])
+        self.assertEqual(len(http_mock.calls), 1)
+
+    @http_mock.activate
+    def test_private_pagination_rejected(self) -> None:
+        http_mock.register(
+            "GET",
+            self.credentials["url"],
+            json={"values": [], "next": "http://127.0.0.1/api"},
+        )
+        with self.assertRaises(RepositoryError):
+            self.repo.build_full_paginated_result(
+                self.credentials, self.credentials["url"], "Could not paginate"
+            )
+        self.assertEqual(len(http_mock.calls), 1)
+
+    @http_mock.activate
+    def test_private_dns_rejected(self) -> None:
+        self.resolve.return_value = [(0, 0, 0, "", ("10.0.0.1", 443))]
+        with self.assertRaises(RepositoryError):
+            self.repo.request("get", self.credentials, self.credentials["url"])
+        self.assertEqual(len(http_mock.calls), 0)
+
+    @http_mock.activate
+    def test_private_peer_rejected(self) -> None:
+        http_mock.register("GET", self.credentials["url"], json={"values": []})
+        with (
+            patch(
+                "weblate.utils.requests._get_response_peer_ip", return_value="10.0.0.1"
+            ),
+            self.assertRaises(RepositoryError),
+        ):
+            self.repo.request("get", self.credentials, self.credentials["url"])
+        self.assertEqual(len(http_mock.calls), 1)
+
+    @http_mock.activate
+    def test_private_host_exemptions(self) -> None:
+        self.resolve.return_value = [(0, 0, 0, "", ("10.0.0.1", 443))]
+        http_mock.register("GET", self.credentials["url"], json={"values": []})
+        for configuration in (
+            {"VCS_RESTRICT_PRIVATE": False},
+            {"VCS_ALLOW_HOSTS": ["forge.example"]},
+            {"VCS_PRIVATE_ALLOWLIST": [".example"]},
+        ):
+            with (
+                self.subTest(configuration=configuration),
+                override_settings(**configuration),
+            ):
+                data, _response, error = self.repo.request(
+                    "get", self.credentials, self.credentials["url"]
+                )
+                self.assertEqual(data, {"values": []})
+                self.assertEqual(error, "")
+        self.assertEqual(len(http_mock.calls), 3)
 
 
 class VCSGitTest(TestCase, RepoTestMixin, TempDirMixin):
@@ -6281,6 +6442,95 @@ class VCSLocalTest(VCSGitTest):
         status = self.repo.status()
         # Older git print up-to-date, newer up to date
         self.assertIn("On branch main", status)
+
+    def test_from_files_rejects_outside_paths_before_replacing_target(self) -> None:
+        target = Path(self.tempdir, "new-repository")
+        target.mkdir()
+        sentinel = target / "sentinel.txt"
+        sentinel.write_bytes(b"original")
+        outside = Path(self.tempdir, "outside.txt")
+        outside.write_bytes(b"outside original")
+
+        for name in (str(outside), "../outside.txt"):
+            with self.subTest(name=name), self.assertRaises(ValidationError):
+                LocalRepository.from_files(str(target), {name: b"replacement"})
+            self.assertEqual(sentinel.read_bytes(), b"original")
+            self.assertEqual(outside.read_bytes(), b"outside original")
+
+        repo = LocalRepository.from_files(
+            str(target), {"nested/translation.txt": b"translation"}
+        )
+        self.assertTrue(repo.is_valid())
+        self.assertEqual(
+            (target / "nested" / "translation.txt").read_bytes(), b"translation"
+        )
+
+    def test_from_files_holds_supplied_lock_through_cleanup(self) -> None:
+        target = os.path.join(self.tempdir, "shared-lock")
+        lock = RepositoryLock(
+            LocalRepository(target),
+            WeblateLock(
+                scope="repository",
+                key="local-initialization-test",
+                slug="shared-lock",
+                timeout=0,
+            ),
+        )
+
+        def acquire_competing_lock() -> bool:
+            competing = WeblateLock(
+                scope="repository",
+                key="local-initialization-test",
+                slug="shared-lock",
+                timeout=0,
+            )
+            try:
+                with competing:
+                    return True
+            except WeblateLockTimeoutError:
+                return False
+
+        original_remove_tree = git_module.remove_tree
+        with ThreadPoolExecutor(max_workers=1) as executor:
+
+            def remove_while_locked(path, **kwargs):
+                self.assertFalse(
+                    executor.submit(acquire_competing_lock).result(timeout=5)
+                )
+                return original_remove_tree(path, **kwargs)
+
+            # Successful initialization reenters the caller's lock, and no
+            # competing component operation may write during file population.
+            with (
+                lock,
+                LocalRepository.build_local_repo(
+                    target, "Initialize test repository", lock=lock
+                ),
+            ):
+                self.assertFalse(
+                    executor.submit(acquire_competing_lock).result(timeout=5)
+                )
+                Path(target, "translation.txt").write_bytes(b"translation")
+            self.assertTrue(executor.submit(acquire_competing_lock).result(timeout=5))
+
+            with (
+                patch.object(LocalRepository, "commit", side_effect=OSError("failed")),
+                patch.object(
+                    git_module, "remove_tree", side_effect=remove_while_locked
+                ),
+                self.assertRaisesRegex(OSError, "failed"),
+            ):
+                LocalRepository.from_files(
+                    target, {"translation.txt": b"translation"}, lock=lock
+                )
+
+            self.assertFalse(Path(target).exists())
+            self.assertTrue(executor.submit(acquire_competing_lock).result(timeout=5))
+            repo = LocalRepository.from_files(
+                target, {"translation.txt": b"retry"}, lock=lock
+            )
+            self.assertTrue(repo.is_valid())
+            self.assertFalse(repo.needs_commit())
 
     def test_upstream_changes(self) -> NoReturn:
         self.skipTest("Not supported")

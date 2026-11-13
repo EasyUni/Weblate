@@ -63,7 +63,6 @@ from weblate.trans.repository import (
     acquire_repository_operation,
     get_operation_call,
     get_repository_components,
-    get_repository_operation_permission,
     keep_repository_operation_reservation,
     refresh_repository_operation,
     release_repository_operation,
@@ -79,6 +78,8 @@ from weblate.trans.repository_context import (
     repository_component_progress,
     suppress_repository_auto_push,
 )
+from weblate.trans.uploads import cleanup_translation_uploads
+from weblate.trans.validators import TranslationTextTooLongError
 from weblate.utils.celery import app, store_task_metadata
 from weblate.utils.change_origin import (
     acting_user_context,
@@ -482,10 +483,9 @@ def execute_repository_operation(
     resume_followup: RepositoryOperationFollowup | None = None,
     followup_previous_head: str | None = None,
 ) -> dict[str, dict[str, str] | bool]:
-    """Execute the components covered by one repository operation task."""
+    """Execute repository work authorized when the request was queued."""
     user = User.objects.get(pk=user_id)
     total = len(component_ids)
-    permission = get_repository_operation_permission(operation)
     failure_messages = list(failure_messages or ())
     display_components: dict[int, list[Component]] = {}
     for source in get_task_components(task_id):
@@ -517,8 +517,6 @@ def execute_repository_operation(
                     resume_followup = None
                     followup_previous_head = None
                 else:
-                    if not user.has_perm(permission, component):
-                        raise PermissionDenied
                     sources = display_components.get(component.pk, [])
                     record_repository_progress(
                         task_id, component, operation, "started", sources=sources
@@ -815,7 +813,10 @@ def bulk_edit_task(
     """Apply a browser bulk edit with fresh scope and permission checks."""
     from django.http import Http404, QueryDict  # ruff: ignore[import-outside-top-level]
 
-    from weblate.trans.bulk import bulk_perform  # ruff: ignore[import-outside-top-level]
+    from weblate.trans.bulk import (  # ruff: ignore[import-outside-top-level]
+        bulk_perform,
+        get_bulk_too_long_message,
+    )
     from weblate.trans.forms import BulkEditForm  # ruff: ignore[import-outside-top-level]
     from weblate.trans.views.search import (  # ruff: ignore[import-outside-top-level]
         get_bulk_edit_options,
@@ -830,6 +831,7 @@ def bulk_edit_task(
         payload.setlist(key, values)
     processed = 0
     updated_so_far = 0
+    too_long: set[int] = set()
 
     def report_progress(done: int, total: int, updated: int) -> None:
         nonlocal processed, updated_so_far
@@ -859,6 +861,7 @@ def bulk_edit_task(
                 user,
                 unit_set,
                 progress=report_progress,
+                too_long_unit_ids=too_long,
                 **get_bulk_edit_options(form, context),
             )
         except (ValidationError, PermissionDenied, Http404) as error:
@@ -897,10 +900,14 @@ def bulk_edit_task(
             )
             % updated
         )
+        level = "success"
+        if too_long:
+            message = f"{message} {get_bulk_too_long_message(len(too_long))}"
+            level = "warning"
         return {
             "message": message,
             "updated": updated,
-            "completion_message": {"text": message, "level": "success"},
+            "completion_message": {"text": message, "level": level},
         }
 
 
@@ -941,11 +948,15 @@ def bulk_accept_user_suggestions(
         ):
             failed += 1
         else:
-            suggestion.accept(
-                request,
-                state=STATE_APPROVED if approve else STATE_TRANSLATED,
-            )
-            accepted += 1
+            try:
+                suggestion.accept(
+                    request,
+                    state=STATE_APPROVED if approve else STATE_TRANSLATED,
+                )
+            except TranslationTextTooLongError:
+                failed += 1
+            else:
+                accepted += 1
 
         report_bulk_accept_user_suggestions_progress(processed, total)
 
@@ -1405,6 +1416,7 @@ def _component_removal(
             component.project.change_set.create(
                 action=ActionEvents.REMOVE_COMPONENT,
                 target=component.slug,
+                details={"restricted": component.restricted},
                 user=user,
                 author=user,
             )
@@ -1567,7 +1579,6 @@ def cleanup_project_tokens(project: Project, user: User | None) -> None:
             email__endswith="@bots.noreply.weblate.org",
         )
         .exclude(username__contains=":")
-        .exclude(full_name="Deleted User")
         .annotate(has_other_project_groups=Exists(other_project_groups))
         .filter(has_other_project_groups=False)
         .distinct()
@@ -2207,6 +2218,9 @@ def cleanup_project_backup_download() -> None:
 
 @app.on_after_finalize.connect
 def setup_periodic_tasks(sender: Celery, **kwargs: object) -> None:
+    sender.add_periodic_task(
+        3600, cleanup_translation_uploads.s(), name="cleanup-translation-uploads"
+    )
     sender.add_periodic_task(3600, commit_pending.s(), name="commit-pending")
     sender.add_periodic_task(3600, update_remotes.s(), name="update-remotes")
     sender.add_periodic_task(3600, cleanup_repos.s(), name="cleanup-repos")

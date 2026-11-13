@@ -72,7 +72,10 @@ from weblate.trans.models import (
 from weblate.trans.models.unit import fill_in_source_translation
 from weblate.trans.tasks import auto_translate
 from weblate.trans.util import redirect_next, render
-from weblate.trans.validators import SUGGESTION_REJECTION_REASON_LENGTH
+from weblate.trans.validators import (
+    SUGGESTION_REJECTION_REASON_LENGTH,
+    TranslationTextTooLongError,
+)
 from weblate.utils import messages
 from weblate.utils.antispam import is_spam
 from weblate.utils.celery import sanitize_task_result, store_task_metadata
@@ -87,6 +90,7 @@ from weblate.utils.ratelimit import (
 )
 from weblate.utils.state import (
     STATE_APPROVED,
+    STATE_READONLY,
     STATE_TRANSLATED,
 )
 from weblate.utils.stats import CategoryLanguage, ProjectLanguage, WorkspaceLanguage
@@ -250,11 +254,11 @@ def get_other_units(user: User, unit: Unit):
 
         units = (
             Unit.objects.filter_access(user)
-            .with_effective_source(custom_sources=custom_sources, select=False)
             .filter(
                 translation__component__project=component.project,
                 translation__language=translation.language,
             )
+            .with_effective_source(custom_sources=custom_sources, select=False)
             .filter(matches)
             .alias(
                 matches_current=Case(
@@ -1084,52 +1088,71 @@ def handle_translate(
     return HttpResponseRedirect(this_unit_url)
 
 
-def handle_merge(unit, request: AuthenticatedHttpRequest, next_unit_url):
-    """Handle unit merging."""
-    mergeform = MergeForm(request.user, unit, request.POST)
-    if not mergeform.is_valid():
-        show_form_errors(request, mergeform)
-        return None
+def handle_merge(
+    unit: Unit, request: AuthenticatedHttpRequest, next_unit_url: str
+) -> HttpResponseRedirect | None:
+    """Handle unit merging against the current, locked destination."""
+    from weblate.trans.models.source import source_operation  # ruff: ignore[import-outside-top-level]
 
-    merged = mergeform.cleaned_data["merge_unit"]
+    with source_operation(unit.translation.component):
+        unit = get_object_or_404(Unit.objects.select_for_update(), pk=unit.pk)
+        mergeform = MergeForm(request.user, unit, request.POST)
+        if not mergeform.is_valid():
+            show_form_errors(request, mergeform)
+            return None
 
-    edit_permission = request.user.has_perm("unit.edit", unit)
-    if not edit_permission:
-        show_unit_edit_denied(request, edit_permission)
-        return None
+        merged = mergeform.cleaned_data["merge_unit"]
 
-    # Store unit
-    state = merged.state
-    if state == STATE_APPROVED and (
-        not unit.translation.enable_review
-        or not request.user.has_perm("unit.review", unit)
-    ):
-        state = STATE_TRANSLATED
-    unit.translate(request.user, merged.get_target_plurals(), state)
-    # Redirect to next entry
-    return HttpResponseRedirect(next_unit_url)
+        edit_permission = request.user.has_perm("unit.edit", unit)
+        if not edit_permission:
+            show_unit_edit_denied(request, edit_permission)
+            return None
+
+        # Store unit
+        state = merged.state
+        if state == STATE_READONLY or (
+            state == STATE_APPROVED
+            and (
+                not unit.translation.enable_review
+                or not request.user.has_perm("unit.review", unit)
+            )
+        ):
+            state = STATE_TRANSLATED
+        try:
+            unit.translate(request.user, merged.get_target_plurals(), state)
+        except TranslationTextTooLongError as error:
+            messages.error(request, error.messages[0])
+            return None
+        # Redirect to next entry
+        return HttpResponseRedirect(next_unit_url)
 
 
-def handle_revert(unit, request: AuthenticatedHttpRequest, next_unit_url):
-    revertform = RevertForm(unit, request.POST)
-    if not revertform.is_valid():
-        show_form_errors(request, revertform)
-        return None
+def handle_revert(
+    unit: Unit, request: AuthenticatedHttpRequest, next_unit_url: str
+) -> HttpResponseRedirect | None:
+    from weblate.trans.models.source import source_operation  # ruff: ignore[import-outside-top-level]
 
-    change = revertform.cleaned_data["revert_change"]
+    with source_operation(unit.translation.component):
+        unit = get_object_or_404(Unit.objects.select_for_update(), pk=unit.pk)
+        revertform = RevertForm(unit, request.POST)
+        if not revertform.is_valid():
+            show_form_errors(request, revertform)
+            return None
 
-    edit_permission = request.user.has_perm("unit.edit", unit)
-    if not edit_permission:
-        show_unit_edit_denied(request, edit_permission)
-        return None
+        change = revertform.cleaned_data["revert_change"]
 
-    if not change.revert(
-        request.user, change_action=ActionEvents.REVERT, request=request
-    ):
-        messages.error(request, gettext("Could not revert the selected change."))
-        return None
-    # Redirect to next entry
-    return HttpResponseRedirect(next_unit_url)
+        edit_permission = request.user.has_perm("unit.edit", unit)
+        if not edit_permission:
+            show_unit_edit_denied(request, edit_permission)
+            return None
+
+        if not change.revert(
+            request.user, change_action=ActionEvents.REVERT, request=request
+        ):
+            messages.error(request, gettext("Could not revert the selected change."))
+            return None
+        # Redirect to next entry
+        return HttpResponseRedirect(next_unit_url)
 
 
 def check_suggest_permissions(
@@ -1200,10 +1223,14 @@ def perform_suggestion_action(
 
     # Perform operation
     if mode in {"accept", "accept_edit", "accept_approve"}:
-        suggestion.accept(
-            request,
-            state=STATE_APPROVED if mode == "accept_approve" else STATE_TRANSLATED,
-        )
+        try:
+            suggestion.accept(
+                request,
+                state=STATE_APPROVED if mode == "accept_approve" else STATE_TRANSLATED,
+            )
+        except TranslationTextTooLongError as error:
+            messages.error(request, error.messages[0])
+            return None
     elif mode in {"delete", "spam"}:
         rejection_reason = request.POST.get("rejection", "")
         if len(rejection_reason) > SUGGESTION_REJECTION_REASON_LENGTH:

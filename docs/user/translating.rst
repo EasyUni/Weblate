@@ -232,6 +232,9 @@ explanation. Existing translations, history, comments, labels, and suggestions
 are retained. Changing source text marks existing translations as needing
 editing. Changing only the key, context, or explanation preserves their states.
 Renaming a key may require corresponding changes in your application code.
+New and renamed keys must be representable in the file format and its encoding.
+For example, PHP keys must use supported variable or array syntax, properties
+keys cannot introduce additional entries, and DTD keys must be XML names.
 
 Changes are written to translation files through the normal pending-change
 queue and follow the project's commit policy. Keys used by pending edits remain
@@ -659,7 +662,9 @@ Choose :guilabel:`Text` for case-sensitive literal replacement, or
 :guilabel:`Regular expression` for a pattern. Leave :guilabel:`Search string`
 empty to disable replacement. An empty :guilabel:`Replacement string` removes
 matching text. Spaces and newlines in the fields are preserved, and each plural form is
-processed separately. The usual translation autofixes still apply.
+processed separately. The usual translation autofixes still apply. Strings
+where the replaced text would exceed the length limit of the translation editor
+are left unchanged, and the preview and result report how many were skipped.
 
 Regular expression replacements use Python syntax: ``\g<1>`` inserts the first
 captured group, ``\g<name>`` inserts a named group, and ``\g<0>`` inserts the

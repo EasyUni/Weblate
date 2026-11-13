@@ -92,7 +92,7 @@ project_copyright = "Michal Čihař"
 author = "Michal Čihař"
 
 # The full version, including alpha/beta/rc tags
-release = "2026.11.2"
+release = "2026.12"
 
 # -- General configuration ---------------------------------------------------
 
@@ -442,6 +442,7 @@ autodoc_mock_imports = [
     "weblate.lang.models",
     "weblate.vcs.git",
     "weblate.utils.files",
+    "weblate.utils.html",
     "weblate.utils.validators",
     "django_otp",
     "django_otp_webauthn",

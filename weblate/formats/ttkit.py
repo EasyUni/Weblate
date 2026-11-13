@@ -85,6 +85,7 @@ from weblate.formats.helpers import (
     CSV_TARGET_PLURAL_FORM,
     format_csv_id_hash,
 )
+from weblate.formats.limits import MAX_TRANSLATION_UNITS, TranslationLimitError
 from weblate.lang.data import FORMULA_WITH_ZERO, ZERO_PLURAL_TYPES
 from weblate.lang.models import Plural
 from weblate.trans.exceptions import is_expected_parse_error
@@ -821,6 +822,33 @@ class TTKitFormat[S: TranslationStore, U: TranslateToolkitUnit, T: TTKitUnit](
     BaseTTKitFormat[S, U, T]
 ):
     @classmethod
+    def validate_context(cls, context: str) -> None:
+        """Validate keys using a new file when no existing store is available."""
+        content = cls.get_new_file_content()
+        if content is None:
+            content = bytes(cls.get_class()())
+        cls(BytesIO(content), is_template=True).validate_new_context(context)
+
+    def validate_new_context(
+        self,
+        context: str,
+        pending_contexts: Iterable[str] | None = None,
+        *,
+        unit: U | None = None,
+    ) -> None:
+        """Validate an identifier using the store's dialect and encoding."""
+        try:
+            if unit is None:
+                unit = self.construct_unit(context)
+                # Properties constructors need the store's effective encoding.
+                unit._store = self.store  # ruff: ignore[private-member-access]
+            unit.validate_id(context)
+        except (ValueError, TypeError) as error:
+            raise ValidationError(
+                gettext("The key cannot be represented in this file format.")
+            ) from error
+
+    @classmethod
     def get_class(cls, encoding: str | None = None) -> type[S]:
         """Return class for handling this module."""
         # Direct class
@@ -888,7 +916,12 @@ class ZeroCLDRPluralMixin(TranslationFormat):
 
     def get_plural(self, language: Language) -> Plural:
         """Return matching plural object."""
-        plural = super().get_plural(language)
+        return self.get_zero_plural(language)
+
+    @classmethod
+    def get_zero_plural(cls, language: Language) -> Plural:
+        """Resolve current zero-plural rules without loading a translation file."""
+        plural = cls.get_plural_by_preference(language)
         if plural.type in ZERO_PLURAL_TYPES:
             return plural
 
@@ -1603,6 +1636,33 @@ class WeblateCSVUnit(csvunit):
 
 class WeblateCSVFile(csvfile):
     UnitClass = WeblateCSVUnit
+    _parsed_rows: int | None = None
+
+    def parse(
+        self,
+        csvsrc: bytes,
+        sample_length: int | None = 1024,
+        *,
+        dialect: str | None = None,
+    ) -> None:
+        """Bound data rows while the parser builds the store."""
+        self._parsed_rows = 0
+        try:
+            super().parse(csvsrc, sample_length=sample_length, dialect=dialect)
+        finally:
+            self._parsed_rows = None
+
+    def addunit(self, unit: WeblateCSVUnit) -> None:
+        if self._parsed_rows is not None:
+            self._parsed_rows += 1
+            if self._parsed_rows > MAX_TRANSLATION_UNITS:
+                raise TranslationLimitError(
+                    gettext(
+                        "CSV file exceeds the maximum allowed count of %d data rows."
+                    )
+                    % MAX_TRANSLATION_UNITS
+                )
+        super().addunit(unit)
 
 
 CSVPluralGroupKey = int
@@ -1821,7 +1881,7 @@ class PHPUnit[U: phpunit, F: "PhpFormat"](KeyValueUnit[U, F]):
     def target(self):
         if not self.has_unit():
             return ""
-        return get_string(self.unit.source)
+        return get_string(self.unit.target or self.unit.source)
 
 
 class INIUnit(TTKitUnit):
@@ -2683,8 +2743,14 @@ class ContextIdValidationMixin:
         cls.parse_new_context_id(context)
 
     def validate_new_context(
-        self, context: str, pending_contexts: Iterable[str] | None = None
+        self,
+        context: str,
+        pending_contexts: Iterable[str] | None = None,
+        *,
+        unit: TranslateToolkitUnit | None = None,
     ) -> None:
+        ttkit_format = cast("TTKitFormat", self)
+        TTKitFormat.validate_new_context(ttkit_format, context, unit=unit)
         # Validate against parsed file UnitIds first. Database contexts are used
         # only for pending additions which are not yet present in the file.
         context_parts = self.parse_new_context_id(context).parts
@@ -2692,7 +2758,6 @@ class ContextIdValidationMixin:
         if not self.has_hierarchical_contexts:
             return
 
-        ttkit_format = cast("BaseTTKitFormat[Any, Any, Any]", self)
         parsed_store_contexts: set[str] | None = (
             set() if pending_contexts is not None else None
         )
@@ -3427,15 +3492,40 @@ class FlatXMLFormat(TTKitFormat):
     empty_file_template = '<?xml version="1.0" encoding="utf-8"?>\n<root></root>'
     supports_flags: bool = True
 
-    def get_format_class_kwargs(self):
-        params = get_effective_params_for_file_format(
-            self.format_id, self.file_format_params
-        )
+    @classmethod
+    def get_flatxml_store_kwargs(
+        cls, file_format_params: FileFormatParams | None
+    ) -> dict[str, str | None]:
+        params = get_effective_params_for_file_format(cls.format_id, file_format_params)
         return {
             "root_name": params.get("flatxml_root_name"),
             "value_name": params.get("flatxml_value_name"),
             "key_name": params.get("flatxml_key_name"),
         }
+
+    def get_format_class_kwargs(self) -> dict[str, str | None]:
+        return self.get_flatxml_store_kwargs(self.file_format_params)
+
+    @classmethod
+    def create_new_file(
+        cls,
+        filename: str,
+        language: Language,
+        base: str,
+        callback: Callable | None = None,
+        file_format_params: FileFormatParams | None = None,
+    ) -> None:
+        if base or cls.format_id != "flatxml":
+            super().create_new_file(
+                filename, language, base, callback, file_format_params
+            )
+            return
+
+        store = cls(
+            cls.get_class()(**cls.get_flatxml_store_kwargs(file_format_params)),
+            file_format_params=file_format_params,
+        )
+        cls.save_atomic(filename, store.save_content)
 
     def get_unit_class_kwargs(self):
         params = get_effective_params_for_file_format(
@@ -3533,19 +3623,6 @@ class XWikiUnit(PropertiesUnit):
     def source(self):
         # Need to decode property encoded string
         return get_string(quote.xwiki_properties_decode(super().source))
-
-    @cached_property
-    def target(self):
-        """Return target string from a Translate Toolkit unit."""
-        if not self.has_unit():
-            return ""
-        # Need to decode property encoded string
-        # This is basically stolen from
-        # translate.storage.properties.propunit.gettarget
-        # which for some reason does not return translation
-        value = quote.xwiki_properties_decode(self.unit.value)
-        value = re.sub(r"\\ ", " ", value)
-        return get_string(value)
 
 
 class XWikiPropertiesFormat(PropertiesBaseFormat):

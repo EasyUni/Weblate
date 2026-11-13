@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
@@ -315,7 +317,45 @@ class CreateTest(ViewTestCase):
         return response
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_rejects_outside_template(self) -> None:
+        with TemporaryDirectory() as directory:
+            outside = Path(directory, "outside.po")
+            outside.write_bytes(b"existing content")
+            category = Category.objects.create(
+                name="Unauthorized category", slug="unauthorized", project=self.project
+            )
+            params = {
+                "vcs": "local",
+                "repo": "local:",
+                "category": category.pk,
+                "file_format": "po-mono",
+                "filemask": "*.po",
+                "template": str(outside),
+                "edit_template": "on",
+                "new_base": "",
+            }
+
+            with patch.object(Component, "clean_repo") as prepare:
+                response = self.client_create_component(False, **params)
+            self.assertIn("project", response.context["form"].errors)
+            prepare.assert_not_called()
+            self.assertEqual(outside.read_bytes(), b"existing content")
+
+            self.project.add_user(self.user, "Administration")
+            response = self.client_create_component(False, **params)
+            self.assertIn("template", response.context["form"].errors)
+            self.assertEqual(outside.read_bytes(), b"existing content")
+            self.assertFalse(Component.objects.filter(slug="create-component").exists())
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_component_blocked(self) -> None:
+        self.assert_unavailable_creation_target(enforced_2fa=False)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_create_component_requires_two_factor(self) -> None:
+        self.assert_unavailable_creation_target(enforced_2fa=True)
+
+    def assert_unavailable_creation_target(self, *, enforced_2fa: bool) -> None:
         self.project.add_user(self.user, "Administration")
         # Keep another eligible destination to exercise project field validation.
         destination = self.create_project(name="Destination", slug="destination")
@@ -339,7 +379,11 @@ class CreateTest(ViewTestCase):
             self.assertIn(self.project, response.context["projects"])
 
         # The block also invalidates destinations from previously opened wizards.
-        UserBlock.objects.create(user=self.user, project=self.project)
+        if enforced_2fa:
+            self.project.enforced_2fa = True
+            self.project.save(update_fields=["enforced_2fa"])
+        else:
+            UserBlock.objects.create(user=self.user, project=self.project)
         for view, extra in (
             ("create-component", {"origin": "scratch"}),
             ("create-component-vcs", {}),
@@ -382,10 +426,21 @@ class CreateTest(ViewTestCase):
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_blocked_management_destinations(self) -> None:
+        self.assert_unavailable_management_target(enforced_2fa=False)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_two_factor_management_destinations(self) -> None:
+        self.assert_unavailable_management_target(enforced_2fa=True)
+
+    def assert_unavailable_management_target(self, *, enforced_2fa: bool) -> None:
         destination = self.create_project(name="Destination", slug="destination")
         destination.add_user(self.user, "Administration")
         self.project.add_user(self.user, "Administration")
-        UserBlock.objects.create(user=self.user, project=destination)
+        if enforced_2fa:
+            destination.enforced_2fa = True
+            destination.save(update_fields=["enforced_2fa"])
+        else:
+            UserBlock.objects.create(user=self.user, project=destination)
         self.user.clear_permissions_cache()
         category = Category.objects.create(
             name="Category", slug="category", project=self.project
@@ -406,6 +461,57 @@ class CreateTest(ViewTestCase):
             with self.subTest(form=type(form).__name__):
                 self.assertFalse(form.is_valid())
                 self.assertIn("project", form.errors)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_superuser_creation_target_with_enforced_two_factor(self) -> None:
+        self.user.is_superuser = True
+        self.user.save(update_fields=["is_superuser"])
+        self.project.enforced_2fa = True
+        self.project.save(update_fields=["enforced_2fa"])
+        self.client_create_component(True)
+
+    @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
+    def test_creation_rechecks_permission_after_validation(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        original_is_valid = ComponentProjectForm.is_valid
+
+        def revoke_access(form: ComponentProjectForm) -> bool:
+            valid = original_is_valid(form)
+            self.assertTrue(valid, form.errors)
+            project = form.cleaned_data["project"]
+            project.enforced_2fa = True
+            Project.objects.filter(pk=project.pk).update(enforced_2fa=True)
+            return valid
+
+        for view, extra in (
+            ("create-component", {"origin": "scratch"}),
+            ("create-component-vcs", {"file_format": "po", "filemask": "po/*.po"}),
+        ):
+            Project.objects.filter(pk=self.project.pk).update(enforced_2fa=False)
+            with (
+                self.subTest(view=view),
+                patch.object(ComponentProjectForm, "is_valid", revoke_access),
+                patch.object(Project, "scratch_create_component") as scratch_create,
+            ):
+                response = self.client.post(
+                    reverse(view),
+                    {
+                        "name": "Revoked component",
+                        "slug": "revoked-component",
+                        "project": self.project.pk,
+                        "source_language": get_default_lang(),
+                        "file_format": "po-mono",
+                        "vcs": "git",
+                        "repo": self.component.get_repo_link_url(),
+                        "new_lang": "none",
+                        **extra,
+                    },
+                )
+                self.assertEqual(response.status_code, 403)
+                scratch_create.assert_not_called()
+                self.assertFalse(
+                    Component.objects.filter(slug="revoked-component").exists()
+                )
 
     @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
     def test_create_component_billing(self) -> None:
@@ -428,6 +534,57 @@ class CreateTest(ViewTestCase):
         billing.plan.save()
 
         self.client_create_component(False, name="c3", slug="c3")
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_create_component_rechecks_billing_on_submission(self) -> None:
+        billing = create_test_billing(self.user)
+        billing.add_project(self.project)
+        self.project.add_user(self.user, "Administration")
+        billing.in_limits = False
+        billing.save(update_fields=["in_limits"], skip_limits=True)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.workspace_id, billing.workspace_id)
+        self.assertFalse(billing.in_limits)
+
+        response = self.client.post(
+            reverse("create-component-vcs"),
+            {
+                "name": "Create Component",
+                "slug": "create-component",
+                "project": self.project.pk,
+                "vcs": "git",
+                "repo": self.component.get_repo_link_url(),
+                "file_format": "po",
+                "filemask": "po/*.po",
+                "new_base": "po/project.pot",
+                "new_lang": "add",
+                "language_regex": "^[^.]+$",
+                "source_language": get_default_lang(),
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.headers.get("Location"))
+        self.assertIn(
+            "project",
+            response.context["form"].errors,
+            str(response.context["form"].errors),
+        )
+        self.assertIn(
+            "No valid billing found or limit exceeded.",
+            str(response.context["form"].errors),
+        )
+        self.assertContains(response, "No valid billing found or limit exceeded.")
+        self.assertFalse(Component.objects.filter(slug="create-component").exists())
+
+    @modify_settings(INSTALLED_APPS={"append": "weblate.billing"})
+    def test_create_component_rejects_unbilled_project_in_final_step(self) -> None:
+        self.project.add_user(self.user, "Administration")
+        for workspace in (None, Workspace.objects.create(name="Unbilled workspace")):
+            with self.subTest(workspace=workspace):
+                self.project.workspace = workspace
+                self.project.save(update_fields=["workspace"])
+                response = self.client_create_component(False)
+                self.assertIn("project", response.context["form"].errors)
+        self.assertFalse(Component.objects.filter(slug="create-component").exists())
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_create_component_admin(self) -> None:
@@ -1541,6 +1698,7 @@ class CreateTest(ViewTestCase):
 
     @modify_settings(INSTALLED_APPS={"remove": "weblate.billing"})
     def test_component_project_form_shows_hidden_field_errors(self) -> None:
+        self.project.add_user(self.user, "Administration")
         other_project = Project.objects.create(name="Other", slug="other")
         other_category = Category.objects.create(
             name="Other category", slug="other-category", project=other_project

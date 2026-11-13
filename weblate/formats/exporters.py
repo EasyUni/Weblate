@@ -10,6 +10,7 @@ import re
 from itertools import chain
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy
 from lxml import etree
 from lxml.etree import XMLSyntaxError
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
     from translate.storage.poxliff import PoXliffUnit
     from translate.storage.tbx import tbxunit
 
-    from weblate.trans.models import Translation
+    from weblate.trans.models import Translation, Unit
 
 # Map to remove control characters except newlines and tabs
 # Based on lxml - src/lxml/apihelpers.pxi _is_valid_xml_utf8
@@ -134,7 +135,7 @@ class PoXliffExporter(XMLExporter):
         if flags.has_value("max-length"):
             output.xmlelement.set("maxwidth", str(flags.get_value("max-length")))
 
-        output.xmlelement.set("weblate-flags", flags.format())
+        output.xmlelement.set("weblate-flags", self.string_filter(flags.format()))
 
     def handle_plurals(self, plurals):
         if len(plurals) == 1:
@@ -195,7 +196,7 @@ class TBXExporter(XMLExporter):
         return output
 
     def store_flags(self, output, flags) -> None:
-        output.xmlelement.set("weblate-flags", flags.format())
+        output.xmlelement.set("weblate-flags", self.string_filter(flags.format()))
 
     def _export_term_metadata(
         self, output, records, language_code, shared_notes
@@ -552,9 +553,13 @@ class MonolingualExporter(BaseExporter):
             BaseExporter.supports(translation) and translation.component.has_template()
         )
 
+    def get_unit_id(self, unit: Unit) -> str:
+        return unit.context
+
     def build_unit(self, unit):
-        output = self.create_unit(unit.context)
-        output.setid(unit.context)
+        identifier = self.get_unit_id(unit)
+        output = self.create_unit(identifier)
+        output.setid(identifier)
         self.add(output, self.handle_plurals(unit.get_target_plurals()))
         return output
 
@@ -585,6 +590,43 @@ class AndroidResourceExporter(XMLFilterMixin, MonolingualExporter):
     extension = "xml"
     verbose = gettext_lazy("Android String Resource")
 
+    @cached_property
+    def reserved_ids(self) -> set[str]:
+        return set()
+
+    @cached_property
+    def used_ids(self) -> set[str]:
+        return set()
+
+    def is_valid_id(self, identifier: str) -> bool:
+        try:
+            self.storage.UnitClass(None).validate_id(identifier)
+        except ValueError:
+            return False
+        return True
+
+    def add_units(self, units: list[Unit]) -> None:
+        # Reserve original names before generating replacements, regardless of
+        # their position in the export. Materialize iterators for both passes.
+        units = list(units)
+        self.reserved_ids.update(
+            unit.context for unit in units if self.is_valid_id(unit.context)
+        )
+        super().add_units(units)
+
+    def get_unit_id(self, unit: Unit) -> str:
+        if self.is_valid_id(unit.context):
+            identifier = unit.context
+        else:
+            base = f"weblate_{unit.checksum}"
+            identifier = base
+            suffix = 2
+            while identifier in self.reserved_ids or identifier in self.used_ids:
+                identifier = f"{base}_{suffix}"
+                suffix += 1
+        self.used_ids.add(identifier)
+        return identifier
+
     def add(self, unit, word) -> None:
         # Need to have storage to handle plurals
         # ruff: ignore[private-member-access]
@@ -608,6 +650,15 @@ class StringsExporter(MonolingualExporter):
     extension = "strings"
     file_format = "strings"
     verbose = gettext_lazy("iOS strings")
+
+    def get_unit_id(self, unit: Unit) -> str:
+        identifier = super().get_unit_id(unit)
+        if unit.translation.component.file_format == self.file_format:
+            # Native .strings contexts already contain serialized key escapes.
+            return identifier
+        # Other formats provide logical identifiers, while setid() expects the
+        # serialized spelling. The serializer handles quotation marks itself.
+        return self.storage.personality.encode(identifier).replace("\r", r"\r")
 
     def create_unit(self, source):
         return self.storage.UnitClass(source, self.storage.personality.name)

@@ -64,7 +64,7 @@ from weblate.trans.tests.utils import (
 )
 from weblate.trans.util import join_plural
 from weblate.utils.change_origin import acting_user_context, get_acting_user
-from weblate.utils.files import remove_tree
+from weblate.utils.files import PathMatchBudget, remove_tree
 from weblate.utils.lock import WeblateLockTimeoutError
 from weblate.utils.state import (
     STATE_APPROVED,
@@ -100,6 +100,16 @@ remote: Host key verification failed.
 
 class ComponentTest(RepoTestCase):
     """Component object testing."""
+
+    def test_ensure_local_repository_skips_remote_and_linked_repositories(self) -> None:
+        for vcs, repo in (
+            ("git", "https://example.com/repository.git"),
+            ("local", "weblate://project/source"),
+        ):
+            with self.subTest(vcs=vcs, repo=repo):
+                component = Component(vcs=vcs, repo=repo)
+                component.ensure_local_repository()
+                self.assertNotIn("repository", component.__dict__)
 
     def test_commit_pending_without_changes_does_not_fetch_bot(self) -> None:
         component = self.create_component()
@@ -1969,6 +1979,55 @@ class ComponentValidationTest(RepoTestCase):
         ):
             self.component.full_clean()
 
+    def test_filemask_traversal_limit(self) -> None:
+        with (
+            patch(
+                "weblate.trans.models.component.PathMatchBudget",
+                return_value=PathMatchBudget(max_work=0),
+            ),
+            self.assertRaisesMessage(
+                ValidationError,
+                "The file mask is too complex and took too long to evaluate.",
+            ) as raised,
+        ):
+            self.component.full_clean()
+        self.assertIn("filemask", raised.exception.message_dict)
+
+    def test_filemask_traversal_limit_during_scan(self) -> None:
+        with (
+            patch(
+                "weblate.trans.models.component.PathMatchBudget",
+                side_effect=lambda: PathMatchBudget(max_work=0),
+            ),
+            patch("weblate.trans.models.component.report_error") as report_error,
+        ):
+            with self.assertRaises(FileMaskTimeoutError):
+                self.component.get_mask_matches()
+            with self.assertRaises(FileMaskTimeoutError):
+                self.component.get_mask_matches(raise_on_timeout=True)
+        report_error.assert_called_once()
+
+    def test_filemask_deadline_during_match_processing(self) -> None:
+        def get_lang_code(path: str) -> str:
+            self.assertEqual(path, "po/cs.po")
+            clock.return_value = 11
+            return "cs"
+
+        with (
+            patch("weblate.utils.files.monotonic", return_value=0) as clock,
+            patch(
+                "weblate.trans.models.component.PathMatchBudget",
+                return_value=PathMatchBudget(deadline=10),
+            ),
+            patch(
+                "weblate.trans.models.component.bounded_glob",
+                return_value=[os.path.join(self.component.full_path, "po/cs.po")],
+            ),
+            patch.object(self.component, "get_lang_code", side_effect=get_lang_code),
+            self.assertRaisesMessage(FileMaskTimeoutError, "deadline"),
+        ):
+            self.component.get_mask_matches(raise_on_timeout=True)
+
     def test_filemask_match_timeout(self) -> None:
         with (
             patch(
@@ -1981,7 +2040,7 @@ class ComponentValidationTest(RepoTestCase):
     def test_filemask_timeout_during_scan(self) -> None:
         with (
             patch(
-                "weblate.trans.models.component.glob",
+                "weblate.trans.models.component.bounded_glob",
                 return_value=[os.path.join(self.component.full_path, "po/cs.po")],
             ),
             patch.object(

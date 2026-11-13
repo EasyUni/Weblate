@@ -2,7 +2,11 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-FROM weblate/weblate:2026.11.0.0@sha256:60d834a24dc4429f0b81bf6206ae686070e1031f3441c84ffb18bcab0d2fe311 AS common
+FROM node:26.13.1-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS node
+# Yarn Classic matches client/yarn.lock; recent Node images omit Yarn.
+RUN npm install --global yarn@1.22.22
+
+FROM weblate/weblate:2026.11.2.0@sha256:559bb57e2cae8471386ac646cb852c615996d199d02a3f8894d004acb03a1b77 AS common
 
 ##########
 # WARNING!
@@ -91,9 +95,27 @@ RUN ln -sf "$(uv --no-cache python find --system --managed-python --no-python-do
 # Compose selects this target with the existing small development context.
 FROM common AS development
 COPY --link --chmod=0755 start-dev /app/bin/
+COPY --from=node /usr/local/ /opt/node/
+ENV PATH=/app/venv/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+RUN apt-get update --error-on=any \
+    && apt-get install -y --no-install-recommends graphviz \
+    && node --version && npm --version && yarn --version
+# The small development build context contains this Dockerfile. Diagnostics
+# compare it with the mounted checkout to detect an image needing a rebuild.
+COPY Dockerfile /usr/local/share/weblate-dev.Dockerfile
 
 ENTRYPOINT ["/app/bin/start-dev"]
 CMD ["runserver"]
+
+
+FROM development AS migration
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+RUN apt-get update --error-on=any \
+    && apt-get install -y --no-install-recommends \
+        libgirepository-2.0-dev libcairo-dev gir1.2-rsvg-2.0 gir1.2-pango-1.0 \
+    && uv --no-cache python install --install-dir /opt/python 3.11 3.13 \
+    && ln -s "$(uv --no-cache python find --managed-python --no-python-downloads 3.11)" /usr/local/bin/python3.11 \
+    && ln -s "$(uv --no-cache python find --managed-python --no-python-downloads 3.13)" /usr/local/bin/python3.13
 
 
 # OSS Scanner builds the final target with the repository root as context.

@@ -35,10 +35,13 @@ from weblate.addons.models import (
 from weblate.lang.models import Language
 from weblate.trans.exceptions import FileParseError
 from weblate.trans.models import Change, Component, Project
+from weblate.trans.validators import TranslationTextTooLongError
 from weblate.utils.celery import app
 from weblate.utils.hash import calculate_checksum
 from weblate.utils.lock import WeblateLockTimeoutError
-from weblate.utils.requests import open_restricted_asset_url
+from weblate.utils.requests import (
+    fetch_restricted_asset_url,
+)
 from weblate.utils.validators import validate_filename
 
 if TYPE_CHECKING:
@@ -97,20 +100,19 @@ def read_cdn_file(component: Component, filename: str) -> str:
     if not filename.startswith(("http://", "https://")):
         return read_component_file(component, filename)
 
-    with open_restricted_asset_url(
+    return fetch_restricted_asset_url(
         "get",
         filename,
         allow_private_targets=not settings.ASSET_RESTRICT_PRIVATE,
         private_allowlist=settings.ASSET_PRIVATE_ALLOWLIST,
-    ) as response:
-        response.read()
-        return response.text
+    ).text
 
 
 def parse_cdn_html(addon: Addon, component: Component) -> list[dict[str, str]]:
     source_translation = component.source_translation
     source_units = set(source_translation.unit_set.values_list("source", flat=True))
-    units = []
+    # Text mapped to the file it was found in
+    units: dict[str, str] = {}
     errors: list[dict[str, str]] = []
 
     for filename in addon.configuration["files"].splitlines():
@@ -141,17 +143,21 @@ def parse_cdn_html(addon: Addon, component: Component) -> list[dict[str, str]]:
                 or text in units
             ):
                 continue
-            units.append(text)
+            units[text] = filename
 
     # Actually create units
-    for text in units:
-        source_translation.add_unit(
-            request=None,
-            context=calculate_checksum(text),
-            source=text,
-            target=None,
-            author=addon.addon.user,
-        )
+    for text, filename in units.items():
+        try:
+            source_translation.add_unit(
+                request=None,
+                context=calculate_checksum(text),
+                source=text,
+                target=None,
+                author=addon.addon.user,
+            )
+        except TranslationTextTooLongError:
+            # Alert occurrences are stored, so the message is not localized
+            errors.append({"filename": filename, "error": "Translation text too long"})
 
     if errors:
         for occurrence in errors:

@@ -12,7 +12,6 @@ from contextlib import contextmanager, nullcontext, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
-from glob import glob
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -160,6 +159,7 @@ from weblate.utils.colors import ColorChoices
 from weblate.utils.decorators import disable_for_loaddata
 from weblate.utils.errors import report_error
 from weblate.utils.fields import EmailField
+from weblate.utils.files import PathMatchBudget, PathMatchLimitError, bounded_glob
 from weblate.utils.html import format_html_join_comma, list_to_tuples
 from weblate.utils.licenses import (
     get_license_choices,
@@ -229,6 +229,7 @@ from weblate.vcs.ssh import add_host_key
 if TYPE_CHECKING:
     from collections.abc import Collection, Generator, Iterable
     from datetime import datetime
+    from typing import BinaryIO
     from uuid import UUID
 
     from django_stubs_ext import StrOrPromise
@@ -464,6 +465,9 @@ class ComponentQuerySet(models.QuerySet["Component", "Component"]):
             linked_component_project,
             project_workspace,
             linked_component_project_workspace,
+            "category__project__workspace",
+            "category__category__project__workspace",
+            "category__category__category__project__workspace",
         )
 
     def defer_huge(self):
@@ -2045,9 +2049,7 @@ class Component(  # ruff: ignore[too-many-public-methods]
                     )
                     continue
 
-            if not addon.can_install(component=component) or not addon.api_available(
-                component
-            ):
+            if not addon.can_install(component=component):
                 component.log_warning("could not enable addon %s, not compatible", name)
                 continue
 
@@ -3201,12 +3203,13 @@ class Component(  # ruff: ignore[too-many-public-methods]
                     )
         return True
 
-    def configure_repo(self, validate=False, pull=True) -> None:
-        """Ensure repository is correctly set up."""
-        if self.is_repo_link:
+    def ensure_local_repository(self) -> None:
+        """Initialize a local repository before component operations use it."""
+        if self.is_repo_link or not self.is_repo_local:
             return
-
-        if self.is_repo_local:
+        # Initialization must use the saved component's lock, including the
+        # existence check, rather than the standalone repository's path lock.
+        with self.repository.lock:
             if not os.path.exists(os.path.join(self.full_path, ".git")):
                 if (
                     not self.template
@@ -3231,7 +3234,16 @@ class Component(  # ruff: ignore[too-many-public-methods]
                     }
                     if self.template
                     else {},
+                    lock=self.repository.lock,
                 )
+
+    def configure_repo(self, validate=False, pull=True) -> None:
+        """Ensure repository is correctly set up."""
+        if self.is_repo_link:
+            return
+
+        if self.is_repo_local:
+            self.ensure_local_repository()
             return
 
         with self.repository.lock:
@@ -4291,6 +4303,7 @@ class Component(  # ruff: ignore[too-many-public-methods]
         return [
             {
                 "project_name": linked.project.name,
+                "full_name": str(linked),
                 "name": linked.name,
                 "url": get_site_url(linked.get_absolute_url()),
             }
@@ -4800,12 +4813,27 @@ class Component(  # ruff: ignore[too-many-public-methods]
 
     def get_mask_matches(self, *, raise_on_timeout: bool = False) -> list[str]:
         """Return files matching current mask."""
+        budget = PathMatchBudget()
+        try:
+            return self._get_mask_matches(budget, raise_on_timeout=raise_on_timeout)
+        except PathMatchLimitError as error:
+            if not raise_on_timeout:
+                report_error(
+                    "Component file mask scan limit exceeded", project=self.project
+                )
+                self.log_warning("file mask scan limit exceeded: %s", error)
+            raise FileMaskTimeoutError(str(error)) from error
+
+    def _get_mask_matches(
+        self, budget: PathMatchBudget, *, raise_on_timeout: bool
+    ) -> list[str]:
         prefix = path_separator(os.path.join(self.full_path, ""))
         matches = set()
         language_re = compile_regex(self.language_regex)
         language_timeout_reported = False
 
-        for filename in glob(os.path.join(self.full_path, self.filemask)):
+        for filename in bounded_glob(self.full_path, self.filemask, budget=budget):
+            budget.check()
             path = path_separator(filename).replace(prefix, "")
             try:
                 code = self.get_lang_code(path)
@@ -4834,6 +4862,7 @@ class Component(  # ruff: ignore[too-many-public-methods]
         # Remove symlinked translations
         targets = set()
         for filename in sorted(matches):
+            budget.check()
             try:
                 resolved = self.repository.resolve_symlinks(filename)
             except RepositorySymlinkError:
@@ -4849,14 +4878,18 @@ class Component(  # ruff: ignore[too-many-public-methods]
                     else:
                         targets.add(resolved)
 
+        budget.check()
         if self.has_template():
             # We do not want to show intermediate translation standalone
             if self.intermediate:
                 matches.discard(self.intermediate)
             # We want to list template among translations as well
             matches.discard(self.template)
-            return [self.template, *sorted(matches)]
-        return sorted(matches)
+            result = [self.template, *sorted(matches)]
+        else:
+            result = sorted(matches)
+        budget.check()
+        return result
 
     def is_gettext_po_template(self) -> bool:
         """Check whether the base file should be handled as a gettext template."""
@@ -6839,7 +6872,7 @@ class Component(  # ruff: ignore[too-many-public-methods]
 
     def load_intermediate_store(self) -> TranslationFormat:
         """Load translate-toolkit store for intermediate."""
-        return self.file_format_cls(  # pylint: disable=too-many-function-args,unexpected-keyword-arg
+        store = self.file_format_cls(  # pylint: disable=too-many-function-args,unexpected-keyword-arg
             self.get_intermediate_filename(),
             language_code=self.source_language.code,
             source_language=self.source_language.code,
@@ -6847,6 +6880,8 @@ class Component(  # ruff: ignore[too-many-public-methods]
             repo_temp_dir=self.repository.get_repo_temp_dir(),
             file_validator=self.check_file_is_valid,
         )
+        store.check_valid()
+        return store
 
     @cached_property
     def intermediate_store(self) -> TranslationFormat | None:
@@ -6861,10 +6896,10 @@ class Component(  # ruff: ignore[too-many-public-methods]
             self.handle_parse_error(exc, filename=self.intermediate)
             return None
 
-    def load_template_store(self, fileobj=None) -> TranslationFormat:
+    def load_template_store(self, fileobj: BinaryIO | None = None) -> TranslationFormat:
         """Load translate-toolkit store for template."""
         with self.start_tracing_span("load_template_store"):
-            return self.file_format_cls(  # pylint: disable=too-many-function-args,unexpected-keyword-arg
+            store = self.file_format_cls(  # pylint: disable=too-many-function-args,unexpected-keyword-arg
                 fileobj or self.get_template_filename(),
                 language_code=self.source_language.code,
                 source_language=self.source_language.code,
@@ -6873,6 +6908,8 @@ class Component(  # ruff: ignore[too-many-public-methods]
                 repo_temp_dir=self.repository.get_repo_temp_dir(),
                 file_validator=self.check_file_is_valid,
             )
+            store.check_valid()
+            return store
 
     @cached_property
     def template_store(self) -> TranslationFormat | None:
@@ -7190,6 +7227,7 @@ class Component(  # ruff: ignore[too-many-public-methods]
         fullname = os.path.join(self.full_path, filename)
 
         with self.repository.lock:
+            self.ensure_local_repository()
             if create_translations:
                 self.commit_pending("add language", None)
 

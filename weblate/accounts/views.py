@@ -654,7 +654,7 @@ def user_remove(request: AuthenticatedHttpRequest):
             AuditLog.objects.create(
                 request.user, request, "removal-request", **request.GET
             )
-            return social_complete(request, "email")
+            return send_email_confirmation(request)
     else:
         confirm_form = PasswordConfirmForm(request)
 
@@ -1147,12 +1147,12 @@ class UserPage(UpdateView):
         owned = (user.owned_projects & allowed_projects.distinct()).order()[:11]
         context["page_owned_projects_more"] = len(owned) == 11
         context["page_owned_projects"] = prefetch_project_flags(
-            prefetch_stats(owned[:10])
+            prefetch_stats(owned[:10]), user=request.user
         )
         watched = (user.watched_projects & allowed_projects).order()[:11]
         context["page_watched_projects_more"] = len(watched) == 11
         context["page_watched_projects"] = prefetch_project_flags(
-            prefetch_stats(watched[:10])
+            prefetch_stats(watched[:10]), user=request.user
         )
         context["user_languages"] = user.profile.all_languages[:7]
         context["page_user_billings"] = []
@@ -1525,7 +1525,7 @@ def register(request: AuthenticatedHttpRequest):
                 return fake_email_sent(request)
             else:
                 store_userid(request)
-                return social_complete(request, "email")
+                return send_email_confirmation(request)
     else:
         form = RegistrationForm(
             request=request, initial=initial, hide_captcha=hide_captcha
@@ -1566,14 +1566,14 @@ def email_login(request: AuthenticatedHttpRequest):
                 )
                 return fake_email_sent(request)
             store_userid(request)
-            return social_complete(request, "email")
+            return send_email_confirmation(request)
     else:
         form = EmailForm(request=request)
 
     return render(
         request,
         "accounts/email.html",
-        {"title": gettext("Verify new e-mail address"), "form": form},
+        {"title": gettext("Add and verify e-mail address"), "form": form},
     )
 
 
@@ -1649,7 +1649,11 @@ def password(request: AuthenticatedHttpRequest):
     return render(
         request,
         "accounts/password.html",
-        {"title": gettext("Change password"), "change_form": change_form, "form": form},
+        {
+            "title": gettext("Change password") if usable else gettext("Set password"),
+            "change_form": change_form,
+            "form": form,
+        },
     )
 
 
@@ -1708,7 +1712,7 @@ def send_password_reset_email(
         return None
     request.session[PASSWORD_RESET_EMAIL_SESSION] = email
     store_userid(request, reset=True, reset_scope=scope)
-    return social_complete(request, "email")
+    return send_email_confirmation(request)
 
 
 def get_registration_hint(email: str) -> str | None:
@@ -2207,6 +2211,7 @@ def get_registration_error_policy(
         case (
             "email_verification_rejected"
             | "weblate.confirmation_expired"
+            | "weblate.confirmation_not_requested"
             | "weblate.invitation_invalid"
         ):
             response = auth_redirect_token(request)
@@ -2359,6 +2364,12 @@ def handle_auth_error(
     if policy.handled:
         return policy.response
     raise error
+
+
+def send_email_confirmation(request: AuthenticatedHttpRequest) -> HttpResponse:
+    """Start e-mail authentication after a Weblate form has validated the request."""
+    request.weblate_email_confirmation = True
+    return social_complete(request, "email")
 
 
 @csrf_exempt

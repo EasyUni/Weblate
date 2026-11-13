@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, incus-container]
+    runs-on: ubuntu-26.04
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:

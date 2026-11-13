@@ -400,6 +400,7 @@ linkcheck_ignore = [
     "https://www.freedesktop.org/",
     # Security advisory is not published yet, remove once it is
     "https://github.com/WeblateOrg/weblate/security/advisories/GHSA-8jpg-5gm2-hjp6",
+    "https://github.com/WeblateOrg/weblate/security/advisories/GHSA-w82r-5w9m-7rhp",
 ]
 
 # HTTP docs
